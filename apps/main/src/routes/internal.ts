@@ -1,0 +1,788 @@
+import { Hono } from "hono";
+import type { Env } from "@open-managed-agents/shared";
+import type { AgentConfig, EnvironmentConfig, VaultConfig, CredentialConfig } from "@open-managed-agents/shared";
+import { generateVaultId } from "@open-managed-agents/shared";
+import type { Services } from "@open-managed-agents/services";
+import { forEachShardServices } from "@open-managed-agents/services";
+import { toEnvironmentConfig } from "@open-managed-agents/environments-store";
+
+// Internal endpoints, called only by the integrations gateway worker via the
+// `MAIN` service binding. Auth is a shared header secret — no better-auth
+// session, no API key. Routes here MUST NOT be exposed publicly; they trust
+// the calling worker to have already authenticated the OMA user.
+//
+// Mounted at /v1/internal/* in apps/main/src/index.ts.
+//
+// EXCEPTION: /v1/internal/usage_events/* uses BILLING_INTERNAL_SECRET
+// (separate Bearer header, separate scope) because the caller is the
+// hosted billing worker — a different trust principal than the
+// integrations gateway. Mounted as a sub-app at the bottom of this file
+// before the default export so it bypasses the integrations auth gate.
+
+const app = new Hono<{ Bindings: Env; Variables: { services: Services } }>();
+
+/**
+ * Append a provider-supplied prose block to the frozen agent snapshot's
+ * `system` field. Used by integration providers (Slack today) to inject
+ * once-per-session protocol vocabulary — the `<oma_signal>` catalog, reply
+ * rules, the "treat signals as telemetry, not conversation context"
+ * directive — so the agent doesn't need that boilerplate re-emitted on
+ * every webhook-derived user.message.
+ *
+ * Frozen-at-create-time is fine: signal protocol changes ship as code, and
+ * sessions opened against an older deploy continue to see the older
+ * protocol prose until they end. No version pinning needed.
+ *
+ * No-op when `additional` is empty/whitespace, so providers can pass
+ * unconditionally without us mutating an unrelated snapshot.
+ */
+export function appendToAgentSnapshotSystemPrompt(
+  snapshot: AgentConfig,
+  additional: string | undefined,
+): AgentConfig {
+  if (!additional || !additional.trim()) return snapshot;
+  const existing = snapshot.system ?? "";
+  const sep = existing.length > 0 && !existing.endsWith("\n") ? "\n\n" : "";
+  return { ...snapshot, system: existing + sep + additional };
+}
+
+/**
+ * Augment an agent snapshot with extra MCP servers, injecting BOTH the
+ * `mcp_servers` URL entry AND a matching `mcp_toolset` declaration into
+ * `tools[]` so the agent runtime actually exposes the server's tools.
+ *
+ * Why both: the harness's MCP wiring (apps/agent/src/harness/tools.ts)
+ * iterates `agentConfig.mcp_servers` to set up clients, but the model only
+ * sees a tool if there's a corresponding `mcp_toolset` declaration in
+ * `tools[]`. Pre-fix, the publish flow added the server URL but never the
+ * toolset entry — so a Slack-published agent had the slack vault + server
+ * attached, yet the model literally told users to run curl commands
+ * because no `mcp__slack__*` tool surfaced. Tracked 2026-05-19.
+ *
+ * Permission policy = always_allow for injected toolsets: the user just
+ * published the agent to this integration, so requiring a per-tool
+ * confirmation defeats the point of a teammate bot. Vault binding still
+ * gates access — unpublish to revoke.
+ *
+ * Idempotent on the toolset side: if the agent already declares an
+ * mcp_toolset for one of the injected servers (e.g. user manually added
+ * slack to the agent before publishing), the existing entry stays.
+ * Servers go through unchanged — `mcp_servers` tolerates duplicates today
+ * but the URL is what callers rely on anyway, and `tools[]` is the
+ * canonical guard.
+ */
+export function injectMcpServersIntoSnapshot(
+  snapshot: AgentConfig,
+  servers: ReadonlyArray<{ name: string; url: string; type?: string }>,
+): AgentConfig {
+  if (servers.length === 0) return snapshot;
+  const existingServers = snapshot.mcp_servers ?? [];
+  const existingTools = snapshot.tools ?? [];
+  const declaredToolsetServers = new Set(
+    existingTools
+      .filter(
+        (t): t is { type: "mcp_toolset"; mcp_server_name: string } =>
+          (t as { type?: string }).type === "mcp_toolset" &&
+          typeof (t as { mcp_server_name?: unknown }).mcp_server_name === "string",
+      )
+      .map((t) => t.mcp_server_name),
+  );
+  const toolsToInject = servers
+    .filter((s) => !declaredToolsetServers.has(s.name))
+    .map((s) => ({
+      // mcp_toolset entries carry an extension field `mcp_server_name` not
+      // represented in ToolsetConfig today — existing rows in production
+      // look identical. Cast through unknown to satisfy TS without widening
+      // the shared type for this one path.
+      type: "mcp_toolset",
+      mcp_server_name: s.name,
+      default_config: { permission_policy: { type: "always_allow" as const } },
+    })) as unknown as AgentConfig["tools"];
+  return {
+    ...snapshot,
+    mcp_servers: [
+      ...existingServers,
+      ...servers.map((s) => ({
+        name: s.name,
+        type: (s.type ?? "url") as "url" | "stdio" | "sse",
+        url: s.url,
+      })),
+    ],
+    tools: [...existingTools, ...toolsToInject],
+  };
+}
+
+// Public hostname of the integrations gateway, used to wire a hosted Linear
+// MCP server into Linear-triggered sessions. We hard-fail when the env var
+// is unset rather than fall back to a default: a silent default would have
+// us mint MCP URLs (and per-session bearer tokens) pointing at whatever
+// hostname was baked in, on any future env stanza that forgot to declare
+// it. Both prod and staging wrangler stanzas explicitly set this — anything
+// else is a config bug we want to see immediately.
+function integrationsOrigin(env: Env): string {
+  const explicit = (env as unknown as { INTEGRATIONS_ORIGIN?: string }).INTEGRATIONS_ORIGIN;
+  if (!explicit) {
+    throw new Error(
+      "INTEGRATIONS_ORIGIN is not configured — refusing to mint MCP URLs against an unknown gateway",
+    );
+  }
+  return explicit;
+}
+
+// Header-secret auth middleware. Reject early if the secret is missing or
+// the binding isn't configured.
+//
+// Scope: every route in `app` (the integrations-internal API). The
+// /v1/internal/usage_events/* sub-app is mounted on a separate Hono
+// instance below with its OWN bearer auth (BILLING_INTERNAL_SECRET) so
+// the two trust principals don't share a secret.
+app.use("*", async (c, next) => {
+  // Skip integrations-secret check for paths owned by the billing sub-app
+  // — they're mounted on the same /v1/internal/* prefix from a different
+  // Hono. Without this short-circuit the integrations gate would 401 the
+  // billing worker before the request ever reached its own auth middleware.
+  if (c.req.path.startsWith("/v1/internal/usage_events")) {
+    return next();
+  }
+  const expected = c.env.INTEGRATIONS_INTERNAL_SECRET;
+  if (!expected) {
+    return c.json({ error: "internal endpoints not configured" }, 503);
+  }
+  const provided = c.req.header("x-internal-secret");
+  if (!provided || provided !== expected) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  await next();
+});
+
+interface CreateSessionBody {
+  action: "create";
+  userId: string;
+  agentId: string;
+  environmentId: string;
+  vaultIds?: string[];
+  mcpServers?: Array<{ name: string; url: string; type?: string }>;
+  metadata?: Record<string, unknown>;
+  initialEvent?: { type: string; content: unknown[]; metadata?: Record<string, unknown> };
+  /**
+   * Optional prose appended to agent_snapshot.system before persistence.
+   * Slack uses this to inject the `<oma_signal>` protocol catalog once per
+   * session instead of duplicating it on every dispatched user.message.
+   */
+  additionalSystemPrompt?: string;
+}
+
+interface ResumeSessionBody {
+  /** Session owner; required to resolve tenantId in O(1) without scanning. */
+  userId: string;
+  event: { type: string; content: unknown[]; metadata?: Record<string, unknown> };
+}
+
+interface CreateVaultCredentialBody {
+  action: "create_with_credential";
+  userId: string;
+  vaultName: string;
+  displayName: string;
+  mcpServerUrl: string;
+  bearerToken: string;
+  provider?: "github" | "linear";
+}
+
+interface AddCapCliBody {
+  action: "add_cap_cli";
+  userId: string;
+  /** Existing vault id; null = create fresh vault. */
+  vaultId: string | null;
+  vaultName: string;
+  displayName: string;
+  /** cap CLI id, e.g. "gh" / "aws" / "kubectl" — must match a builtin spec. */
+  cliId: string;
+  token: string;
+  /** Optional unix-ms expiration (for short-lived upstream tokens). */
+  expiresAt?: number;
+  /** Optional refresh token (resolver may use to mint a fresh access token). */
+  refreshToken?: string;
+  /** Mode-specific extras (e.g. AWS access_key_id / session_token). */
+  extras?: Record<string, string>;
+  provider?: "github" | "linear";
+}
+
+interface RotateBody {
+  action: "rotate_bearer" | "rotate_cap_cli";
+  userId: string;
+  vaultId: string;
+  newToken: string;
+  /** Required only when action=rotate_cap_cli (disambiguates if vault has multiple). */
+  cliId?: string;
+}
+
+/**
+ * POST /v1/internal/sessions
+ * Body: CreateSessionBody. Creates a new session and (optionally) seeds it
+ * with an initial user message. Returns { sessionId }.
+ */
+app.post("/sessions", async (c) => {
+  const body = await c.req.json<CreateSessionBody>();
+  if (body.action !== "create") {
+    return c.json({ error: "unknown action" }, 400);
+  }
+  if (!body.userId || !body.agentId || !body.environmentId) {
+    return c.json({ error: "userId, agentId, environmentId required" }, 400);
+  }
+
+  const tenantId = await resolveTenantId(c.env, body.userId);
+  if (!tenantId) return c.json({ error: "user has no tenant" }, 404);
+
+  const agentRow = await c.var.services.agents.get({ tenantId, agentId: body.agentId });
+  if (!agentRow) return c.json({ error: "agent not found in tenant" }, 404);
+
+  const envRow = await c.var.services.environments.get({
+    tenantId,
+    environmentId: body.environmentId,
+  });
+  if (!envRow) return c.json({ error: "environment not found in tenant" }, 404);
+
+  // Resolve the sandbox binding for this environment. Same naming convention
+  // as the public sessions route: SANDBOX_<sanitized worker name>.
+  // Read directly from the row — sandbox_worker_name is a server-internal
+  // detail, not surfaced on the wire.
+  if (!envRow.sandbox_worker_name) {
+    return c.json({ error: "environment has no sandbox worker" }, 500);
+  }
+  const bindingName = `SANDBOX_${envRow.sandbox_worker_name.replace(/-/g, "_")}`;
+  const binding = (c.env as unknown as Record<string, unknown>)[bindingName] as
+    | Fetcher
+    | undefined;
+  if (!binding) {
+    return c.json({ error: `sandbox binding ${bindingName} not bound` }, 500);
+  }
+
+  // Build the agent snapshot up-front so we can ship it to SessionDO at /init
+  // (and so the per-session MCP-server augmentation actually takes effect on
+  // the snapshot the DO uses, not just the one we persist below).
+  const vaultIds = body.vaultIds ?? [];
+  const { tenant_id: _atid, ...agentBase } = agentRow;
+  let agentSnapshot: AgentConfig = agentBase;
+  if (body.mcpServers && body.mcpServers.length > 0) {
+    agentSnapshot = injectMcpServersIntoSnapshot(agentSnapshot, body.mcpServers);
+  }
+  // Provider-supplied system-prompt augmentation (Slack signal protocol etc.).
+  // Idempotent on falsy input so it's safe to pass unconditionally.
+  agentSnapshot = appendToAgentSnapshotSystemPrompt(agentSnapshot, body.additionalSystemPrompt);
+
+  // Allocate the session id by inserting the row first — sessions-store owns
+  // id generation. Linear MCP wiring below augments the snapshot + metadata
+  // and we re-persist via service.update to keep the row consistent.
+  const initialMetadata: Record<string, unknown> = { ...(body.metadata ?? {}) };
+  const { session: createdSession } = await c.var.services.sessions.create({
+    tenantId,
+    agentId: body.agentId,
+    environmentId: body.environmentId,
+    title: "",
+    vaultIds,
+    agentSnapshot,
+    environmentSnapshot: toEnvironmentConfig(envRow),
+    metadata: Object.keys(initialMetadata).length === 0 ? undefined : initialMetadata,
+  });
+  const sessionId = createdSession.id;
+
+  // Pre-fetch vault credentials so SessionDO can serve them from state
+  // instead of reading CONFIG_KV (which may be a different namespace if
+  // sandbox-default is shared across envs).
+  const vaultCredentials = await fetchVaultCredentials(c.var.services, tenantId, vaultIds);
+
+  // Linear-triggered session: wire a hosted Linear MCP server into the
+  // sandbox. Mint a per-session UUID, store in metadata.linear.mcp_token,
+  // inject a static_bearer cred so outbound MITM auto-attaches it on calls
+  // to the integrations gateway, and add the MCP entry to agent_snapshot
+  // so the harness picks it up alongside the agent's own mcp_servers.
+  const sessionMetadata: Record<string, unknown> = { ...initialMetadata };
+  const linearMeta = sessionMetadata.linear as Record<string, unknown> | undefined;
+  let metadataDirty = false;
+  if (linearMeta) {
+    const mcpToken = crypto.randomUUID();
+    const mcpUrl = `${integrationsOrigin(c.env)}/linear/mcp/${sessionId}`;
+    // Per-turn context (which AgentSession to reply into, which comment to
+    // thread under, who triggered) lives on the initialEvent's metadata.linear.
+    // Merge it onto the session-static metadata so the MCP server can read it
+    // server-side without reaching back into event history.
+    const eventLinear =
+      (body.initialEvent?.metadata?.linear ?? {}) as Record<string, unknown>;
+    sessionMetadata.linear = {
+      ...linearMeta,
+      mcp_token: mcpToken,
+      mcp_url: mcpUrl,
+      currentAgentSessionId: eventLinear.agentSessionId ?? null,
+      triggerCommentId: eventLinear.commentId ?? null,
+      actor: {
+        id: eventLinear.actorUserId ?? null,
+        // displayName lookup deferred to the MCP server; webhook payload
+        // doesn't always include it.
+        displayName: null,
+      },
+    };
+    metadataDirty = true;
+
+    // Append our hosted MCP entry to the agent snapshot's mcp_servers list.
+    // The Linear provider no longer registers mcp.linear.app — we own that
+    // wiring here so any provider can ride the same hosted shim later.
+    agentSnapshot = {
+      ...agentSnapshot,
+      mcp_servers: [
+        ...(agentSnapshot.mcp_servers ?? []),
+        { name: "linear", type: "url" as const, url: mcpUrl },
+      ],
+    };
+
+    // Inject the per-session bearer into vaultCredentials so SessionDO's
+    // outbound handler matches integrations.openma.dev hostname and attaches
+    // Authorization: Bearer <mcp_token>. We attach to the first vault if any
+    // (so cred lifecycle ties to the Linear vault); otherwise create a
+    // synthetic vault entry just for this MCP cred.
+    const synthCred: CredentialConfig = {
+      id: `cred-mcp-${sessionId}`,
+      vault_id: vaultIds[0] ?? `vlt-mcp-${sessionId}`,
+      display_name: "Linear MCP session token",
+      auth: {
+        type: "static_bearer",
+        mcp_server_url: mcpUrl,
+        token: mcpToken,
+      },
+      created_at: new Date().toISOString(),
+    };
+    const target = vaultCredentials.find((v) => v.vault_id === synthCred.vault_id);
+    if (target) {
+      target.credentials.push(synthCred);
+    } else {
+      vaultCredentials.push({ vault_id: synthCred.vault_id, credentials: [synthCred] });
+    }
+  }
+
+  // Re-persist the augmented snapshot + metadata when the linear branch
+  // mutated either. Skipped for the common (non-Linear) case.
+  if (metadataDirty) {
+    await c.var.services.sessions.update({
+      tenantId,
+      sessionId,
+      agentSnapshot,
+      metadata: sessionMetadata,
+    });
+  }
+
+  // Initialize SessionDO via the sandbox worker. Pass vault_ids so the
+  // outbound Worker can match credentials for this session, plus the
+  // pre-fetched config snapshots (see snapshot rationale above).
+  await binding.fetch(`https://sandbox/sessions/${sessionId}/init`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      agent_id: body.agentId,
+      environment_id: body.environmentId,
+      title: "",
+      session_id: sessionId,
+      tenant_id: tenantId,
+      vault_ids: vaultIds,
+      agent_snapshot: agentSnapshot,
+      environment_snapshot: toEnvironmentConfig(envRow),
+      vault_credentials: vaultCredentials,
+      // Generic event hooks. Per-provider consumers live behind these URLs;
+      // SessionDO POSTs every broadcast to each one. Provider-specific
+      // translation (e.g. Linear AgentActivity mirror) happens at the
+      // consuming endpoint.
+      //
+      // Linear no longer subscribes here — the bot drives all panel-visible
+      // output explicitly via the linear_say / linear_request_input /
+      // linear_post_comment MCP tools. event-tap auto-mirror was removed
+      // because (a) auto-mirror conflicted with elicitation panel state
+      // (trailing assistant message would close the panel), (b) the panel
+      // mirror duplicated the same text into the issue thread, and
+      // (c) bot internal thinking was leaked to user view. Bot is now a
+      // first-class agent that decides what to surface.
+      event_hooks: undefined,
+    }),
+  });
+
+  // Seed the session with the initial event, if any.
+  if (body.initialEvent) {
+    await binding.fetch(`https://sandbox/sessions/${sessionId}/event`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body.initialEvent),
+    });
+  }
+
+  return c.json({ sessionId });
+});
+
+/**
+ * POST /v1/internal/sessions/:id/events
+ * Body: ResumeSessionBody. Appends an event to an existing session.
+ */
+app.post("/sessions/:id/events", async (c) => {
+  const sessionId = c.req.param("id");
+  const body = await c.req.json<ResumeSessionBody>();
+  if (!body?.event || !body?.userId) {
+    return c.json({ error: "userId and event required" }, 400);
+  }
+
+  const tenantId = await resolveTenantId(c.env, body.userId);
+  if (!tenantId) return c.json({ error: "user has no tenant" }, 404);
+
+  const session = await c.var.services.sessions.get({ tenantId, sessionId });
+  if (!session) return c.json({ error: "session not found" }, 404);
+  if (!session.environment_id) {
+    return c.json({ error: "session has no environment_id" }, 400);
+  }
+
+  const envRow2 = await c.var.services.environments.get({
+    tenantId,
+    environmentId: session.environment_id,
+  });
+  if (!envRow2) return c.json({ error: "environment missing" }, 500);
+  const bindingName = `SANDBOX_${(envRow2.sandbox_worker_name ?? "").replace(/-/g, "_")}`;
+  const binding = (c.env as unknown as Record<string, unknown>)[bindingName] as
+    | Fetcher
+    | undefined;
+  if (!binding) return c.json({ error: `sandbox binding missing` }, 500);
+
+  await binding.fetch(`https://sandbox/sessions/${sessionId}/event`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body.event),
+  });
+
+  return c.json({ ok: true });
+});
+
+/**
+ * GET /v1/internal/sessions/:id
+ * Returns the persisted session record (id + metadata + snapshots) so the
+ * integrations gateway can validate per-session MCP tokens and resolve the
+ * publication. O(1) PRIMARY KEY lookup via the sessions-store cross-tenant
+ * `getById` — the legacy `sidx:` reverse index + paginated tenant scan
+ * fallback is retired.
+ */
+app.get("/sessions/:id", async (c) => {
+  const sessionId = c.req.param("id");
+  const session = await c.var.services.sessions.getById({ sessionId });
+  if (!session) return c.json({ error: "session not found" }, 404);
+  return c.json(session);
+});
+
+/**
+ * POST /v1/internal/vaults
+ * Body discriminated by `action`:
+ *   - "create_with_credential":  CreateVaultCredentialBody  → fresh vault + static_bearer
+ *   - "add_cap_cli":             AddCapCliBody              → cap_cli cred (in existing or fresh vault)
+ *
+ * Both return { vaultId, credentialId }.
+ */
+app.post("/vaults", async (c) => {
+  const body = (await c.req.json()) as
+    | CreateVaultCredentialBody
+    | AddCapCliBody;
+
+  if (body.action === "create_with_credential") {
+    if (!body.userId || !body.mcpServerUrl || !body.bearerToken) {
+      return c.json(
+        { error: "userId, mcpServerUrl, bearerToken required" },
+        400,
+      );
+    }
+    const tenantId = await resolveTenantId(c.env, body.userId);
+    if (!tenantId) return c.json({ error: "user has no tenant" }, 404);
+
+    const vault = await c.var.services.vaults.create({
+      tenantId,
+      name: body.vaultName,
+    });
+
+    const credential = await c.var.services.credentials.create({
+      tenantId,
+      vaultId: vault.id,
+      displayName: body.displayName,
+      auth: {
+        type: "static_bearer",
+        mcp_server_url: body.mcpServerUrl,
+        token: body.bearerToken,
+        provider: body.provider,
+      },
+    });
+    return c.json({ vaultId: vault.id, credentialId: credential.id });
+  }
+
+  if (body.action === "add_cap_cli") {
+    if (!body.userId || !body.cliId || !body.token) {
+      return c.json(
+        { error: "userId, cliId, token required" },
+        400,
+      );
+    }
+    const tenantId = await resolveTenantId(c.env, body.userId);
+    if (!tenantId) return c.json({ error: "user has no tenant" }, 404);
+
+    let vaultId = body.vaultId;
+    if (!vaultId) {
+      const vault = await c.var.services.vaults.create({
+        tenantId,
+        name: body.vaultName,
+      });
+      vaultId = vault.id;
+    } else {
+      // Caller-supplied vault must exist in this tenant; refuse cross-tenant attach.
+      if (!(await c.var.services.vaults.exists({ tenantId, vaultId }))) {
+        return c.json({ error: "vault not found in tenant" }, 404);
+      }
+    }
+
+    const credential = await c.var.services.credentials.create({
+      tenantId,
+      vaultId,
+      displayName: body.displayName,
+      auth: {
+        type: "cap_cli",
+        cli_id: body.cliId,
+        token: body.token,
+        ...(body.expiresAt !== undefined
+          ? { expires_at: new Date(body.expiresAt).toISOString() }
+          : {}),
+        ...(body.refreshToken ? { refresh_token: body.refreshToken } : {}),
+        ...(body.extras ? { extras: body.extras } : {}),
+        provider: body.provider,
+      },
+    });
+    return c.json({ vaultId, credentialId: credential.id });
+  }
+
+  return c.json({ error: "unknown action" }, 400);
+});
+
+/**
+ * POST /v1/internal/vaults/rotate
+ * Replace the token on a credential in the given vault, looking it up by
+ * type (and cli_id for cap_cli). Used to refresh short-lived upstream
+ * tokens (e.g. GitHub installation tokens, ~1hr TTL) without the caller
+ * having to remember credential ids.
+ */
+app.post("/vaults/rotate", async (c) => {
+  const body = (await c.req.json()) as RotateBody;
+  if (!body.userId || !body.vaultId || !body.newToken) {
+    return c.json({ error: "userId, vaultId, newToken required" }, 400);
+  }
+  const tenantId = await resolveTenantId(c.env, body.userId);
+  if (!tenantId) return c.json({ error: "user has no tenant" }, 404);
+
+  const service = c.var.services.credentials;
+  const list = await service.list({ tenantId, vaultId: body.vaultId });
+  if (!list.length) return c.json({ error: "vault has no credentials" }, 404);
+
+  const target = list.find((cred) => {
+    if (body.action === "rotate_bearer") return cred.auth?.type === "static_bearer";
+    if (body.action === "rotate_cap_cli") {
+      return (
+        cred.auth?.type === "cap_cli" &&
+        (!body.cliId || cred.auth.cli_id === body.cliId)
+      );
+    }
+    return false;
+  });
+  if (!target) return c.json({ error: "matching credential not found" }, 404);
+
+  if (body.action === "rotate_bearer") {
+    if (target.auth?.type !== "static_bearer") {
+      return c.json({ error: "credential is not static_bearer" }, 400);
+    }
+  } else {
+    if (target.auth?.type !== "cap_cli") {
+      return c.json({ error: "credential is not cap_cli" }, 400);
+    }
+  }
+
+  // Merge-replacement keeps every other auth field; service.update merges
+  // the partial into the existing row's auth blob.
+  await service.update({
+    tenantId,
+    vaultId: body.vaultId,
+    credentialId: target.id,
+    auth: { token: body.newToken },
+  });
+  return c.json({ ok: true, credentialId: target.id });
+});
+
+// ─── Helpers ─────────────────────────────────────────────────────────────
+
+async function resolveTenantId(env: Env, userId: string): Promise<string | null> {
+  if (!env.MAIN_DB) return null;
+  // Avoid pulling better-auth into the hot path; one direct query.
+  const row = await env.MAIN_DB.prepare(`SELECT tenantId FROM "user" WHERE id = ?`)
+    .bind(userId)
+    .first<{ tenantId: string | null }>();
+  return row?.tenantId ?? null;
+}
+
+/**
+ * Pre-fetch all credentials for the given vaults so they can be passed into
+ * SessionDO at /init. Reads from D1 via the credentials-store service.
+ */
+async function fetchVaultCredentials(
+  services: Services,
+  tenantId: string,
+  vaultIds: string[],
+): Promise<Array<{ vault_id: string; credentials: CredentialConfig[] }>> {
+  if (!vaultIds.length) return [];
+  const grouped = await services.credentials.listByVaults({
+    tenantId,
+    vaultIds,
+  });
+  return grouped.map((g) => ({
+    vault_id: g.vault_id,
+    credentials: g.credentials as unknown as CredentialConfig[],
+  }));
+}
+
+// ─── Local ACP runtime ────────────────────────────────────────────────────
+
+
+// /v1/internal/runtime-attach-harness was removed: AcpProxyHarness on the
+// agent worker now binds RUNTIME_ROOM directly via cross-script DO binding
+// (apps/agent/wrangler.jsonc → script_name: "managed-agents") and calls
+// `runtime_room_stub.fetch("http://runtime-room/_attach_harness", ...)`.
+// One less worker hop, no shared INTEGRATIONS_INTERNAL_SECRET on agent.
+
+// ─────────────────────────────────────────────────────────────────────
+// /v1/internal/usage_events/* — billing reconcile API
+//
+// Service-to-service: the hosted billing worker
+// (managed-agents-billing) calls these endpoints from a daily cron to
+// pull unbilled raw usage events, apply its rate map, debit
+// credit_ledger, then ack the ids back. OSS knows nothing about money;
+// this is purely the read+ack surface over the per-tenant `usage_events`
+// table.
+//
+// Auth: Bearer BILLING_INTERNAL_SECRET (separate from the integrations
+// gateway secret because the trust principal is different — we don't
+// want the integrations gateway able to ack billing rows or vice versa).
+// 503 when secret is unset (self-host / dev with no billing worker).
+//
+// Cross-shard fan-out: `forEachShardServices` enumerates every shard
+// registered in shard_pool and runs the read against each shard's
+// per-tenant DB. Single shard = no overhead; multi-shard = parallel
+// fan-out with results merged client-side.
+// ─────────────────────────────────────────────────────────────────────
+const billingApp = new Hono<{ Bindings: Env }>();
+
+billingApp.use("/usage_events/*", async (c, next) => {
+  const expected = c.env.BILLING_INTERNAL_SECRET;
+  if (!expected) {
+    return c.json({ error: "billing internal endpoints not configured" }, 503);
+  }
+  const auth = c.req.header("authorization") ?? "";
+  const provided = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
+  if (!provided || provided !== expected) {
+    return c.json({ error: "unauthorized" }, 401);
+  }
+  await next();
+});
+
+/**
+ * GET /v1/internal/usage_events
+ * Query:
+ *   tenant_id  optional — filter to a single tenant. If omitted, returns
+ *              unbilled events across ALL tenants on every shard, ordered
+ *              by (tenant_id, id).
+ *   since      optional — id cursor; only returns rows with id > since.
+ *              Defaults to 0. Per-tenant cursor; the caller passes a
+ *              global cursor at its own risk (rows interleave between
+ *              shards/tenants).
+ *   limit      optional — per-tenant cap. Default 500, max 5000.
+ *
+ * Response:
+ *   {
+ *     events: [{ id, tenant_id, session_id, agent_id, kind, value,
+ *                created_at, billed_at }, ...],
+ *     count: number
+ *   }
+ */
+billingApp.get("/usage_events", async (c) => {
+  const sinceRaw = c.req.query("since");
+  const limitRaw = c.req.query("limit");
+  const tenantFilter = c.req.query("tenant_id");
+  const since = sinceRaw ? Math.max(0, Number.parseInt(sinceRaw, 10) || 0) : 0;
+  const limit = limitRaw ? Math.max(1, Math.min(5000, Number.parseInt(limitRaw, 10) || 500)) : 500;
+
+  // Fan out to every shard. listUnbilled is per-tenant, so we have to
+  // discover the tenant set on each shard before reading. The simplest
+  // discovery query: SELECT DISTINCT tenant_id FROM usage_events WHERE
+  // billed_at IS NULL — bounded by the unbilled-rows index.
+  const perShard = await forEachShardServices(c.env, async (services, _shardName) => {
+    // Pull tenant ids with unbilled events on this shard.
+    const tenantsRow = tenantFilter
+      ? [{ tenant_id: tenantFilter }]
+      : await listUnbilledTenantsOnShard(services);
+    const out: unknown[] = [];
+    for (const { tenant_id } of tenantsRow) {
+      const rows = await services.usage.listUnbilled(tenant_id, since, limit);
+      out.push(...rows);
+    }
+    return out;
+  });
+
+  // Flatten + sort by (tenant_id, id) ASC for caller stability.
+  const merged: Array<{ id: number; tenant_id: string }> = [];
+  for (const list of perShard) {
+    if (Array.isArray(list)) merged.push(...(list as Array<{ id: number; tenant_id: string }>));
+  }
+  merged.sort((a, b) => {
+    if (a.tenant_id < b.tenant_id) return -1;
+    if (a.tenant_id > b.tenant_id) return 1;
+    return a.id - b.id;
+  });
+
+  return c.json({ events: merged, count: merged.length });
+});
+
+/**
+ * POST /v1/internal/usage_events/ack
+ * Body: { ids: number[] }
+ *
+ * Marks the given ids as billed (sets billed_at = now). Idempotent: a
+ * second ack with overlapping ids is a no-op. Cross-shard: fans out to
+ * every shard; each shard's ack only touches its own rows (id is
+ * AUTOINCREMENT but unique per shard — the caller's id set is grouped
+ * by shard implicitly by tenant routing on the read side).
+ */
+billingApp.post("/usage_events/ack", async (c) => {
+  const body = await c.req.json<{ ids?: unknown }>().catch(() => ({} as { ids?: unknown }));
+  const idsRaw = Array.isArray(body?.ids) ? (body.ids as unknown[]) : [];
+  const ids = idsRaw.filter(
+    (n: unknown): n is number =>
+      typeof n === "number" && Number.isInteger(n) && n > 0,
+  );
+  if (!ids.length) {
+    return c.json({ ok: true, acked: 0 });
+  }
+  await forEachShardServices(c.env, async (services) => {
+    await services.usage.ack(ids);
+  });
+  return c.json({ ok: true, acked: ids.length });
+});
+
+// Helper: enumerate tenants with unbilled events on this shard. Used by
+// the cross-shard fan-out so the caller doesn't have to pre-enumerate.
+async function listUnbilledTenantsOnShard(
+  services: Services,
+): Promise<Array<{ tenant_id: string }>> {
+  return services.usage.listUnbilledTenants();
+}
+
+// Mount the billing sub-app onto the same /v1/internal/* base. Because
+// we Hono-mount via `app.route("/", billingApp)`, every billingApp path
+// becomes a sibling under `/v1/internal/*` — and the integrations auth
+// middleware above explicitly skips /v1/internal/usage_events/* paths
+// so this sub-app's own bearer middleware is the only gate.
+app.route("/", billingApp);
+
+export default app;
+
+// Test-only exports.
+export const __testInternals = { integrationsOrigin };

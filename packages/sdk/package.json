@@ -1,0 +1,40 @@
+{
+  "name": "@openma/sdk",
+  "version": "0.1.0-beta.2",
+  "description": "[Deprecated — use @anthropic-ai/sdk with baseURL=https://openma.dev] Official TypeScript SDK for the openma managed agents platform.",
+  "deprecated": "@openma/sdk is deprecated. The openma API is wire-compatible with Anthropic's Managed Agents API — use `@anthropic-ai/sdk` with `baseURL: 'https://openma.dev'`. See https://openma.dev/docs/cli-sdk for migration.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": ["ai", "agents", "managed-agents", "openma", "sdk", "llm", "streaming", "sse"],
+  "license": "Apache-2.0",
+  "homepage": "https://openma.dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/open-ma/open-managed-agents",
+    "directory": "packages/sdk"
+  },
+  "bugs": {
+    "url": "https://github.com/open-ma/open-managed-agents/issues"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}

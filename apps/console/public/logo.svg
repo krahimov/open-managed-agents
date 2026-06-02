@@ -1,0 +1,16 @@
+<svg width="162" height="113" viewBox="196 55 162 113" role="img" xmlns="http://www.w3.org/2000/svg">
+<defs><mask id="m" maskUnits="userSpaceOnUse">
+  <rect x="-200" y="-200" width="900" height="900" fill="white"/>
+  <rect x="-4" y="16.4" width="62.2" height="108.8" fill="black" rx="2"/>
+  <rect x="96" y="16.4" width="62.2" height="108.8" fill="black" rx="2"/>
+</mask></defs>
+<g transform="translate(200, 40)" fill="none" stroke="#FF6B50" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round">
+  <text font-family="'JetBrains Mono', 'SF Mono', monospace" font-size="90" font-weight="800" fill="#FF6B50" stroke="none" x="0" y="102">[</text>
+  <g transform="translate(52, 10)">
+    <path d="M30,50 Q28,30 22,8 Q35,20 40,45" mask="url(#m)"/>
+    <path d="M30,50 Q28,58 30,65" stroke-width="3" mask="url(#m)"/>
+    <circle cx="34" cy="52" r="3.5" fill="#FF6B50" stroke="none"/>
+  </g>
+  <text font-family="'JetBrains Mono', 'SF Mono', monospace" font-size="90" font-weight="800" fill="#FF6B50" stroke="none" x="100" y="102">]</text>
+</g>
+</svg>

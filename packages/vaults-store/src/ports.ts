@@ -1,0 +1,97 @@
+// Abstract ports the VaultService depends on. Same DIP pattern as
+// packages/credentials-store/src/ports.ts.
+//
+// Keep these tiny and runtime-agnostic: no Cloudflare types, no D1 query
+// language. Pass plain data + return plain data.
+
+import type { VaultRow } from "./types";
+import type { PageCursor } from "@open-managed-agents/shared";
+
+export interface NewVaultInput {
+  id: string;
+  tenantId: string;
+  name: string;
+  createdAt: number;
+}
+
+export interface VaultUpdateFields {
+  name?: string;
+  updatedAt: number;
+}
+
+export interface VaultRepo {
+  insert(input: NewVaultInput): Promise<VaultRow>;
+
+  get(tenantId: string, vaultId: string): Promise<VaultRow | null>;
+
+  /**
+   * Cheap existence check used by credentials routes that need to verify
+   * vault membership before doing the actual credential op. Avoids loading
+   * the whole row when the only thing the caller cares about is yes/no.
+   */
+  exists(tenantId: string, vaultId: string): Promise<boolean>;
+
+  list(
+    tenantId: string,
+    opts: { includeArchived: boolean },
+  ): Promise<VaultRow[]>;
+
+  /**
+   * Cursor-paginated list. Order: created_at DESC, id DESC.
+   *
+   * `status` and the createdAt range filters stack as extra WHERE
+   * conditions on top of the cursor query — the (created_at, id)
+   * ordering they're keyed against is unchanged, so cursors stay
+   * valid across all filter combinations.
+   */
+  listPage(
+    tenantId: string,
+    opts: {
+      /** Row archive state. `'active'` → archived_at IS NULL,
+       *  `'archived'` → archived_at IS NOT NULL, `'any'` → no filter.
+       *  When unset, falls back to `includeArchived` (back-compat). */
+      status?: "active" | "archived" | "any";
+      /** Legacy 2-way archive toggle. Used only when `status` is unset. */
+      includeArchived: boolean;
+      /** Lower bound on vaults.created_at (epoch ms, inclusive). Driven
+       *  by the Created filter chip in the UI. */
+      createdAfter?: number;
+      /** Upper bound on vaults.created_at (epoch ms, exclusive). */
+      createdBefore?: number;
+      limit: number;
+      after?: PageCursor;
+      /** Case-insensitive substring filter against vault name.
+       *  Trimmed blank → unfiltered. Used by Combobox typeahead. */
+      q?: string;
+    },
+  ): Promise<{ items: VaultRow[]; hasMore: boolean }>;
+
+  /** Cheap COUNT(*) for /v1/stats. Index `idx_vaults_tenant` covers it. */
+  count(tenantId: string, opts: { includeArchived: boolean }): Promise<number>;
+
+  update(
+    tenantId: string,
+    vaultId: string,
+    update: VaultUpdateFields,
+  ): Promise<VaultRow>;
+
+  archive(
+    tenantId: string,
+    vaultId: string,
+    archivedAt: number,
+  ): Promise<VaultRow>;
+
+  delete(tenantId: string, vaultId: string): Promise<void>;
+}
+
+export interface Clock {
+  nowMs(): number;
+}
+
+export interface IdGenerator {
+  vaultId(): string;
+}
+
+export interface Logger {
+  warn(msg: string, ctx?: unknown): void;
+}

@@ -1,0 +1,291 @@
+// Runtime ports — abstract dependencies a provider needs from its host.
+//
+// Provider packages (e.g. @open-managed-agents/linear) accept implementations
+// of these via constructor injection. Adapter packages (e.g.
+// @open-managed-agents/integrations-adapters-cf) implement them against
+// concrete runtimes.
+//
+// Keep these tiny and runtime-agnostic. Do not import Web Request/Response
+// types here — pass plain data instead.
+
+import type { SessionId, AgentId, UserId } from "./domain";
+import type {
+  AppRepo,
+  DispatchRuleRepo,
+  GitHubAppRepo,
+  InstallationRepo,
+  PublicationRepo,
+  SessionScopeRepo,
+  SetupLinkRepo,
+  WebhookEventStore,
+} from "./persistence";
+
+export interface Clock {
+  /** Milliseconds since epoch. */
+  nowMs(): number;
+}
+
+export interface IdGenerator {
+  /** URL-safe random id, ≥128 bits of entropy. */
+  generate(): string;
+}
+
+/**
+ * Resolves the OMA tenant id for a given OMA user. The integrations
+ * gateway needs this whenever it inserts a new installation/publication/App
+ * row so the row can carry tenant_id (Phase 0 of the per-tenant-D1 work).
+ *
+ * Implemented in adapters via a SELECT against the `user` table (which lives
+ * in the better-auth control-plane DB). Provider code calls this at install
+ * completion time, when only `state.userId` is known from the OAuth state JWT.
+ */
+export interface TenantResolver {
+  /**
+   * Returns the user's tenantId. Throws when the user has no tenant — that's
+   * an integrity violation (every user should have a tenant after sign-up,
+   * see auth-config.ts ensureTenant), and silently inserting a row with
+   * tenantId="" would defeat the point of this column.
+   */
+  resolveByUserId(userId: UserId): Promise<string>;
+}
+
+/**
+ * Symmetric encryption for tokens at rest. Output is opaque to callers — only
+ * the same Crypto instance can decrypt what it produced.
+ */
+export interface Crypto {
+  encrypt(plaintext: string): Promise<string>;
+  decrypt(ciphertext: string): Promise<string>;
+}
+
+/**
+ * Constant-time HMAC verification for webhook signatures. Separate from Crypto
+ * so adapters can use Web Crypto's verify() directly.
+ */
+export interface HmacVerifier {
+  verify(secret: string, body: string, signature: string): Promise<boolean>;
+}
+
+/**
+ * Short-lived signed tokens scoped to a single MCP session. The payload type
+ * is opaque here; provider code defines and validates its own shape.
+ */
+export interface JwtSigner {
+  sign(payload: object, ttlSeconds: number): Promise<string>;
+  verify<T extends object = object>(token: string): Promise<T>;
+}
+
+/**
+ * Plain HTTP client. Avoids depending on Web Fetch types so this package can
+ * be unit-tested in pure Node without polyfills.
+ */
+export interface HttpRequest {
+  method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+  url: string;
+  headers?: Record<string, string>;
+  body?: string;
+}
+export interface HttpResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: string;
+}
+export interface HttpClient {
+  fetch(req: HttpRequest): Promise<HttpResponse>;
+}
+
+/**
+ * Bridge to OMA's session lifecycle. Implemented as a service-binding call to
+ * apps/main in production; an in-memory fake in unit tests.
+ */
+export interface CreateSessionInput {
+  userId: UserId;
+  agentId: AgentId;
+  /** OMA environment the session runs in. Required by the main worker. */
+  environmentId: string;
+  /** Vault ids whose credentials should be available to this session. */
+  vaultIds: ReadonlyArray<string>;
+  /**
+   * MCP servers the agent should have access to in this session, in addition
+   * to whatever's on the agent config. Each entry's URL gets matched against
+   * the vault credentials by hostname for outbound injection.
+   */
+  mcpServers: ReadonlyArray<{ name: string; url: string }>;
+  /** Arbitrary metadata stored on the session for later observability. */
+  metadata: Record<string, unknown>;
+  /** First user.message-shaped event. */
+  initialEvent: SessionEventInput;
+  /**
+   * Provider-supplied prose appended to the frozen `agent_snapshot.system`
+   * before the session record is written. Use for protocol/signal vocabulary
+   * the agent must know once per session — putting it here (instead of
+   * duplicating it on every webhook-derived user.message) keeps prompt-cache
+   * locality and slashes per-turn token cost.
+   *
+   * Slack uses this for the `<oma_signal>` catalog + reply rules; the system
+   * prompt is frozen at session.create time so resumes still see whatever
+   * protocol was current at creation. Empty/undefined leaves the snapshot's
+   * system field untouched.
+   */
+  additionalSystemPrompt?: string;
+}
+
+export interface SessionEventInput {
+  type: string;
+  content: ReadonlyArray<{ type: string; text?: string; [k: string]: unknown }>;
+  metadata?: Record<string, unknown>;
+}
+
+export interface SessionCreator {
+  create(input: CreateSessionInput): Promise<{ sessionId: SessionId }>;
+  /**
+   * Append an event to an existing session (per_issue granularity). userId
+   * is required so the host can resolve the session's tenant in O(1) without
+   * scanning. Pass the same userId that owned the original `create` call.
+   */
+  resume(userId: UserId, sessionId: SessionId, event: SessionEventInput): Promise<void>;
+}
+
+/**
+ * Bridge to OMA's vault system. Lets a provider stash an external API token
+ * in the user's tenant, returning a vault id the agent's session binds to.
+ * The token is then injected into outbound requests by the sandbox's outbound
+ * Worker — sandbox code never sees it.
+ */
+export interface CreateCredentialInput {
+  userId: UserId;
+  /** Human-readable vault name shown in OMA Console. */
+  vaultName: string;
+  /** Display label for the credential row. */
+  displayName: string;
+  /** Hostname-matched URL the credential is injected for. */
+  mcpServerUrl: string;
+  /** The actual bearer token (will be encrypted in OMA's storage). */
+  bearerToken: string;
+  /**
+   * Provider tag for refresh routing. When set, the outbound proxy can
+   * request a token refresh via this provider's integration gateway. Used
+   * to support short-lived upstream tokens (e.g. GitHub installation
+   * tokens, ~1hr TTL).
+   */
+  provider?: ProviderTag;
+}
+
+export interface CreateCapCliInput {
+  userId: UserId;
+  /** Existing vault id to attach the credential to. Pass null to create a fresh vault. */
+  vaultId: string | null;
+  vaultName: string;
+  displayName: string;
+  /**
+   * cap CLI id, e.g. `"gh"` / `"aws"` / `"kubectl"`. Must match a builtin
+   * spec in @open-managed-agents/cap.
+   */
+  cliId: string;
+  /** Token value. Stored encrypted. Injected by cap proxy at HTTPS time. */
+  token: string;
+  /** Optional ISO-8601 expiration for short-lived upstream tokens. */
+  expiresAt?: string;
+  /** Optional refresh token (the resolver may use it to mint fresh access tokens). */
+  refreshToken?: string;
+  /** Mode-specific extras (e.g. AWS access_key_id / session_token). */
+  extras?: Record<string, string>;
+  /** Provider tag — see CreateCredentialInput. */
+  provider?: ProviderTag;
+}
+
+/**
+ * Tag a credential with the integration provider that owns it. Lets the
+ * outbound proxy / session-create handler request server-side token refresh
+ * without coupling agent worker code to provider specifics. Slack tokens are
+ * long-lived by default (no rotation), so slack-tagged credentials are not
+ * needed today.
+ */
+export type ProviderTag = "github" | "linear";
+
+export interface VaultManager {
+  /**
+   * Create a fresh vault with one static_bearer credential. Returns the
+   * vault id (use as session.vault_ids) and credential id.
+   */
+  createCredentialForUser(
+    input: CreateCredentialInput,
+  ): Promise<{ vaultId: string; credentialId: string }>;
+
+  /**
+   * Add a `cap_cli` credential to an existing vault (or create a fresh
+   * vault when `vaultId` is null). Returns the vault id and credential id.
+   *
+   * Use this alongside `createCredentialForUser` when one identity needs
+   * both an MCP-injected bearer (for hosted MCP servers) AND a sandbox
+   * CLI token. cap proxy injects the token at HTTPS time when sandbox
+   * traffic matches the registered cap CLI spec — token never enters the
+   * sandbox process env.
+   */
+  addCapCliCredential(
+    input: CreateCapCliInput,
+  ): Promise<{ vaultId: string; credentialId: string }>;
+
+  /**
+   * Replace the bearer token on the static_bearer credential in this vault.
+   * The vault is expected to have exactly one static_bearer credential
+   * (current OMA convention: one identity per vault). Returns true if a
+   * matching credential was found and updated, false if not.
+   *
+   * Used to refresh short-lived upstream tokens (e.g. GitHub installation
+   * tokens, ~1hr TTL) without requiring the caller to track credential ids.
+   */
+  rotateBearerToken(input: {
+    userId: UserId;
+    vaultId: string;
+    newBearerToken: string;
+  }): Promise<boolean>;
+
+  /**
+   * Replace the token on the cap_cli credential in this vault matching
+   * the given cli_id. The vault may hold multiple cap_cli creds (one per
+   * cli_id); `cliId` disambiguates.
+   */
+  rotateCapCliToken(input: {
+    userId: UserId;
+    vaultId: string;
+    cliId: string;
+    newToken: string;
+  }): Promise<boolean>;
+}
+
+/**
+ * Bag of generic ports a provider depends on. Constructed by the host's
+ * composition root (apps/integrations/wire.ts in production) and passed into
+ * each IntegrationProvider's constructor.
+ *
+ * Per-provider configuration (e.g. Linear App credentials) lives on the
+ * provider itself, not in this Container.
+ */
+export interface Container {
+  clock: Clock;
+  ids: IdGenerator;
+  crypto: Crypto;
+  hmac: HmacVerifier;
+  jwt: JwtSigner;
+  http: HttpClient;
+  /** Maps OMA userId → tenantId. Used by providers to populate tenant_id on
+   *  newly inserted installations/publications/Apps (Phase 0 of per-tenant-D1). */
+  tenants: TenantResolver;
+  sessions: SessionCreator;
+  vaults: VaultManager;
+  installations: InstallationRepo;
+  publications: PublicationRepo;
+  apps: AppRepo;
+  /** GitHub-App credential storage. Populated when the github provider is wired. */
+  githubApps: GitHubAppRepo;
+  /** Webhook dedup + audit. For Linear, the wire layer narrows this to
+   *  `LinearEventStore` (extends WebhookEventStore with the merged-table
+   *  drain queue methods); GitHub/Slack use the base interface. */
+  webhookEvents: WebhookEventStore;
+  /** Cron autopilot rules — Linear only for now. */
+  dispatchRules: DispatchRuleRepo;
+  /** Per-thread / per-channel session reuse (Slack). */
+  sessionScopes: SessionScopeRepo;
+  setupLinks: SetupLinkRepo;
+}

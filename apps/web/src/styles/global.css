@@ -1,0 +1,211 @@
+@import "tailwindcss";
+
+/* Mirror the Console design tokens so cross-link feel is consistent. */
+@theme {
+  --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Source Serif 4", ui-serif, Georgia, serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+
+  --color-bg: #fdfdfc;
+  --color-bg-surface: #f5f5f5;
+  --color-fg: #171717;
+  --color-fg-muted: #737373;
+  /* Tertiary text — small kicker labels, dates, breadcrumbs. #707070 lands
+     at ~4.84:1 against --color-bg (#fdfdfc warm-tinted), comfortably above
+     AA-normal (4.5:1). Earlier #767676 was just under threshold (4.43:1)
+     because the bg isn't pure white. */
+  --color-fg-subtle: #707070;
+  --color-border: #e5e5e5;
+  --color-border-strong: #d4d4d4;
+  /* Coral brand — matches .impeccable.md (#FF6B50) and the console + logo. */
+  --color-brand: #ff6b50;
+  --color-brand-hover: #e85a40;
+  --color-brand-subtle: #fff0ec;
+  /* Dark warm tone — pairs with brand at ~5.4:1 (AA-pass; white would be 2.96:1, AA-fail).
+     Used by anything that puts text on a brand background. */
+  --color-brand-fg: #3d2520;
+}
+
+.dark {
+  --color-bg: #161616;
+  --color-bg-surface: #222222;
+  --color-fg: #ededed;
+  --color-fg-muted: #999999;
+  /* Tertiary text in dark mode — bumped from #6b6b6b to #9b9b9b for AA
+     contrast (≥4.5:1) against --color-bg. */
+  --color-fg-subtle: #9b9b9b;
+  --color-border: #333333;
+  --color-border-strong: #444444;
+  /* Brand stays #ff6b50 in dark too — spec calls for identical hue both modes;
+     it lands at ~6.5:1 on the dark bg so it passes AA without darkening. */
+  --color-brand: #ff6b50;
+  --color-brand-hover: #ff8068;
+  --color-brand-subtle: #3d2520;
+  /* Same dark fg in dark mode — brand stays coral, the dark-on-coral pair
+     keeps AA contrast (white-on-coral fails at any size below ~24px bold). */
+  --color-brand-fg: #3d2520;
+}
+
+html {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  /* Smooth-scroll for in-page anchors (header is sticky, so we need
+     the scroll-margin so anchors clear it). */
+  scroll-behavior: smooth;
+}
+
+/* Anchor targets clear the sticky header (h-13 at desktop). Anything
+   you can scroll to via #anchor should set this — applied broadly
+   here so we don't need per-element scroll-margin. */
+:where(h1, h2, h3, h4, [id]) {
+  scroll-margin-top: 5rem;
+}
+
+/* Sticky-header polish: small shadow once the page leaves the top. JS
+   toggles [data-scrolled] in Base.astro. The base header has a
+   backdrop-blur so content scrolls behind it gracefully. */
+[data-site-header] {
+  transition: box-shadow 200ms ease-out, border-color 200ms ease-out;
+}
+[data-site-header][data-scrolled] {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 4px 12px rgba(0, 0, 0, 0.04);
+  border-bottom-color: var(--color-border-strong);
+}
+.dark [data-site-header][data-scrolled] {
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4), 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+/* Section reveal: starts faded + nudged down, fades in once it enters
+   the viewport. IntersectionObserver in Base.astro adds .is-visible.
+   Pages opt in by adding `data-reveal` to a section. Gated behind
+   html.js so a JS-disabled or pre-hydration render shows the content
+   normally instead of stuck-invisible. Also off for reduced-motion. */
+@media (prefers-reduced-motion: no-preference) {
+  html.js [data-reveal] {
+    opacity: 0;
+    transform: translateY(16px);
+    transition: opacity 600ms ease-out, transform 600ms ease-out;
+    will-change: opacity, transform;
+  }
+  html.js [data-reveal].is-visible {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Card hover-lift — applies to anything tagged data-lift (FeatureCard,
+   PricingCard, BlogPostCard). Cheap GPU transform, no layout cost. */
+[data-lift] {
+  transition: transform 180ms ease-out, box-shadow 180ms ease-out, border-color 180ms ease-out;
+  will-change: transform;
+}
+[data-lift]:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px -10px rgba(0, 0, 0, 0.12);
+}
+.dark [data-lift]:hover {
+  box-shadow: 0 8px 24px -10px rgba(0, 0, 0, 0.6);
+}
+
+/* Anchor defaults — color is `inherit` by default so nav/breadcrumb/
+   footer links pick up the surrounding text color instead of being
+   loud-red everywhere. The body-link coral is opt-in via the prose
+   selector below — only links inside paragraphs / lists / table cells
+   / blockquotes get colored + underlined. */
+@layer base {
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+  a:hover {
+    text-decoration: underline;
+  }
+}
+
+/* Inline body links: text inherits fg (passes AA-normal at 14:1+), brand
+   coral lives on the underline + hover state. Decoration colors aren't
+   subject to WCAG 1.4.3, so we get visible brand presence without using
+   coral as the readable text color (which would fail 4.5:1 on white). */
+:where(p, li, dd, td, blockquote) a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--color-brand);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 3px;
+  transition: color 120ms ease-out, text-decoration-color 120ms ease-out;
+}
+:where(p, li, dd, td, blockquote) a:hover {
+  color: var(--color-brand);
+  text-decoration-color: var(--color-brand-hover);
+}
+
+/* Brand-colored focus ring on every interactive element. The site had no
+   focus-visible styling before — keyboard users on a public marketing
+   site couldn't see where focus was. */
+a:focus-visible,
+button:focus-visible,
+summary:focus-visible,
+[role="button"]:focus-visible,
+input:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Reduced-motion users get instant transitions. Any future animation
+   we add will inherit this guard. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Markdown rendered prose (blog posts). Tailwind's typography plugin would
+   give richer defaults; keeping minimal here to avoid an extra dep. */
+.prose {
+  max-width: 70ch;
+  line-height: 1.7;
+}
+.prose h1 { font-family: var(--font-display); font-size: 2rem; font-weight: 700; margin-top: 2.5rem; margin-bottom: 1rem; }
+.prose h2 { font-family: var(--font-display); font-size: 1.5rem; font-weight: 600; margin-top: 2rem; margin-bottom: 0.75rem; }
+.prose h3 { font-size: 1.2rem; font-weight: 600; margin-top: 1.5rem; margin-bottom: 0.5rem; }
+.prose p { margin: 1rem 0; }
+.prose ul, .prose ol { margin: 1rem 0; padding-left: 1.5rem; }
+.prose li { margin: 0.25rem 0; }
+.prose code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: var(--color-bg-surface);
+  padding: 0.125rem 0.35rem;
+  border-radius: 0.25rem;
+}
+.prose pre {
+  background: var(--color-bg-surface);
+  padding: 1rem;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+  margin: 1rem 0;
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+}
+.prose pre code { background: none; padding: 0; }
+.prose blockquote {
+  border-left: 3px solid var(--color-brand);
+  padding-left: 1rem;
+  color: var(--color-fg-muted);
+  font-style: italic;
+  margin: 1rem 0;
+}
+.prose img {
+  max-width: 100%;
+  border-radius: 0.5rem;
+  margin: 1.5rem 0;
+}

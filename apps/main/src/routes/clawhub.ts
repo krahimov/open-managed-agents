@@ -1,0 +1,159 @@
+import { Hono } from "hono";
+import type { Env } from "@open-managed-agents/shared";
+import { logWarn } from "@open-managed-agents/shared";
+import type { Services } from "@open-managed-agents/services";
+import { kvKey } from "../kv-helpers";
+import { generateId, skillFileR2Key } from "@open-managed-agents/shared";
+
+const app = new Hono<{ Bindings: Env; Variables: { tenant_id: string; services: Services } }>();
+
+const CLAWHUB_BASE = "https://clawhub.ai/api/v1";
+
+interface ClawHubPackage {
+  name: string;
+  displayName: string;
+  summary: string;
+  family: string;
+  latestVersion: string;
+  ownerHandle: string;
+}
+
+// GET /v1/clawhub/search?q=xxx — search ClawHub registry
+app.get("/search", async (c) => {
+  const q = c.req.query("q") || "";
+  const res = await fetch(`${CLAWHUB_BASE}/packages${q ? `?q=${encodeURIComponent(q)}` : ""}`);
+  if (!res.ok) return c.json({ error: `ClawHub search failed: ${res.status}` }, 502);
+  const body = (await res.json()) as { items: ClawHubPackage[] };
+  // Filter to skills only
+  const skills = (body.items || [])
+    .filter((p) => p.family === "skill")
+    .map((p) => ({
+      slug: p.name,
+      name: p.displayName || p.name,
+      description: p.summary || "",
+      version: p.latestVersion,
+      owner: p.ownerHandle,
+    }));
+  return c.json({ data: skills });
+});
+
+// POST /v1/clawhub/install — install a skill from ClawHub
+app.post("/install", async (c) => {
+  const t = c.get("tenant_id");
+  const body = await c.req.json<{ slug: string }>();
+  if (!body.slug) return c.json({ error: "slug is required" }, 400);
+
+  // 1. Get package metadata
+  const metaRes = await fetch(`${CLAWHUB_BASE}/packages/${encodeURIComponent(body.slug)}`);
+  if (!metaRes.ok) return c.json({ error: `Skill "${body.slug}" not found on ClawHub` }, 404);
+  const meta = (await metaRes.json()) as { package: ClawHubPackage };
+
+  // 2. Download zip
+  const dlRes = await fetch(`${CLAWHUB_BASE}/download?slug=${encodeURIComponent(body.slug)}`);
+  if (!dlRes.ok) return c.json({ error: `Failed to download skill: ${dlRes.status}` }, 502);
+
+  // 3. Extract files from zip
+  const files = await extractZipFiles(dlRes);
+
+  if (files.length === 0) {
+    return c.json({ error: "Downloaded zip contains no files" }, 502);
+  }
+
+  const bucket = c.var.services.filesBlob;
+  if (!bucket) return c.json({ error: "FILES_BUCKET binding not configured" }, 500);
+
+  // 4. Write file bytes to R2, store only manifest in KV
+  const pkg = meta.package;
+  const skillName = (pkg.displayName || pkg.name).toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 64);
+  const id = `skill_${generateId()}`;
+  const versionId = Date.now().toString();
+  const now = new Date().toISOString();
+
+  const manifest: Array<{ filename: string; size_bytes: number; encoding: "utf8" }> = [];
+  for (const f of files) {
+    const bytes = new TextEncoder().encode(f.content);
+    await bucket.put(skillFileR2Key(t, id, versionId, f.filename), bytes);
+    manifest.push({ filename: f.filename, size_bytes: bytes.byteLength, encoding: "utf8" });
+  }
+
+  const skill = {
+    id,
+    display_title: pkg.displayName || pkg.name,
+    name: skillName,
+    description: pkg.summary || "",
+    source: "custom" as const,
+    latest_version: versionId,
+    created_at: now,
+    clawhub_slug: body.slug,
+  };
+
+  const version = { version: versionId, files: manifest, created_at: now };
+
+  await Promise.all([
+    c.var.services.kv.put(kvKey(t, "skill", id), JSON.stringify(skill)),
+    c.var.services.kv.put(kvKey(t, "skillver", id, versionId), JSON.stringify(version)),
+  ]);
+
+  return c.json({ ...skill, files }, 201);
+});
+
+/**
+ * Extract text files from a zip ArrayBuffer.
+ * Minimal zip parser — handles Store (0) and Deflate (8) methods.
+ */
+async function extractZipFiles(res: Response): Promise<Array<{ filename: string; content: string }>> {
+  const buf = await res.arrayBuffer();
+  const view = new DataView(buf);
+  const files: Array<{ filename: string; content: string }> = [];
+  let offset = 0;
+
+  while (offset < buf.byteLength - 4) {
+    const sig = view.getUint32(offset, true);
+    if (sig !== 0x04034b50) break; // Local file header signature
+
+    const compressionMethod = view.getUint16(offset + 8, true);
+    const compressedSize = view.getUint32(offset + 18, true);
+    const nameLen = view.getUint16(offset + 26, true);
+    const extraLen = view.getUint16(offset + 28, true);
+
+    const nameBytes = new Uint8Array(buf, offset + 30, nameLen);
+    const filename = new TextDecoder().decode(nameBytes);
+
+    const dataStart = offset + 30 + nameLen + extraLen;
+    const rawData = new Uint8Array(buf, dataStart, compressedSize);
+
+    if (!filename.endsWith("/") && !filename.startsWith("__MACOSX")) {
+      try {
+        let content: string;
+        if (compressionMethod === 8) {
+          // Deflate
+          const ds = new DecompressionStream("deflate-raw");
+          const writer = ds.writable.getWriter();
+          writer.write(rawData).catch((err) => {
+            logWarn({ op: "clawhub.zip.deflate_write", err }, "deflate write failed");
+          });
+          writer.close().catch((err) => {
+            logWarn({ op: "clawhub.zip.deflate_close", err }, "deflate close failed");
+          });
+          const decompressed = new Response(ds.readable);
+          content = await decompressed.text();
+        } else {
+          content = new TextDecoder().decode(rawData);
+        }
+        files.push({ filename, content });
+      } catch (err) {
+        // Skip files that fail to decompress — preserve the rest of the zip.
+        logWarn(
+          { op: "clawhub.zip.entry_decompress", filename, err },
+          "skipping unreadable zip entry",
+        );
+      }
+    }
+
+    offset = dataStart + compressedSize;
+  }
+
+  return files;
+}
+
+export default app;

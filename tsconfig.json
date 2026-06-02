@@ -1,0 +1,23 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022"],
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers/types"],
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "jsxImportSource": "hono/jsx"
+  },
+  "include": [
+    "packages/*/src/**/*.ts",
+    "apps/*/src/**/*.ts",
+    "apps/main/worker-env.d.ts"
+  ],
+  "exclude": ["node_modules", "test", "apps/console", "apps/docs", "apps/main-node", "apps/oma-vault", "apps/web", "packages/cli", "packages/integrations-ui", "packages/acp-runtime", "packages/cap", "packages/sandbox/src/adapters/local-subprocess.ts", "packages/sandbox/src/adapters/daytona.ts", "packages/sandbox/src/adapters/litebox.ts", "packages/sandbox/src/adapters/boxrun.ts", "packages/memory-store/src/adapters/local-fs-blob.ts", "packages/blob-store/src/adapters/local-fs.ts"]
+}

@@ -1,0 +1,382 @@
+// Domain value types for integrations.
+//
+// These are the shapes passed across package boundaries. Concrete adapters
+// (D1, GraphQL clients) translate to and from these types.
+
+export type ProviderId = "linear" | "github" | "slack";
+
+/** External workspace id (Linear workspace, Slack team, etc.). */
+export type WorkspaceId = string;
+
+/** OMA platform user (better-auth user id). */
+export type UserId = string;
+
+/** OMA agent id. */
+export type AgentId = string;
+
+/** OMA session id. */
+export type SessionId = string;
+
+export interface Persona {
+  /** Display name shown in the integration's UI (e.g. createAsUser, App name). */
+  name: string;
+  /** Avatar URL shown alongside the name. */
+  avatarUrl: string | null;
+}
+
+/**
+/**
+ * Capability keys gating provider API operations. Stable strings, used in JWT
+ * scopes and DB rows. Cross-provider keys (`issue.*` / `comment.*` / etc.)
+ * are shared so a publication can hold a uniform capability shape regardless
+ * of source — providers ignore keys that don't apply to them. Provider-
+ * specific keys (GitHub's `pr.*`, Slack's `message.*`) coexist in the union;
+ * each provider narrows internally.
+ */
+export type CapabilityKey =
+  // Cross-provider
+  | "issue.read"
+  | "issue.create"
+  | "issue.update"
+  | "issue.delete"
+  | "comment.write"
+  | "comment.delete"
+  | "label.add"
+  | "label.remove"
+  | "assignee.set"
+  | "assignee.set_other"
+  | "status.set"
+  | "priority.set"
+  | "subissue.create"
+  | "user.mention"
+  | "search.read"
+  // GitHub-specific
+  | "pr.read"
+  | "pr.create"
+  | "pr.update"
+  | "pr.merge"
+  | "pr.close"
+  | "pr.review.write"
+  | "pr.review.comment"
+  | "repo.read"
+  | "repo.write"
+  | "repo.branch.create"
+  | "repo.branch.delete"
+  | "workflow.read"
+  | "workflow.dispatch"
+  | "release.read"
+  | "release.create"
+  // Slack-specific
+  | "message.read"
+  | "message.write"
+  | "message.update"
+  | "message.delete"
+  | "thread.reply"
+  | "reaction.add"
+  | "reaction.remove"
+  | "user.read"
+  | "canvas.write";
+
+export type CapabilitySet = ReadonlySet<CapabilityKey>;
+
+/**
+ * How an installation was provisioned. Drives credential type, trigger
+ * mechanism, and toolset capabilities.
+ *
+ * - `dedicated`: BYO Linear OAuth App registered by the user. OAuth-app
+ *   token in vault, bot identity is the OAuth app's auto-created bot user,
+ *   webhook-driven, AgentSession panel available.
+ * - `personal_token`: User pasted a Linear Personal API Key (PAT). Token
+ *   in vault, bot identity is the PAT owner (a real user account), no
+ *   webhook source — driven exclusively by linear_dispatch_rules cron
+ *   sweep. No AgentSession panel.
+ *
+ * The DB column `linear_installations.install_kind` stores this verbatim.
+ */
+export type InstallKind = "dedicated" | "personal_token";
+
+/**
+ * Cron-driven autopilot rule. The dispatch sweep loops periodically, picks
+ * rules whose `lastPolledAt` is older than `pollIntervalSeconds`, runs a
+ * Linear GraphQL query bounded by the filter fields, and assigns up to
+ * `maxConcurrent` matching issues to the publication's bot user.
+ *
+ * Filter fields are AND-combined. `filterStates: null` means "any active
+ * state". `filterLabel: null` means "no label filter" — Symphony's default
+ * but a footgun for new tenants, so the admin API rejects creating a rule
+ * with no filter at all.
+ *
+ * Behavior diverges by installation kind:
+ *   - `dedicated`:      sweep calls issueUpdate(assignee=botUserId), Linear
+ *                       fires IssueAssignedToYou, existing webhook path
+ *                       handles dispatch. Idempotency: assignee=null filter
+ *                       + linear_issue_sessions dedup at create time.
+ *   - `personal_token`: no webhook source. Sweep CAS-claims via
+ *                       IssueSessionRepo.claim(), then directly invokes
+ *                       sessions.create(). Optionally also issueUpdate for
+ *                       Linear UI visibility.
+ */
+export interface DispatchRule {
+  id: string;
+  tenantId: string;
+  publicationId: string;
+  name: string;
+  enabled: boolean;
+  filterLabel: string | null;
+  filterStates: readonly string[] | null;
+  filterProjectId: string | null;
+  maxConcurrent: number;
+  pollIntervalSeconds: number;
+  lastPolledAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** Insert payload — id and timestamps assigned by the repo. */
+export interface NewDispatchRule {
+  tenantId: string;
+  publicationId: string;
+  name: string;
+  enabled: boolean;
+  filterLabel: string | null;
+  filterStates: readonly string[] | null;
+  filterProjectId: string | null;
+  maxConcurrent: number;
+  pollIntervalSeconds: number;
+}
+
+/** Patch payload — only mutable fields. tenantId/publicationId are immutable. */
+export type DispatchRulePatch = Partial<{
+  name: string;
+  enabled: boolean;
+  filterLabel: string | null;
+  filterStates: readonly string[] | null;
+  filterProjectId: string | null;
+  maxConcurrent: number;
+  pollIntervalSeconds: number;
+}>;
+
+/**
+ * Webhook event awaiting async dispatch. Webhook handler persists, returns
+ * 200 immediately, and the cron sweep drains the table on each tick.
+ *
+ * `payload` is a JSON-serialized NormalizedWebhookEvent — drain code
+ * re-parses and processes via LinearProvider.processPendingEvent. Storing
+ * the normalized form (vs raw Linear payload) keeps drain code decoupled
+ * from envelope-shape changes.
+ *
+ * Lifecycle:
+ *   - inserted with processedAt=null
+ *   - on successful dispatch: processedAt=nowMs, processedSessionId=<id>
+ *   - on dispatch failure: processedAt=nowMs, errorMessage=<reason>
+ *     (no automatic retry — operator decides)
+ */
+export interface PendingEvent {
+  id: string;
+  tenantId: string;
+  publicationId: string;
+  eventKind: string;
+  issueId: string | null;
+  issueIdentifier: string | null;
+  workspaceId: string | null;
+  payload: string;
+  receivedAt: number;
+  processedAt: number | null;
+  processedSessionId: string | null;
+  errorMessage: string | null;
+}
+
+/** Insert payload — id and receivedAt are assigned by the repo. */
+export interface NewPendingEvent {
+  tenantId: string;
+  publicationId: string;
+  eventKind: string;
+  issueId: string | null;
+  issueIdentifier: string | null;
+  workspaceId: string | null;
+  payload: string;
+}
+
+export type PublicationMode = "full";
+
+export type PublicationStatus =
+  | "pending_setup"
+  /** Publication-first install: credentials staged on the row, OAuth not
+   *  yet completed. Slack and GitHub flow through this on the way from
+   *  pending_setup → awaiting_install. */
+  | "credentials_filled"
+  | "awaiting_install"
+  | "live"
+  | "needs_reauth"
+  | "unpublished";
+
+export type SessionScopeStatus =
+  | "active"
+  /** Race-claim placeholder: a dispatcher won the (publication, scope_key)
+   *  INSERT and is currently calling sessions.create. `session_id` is a
+   *  `_pending_<uuid>` sentinel until `fulfillPending` writes the real id
+   *  and flips to 'active'. Concurrent dispatchers see the pending row,
+   *  poll briefly, then resume the winner's session. Stale pending rows
+   *  (>60s since `created_at`, claim crashed before fulfill) become
+   *  eligible for reassignIfInactive takeover. */
+  | "pending"
+  | "completed"
+  | "human_handoff"
+  | "rerouted"
+  | "escalated"
+  /** PAT-mode dispatch sweep claimed the slot but sessions.create then
+   *  threw. The slot is logically free for the next sweep tick to retry,
+   *  but we keep the row so audits can spot repeated failures. */
+  | "failed";
+
+export type SessionGranularity = "per_issue" | "per_thread" | "per_event" | "per_channel";
+
+export interface Installation {
+  id: string;
+  /** OMA tenant that owns this installation. NOT NULL in storage; backfilled
+   *  from user.tenantId for legacy rows in migration 0002. */
+  tenantId: string;
+  userId: UserId;
+  providerId: ProviderId;
+  workspaceId: WorkspaceId;
+  workspaceName: string;
+  installKind: InstallKind;
+  /** Set only when installKind === "dedicated"; references AppRepo. */
+  appId: string | null;
+  /** Bot user id assigned by the provider when the install completed. */
+  botUserId: string;
+  scopes: ReadonlyArray<string>;
+  /**
+   * Vault id (in OMA's tenant) holding the bearer credential for this
+   * install's external API. Sessions triggered by this install bind to this
+   * vault so the outbound Worker can inject the token.
+   */
+  vaultId: string | null;
+  createdAt: number;
+  revokedAt: number | null;
+}
+
+export interface Publication {
+  id: string;
+  /** OMA tenant that owns this publication. NOT NULL in storage. */
+  tenantId: string;
+  userId: UserId;
+  agentId: AgentId;
+  installationId: string;
+  /**
+   * OMA environment the agent runs in when triggered by this publication.
+   * Bound at publish time; required for the gateway to spin up a sandbox.
+   */
+  environmentId: string;
+  mode: PublicationMode;
+  status: PublicationStatus;
+  persona: Persona;
+  capabilities: CapabilitySet;
+  sessionGranularity: SessionGranularity;
+  createdAt: number;
+  unpublishedAt: number | null;
+}
+
+export interface AppCredentials {
+  id: string;
+  /** OMA tenant that owns these App credentials. NOT NULL in storage. */
+  tenantId: string;
+  /** Set only after the related publication has been materialized. */
+  publicationId: string | null;
+  /** OAuth client id from the provider's developer portal. */
+  clientId: string;
+  /** Stored encrypted; adapters return plaintext via Crypto.decrypt. */
+  clientSecretCipher: string;
+  /** Stored encrypted; HMAC secret for incoming webhooks. */
+  webhookSecretCipher: string;
+  createdAt: number;
+}
+
+/**
+ * GitHub App credentials. Distinct from `AppCredentials` because GitHub Apps
+ * carry a few extra invariants Linear's OAuth apps don't have:
+ *
+ *   - Numeric `appId` (used as `iss` in App JWTs)
+ *   - URL `appSlug` (used to build the install link)
+ *   - `botLogin` (e.g. "myapp[bot]" — needed at webhook parse time to
+ *     detect "@mention" / "assigned-to-bot")
+ *   - PEM-encoded RSA private key (used to mint short-lived App JWTs which
+ *     in turn mint per-installation access tokens)
+ *
+ * `clientId` / `clientSecret` are optional — only needed if the App also
+ * supports OAuth-style "Sign in with GitHub" for user attribution. For the
+ * pure App-bot install used by OMA today, both are null.
+ */
+export interface GitHubAppCredentials {
+  id: string;
+  /** OMA tenant that owns these App credentials. NOT NULL in storage. */
+  tenantId: string;
+  publicationId: string | null;
+  appId: string;
+  appSlug: string;
+  botLogin: string;
+  clientId: string | null;
+  clientSecretCipher: string | null;
+  webhookSecretCipher: string;
+  privateKeyCipher: string;
+  createdAt: number;
+}
+
+// Per-issue session bookkeeping moved out of core. Linear and GitHub each
+// own their own typed shape (`LinearIssueSession` / `GitHubIssueSession`)
+// in their respective provider packages, backed by separate tables. There
+// is no longer a unified `IssueSession` here on purpose — the conflation
+// is what produced the cross-provider table leak we just split out.
+
+
+
+/**
+ * Generalized session-scope binding for providers whose session granularity
+ * isn't a single issue id. Slack uses this with `scopeKey = ${channel_id}:
+ * ${thread_ts ?? event_ts}`. Same shape as `IssueSession`, just with an
+ * opaque `scopeKey` instead of a provider-native `issueId`.
+ */
+export interface SessionScope {
+  /** OMA tenant that owns this session-scope row. NOT NULL in storage. */
+  tenantId: string;
+  publicationId: string;
+  /**
+   * Provider-native key identifying the conversational scope this session is
+   * bound to. Linear stores the issue id (e.g. `iss_…`); Slack stores
+   * `${channel_id}:${thread_ts ?? event_ts}` (per_thread) or `channel:${channel_id}`
+   * (per_channel). Opaque to core.
+   */
+  scopeKey: string;
+  sessionId: SessionId;
+  status: SessionScopeStatus;
+  createdAt: number;
+  /**
+   * For Slack per_channel: when set to a future ms timestamp, a debounced
+   * channel-scan turn has already been dispatched and the next top-level
+   * messages within this window should be silently throttled. The agent's
+   * scheduleWakeup will fire around this time and re-scan via
+   * conversations.history. Cleared once the scan turn completes.
+   */
+  pendingScanUntil?: number | null;
+  /**
+   * For Slack per_channel: timestamp of the last completed scan turn — agent
+   * uses this as `oldest` in `conversations.history` to bound its re-read.
+   */
+  lastScanAt?: number | null;
+  /**
+   * For Slack per_channel: cached channel display name. Updated on
+   * channel_rename without waking the agent; agent reads it on next wake.
+   */
+  channelName?: string | null;
+}
+
+export interface SetupLink {
+  token: string;
+  /** OMA tenant that owns this setup link. NOT NULL in storage. */
+  tenantId: string;
+  publicationId: string;
+  createdBy: UserId;
+  expiresAt: number;
+  usedAt: number | null;
+  usedByEmail: string | null;
+}

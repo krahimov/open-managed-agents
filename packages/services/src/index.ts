@@ -1,0 +1,493 @@
+// Service container — one canonical surface for all platform-agnostic
+// services in OMA.
+//
+// Why this exists:
+//   - Wiring decision (D1 vs Postgres vs SQLite vs in-memory) lives in ONE
+//     place — the buildXxxServices factories below. Routes / DOs / cron all
+//     depend on the `Services` interface; swapping deployment = swap factory.
+//   - HTTP routes pick services off `c.var.services` (Hono request scope).
+//   - DO / outbound worker / cron / anything outside Hono builds its own
+//     instance via the same factory. Same `Services` type, no duplication.
+//   - Tests use a TenantDbProvider fake plus the same factory.
+//
+// Adding a new store:
+//   1. Add `<storeName>: <ServiceType>` to the `Services` interface
+//   2. Add construction call to each `buildXxxServices` (CF + future Node + tests)
+//   3. Consumers reference `c.var.services.<storeName>` (HTTP) or
+//      `services.<storeName>` (everywhere else). No import changes anywhere.
+//
+// Per-tenant DB routing (Phase 1+):
+//   - `buildCfServices(env, db)` takes a resolved D1Database — every adapter
+//     constructed inside reads/writes against that one DB.
+//   - The DB is resolved per-request by the new `tenantDbMiddleware`, which
+//     calls `TenantDbProvider.resolve(tenantId)` after authMiddleware sets
+//     `c.var.tenant_id`. Phase 1 default returns the shared `env.MAIN_DB`
+//     for every tenant — zero behaviour change. Phase 4 swaps in the
+//     static-binding resolver.
+//
+// The self-host escape hatch:
+//   - Today only `buildCfServices` exists.
+//   - When self-hosting on Node + Postgres becomes a real target, add a
+//     `buildNodeServices(opts: { pg, ... })` that returns the same `Services`
+//     shape from Postgres adapters. Entry file picks one based on env.
+//   - Routes and business code don't change at all.
+
+import type { MiddlewareHandler } from "hono";
+import type { Env } from "@open-managed-agents/shared";
+import {
+  CredentialService,
+  createCfCredentialService,
+} from "@open-managed-agents/credentials-store";
+import {
+  MemoryStoreService,
+  createCfMemoryStoreService,
+} from "@open-managed-agents/memory-store";
+import {
+  VaultService,
+  createCfVaultService,
+} from "@open-managed-agents/vaults-store";
+import {
+  SessionService,
+  createCfSessionService,
+} from "@open-managed-agents/sessions-store";
+import {
+  FileService,
+  createCfFileService,
+} from "@open-managed-agents/files-store";
+import {
+  EvalRunService,
+  createCfEvalRunService,
+} from "@open-managed-agents/evals-store";
+import {
+  ModelCardService,
+  createCfModelCardService,
+} from "@open-managed-agents/model-cards-store";
+import {
+  AgentService,
+  createCfAgentService,
+} from "@open-managed-agents/agents-store";
+import {
+  EnvironmentService,
+  createCfEnvironmentService,
+} from "@open-managed-agents/environments-store";
+import {
+  OutboundSnapshotService,
+  createCfOutboundSnapshotService,
+} from "@open-managed-agents/outbound-snapshots-store";
+import {
+  SessionSecretService,
+  createCfSessionSecretService,
+} from "@open-managed-agents/session-secrets-store";
+import {
+  CfSharedAuthDbProvider,
+  MetaTableTenantDbProvider,
+  type TenantDbProvider,
+} from "@open-managed-agents/tenant-db";
+import {
+  TenantShardDirectoryService,
+  ShardPoolService,
+  MemoryStoreTenantIndexService,
+  createCfTenantShardDirectoryService,
+  createCfShardPoolService,
+  createCfMemoryStoreTenantIndexService,
+} from "@open-managed-agents/tenant-dbs-store";
+import {
+  WebCryptoAesGcm,
+} from "@open-managed-agents/integrations-adapters-cf";
+import { type BlobStore, blobStoreFromR2 } from "@open-managed-agents/blob-store";
+import { type KvStore, CfKvStore } from "@open-managed-agents/kv-store";
+import { parseStoreBackends, pickBackend } from "./store-backends";
+import { type UsageStore, createCfUsageStore } from "./usage";
+
+export { parseStoreBackends, pickBackend } from "./store-backends";
+export type { StoreBackendName, BackendFactories } from "./store-backends";
+export { getPgPool } from "./pg-pool";
+export {
+  SqlUsageStore,
+  createCfUsageStore,
+  clampUsageValue,
+  MAX_VALUE_PER_EMIT_SEC,
+} from "./usage";
+export type { UsageStore, UsageKind, UsageEventInput, UsageEventRow } from "./usage";
+
+/**
+ * The platform-agnostic service surface. Every service the application uses
+ * (storage, integrations, etc.) shows up here as an abstract interface from
+ * its store package — never a Cloudflare-specific class.
+ */
+export interface Services {
+  credentials: CredentialService;
+  memory: MemoryStoreService;
+  vaults: VaultService;
+  sessions: SessionService;
+  files: FileService;
+  evals: EvalRunService;
+  modelCards: ModelCardService;
+  agents: AgentService;
+  environments: EnvironmentService;
+  outboundSnapshots: OutboundSnapshotService;
+  sessionSecrets: SessionSecretService;
+  /** Control-plane: tenant_id → binding_name assignment. Hot-path read on
+   *  every authenticated request via MetaTableTenantDbProvider. Always
+   *  queries control-plane DB. */
+  tenantShardDirectory: TenantShardDirectoryService;
+  /** Control-plane: per-shard status / capacity / tenant count. Used for
+   *  shard selection at sign-up + capacity monitoring. */
+  shardPool: ShardPoolService;
+  /** Control-plane: memory_store_id → tenant_id index. Populated on
+   *  store creation, consumed by the R2 memory-events queue consumer to
+   *  resolve the per-tenant shard from an R2 storage key (which carries
+   *  no tenant_id). */
+  memoryStoreTenantIndex: MemoryStoreTenantIndexService;
+  /**
+   * File-bytes blob store (R2 FILES_BUCKET in CF, local-FS / S3 in Node).
+   * Null when the underlying storage isn't configured — routes that need it
+   * return 500 with a "not configured" message, matching pre-port behavior.
+   * The self-host adapter (forthcoming) returns a non-null blob store wired to
+   * S3 / local FS — routes never see runtime-specific types.
+   */
+  filesBlob: BlobStore | null;
+  /**
+   * Generic key-value store (CONFIG_KV in CF, SQL-table-backed in Node).
+   * Used by routes that don't yet have a dedicated store package — quotas
+   * counters, skill metadata, api-key records, OAuth state, eval trajectory
+   * blobs, etc. Required at the type level: CONFIG_KV is non-optional in
+   * the Env shape; tests inject an InMemoryKvStore instead. Store packages
+   * with their own KV adapters (KvSessionSecretRepo / KvOutboundSnapshotRepo)
+   * keep their direct KVNamespace dependency — they'll get full SQL-table
+   * replacements in Phase C, not KvStore wrappers.
+   */
+  kv: KvStore;
+  /**
+   * Usage event recorder/reader. Per-tenant `usage_events` table populated
+   * by sandbox / browser / session lifecycle hooks; consumed by the hosted
+   * billing worker's reconcile cron via /v1/internal/usage_events. OSS owns
+   * the count, hosted owns the rate map + ledger debit. See
+   * packages/services/src/usage.ts for details.
+   */
+  usage: UsageStore;
+}
+
+/**
+ * Default Hono context shape used by every OMA HTTP route. Combine in route
+ * files like:
+ *
+ *   const app = new Hono<AppContext & { Variables: { tenant_id: string } }>();
+ *
+ * Or use `AppContextWithTenant` below for the common case.
+ */
+export interface AppContext {
+  Bindings: Env;
+  Variables: {
+    services: Services;
+    /** Resolved per-tenant DB. Set by `tenantDbMiddleware` before routes run. */
+    tenantDb: D1Database;
+  };
+}
+
+/**
+ * Most authenticated routes need both the services container and the
+ * `tenant_id` set by the auth middleware. Re-exported as the canonical
+ * "authenticated route" Hono context.
+ */
+export interface AppContextWithTenant {
+  Bindings: Env;
+  Variables: {
+    services: Services;
+    tenantDb: D1Database;
+    tenant_id: string;
+    user_id?: string;
+  };
+}
+
+// ============================================================
+// Wiring factories — pick one based on deployment target
+// ============================================================
+
+/**
+ * Build a label-scoped at-rest encryption boundary for a single subsystem.
+ * Each subsystem (model cards, credentials, …) passes a distinct `label`;
+ * HKDF-style derivation in WebCryptoAesGcm gives each one a different AES key,
+ * so a leak in one subsystem cannot decrypt another's ciphertexts.
+ *
+ * Caller MUST have already verified that env.PLATFORM_ROOT_SECRET is non-empty
+ * (buildServices throws at boot if it isn't).
+ */
+function mintCrypto(env: Env, label: string): WebCryptoAesGcm {
+  return new WebCryptoAesGcm(env.PLATFORM_ROOT_SECRET!, label);
+}
+
+/**
+ * Production / staging on Cloudflare Workers. Wires every service against
+ * the resolved per-tenant D1 database. The TenantDbProvider middleware
+ * resolves the right DB for the current request before this factory runs.
+ *
+ * Per-store backend dispatch: each D1-backed store goes through `pickBackend`
+ * so its concrete adapter can be swapped to pg / memory / future backends
+ * via the `STORE_BACKENDS` env JSON without touching service or route code.
+ * Tenant routing is the storage provider's concern, NOT the service layer —
+ * the cf factory uses the per-tenant D1 binding, a pg factory could use
+ * row-level tenant_id filters or schema-per-tenant, etc.
+ *
+ * KV-backed services (outbound snapshots, session secrets) and control-plane
+ * services (tenant directory, installation index) are not dispatched today
+ * because they have a single sensible backend.
+ *
+ * To wire a new backend (e.g. pg) for a store:
+ *   1. Implement Pg<X>Repo + createPg<X>Service in packages/<store>-store
+ *   2. Uncomment / add the `pg: () => createPg<X>Service(...)` line in the
+ *      relevant pickBackend call below
+ *   3. Set STORE_BACKENDS={"<key>":"pg"} in the worker's env
+ */
+export function buildServices(env: Env, db: D1Database): Services {
+  const overrides = parseStoreBackends(env);
+  // At-rest encryption is mandatory in this build. Refuse to start if the
+  // signing key isn't configured rather than silently writing plaintext —
+  // historical regressions of that exact shape are why this check exists.
+  if (!env.PLATFORM_ROOT_SECRET) {
+    throw new Error(
+      "buildServices: PLATFORM_ROOT_SECRET is required for at-rest encryption of credentials.auth and model_cards.api_key_cipher. " +
+        "Set it via `wrangler secret put PLATFORM_ROOT_SECRET` (or in .dev.vars for local dev). " +
+        "Generate with: openssl rand -base64 32",
+    );
+  }
+  return {
+    credentials: pickBackend(overrides, "credentials", {
+      cf: () =>
+        createCfCredentialService(
+          { db },
+          { crypto: mintCrypto(env, "credentials.auth") },
+        ),
+      // pg: () => createPgCredentialService({ pg: getPgPool(env) }),
+    }),
+    memory: pickBackend(overrides, "memory", {
+      cf: () => createCfMemoryStoreService({
+        db,
+        // MEMORY_BUCKET is required at runtime — no noop fallback. The bang
+        // intentionally throws if the binding is missing so the failure is
+        // visible at first request rather than silently degrading.
+        r2: env.MEMORY_BUCKET!,
+      }),
+      // pg: () => createPgMemoryStoreService({ pg: getPgPool(env), r2: env.MEMORY_BUCKET! }),
+    }),
+    vaults: pickBackend(overrides, "vaults", {
+      cf: () => createCfVaultService({ db }),
+      // pg: () => createPgVaultService({ pg: getPgPool(env) }),
+    }),
+    sessions: pickBackend(overrides, "sessions", {
+      cf: () => createCfSessionService({ db }),
+      // pg: () => createPgSessionService({ pg: getPgPool(env) }),
+    }),
+    files: pickBackend(overrides, "files", {
+      cf: () => createCfFileService({ db }),
+      // pg: () => createPgFileService({ pg: getPgPool(env) }),
+    }),
+    evals: pickBackend(overrides, "evals", {
+      cf: () => createCfEvalRunService({ db }),
+      // pg: () => createPgEvalRunService({ pg: getPgPool(env) }),
+    }),
+    modelCards: pickBackend(overrides, "modelCards", {
+      cf: () =>
+        createCfModelCardService(
+          { db },
+          { crypto: mintCrypto(env, "model.cards.keys") },
+        ),
+      // pg: () => createPgModelCardService({ pg: getPgPool(env) }),
+    }),
+    agents: pickBackend(overrides, "agents", {
+      cf: () => createCfAgentService({ db }),
+      // pg: () => createPgAgentService({ pg: getPgPool(env) }),
+    }),
+    environments: pickBackend(overrides, "environments", {
+      cf: () => createCfEnvironmentService({ db }),
+      // pg: () => createPgEnvironmentService({ pg: getPgPool(env) }),
+    }),
+    outboundSnapshots: createCfOutboundSnapshotService(env),
+    sessionSecrets: createCfSessionSecretService(env),
+    // Control-plane services: always query env.ROUTER_DB (not the per-tenant
+    // db). Falls back to env.MAIN_DB during the rollout grace period when
+    // ROUTER_DB binding may not yet be present in older deployments.
+    tenantShardDirectory: createCfTenantShardDirectoryService({
+      controlPlaneDb: env.ROUTER_DB ?? env.MAIN_DB,
+    }),
+    shardPool: createCfShardPoolService({
+      controlPlaneDb: env.ROUTER_DB ?? env.MAIN_DB,
+    }),
+    memoryStoreTenantIndex: createCfMemoryStoreTenantIndexService({
+      controlPlaneDb: env.ROUTER_DB ?? env.MAIN_DB,
+    }),
+    // File blob storage. CF: R2 binding; self-host: S3 / local-FS adapter.
+    filesBlob: blobStoreFromR2(env.FILES_BUCKET),
+    // Generic KV. CF: CONFIG_KV binding; self-host: SQL-table-backed adapter.
+    kv: new CfKvStore(env.CONFIG_KV),
+    // Resource usage event log. Tenant-scoped table on the resolved per-
+    // tenant DB (no STORE_BACKENDS dispatch — Postgres adapter would just
+    // swap the underlying SqlClient).
+    usage: createCfUsageStore({ db }),
+  };
+}
+
+/**
+ * Backwards-compat alias — old call sites still use `buildCfServices`. New
+ * code should prefer `buildServices` since the function is no longer
+ * Cloudflare-specific (a `pg` adapter, when wired, gets selected by env).
+ */
+export const buildCfServices = buildServices;
+
+/**
+ * Build the TenantDbProvider used by the middleware.
+ *
+ * Three modes, chosen in order:
+ *
+ * 1. **Single-D1 mode** (auto-detected, OR `SINGLE_D1_MODE="1"`, OR
+ *    `PER_TENANT_DB_ENABLED="false"`). Self-host deployments with only the
+ *    MAIN_DB binding land here — there's no shard to route to, so we skip
+ *    the meta-table read and serve every tenant from MAIN_DB directly.
+ *    Auto-detection: if the env doesn't have an `AUTH_DB_01` binding, we
+ *    assume single-D1. Self-hosters omit the shard bindings from
+ *    wrangler.jsonc and the mode kicks in without any flag.
+ *
+ * 2. **Multi-shard mode** (default for openma.dev's `--env production`).
+ *    Reads `tenant_shard` from `ROUTER_DB` (or MAIN_DB legacy fallback) and
+ *    resolves to the named binding. MAIN_DB fallback for unmapped tenants.
+ *    Per-isolate cache; no TTL (sharding is sticky).
+ *
+ * 3. **Legacy killswitch** (`PER_TENANT_DB_ENABLED="false"`). Same shape as
+ *    single-D1 mode — exists for instant rollback if the meta table itself
+ *    breaks in production.
+ *
+ * Tests should construct their own StaticTenantDbProvider via
+ * @open-managed-agents/tenant-db/test-fakes and bypass this factory.
+ */
+export function buildCfTenantDbProvider(env: Env): TenantDbProvider {
+  const envBag = env as unknown as Record<string, unknown>;
+  const perTenantFlag = envBag.PER_TENANT_DB_ENABLED;
+  const explicitDisabled = perTenantFlag === "false" || perTenantFlag === "0";
+  const explicitSingleD1 = envBag.SINGLE_D1_MODE === "1";
+  // Auto-detect: shard bindings are present iff this is a multi-shard
+  // deployment. AUTH_DB_01 is the canary because AUTH_DB_00 may be aliased
+  // to MAIN_DB on legacy single-shard deployments (see env.production
+  // overlay), but AUTH_DB_01 only ever exists when the operator opted into
+  // multi-shard.
+  const implicitSingleD1 = !envBag.AUTH_DB_01;
+  if (explicitDisabled || explicitSingleD1 || implicitSingleD1) {
+    return new CfSharedAuthDbProvider(env.MAIN_DB);
+  }
+  return new MetaTableTenantDbProvider(
+    envBag,
+    env.ROUTER_DB ?? env.MAIN_DB,
+    env.MAIN_DB,
+  );
+}
+
+/**
+ * Async helper for non-Hono entry points (Durable Objects, cron, eval-runner,
+ * outbound worker). Resolves the per-tenant DB then builds the full Services
+ * container against it.
+ *
+ * Hono routes use `tenantDbMiddleware` + `servicesMiddleware` instead, so
+ * they don't need to call this directly.
+ */
+export async function getCfServicesForTenant(
+  env: Env,
+  tenantId: string,
+): Promise<Services> {
+  const provider = buildCfTenantDbProvider(env);
+  const db = await provider.resolve(tenantId);
+  return buildCfServices(env, db);
+}
+
+/**
+ * Cross-shard fan-out for non-Hono entry points (cron sweeps, admin scans,
+ * eval-runner). Iterates every shard registered in shard_pool, builds the
+ * Services container against each shard's DB, and runs `fn` per shard in
+ * parallel. Returns the array of fn results.
+ *
+ * Why this lives in services and not in app code: callers should depend on
+ * the abstract "for every shard, here's a Services" contract — not on the
+ * CF-specific list of binding names. Adding shards = INSERT shard_pool +
+ * add wrangler binding; no code change in cron / eval-runner / etc.
+ *
+ * Bindings declared in shard_pool but not present on this worker are
+ * skipped with a logged warning rather than throwing — useful when a
+ * worker (e.g. apps/agent) is intentionally bound to a subset.
+ */
+export async function forEachShardServices<T>(
+  env: Env,
+  fn: (services: Services, shardName: string) => Promise<T>,
+): Promise<T[]> {
+  const controlPlaneDb = env.ROUTER_DB ?? env.MAIN_DB;
+  const pool = createCfShardPoolService({ controlPlaneDb });
+  const shards = await pool.listAll();
+  const envBindings = env as unknown as Record<string, D1Database | undefined>;
+  return Promise.all(
+    shards.map(async (shard) => {
+      const db = envBindings[shard.bindingName];
+      if (!db) {
+        // Soft-skip: useful when apps/agent etc. binds a subset.
+        // The CF entry that owns the cron must bind every shard.
+        return undefined as T;
+      }
+      return fn(buildCfServices(env, db), shard.bindingName);
+    }),
+  ).then((results) => results.filter((x) => x !== undefined) as T[]);
+}
+
+// Future:
+//
+// export function buildNodeServices(opts: { pg: pg.Pool; ... }): Services {
+//   return {
+//     credentials: createPgCredentialService(opts.pg),
+//     memory: createPgMemoryStoreService(opts.pg),
+//   };
+// }
+//
+// export function buildSqliteServices(opts: { db: better-sqlite3.Database }): Services {
+//   return { ... };
+// }
+
+// ============================================================
+// Hono middleware — drop into apps/main entry
+// ============================================================
+
+/**
+ * Resolve the per-tenant D1 binding for the current request and stash it on
+ * `c.var.tenantDb`. Mount AFTER the auth middleware (which sets
+ * `c.var.tenant_id`) and BEFORE `servicesMiddleware`.
+ *
+ *   app.use("*", authMiddleware);
+ *   app.use("*", tenantDbMiddleware);
+ *   app.use("*", servicesMiddleware);
+ *
+ * Routes that don't need the services container (e.g. /health, /auth/*)
+ * still get the resolved DB on `c.var.tenantDb` — cheap, async-light.
+ */
+export const tenantDbMiddleware: MiddlewareHandler<{
+  Bindings: Env;
+  Variables: { tenant_id?: string; tenantDb: D1Database };
+}> = async (c, next) => {
+  const provider = buildCfTenantDbProvider(c.env);
+  // Routes upstream of authMiddleware (e.g. /health, /auth/*) won't have
+  // tenant_id set; resolve("" ) returns the shared MAIN_DB under the Phase 1
+  // default, which is the right answer for those paths.
+  const tenantId = c.get("tenant_id") ?? "";
+  const tenantDb = await provider.resolve(tenantId);
+  c.set("tenantDb", tenantDb);
+  await next();
+};
+
+/**
+ * Mount once at the top of the app. After this middleware runs every route
+ * can read `c.var.services` to access the canonical service surface.
+ *
+ *   app.use("*", servicesMiddleware);
+ *
+ * Requires `c.var.tenantDb` to be set by `tenantDbMiddleware` first.
+ */
+export const servicesMiddleware: MiddlewareHandler<AppContext> = async (
+  c,
+  next,
+) => {
+  c.set("services", buildCfServices(c.env, c.var.tenantDb));
+  await next();
+};

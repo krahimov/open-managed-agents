@@ -1,0 +1,39 @@
+{
+  "name": "@open-managed-agents/sandbox",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./adapters/local-subprocess": "./src/adapters/local-subprocess.ts",
+    "./adapters/e2b": "./src/adapters/e2b.ts",
+    "./adapters/daytona": "./src/adapters/daytona.ts",
+    "./adapters/litebox": "./src/adapters/litebox.ts",
+    "./adapters/boxrun": "./src/adapters/boxrun.ts",
+    "./orchestrator": "./src/orchestrator.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1044.0",
+    "@open-managed-agents/observability": "workspace:*",
+    "@open-managed-agents/shared": "workspace:*"
+  },
+  "peerDependencies": {
+    "@boxlite-ai/boxlite": "^0.9.0",
+    "@daytonaio/sdk": "^0.171.0",
+    "e2b": "^1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "e2b": {
+      "optional": true
+    },
+    "@daytonaio/sdk": {
+      "optional": true
+    },
+    "@boxlite-ai/boxlite": {
+      "optional": true
+    }
+  }
+}

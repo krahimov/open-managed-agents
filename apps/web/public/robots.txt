@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+
+# Don't index drafts that slip in via direct URL.
+Disallow: /drafts/
+
+Sitemap: https://openma.dev/sitemap-index.xml

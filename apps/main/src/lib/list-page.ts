@@ -1,0 +1,103 @@
+// Route-layer helpers for cursor pagination. Pairs with the cursor mechanics
+// in @open-managed-agents/shared/pagination — that side does the encode /
+// decode / SQL fragments; this side maps Hono's request/response idiom onto
+// the service.listPage call shape.
+//
+// Wire contract (dual — accepts both Anthropic and legacy OMA forms):
+//   GET /v1/<resource>?limit=N&page=<opaque>&include_archived=true&q=<substring>   ← Anthropic SDK
+//   GET /v1/<resource>?limit=N&cursor=<opaque>&include_archived=true&q=<substring> ← legacy OMA
+//
+//   200 { data: T[], next_page?: string, next_cursor?: string }
+//        ── both keys carry the same opaque value; emit both so OMA SDK /
+//        Console (read next_cursor) and @anthropic-ai/sdk (reads next_page,
+//        per its core/pagination.js) both iterate correctly.
+//
+// `?q=<substring>` is OMA-only (Anthropic doesn't have it). Powers the
+// Combobox typeahead in the Console; backend translates to LIKE in the
+// store layer.
+//
+// Each route handler collapses to:
+//
+//   app.get("/", async (c) => {
+//     const params = parsePageQuery(c);
+//     const page = await c.var.services.foo.listPage({
+//       tenantId: c.get("tenant_id"),
+//       ...params,
+//     });
+//     return jsonPage(c, page, toApiFoo);
+//   });
+
+import type { Context } from "hono";
+
+export interface PageQuery {
+  limit?: number;
+  cursor?: string;
+  includeArchived?: boolean;
+  /** Optional substring filter — matched case-insensitively against each
+   *  resource's user-facing name (and `model_id` for model_cards). Used by
+   *  the Combobox typeahead in the Console; absence = unfiltered list. */
+  q?: string;
+}
+
+/** Parse `?limit=N&{cursor|page}=...&include_archived=true&q=...` from the
+ *  request. Service layer clamps limit; we just shuttle the raw value
+ *  through.
+ *
+ *  Accepts both `cursor` (legacy OMA) and `page` (Anthropic SDK) — they
+ *  carry the same opaque token, so whichever the caller sends maps to
+ *  `cursor`. `q` is trimmed and dropped when blank so handlers don't
+ *  need a length guard at every callsite. */
+export function parsePageQuery(c: Context): PageQuery {
+  const limitParam = c.req.query("limit");
+  // Anthropic SDK sends `?page=`; legacy OMA callers send `?cursor=`. Honor
+  // both. If both are set, prefer `cursor` so old code that explicitly chose
+  // it doesn't silently flip behavior.
+  const cursor = c.req.query("cursor") || c.req.query("page") || undefined;
+  const includeArchived = c.req.query("include_archived") === "true";
+  const limit = limitParam ? parseInt(limitParam, 10) : undefined;
+  const qRaw = c.req.query("q");
+  const q = qRaw && qRaw.trim() ? qRaw.trim() : undefined;
+  return {
+    limit: limit !== undefined && !isNaN(limit) ? limit : undefined,
+    cursor,
+    includeArchived,
+    q,
+  };
+}
+
+/** Map a service-layer page to the wire shape and emit JSON.
+ *
+ *  Wire fields:
+ *    - `data`        — array of mapped items
+ *    - `next_page`   — opaque token (Anthropic SDK reads `body.next_page`,
+ *                      see its core/pagination.js). Omitted entirely when
+ *                      no more pages — matches the strict Anthropic
+ *                      schemas for agents/sessions/vaults/memory_stores
+ *                      (BetaManagedAgentsList* — `additionalProperties:
+ *                      false`, `next_page: string`). The Anthropic SDK
+ *                      reads `body.next_page || null`, so absent and null
+ *                      are equivalent at the iterator level.
+ *    - `next_cursor` — same opaque token, kept for the legacy OMA Console
+ *                      / CLI clients (apps/console/src/lib/useCursorList.ts).
+ *                      Omitted when no more pages — matches their
+ *                      historical contract.
+ *
+ *  Note: `has_more` and explicit `next_page: null` would help the few
+ *  permissive Anthropic schemas (environments, skills, files) at the
+ *  strict-validator level, but they violate the strict
+ *  `additionalProperties: false` on the larger Family A set. SDK
+ *  iteration works either way; we optimize for the stricter family.
+ */
+export function jsonPage<TRow, TApi>(
+  c: Context,
+  page: { items: TRow[]; nextCursor?: string },
+  mapFn: (row: TRow) => TApi,
+): Response {
+  const data = page.items.map(mapFn);
+  if (!page.nextCursor) return c.json({ data });
+  return c.json({
+    data,
+    next_page: page.nextCursor,
+    next_cursor: page.nextCursor,
+  });
+}

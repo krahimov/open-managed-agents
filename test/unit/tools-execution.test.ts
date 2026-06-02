@@ -1,0 +1,1016 @@
+// @ts-nocheck
+import { env } from "cloudflare:workers";
+import { describe, it, expect } from "vitest";
+import { buildTools } from "../../apps/agent/src/harness/tools";
+import { TestSandbox } from "../../apps/agent/src/runtime/sandbox";
+import { InMemoryHistory, eventsToMessages } from "../../apps/agent/src/runtime/history";
+import type { AgentConfig } from "@open-managed-agents/shared";
+
+// ============================================================
+// Helpers
+// ============================================================
+
+function makeAgentConfig(overrides?: Partial<AgentConfig>): AgentConfig {
+  return {
+    id: "agent_test",
+    name: "Test Agent",
+    model: "claude-sonnet-4-6",
+    system: "You are a test agent.",
+    tools: [{ type: "agent_toolset_20260401" }],
+    version: 1,
+    created_at: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+function makeMockKV() {
+  const store = new Map<string, string>();
+  return {
+    get: async (key: string) => store.get(key) ?? null,
+    put: async (key: string, value: string) => {
+      store.set(key, value);
+    },
+    delete: async (key: string) => {
+      store.delete(key);
+    },
+    list: async (opts: { prefix: string }) => ({
+      keys: [...store.keys()]
+        .filter((k) => k.startsWith(opts.prefix))
+        .map((name) => ({ name })),
+    }),
+  } as unknown as KVNamespace;
+}
+
+const TOOL_EXEC_OPTS = {
+  toolCallId: "tc_test",
+  messages: [],
+  abortSignal: undefined as any,
+};
+
+// ============================================================
+// 1. Built-in tool execution
+// ============================================================
+describe("Built-in tool execution", () => {
+  it("bash tool execute returns sandbox result", async () => {
+    const sandbox = new TestSandbox();
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    const result = await tools.bash.execute(
+      { command: "echo hello" },
+      TOOL_EXEC_OPTS
+    );
+    expect(result).toContain("exit=0");
+    expect(result).toContain("echo hello");
+  });
+
+  it("bash tool passes timeout to sandbox", async () => {
+    let capturedTimeout: number | undefined;
+    const sandbox: any = {
+      exec: async (cmd: string, timeout?: number) => {
+        capturedTimeout = timeout;
+        return `exit=0\n(done)`;
+      },
+      readFile: async () => "",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    await tools.bash.execute(
+      { command: "sleep 10", timeout: 60000 },
+      TOOL_EXEC_OPTS
+    );
+    expect(capturedTimeout).toBe(60000);
+  });
+
+  it("bash tool appends a retry hint after chained secret-backed command failure", async () => {
+    const sandbox: any = {
+      exec: async () =>
+        "exit=1\nfatal: could not read Username for 'https://github.com': terminal prompts disabled\n\nHint: This chained shell command includes a secret-backed command (`git`) and failed. Retry with a single authenticated command when possible.",
+      registerCommandSecrets: () => {},
+      readFile: async () => "",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    const result = await tools.bash.execute(
+      { command: "cd /workspace && git push origin main" },
+      TOOL_EXEC_OPTS
+    );
+
+    expect(result).toContain("fatal: could not read Username");
+    expect(result).toContain("Hint:");
+    expect(result).toContain("secret-backed command (`git`)");
+  });
+
+  it("bash tool does not append the retry hint for simple command failures", async () => {
+    const sandbox: any = {
+      exec: async () => "exit=1\nls: missing operand",
+      registerCommandSecrets: () => {},
+      readFile: async () => "",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    const result = await tools.bash.execute(
+      { command: "ls" },
+      TOOL_EXEC_OPTS
+    );
+
+    expect(result).toContain("ls: missing operand");
+    expect(result).not.toContain("secret-backed command");
+  });
+
+  it("read tool calls readFile with path", async () => {
+    const sandbox = new TestSandbox();
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    const result = await tools.read.execute(
+      { file_path: "/workspace/readme.md" },
+      TOOL_EXEC_OPTS
+    );
+    expect(result).toContain("/workspace/readme.md");
+    expect(result).toContain("test");
+  });
+
+  it("write tool calls writeFile with path and content", async () => {
+    const sandbox = new TestSandbox();
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    const result = await tools.write.execute(
+      { file_path: "/workspace/out.txt", content: "hello world" },
+      TOOL_EXEC_OPTS
+    );
+    expect(result).toBe("ok");
+  });
+
+  it("edit tool uses readFile and writeFile", async () => {
+    let readPath = "";
+    let writtenPath = "";
+    let writtenContent = "";
+    const sandbox: any = {
+      exec: async (cmd: string) => "exit=0\n",
+      readFile: async (path: string) => {
+        readPath = path;
+        return "hello foo world";
+      },
+      writeFile: async (path: string, content: string) => {
+        writtenPath = path;
+        writtenContent = content;
+        return "ok";
+      },
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    const result = await tools.edit.execute(
+      {
+        file_path: "/workspace/file.py",
+        old_string: "foo",
+        new_string: "bar",
+      },
+      TOOL_EXEC_OPTS
+    );
+    expect(readPath).toBe("/workspace/file.py");
+    expect(writtenPath).toBe("/workspace/file.py");
+    expect(writtenContent).toBe("hello bar world");
+    expect(result).toBe("ok");
+  });
+
+  it("glob tool uses bash globstar", async () => {
+    let capturedCmd = "";
+    const sandbox: any = {
+      exec: async (cmd: string) => {
+        capturedCmd = cmd;
+        return "exit=0\n";
+      },
+      readFile: async () => "",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    await tools.glob.execute(
+      { pattern: "**/*.ts", path: "/workspace/src" },
+      TOOL_EXEC_OPTS
+    );
+    expect(capturedCmd).toContain("globstar");
+    expect(capturedCmd).toContain("/workspace/src");
+    expect(capturedCmd).toContain("**/*.ts");
+  });
+
+  it("grep tool uses grep command with pattern", async () => {
+    let capturedCmd = "";
+    const sandbox: any = {
+      exec: async (cmd: string) => {
+        capturedCmd = cmd;
+        return "exit=0\n";
+      },
+      readFile: async () => "",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    await tools.grep.execute(
+      { pattern: "TODO", path: "/workspace" },
+      TOOL_EXEC_OPTS
+    );
+    expect(capturedCmd).toContain("grep");
+    expect(capturedCmd).toContain("TODO");
+    expect(capturedCmd).toContain("/workspace");
+  });
+
+  it("grep tool returns 'No matches found' on exit=1 (no match, not error)", async () => {
+    let callCount = 0;
+    const sandbox: any = {
+      exec: async () => {
+        callCount++;
+        if (callCount === 1) return "exit=0\ngrep"; // probe: returns 'grep' (no rg)
+        return "exit=1\n"; // grep no match
+      },
+      readFile: async () => "",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+    const result = await tools.grep.execute({ pattern: "missing", path: "/workspace" }, TOOL_EXEC_OPTS);
+    expect(result).toBe("No matches found");
+  });
+
+  it("grep tool surfaces error on exit=2 (file not found / bad regex)", async () => {
+    let callCount = 0;
+    const sandbox: any = {
+      exec: async () => {
+        callCount++;
+        if (callCount === 1) return "exit=0\ngrep";
+        return "exit=2\nNo such file or directory";
+      },
+      readFile: async () => "",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+    const result = await tools.grep.execute({ pattern: "x", path: "/missing" }, TOOL_EXEC_OPTS);
+    expect(result).toContain("Error");
+    expect(result).toContain("code 2");
+  });
+
+  it("grep tool output_mode files_with_matches returns 'Found N file' header", async () => {
+    let callCount = 0;
+    const sandbox: any = {
+      exec: async () => {
+        callCount++;
+        if (callCount === 1) return "exit=0\ngrep";
+        return "exit=0\n/workspace/a.py\n/workspace/b.py\n/workspace/c.py";
+      },
+      readFile: async () => "",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+    const result = await tools.grep.execute(
+      { pattern: "x", output_mode: "files_with_matches" },
+      TOOL_EXEC_OPTS,
+    );
+    expect(result).toContain("Found 3 files");
+    expect(result).toContain("/workspace/a.py");
+  });
+
+  it("grep tool output_mode count returns aggregate", async () => {
+    let callCount = 0;
+    const sandbox: any = {
+      exec: async () => {
+        callCount++;
+        if (callCount === 1) return "exit=0\ngrep";
+        return "exit=0\n/workspace/a.py:5\n/workspace/b.py:3";
+      },
+      readFile: async () => "",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+    const result = await tools.grep.execute(
+      { pattern: "x", output_mode: "count" },
+      TOOL_EXEC_OPTS,
+    );
+    expect(result).toContain("Found 8 total occurrences across 2 files");
+  });
+
+  it("grep tool case-insensitive flag adds -i", async () => {
+    let capturedCmd = "";
+    const sandbox: any = {
+      exec: async (cmd: string) => {
+        capturedCmd = cmd;
+        return "exit=0\n";
+      },
+      readFile: async () => "",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+    await tools.grep.execute({ pattern: "x", "-i": true }, TOOL_EXEC_OPTS);
+    expect(capturedCmd).toMatch(/\s-i\s/);
+  });
+
+  it("edit tool refuses ambiguous old_string by default", async () => {
+    const sandbox: any = {
+      exec: async () => "exit=0\n",
+      readFile: async () => "foo bar foo",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+    const result = await tools.edit.execute(
+      { file_path: "/workspace/x", old_string: "foo", new_string: "baz" },
+      TOOL_EXEC_OPTS,
+    );
+    expect(result).toContain("appears 2 times");
+    expect(result).toContain("replace_all=true");
+  });
+
+  it("edit tool replace_all=true substitutes all occurrences", async () => {
+    let written = "";
+    const sandbox: any = {
+      exec: async () => "exit=0\n",
+      readFile: async () => "foo bar foo baz foo",
+      writeFile: async (_p: string, c: string) => {
+        written = c;
+        return "ok";
+      },
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+    const result = await tools.edit.execute(
+      { file_path: "/workspace/x", old_string: "foo", new_string: "QUX", replace_all: true },
+      TOOL_EXEC_OPTS,
+    );
+    expect(result).toBe("ok");
+    expect(written).toBe("QUX bar QUX baz QUX");
+  });
+
+  it("read tool offset+limit slices file", async () => {
+    const sandbox: any = {
+      exec: async () => "exit=0\n",
+      readFile: async () => "line1\nline2\nline3\nline4\nline5",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+    const result = await tools.read.execute(
+      { file_path: "/workspace/x", offset: 2, limit: 2 },
+      TOOL_EXEC_OPTS,
+    );
+    expect(result).toContain("2\tline2");
+    expect(result).toContain("3\tline3");
+    expect(result).not.toContain("line1");
+    expect(result).not.toContain("line4");
+  });
+
+  it("read tool returns image content block for .png", async () => {
+    const fakeBase64 = "iVBORw0KGgo=";
+    let capturedCmd = "";
+    const sandbox: any = {
+      exec: async (cmd: string) => {
+        capturedCmd = cmd;
+        return `exit=0\n${fakeBase64}`;
+      },
+      readFile: async () => "should-not-be-called",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+    const result = await tools.read.execute(
+      { file_path: "/workspace/cat.png" },
+      TOOL_EXEC_OPTS,
+    );
+    expect(capturedCmd).toContain("base64");
+    expect(capturedCmd).toContain("/workspace/cat.png");
+    expect(typeof result).toBe("object");
+    expect((result as any).type).toBe("image");
+    expect((result as any).source.type).toBe("base64");
+    expect((result as any).source.media_type).toBe("image/png");
+    expect((result as any).source.data).toBe(fakeBase64);
+  });
+
+  it("read tool returns document content block for .pdf", async () => {
+    const fakePdfB64 = "JVBERi0xLjQK";
+    const sandbox: any = {
+      exec: async () => `exit=0\n${fakePdfB64}`,
+      readFile: async () => "should-not-be-called",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+    const result = await tools.read.execute(
+      { file_path: "/workspace/report.pdf" },
+      TOOL_EXEC_OPTS,
+    );
+    expect((result as any).type).toBe("document");
+    expect((result as any).source.media_type).toBe("application/pdf");
+    expect((result as any).source.data).toBe(fakePdfB64);
+  });
+
+  it("read tool case-insensitive extension (.PNG → image)", async () => {
+    const sandbox: any = {
+      exec: async () => `exit=0\nabc`,
+      readFile: async () => "should-not-be-called",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+    const result = await tools.read.execute(
+      { file_path: "/workspace/SCREENSHOT.PNG" },
+      TOOL_EXEC_OPTS,
+    );
+    expect((result as any).type).toBe("image");
+    expect((result as any).source.media_type).toBe("image/png");
+  });
+
+  it("read tool toModelOutput converts document to file-data", async () => {
+    const sandbox: any = {
+      exec: async () => `exit=0\nXYZ`,
+      readFile: async () => "",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+    const result = await tools.read.execute(
+      { file_path: "/workspace/x.pdf" },
+      TOOL_EXEC_OPTS,
+    );
+    const modelOutput = (tools.read as any).toModelOutput({
+      toolCallId: "tu1",
+      input: { file_path: "/workspace/x.pdf" },
+      output: result,
+    });
+    expect(modelOutput.type).toBe("content");
+    expect(modelOutput.value[0].type).toBe("file-data");
+    expect(modelOutput.value[0].mediaType).toBe("application/pdf");
+  });
+
+  it("read tool toModelOutput converts image block → AI SDK content shape", async () => {
+    const fakeBase64 = "abc";
+    const sandbox: any = {
+      exec: async () => `exit=0\n${fakeBase64}`,
+      readFile: async () => "",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+    const result = await tools.read.execute(
+      { file_path: "/workspace/x.jpeg" },
+      TOOL_EXEC_OPTS,
+    );
+    const modelOutput = (tools.read as any).toModelOutput({
+      toolCallId: "tu1",
+      input: { file_path: "/workspace/x.jpeg" },
+      output: result,
+    });
+    expect(modelOutput.type).toBe("content");
+    expect(modelOutput.value).toHaveLength(1);
+    expect(modelOutput.value[0].type).toBe("file-data");
+    expect(modelOutput.value[0].mediaType).toBe("image/jpeg");
+    expect(modelOutput.value[0].data).toBe(fakeBase64);
+  });
+
+  it("read tool toModelOutput passes string outputs as text", async () => {
+    const sandbox: any = {
+      exec: async () => "exit=0\n",
+      readFile: async () => "hello world",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+    const result = await tools.read.execute(
+      { file_path: "/workspace/notes.txt" },
+      TOOL_EXEC_OPTS,
+    );
+    const modelOutput = (tools.read as any).toModelOutput({
+      toolCallId: "tu1",
+      input: { file_path: "/workspace/notes.txt" },
+      output: result,
+    });
+    expect(modelOutput.type).toBe("text");
+    expect(modelOutput.value).toBe("hello world");
+  });
+
+  it("web_fetch tool constructs curl with URL", async () => {
+    let capturedCmd = "";
+    const sandbox: any = {
+      exec: async (cmd: string) => {
+        capturedCmd = cmd;
+        return "exit=0\n<html></html>";
+      },
+      readFile: async () => "",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    await tools.web_fetch.execute(
+      { url: "https://example.com" },
+      TOOL_EXEC_OPTS
+    );
+    expect(capturedCmd).toContain("curl");
+    expect(capturedCmd).toContain("https://example.com");
+  });
+
+  it("web_fetch tool respects max_length param", async () => {
+    let capturedCmd = "";
+    const sandbox: any = {
+      exec: async (cmd: string) => {
+        capturedCmd = cmd;
+        return "exit=0\ndata";
+      },
+      readFile: async () => "",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    await tools.web_fetch.execute(
+      { url: "https://example.com", max_length: 1000 },
+      TOOL_EXEC_OPTS
+    );
+    expect(capturedCmd).toContain("head -c 1000");
+  });
+
+  it("web_search default (DDG) is defined in agent_toolset", async () => {
+    const sandbox = new TestSandbox();
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+    // Default web_search is DuckDuckGo — always available, no API key needed
+    expect(tools.web_search).toBeDefined();
+    expect(typeof tools.web_search.execute).toBe("function");
+  });
+
+  it("web_search with TAVILY_API_KEY is defined", async () => {
+    const sandbox = new TestSandbox();
+    const tools = await buildTools(makeAgentConfig(), sandbox, {
+      TAVILY_API_KEY: "tvly-test-key",
+    });
+    expect(tools.web_search).toBeDefined();
+    expect(typeof tools.web_search).toBe("object");
+  });
+});
+
+// ============================================================
+// 2. Tool enable/disable combinations
+// ============================================================
+describe("Tool enable/disable combinations", () => {
+  it("default_config enabled=true, specific tools disabled via configs", async () => {
+    const config = makeAgentConfig({
+      tools: [
+        {
+          type: "agent_toolset_20260401",
+          default_config: { enabled: true },
+          configs: [
+            { name: "web_fetch", enabled: false },
+            { name: "web_search", enabled: false },
+          ],
+        },
+      ],
+    });
+    const tools = await buildTools(config, new TestSandbox());
+
+    expect(tools.bash).toBeDefined();
+    expect(tools.read).toBeDefined();
+    expect(tools.write).toBeDefined();
+    expect(tools.edit).toBeDefined();
+    expect(tools.glob).toBeDefined();
+    expect(tools.grep).toBeDefined();
+    expect(tools.web_fetch).toBeUndefined();
+    expect(tools.web_search).toBeUndefined();
+  });
+
+  it("default_config enabled=false with empty configs results in no tools", async () => {
+    // Note: the filtering logic only activates when `configs` is present.
+    // With configs=[] and default_config.enabled=false, no tools are enabled.
+    const config = makeAgentConfig({
+      tools: [
+        {
+          type: "agent_toolset_20260401",
+          default_config: { enabled: false },
+          configs: [],
+        },
+      ],
+    });
+    const tools = await buildTools(config, new TestSandbox());
+
+    expect(tools.bash).toBeUndefined();
+    expect(tools.read).toBeUndefined();
+    expect(tools.write).toBeUndefined();
+    expect(tools.edit).toBeUndefined();
+    expect(tools.glob).toBeUndefined();
+    expect(tools.grep).toBeUndefined();
+    expect(tools.web_fetch).toBeUndefined();
+    expect(tools.web_search).toBeUndefined();
+  });
+
+  it("only bash+grep enabled, 6 others disabled", async () => {
+    const config = makeAgentConfig({
+      tools: [
+        {
+          type: "agent_toolset_20260401",
+          default_config: { enabled: false },
+          configs: [
+            { name: "bash", enabled: true },
+            { name: "grep", enabled: true },
+          ],
+        },
+      ],
+    });
+    const tools = await buildTools(config, new TestSandbox());
+
+    expect(tools.bash).toBeDefined();
+    expect(tools.grep).toBeDefined();
+    expect(tools.read).toBeUndefined();
+    expect(tools.write).toBeUndefined();
+    expect(tools.edit).toBeUndefined();
+    expect(tools.glob).toBeUndefined();
+    expect(tools.web_fetch).toBeUndefined();
+    expect(tools.web_search).toBeUndefined();
+  });
+
+  it("all tools explicitly disabled", async () => {
+    const config = makeAgentConfig({
+      tools: [
+        {
+          type: "agent_toolset_20260401",
+          default_config: { enabled: true },
+          configs: [
+            { name: "bash", enabled: false },
+            { name: "read", enabled: false },
+            { name: "write", enabled: false },
+            { name: "edit", enabled: false },
+            { name: "glob", enabled: false },
+            { name: "grep", enabled: false },
+            { name: "web_fetch", enabled: false },
+            { name: "web_search", enabled: false },
+          ],
+        },
+      ],
+    });
+    const tools = await buildTools(config, new TestSandbox());
+
+    expect(tools.bash).toBeUndefined();
+    expect(tools.read).toBeUndefined();
+    expect(tools.write).toBeUndefined();
+    expect(tools.edit).toBeUndefined();
+    expect(tools.glob).toBeUndefined();
+    expect(tools.grep).toBeUndefined();
+    expect(tools.web_fetch).toBeUndefined();
+    expect(tools.web_search).toBeUndefined();
+  });
+
+  it("only web tools (web_fetch + web_search)", async () => {
+    const config = makeAgentConfig({
+      tools: [
+        {
+          type: "agent_toolset_20260401",
+          default_config: { enabled: false },
+          configs: [
+            { name: "web_fetch", enabled: true },
+            { name: "web_search", enabled: true },
+          ],
+        },
+      ],
+    });
+    const tools = await buildTools(config, new TestSandbox());
+
+    expect(tools.web_fetch).toBeDefined();
+    expect(tools.web_search).toBeDefined();
+    expect(tools.bash).toBeUndefined();
+    expect(tools.read).toBeUndefined();
+    expect(tools.write).toBeUndefined();
+    expect(tools.edit).toBeUndefined();
+    expect(tools.glob).toBeUndefined();
+    expect(tools.grep).toBeUndefined();
+  });
+
+  it("only file tools (read + write + edit)", async () => {
+    const config = makeAgentConfig({
+      tools: [
+        {
+          type: "agent_toolset_20260401",
+          default_config: { enabled: false },
+          configs: [
+            { name: "read", enabled: true },
+            { name: "write", enabled: true },
+            { name: "edit", enabled: true },
+          ],
+        },
+      ],
+    });
+    const tools = await buildTools(config, new TestSandbox());
+
+    expect(tools.read).toBeDefined();
+    expect(tools.write).toBeDefined();
+    expect(tools.edit).toBeDefined();
+    expect(tools.bash).toBeUndefined();
+    expect(tools.glob).toBeUndefined();
+    expect(tools.grep).toBeUndefined();
+    expect(tools.web_fetch).toBeUndefined();
+    expect(tools.web_search).toBeUndefined();
+  });
+
+  it("no tools config results in all 8 enabled", async () => {
+    const config = makeAgentConfig({ tools: [] });
+    const tools = await buildTools(config, new TestSandbox());
+
+    expect(tools.bash).toBeDefined();
+    expect(tools.read).toBeDefined();
+    expect(tools.write).toBeDefined();
+    expect(tools.edit).toBeDefined();
+    expect(tools.glob).toBeDefined();
+    expect(tools.grep).toBeDefined();
+    expect(tools.web_fetch).toBeDefined();
+    expect(tools.web_search).toBeDefined();
+  });
+});
+
+// ============================================================
+// 3. Custom tools
+// ============================================================
+describe("Custom tools", () => {
+  it("custom tool appears in tools map", async () => {
+    const config = makeAgentConfig({
+      tools: [
+        { type: "agent_toolset_20260401" },
+        {
+          type: "custom",
+          name: "get_weather",
+          description: "Get weather forecast",
+          input_schema: {},
+        },
+      ],
+    });
+    const tools = await buildTools(config, new TestSandbox());
+
+    expect(tools.get_weather).toBeDefined();
+  });
+
+  it("custom tool has no execute function", async () => {
+    const config = makeAgentConfig({
+      tools: [
+        {
+          type: "custom",
+          name: "deploy_app",
+          description: "Deploy an application",
+          input_schema: {},
+        },
+      ],
+    });
+    const tools = await buildTools(config, new TestSandbox());
+
+    expect(tools.deploy_app).toBeDefined();
+    // Custom tools created via tool() without execute have no execute property
+    expect(tools.deploy_app.execute).toBeUndefined();
+  });
+
+  it("multiple custom tools alongside toolset", async () => {
+    const config = makeAgentConfig({
+      tools: [
+        { type: "agent_toolset_20260401" },
+        {
+          type: "custom",
+          name: "tool_a",
+          description: "Tool A",
+          input_schema: {},
+        },
+        {
+          type: "custom",
+          name: "tool_b",
+          description: "Tool B",
+          input_schema: {},
+        },
+      ],
+    });
+    const tools = await buildTools(config, new TestSandbox());
+
+    // Built-in tools present
+    expect(tools.bash).toBeDefined();
+    expect(tools.read).toBeDefined();
+    // Custom tools present
+    expect(tools.tool_a).toBeDefined();
+    expect(tools.tool_b).toBeDefined();
+  });
+
+  it("buildTools with only custom tools (no toolset)", async () => {
+    const config = makeAgentConfig({
+      tools: [
+        {
+          type: "custom",
+          name: "only_custom",
+          description: "The only tool",
+          input_schema: {},
+        },
+      ],
+    });
+    const tools = await buildTools(config, new TestSandbox());
+
+    // All built-in tools should be present since there is no toolset config
+    // (getEnabledTools returns allTools when no ToolsetConfig is found)
+    expect(tools.bash).toBeDefined();
+    expect(tools.only_custom).toBeDefined();
+  });
+});
+
+// ============================================================
+// 4. MCP tools — REMOVED. The legacy `mcp_<srv>_list_tools` / `mcp_<srv>_call`
+// generic-RPC entries no longer exist. Each remote MCP tool is now expanded
+// inline at buildTools time as `mcp__<server>__<tool>` with the upstream
+// schema (see apps/agent/src/harness/tools.ts:1150). Coverage of the new
+// shape is in MCP integration tests under test/integration/.
+// ============================================================
+
+// ============================================================
+// 5. Memory tools — REMOVED in the Anthropic Memory Store migration. Agents
+// no longer get bespoke memory_* tools; each attached store is mounted at
+// /mnt/memory/<store_name>/ via sandbox.mountBucket and the agent uses the
+// standard file tools (bash/read/write/edit/glob/grep). Service-level
+// behavior is exercised in test/unit/memory-store-service.test.ts; the queue
+// consumer for FUSE writes in test/unit/memory-events-consumer.test.ts.
+// ============================================================
+
+// ============================================================
+// 5. New features: truncation, edit safety, glob fix, custom tool schema, event IDs
+// ============================================================
+describe("Tool result truncation", () => {
+  it("truncates results exceeding MAX_TOOL_RESULT_CHARS", async () => {
+    const bigOutput = "x".repeat(60000);
+    const sandbox: any = {
+      exec: async () => bigOutput,
+      readFile: async () => bigOutput,
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    const result = await tools.bash.execute(
+      { command: "cat bigfile" },
+      TOOL_EXEC_OPTS
+    );
+    expect(result.length).toBeLessThan(60000);
+    expect(result).toContain("truncated");
+    expect(result).toContain("60000");
+  });
+
+  it("does not truncate small results", async () => {
+    const sandbox = new TestSandbox();
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    const result = await tools.bash.execute(
+      { command: "echo hello" },
+      TOOL_EXEC_OPTS
+    );
+    expect(result).not.toContain("truncated");
+  });
+
+  it("truncates read tool results", async () => {
+    const bigContent = "y".repeat(60000);
+    const sandbox: any = {
+      exec: async () => "exit=0",
+      readFile: async () => bigContent,
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    const result = await tools.read.execute(
+      { file_path: "/big.txt" },
+      TOOL_EXEC_OPTS
+    );
+    expect(result.length).toBeLessThan(60000);
+    expect(result).toContain("truncated");
+  });
+});
+
+describe("Edit tool safety", () => {
+  it("handles strings with triple quotes safely", async () => {
+    let writtenContent = "";
+    const sandbox: any = {
+      exec: async () => "exit=0",
+      readFile: async () => "before '''dangerous''' after",
+      writeFile: async (_p: string, content: string) => {
+        writtenContent = content;
+        return "ok";
+      },
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    const result = await tools.edit.execute(
+      {
+        path: "/test.py",
+        old_string: "'''dangerous'''",
+        new_string: "'''safe'''",
+      },
+      TOOL_EXEC_OPTS
+    );
+    expect(result).toBe("ok");
+    expect(writtenContent).toBe("before '''safe''' after");
+  });
+
+  it("returns error when old_string not found", async () => {
+    const sandbox: any = {
+      exec: async () => "exit=0",
+      readFile: async () => "file content here",
+      writeFile: async () => "ok",
+    };
+    const tools = await buildTools(makeAgentConfig(), sandbox);
+
+    const result = await tools.edit.execute(
+      {
+        path: "/test.py",
+        old_string: "nonexistent",
+        new_string: "replacement",
+      },
+      TOOL_EXEC_OPTS
+    );
+    expect(result).toContain("not found");
+  });
+});
+
+describe("Custom tool input_schema", () => {
+  it("converts JSON Schema properties to Zod parameters", async () => {
+    const config = makeAgentConfig({
+      tools: [
+        { type: "agent_toolset_20260401" },
+        {
+          type: "custom",
+          name: "my_tool",
+          description: "A custom tool",
+          input_schema: {
+            type: "object",
+            properties: {
+              query: { type: "string", description: "Search query" },
+              limit: { type: "number", description: "Max results" },
+              verbose: { type: "boolean" },
+            },
+            required: ["query"],
+          },
+        } as any,
+      ],
+    });
+    const tools = await buildTools(config, new TestSandbox());
+
+    expect(tools.my_tool).toBeDefined();
+    // Custom tools should not have execute (they are client-handled)
+    expect(tools.my_tool.execute).toBeUndefined();
+    // The tool should have an inputSchema (ai@6 renamed parameters → inputSchema)
+    expect(tools.my_tool.inputSchema).toBeDefined();
+  });
+
+  it("uses empty schema when input_schema is not provided", async () => {
+    const config = makeAgentConfig({
+      tools: [
+        { type: "agent_toolset_20260401" },
+        {
+          type: "custom",
+          name: "simple_tool",
+          description: "A simple custom tool",
+          input_schema: {},
+        } as any,
+      ],
+    });
+    const tools = await buildTools(config, new TestSandbox());
+    expect(tools.simple_tool).toBeDefined();
+  });
+});
+
+describe("Event IDs on history", () => {
+  it("events get stamped with id and processed_at on append", () => {
+    const history = new InMemoryHistory();
+
+    const event: any = {
+      type: "user.message",
+      content: [{ type: "text", text: "hello" }],
+    };
+    history.append(event);
+
+    const events = history.getEvents();
+    expect(events[0].id).toBeDefined();
+    expect((events[0] as any).id).toMatch(/^sevt-/);
+    expect((events[0] as any).processed_at).toBeDefined();
+  });
+
+  it("preserves existing id if already set", () => {
+    const history = new InMemoryHistory();
+
+    const event: any = {
+      type: "user.message",
+      id: "evt_custom_123",
+      content: [{ type: "text", text: "hello" }],
+    };
+    history.append(event);
+
+    const events = history.getEvents();
+    expect((events[0] as any).id).toBe("evt_custom_123");
+  });
+});
+
+describe("MCP event types in eventsToMessages", () => {
+  it("converts agent.mcp_tool_use and agent.mcp_tool_result to messages", () => {
+    const events: any[] = [
+      { type: "user.message", content: [{ type: "text", text: "use mcp" }] },
+      {
+        type: "agent.mcp_tool_use",
+        id: "tc_mcp_1",
+        mcp_server_name: "github",
+        name: "mcp_github_call",
+        input: { tool_name: "get_issue", arguments: { number: 42 } },
+      },
+      {
+        type: "agent.mcp_tool_result",
+        mcp_tool_use_id: "tc_mcp_1",
+        content: '{"title": "Bug fix"}',
+      },
+      { type: "agent.message", content: [{ type: "text", text: "Done" }] },
+    ];
+    const messages = eventsToMessages(events);
+    // user, assistant (tool-call), tool (tool-result), assistant (text)
+    expect(messages).toHaveLength(4);
+    expect(messages[0].role).toBe("user");
+    expect(messages[1].role).toBe("assistant");
+    expect(messages[2].role).toBe("tool");
+    expect(messages[3].role).toBe("assistant");
+  });
+});

@@ -1,0 +1,36 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "managed-agents-test",
+  "main": "test/test-worker.ts",
+  "compatibility_date": "2025-09-15",
+  "compatibility_flags": ["nodejs_compat"],
+
+  "kv_namespaces": [
+    { "binding": "CONFIG_KV", "id": "test-kv-id" }
+  ],
+
+  "d1_databases": [
+    { "binding": "AUTH_DB", "database_name": "test-auth-db", "database_id": "test-auth-db-id", "migrations_dir": "apps/main/migrations" },
+    { "binding": "INTEGRATIONS_DB", "database_name": "test-integrations-db", "database_id": "test-integrations-db-id", "migrations_dir": "apps/main/migrations-integrations" }
+  ],
+
+  "r2_buckets": [
+    { "binding": "FILES_BUCKET", "bucket_name": "test-files" },
+    { "binding": "MEMORY_BUCKET", "bucket_name": "test-memory" }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      { "name": "SESSION_DO", "class_name": "SessionDO" },
+      { "name": "SANDBOX", "class_name": "Sandbox" },
+      { "name": "RUNTIME_ROOM", "class_name": "RuntimeRoom" }
+    ]
+  },
+
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["SessionDO", "Sandbox", "RuntimeRoom"]
+    }
+  ]
+}

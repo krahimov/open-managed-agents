@@ -1,0 +1,252 @@
+#!/usr/bin/env node
+//
+// scripts/lane-generate.mjs
+//
+// Generate per-lane wrangler configs that share prod data but use unique
+// worker names. A "lane" is an ephemeral deploy of the same code base under
+// a different worker name, intended for per-PR / per-feature parallel testing.
+//
+// What a lane GETS:
+//   - Its own main + agent + integrations workers (code isolation)
+//   - Its own DO storage (each worker's SESSION_DO is independent)
+//
+// What a lane SHARES with prod (intentional):
+//   - CONFIG_KV namespace
+//   - AUTH_DB / integrations D1
+//   - All R2 buckets (FILES / WORKSPACE / BACKUP)
+//   - Vectorize, AI, BROWSER, SEND_EMAIL bindings
+//   - Analytics dataset (oma_events)
+//   - Rate limit namespaces
+//
+// What gets STRIPPED on lane configs:
+//   - routes (lanes use workers.dev URLs, no custom domain)
+//   - env.* blocks (no staging override on a lane)
+//   - triggers.crons (lanes must not run prod cron jobs against shared data)
+//
+// Usage:
+//   node scripts/lane-generate.mjs <lane_name> [--check]
+//
+// Env:
+//   CF_SUBDOMAIN — required to write the lane's INTEGRATIONS_ORIGIN var. If
+//                  unset, a placeholder string is written and the script
+//                  warns; deploy will not work until set.
+//
+// Output (idempotent — overwrites existing):
+//   apps/main/wrangler.lane-<name>.jsonc
+//   apps/agent/wrangler.lane-<name>.jsonc
+//   apps/integrations/wrangler.lane-<name>.jsonc
+//
+// These are gitignored. After generation:
+//   cd apps/main          && npx wrangler deploy --config wrangler.lane-<name>.jsonc
+//   cd apps/agent         && npx wrangler deploy --config wrangler.lane-<name>.jsonc
+//   cd apps/integrations  && npx wrangler deploy --config wrangler.lane-<name>.jsonc
+//
+// Secrets are NOT propagated by this script — copy them manually with
+// `wrangler secret put` per lane worker, or extend deploy-lane.yml.
+
+import { readFileSync, writeFileSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const ROOT = join(__dirname, "..");
+
+// ── 1. Parse args ───────────────────────────────────────────────────────────
+const LANE = process.argv[2];
+const CHECK_ONLY = process.argv.includes("--check");
+
+if (!LANE) {
+  console.error("Usage: lane-generate.mjs <lane_name> [--check]");
+  process.exit(2);
+}
+
+// CF worker names: lowercase, alphanumeric + dashes, must start with letter/digit.
+// We prefix with "managed-agents-lane-" / etc. so allow up to 30 chars here
+// (leaves headroom under the 63-char CF limit).
+if (!/^[a-z0-9][a-z0-9-]{1,30}$/.test(LANE)) {
+  console.error(`Error: lane name '${LANE}' must match ^[a-z0-9][a-z0-9-]{1,30}$`);
+  process.exit(2);
+}
+
+const SUBDOMAIN = process.env.CF_SUBDOMAIN || "";
+if (!SUBDOMAIN) {
+  console.warn(
+    "WARN: CF_SUBDOMAIN env var not set — INTEGRATIONS_ORIGIN will use a placeholder.",
+  );
+  console.warn("      Set CF_SUBDOMAIN (your CF account workers.dev subdomain) before deploying.");
+}
+
+const NAMES = {
+  main:         `managed-agents-lane-${LANE}`,
+  agent:        `sandbox-default-lane-${LANE}`,
+  integrations: `managed-agents-integrations-lane-${LANE}`,
+};
+
+const INT_ORIGIN = SUBDOMAIN
+  ? `https://${NAMES.integrations}.${SUBDOMAIN}.workers.dev`
+  : `https://${NAMES.integrations}.<CF_SUBDOMAIN>.workers.dev`;
+
+const MAIN_URL = SUBDOMAIN
+  ? `https://${NAMES.main}.${SUBDOMAIN}.workers.dev`
+  : `https://${NAMES.main}.<CF_SUBDOMAIN>.workers.dev`;
+
+// ── 2. JSONC reader ─────────────────────────────────────────────────────────
+// Strips // and /* */ comments without disturbing string contents. Tiny state
+// machine — handles \" escapes inside strings so URLs / paths are preserved.
+function stripJsonc(src) {
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    const n = src[i + 1];
+    if (c === '"') {
+      out += c; i++;
+      while (i < src.length) {
+        const ch = src[i];
+        out += ch; i++;
+        if (ch === "\\") { out += src[i]; i++; continue; }
+        if (ch === '"') break;
+      }
+      continue;
+    }
+    if (c === "/" && n === "/") {
+      while (i < src.length && src[i] !== "\n") i++;
+      continue;
+    }
+    if (c === "/" && n === "*") {
+      i += 2;
+      while (i < src.length && !(src[i] === "*" && src[i + 1] === "/")) i++;
+      i += 2;
+      continue;
+    }
+    out += c; i++;
+  }
+  return out;
+}
+
+function readWrangler(relPath) {
+  const abs = join(ROOT, relPath);
+  const raw = readFileSync(abs, "utf8");
+  try {
+    return JSON.parse(stripJsonc(raw));
+  } catch (err) {
+    throw new Error(`Failed to parse ${relPath}: ${err.message}`);
+  }
+}
+
+function writeJson(relPath, obj) {
+  const abs = join(ROOT, relPath);
+  if (CHECK_ONLY) {
+    console.log(`[check] would write ${relPath} (${JSON.stringify(obj).length} bytes)`);
+    return;
+  }
+  writeFileSync(abs, JSON.stringify(obj, null, 2) + "\n");
+}
+
+// Resolve the staging variant of a wrangler config: the top-level fields are
+// prod; env.staging overrides what's different on staging. Lanes share
+// STAGING data (KV, D1, R2) — never prod, even though both physically exist
+// in the same CF account. Without this, lane signups land in prod's AUTH_DB
+// and lane test sessions write to prod CONFIG_KV.
+//
+// Strategy: deep-merge env.staging onto the top-level prod config. Fields
+// listed in env.staging fully replace the corresponding top-level field
+// (Cloudflare's own merge semantics for env overrides).
+function resolveStaging(rel) {
+  const cfg = readWrangler(rel);
+  const staging = cfg.env?.staging;
+  if (!staging) {
+    throw new Error(`${rel} has no env.staging block; lane generator can't safely target staging data`);
+  }
+  // Replace, don't merge — matches Cloudflare's own per-env override semantics
+  // for resource bindings (kv_namespaces, d1_databases, r2_buckets, services,
+  // ratelimits, analytics_engine_datasets).
+  const merged = { ...cfg, ...staging };
+  delete merged.env;
+  return merged;
+}
+
+// ── 3. Build main lane config ───────────────────────────────────────────────
+const main = resolveStaging("apps/main/wrangler.jsonc");
+main.name = NAMES.main;
+delete main.routes;
+delete main.triggers; // no cron on lanes — would still hit shared staging data N×
+// CF Queues allow exactly ONE consumer per queue. The staging memory queue
+// (`managed-agents-memory-events-staging`) is shared across the whole CF
+// account: prod-staging worker, every lane, anyone with the same wrangler
+// config — they all want to register as consumer, only the first one wins.
+// Subsequent deploys fail with `code: 11004 — already has a consumer`.
+//
+// Lanes don't need queue consumption to test API surfaces (the consumer
+// only reflects R2 FUSE writes back into D1; live agent sessions are the
+// thing that exercises it). Strip consumers from every lane config so
+// whoever owns the queue (typically `managed-agents-staging` or the first
+// lane that grabbed it) keeps it. Re-enable per-lane only if that lane
+// specifically needs to test the memory event pipeline AND no other
+// consumer is registered.
+delete main.queues;
+main.vars = {
+  ...(main.vars || {}),
+  // Linear / GitHub / Slack OAuth callbacks land here; must be the lane's
+  // own integrations worker, not staging's shared one.
+  INTEGRATIONS_ORIGIN: INT_ORIGIN,
+  // Cloudflare-published "always-pass" Turnstile site key — paired with the
+  // matching always-pass secret set on lane workers via deploy-lane.yml.
+  // Lanes are dev-only; real Turnstile keys never get exposed.
+  // https://developers.cloudflare.com/turnstile/troubleshooting/testing/
+  TURNSTILE_SITE_KEY: "1x00000000000000000000AA",
+};
+main.services = [
+  { binding: "SANDBOX_sandbox_default", service: NAMES.agent },
+  { binding: "INTEGRATIONS",            service: NAMES.integrations },
+];
+writeJson(`apps/main/wrangler.lane-${LANE}.jsonc`, main);
+
+// ── 4. Build agent lane config ──────────────────────────────────────────────
+const agent = resolveStaging("apps/agent/wrangler.jsonc");
+agent.name = NAMES.agent;
+delete agent.routes;
+delete agent.triggers;
+agent.services = [
+  { binding: "INTEGRATIONS", service: NAMES.integrations },
+  // MAIN binding so AcpProxyHarness can call /v1/internal/runtime-attach-harness
+  // on the lane's main worker (not prod's). Required for local-runtime sessions.
+  { binding: "MAIN", service: NAMES.main },
+];
+writeJson(`apps/agent/wrangler.lane-${LANE}.jsonc`, agent);
+
+// ── 5. Build integrations lane config ───────────────────────────────────────
+const integrations = resolveStaging("apps/integrations/wrangler.jsonc");
+integrations.name = NAMES.integrations;
+delete integrations.routes;
+integrations.vars = {
+  ...(integrations.vars || {}),
+  GATEWAY_ORIGIN: INT_ORIGIN,
+};
+integrations.services = [
+  { binding: "MAIN", service: NAMES.main },
+];
+// integrations on staging is already correctly pointed at openma-auth-staging
+// (commit c537c9b), so no D1-id override needed once we resolve from
+// env.staging. The earlier prod-side stale-id workaround (overlay main's
+// AUTH_DB id) is no longer needed; main now points at openma-auth-staging
+// too via the same staging-resolution path.
+writeJson(`apps/integrations/wrangler.lane-${LANE}.jsonc`, integrations);
+
+// ── 6. Summary ──────────────────────────────────────────────────────────────
+const tag = CHECK_ONLY ? "[check]" : "Generated";
+console.log(`${tag} lane '${LANE}' configs:`);
+console.log(`  apps/main/wrangler.lane-${LANE}.jsonc          (${NAMES.main})`);
+console.log(`  apps/agent/wrangler.lane-${LANE}.jsonc         (${NAMES.agent})`);
+console.log(`  apps/integrations/wrangler.lane-${LANE}.jsonc  (${NAMES.integrations})`);
+console.log("");
+console.log("URLs (after deploy):");
+console.log(`  main:         ${MAIN_URL}`);
+console.log(`  integrations: ${INT_ORIGIN}`);
+console.log("");
+console.log("Deploy (must be in this order so service bindings resolve):");
+console.log(`  1. cd apps/integrations && npx wrangler deploy --config wrangler.lane-${LANE}.jsonc`);
+console.log(`  2. cd apps/agent        && npx wrangler deploy --config wrangler.lane-${LANE}.jsonc`);
+console.log(`  3. cd apps/main         && npx wrangler deploy --config wrangler.lane-${LANE}.jsonc`);
+console.log("");
+console.log("Tear down: gh workflow run teardown-lane.yml -F lane_name=" + LANE);

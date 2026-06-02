@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "strict": false,
+    "noImplicitAny": false,
+    "skipLibCheck": true
+  },
+  "include": [
+    "test/**/*.ts",
+    "packages/*/src/**/*.ts",
+    "apps/*/src/**/*.ts",
+    "apps/main/worker-env.d.ts"
+  ],
+  "exclude": ["node_modules"]
+}

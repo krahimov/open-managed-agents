@@ -1,0 +1,322 @@
+import { betterAuth } from "better-auth";
+import { drizzle } from "drizzle-orm/d1";
+import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import { emailOTP } from "better-auth/plugins";
+import type { Env } from "@open-managed-agents/shared";
+import {
+  createCfShardPoolService,
+  createCfTenantShardDirectoryService,
+} from "@open-managed-agents/tenant-dbs-store";
+import * as schema from "./db/schema";
+
+function sendEmail(
+  env: Env,
+  to: string,
+  subject: string,
+  html: string,
+  text: string,
+) {
+  if (!env.SEND_EMAIL) {
+    console.log(`[auth] email not sent to ${to} (SEND_EMAIL binding not configured): ${subject}`);
+    return;
+  }
+  return env.SEND_EMAIL.send({
+    from: "openma <noreply@openma.dev>",
+    to,
+    subject,
+    html,
+    text,
+  });
+}
+
+function otpEmailHtml(code: string, label: string): string {
+  return [
+    '<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:32px">',
+    `<h2 style="margin:0 0 16px">${label}</h2>`,
+    `<p style="font-size:32px;letter-spacing:8px;font-weight:bold;margin:24px 0">${code}</p>`,
+    '<p style="color:#666;font-size:14px">This code expires in 5 minutes. If you did not request this, ignore this email.</p>',
+    "</div>",
+  ].join("");
+}
+
+export function createAuth(env: Env) {
+  const db = drizzle(env.MAIN_DB, { schema });
+
+  const socialProviders: Record<string, unknown> = {};
+  if (env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET) {
+    socialProviders.google = {
+      clientId: env.GOOGLE_CLIENT_ID,
+      clientSecret: env.GOOGLE_CLIENT_SECRET,
+    };
+  }
+
+  return betterAuth({
+    basePath: "/auth",
+    secret: env.BETTER_AUTH_SECRET,
+    emailAndPassword: {
+      enabled: true,
+      requireEmailVerification: true,
+      sendResetPassword: async ({ user, url }) => {
+        await sendEmail(
+          env,
+          user.email,
+          "Reset your password — openma",
+          `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:32px"><h2>Reset your password</h2><p>Click the button below to reset your password.</p><a href="${url}" style="display:inline-block;padding:12px 24px;background:#111;color:#fff;text-decoration:none;border-radius:6px;margin:16px 0">Reset password</a><p style="color:#666;font-size:14px">If you did not request this, ignore this email.</p></div>`,
+          `Reset your password: ${url}`,
+        );
+      },
+    },
+    emailVerification: {
+      sendVerificationEmail: async ({ user, url }) => {
+        await sendEmail(
+          env,
+          user.email,
+          "Verify your email — openma",
+          `<div style="font-family:sans-serif;max-width:400px;margin:0 auto;padding:32px"><h2>Verify your email</h2><p>Click the button below to verify your email address.</p><a href="${url}" style="display:inline-block;padding:12px 24px;background:#111;color:#fff;text-decoration:none;border-radius:6px;margin:16px 0">Verify email</a><p style="color:#666;font-size:14px">If you did not create an account, ignore this email.</p></div>`,
+          `Verify your email: ${url}`,
+        );
+      },
+      sendOnSignUp: true,
+      autoSignInAfterVerification: true,
+    },
+    plugins: [
+      emailOTP({
+        otpLength: 6,
+        expiresIn: 300,
+        sendVerificationOnSignUp: true,
+        async sendVerificationOTP({ email, otp, type }) {
+          const labels: Record<string, string> = {
+            "sign-in": "Your sign-in code",
+            "email-verification": "Verify your email",
+            "forget-password": "Your password reset code",
+          };
+          const label = labels[type] ?? "Your verification code";
+          await sendEmail(
+            env,
+            email,
+            `${label} — openma`,
+            otpEmailHtml(otp, label),
+            `${label}: ${otp}`,
+          );
+        },
+      }),
+    ],
+    socialProviders,
+    database: drizzleAdapter(db, { provider: "sqlite", schema }),
+    trustedOrigins: ["*"],
+    // Cross-subdomain session cookies. Hosted sets AUTH_COOKIE_DOMAIN
+    // to ".openma.dev" so the cookie minted on app.openma.dev is also
+    // sent on requests to openma.dev (apex landing) — lets the marketing
+    // site show "logged in as X" without re-auth. Self-hosters leaving
+    // the var unset get default per-host scoping.
+    //
+    // AUTH_COOKIE_NAME (optional, recommended for non-prod envs that
+    // share the openma.dev parent domain): override the session-token
+    // cookie name so a browser used against both prod (.openma.dev) and
+    // staging (.staging.openma.dev) doesn't end up with two same-named
+    // cookies — browsers send both, server reads the first, and the
+    // wrong-env token defeats sign-in.
+    ...(env.AUTH_COOKIE_DOMAIN
+      ? {
+          advanced: {
+            crossSubDomainCookies: {
+              enabled: true,
+              domain: env.AUTH_COOKIE_DOMAIN,
+            },
+            defaultCookieAttributes: {
+              domain: env.AUTH_COOKIE_DOMAIN,
+              sameSite: "lax" as const,
+              secure: true,
+            },
+            ...(env.AUTH_COOKIE_NAME
+              ? {
+                  cookies: {
+                    session_token: { name: env.AUTH_COOKIE_NAME },
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
+    user: {
+      additionalFields: {
+        tenantId: { type: "string", required: false },
+        role: { type: "string", required: false, defaultValue: "member" },
+      },
+    },
+    databaseHooks: {
+      user: {
+        create: {
+          after: async (user) => {
+            try {
+              await ensureTenant(env, user.id, user.name, user.email);
+            } catch (err) {
+              // Don't block sign-up on tenant creation — auth.ts has a self-heal
+              // path that will retry on first authenticated request. Log so the
+              // failure is visible.
+              console.error("user.create.after: ensureTenant failed", {
+                user_id: user.id,
+                err: err instanceof Error ? err.message : String(err),
+              });
+            }
+          },
+        },
+      },
+    },
+  });
+}
+
+/**
+ * Look up a user's tenantId from D1.
+ *
+ * Returns the user.tenantId column (legacy "default tenant"). For
+ * multi-tenant aware code paths, prefer listMemberships() — this helper
+ * only returns the user's first/default tenant.
+ */
+export async function getTenantId(db: D1Database, userId: string): Promise<string | null> {
+  const result = await db
+    .prepare("SELECT tenantId FROM user WHERE id = ?")
+    .bind(userId)
+    .first<{ tenantId: string | null }>();
+  return result?.tenantId ?? null;
+}
+
+/**
+ * List every tenant the user belongs to. Returns one row per membership
+ * with role; empty array when the user has no memberships (shouldn't
+ * happen post-signup but defended).
+ *
+ * Joined against `tenant` so callers get display names without a second
+ * roundtrip. The query order is stable (created_at ASC then id ASC) so
+ * UI lists don't reshuffle on repeat fetches.
+ */
+export async function listMemberships(
+  db: D1Database,
+  userId: string,
+): Promise<Array<{ id: string; name: string; role: string; created_at: number }>> {
+  const { results } = await db
+    .prepare(
+      `SELECT t.id AS id, t.name AS name, m.role AS role, m.created_at AS created_at
+         FROM membership m
+         JOIN tenant t ON t.id = m.tenant_id
+        WHERE m.user_id = ?
+        ORDER BY m.created_at ASC, t.id ASC`,
+    )
+    .bind(userId)
+    .all<{ id: string; name: string; role: string; created_at: number }>();
+  return results ?? [];
+}
+
+/**
+ * Verify a (user, tenant) membership exists. Hot-path call used by the
+ * auth middleware on every cookie-authenticated request — small enough
+ * that a single primary-key lookup is fine.
+ */
+export async function hasMembership(
+  db: D1Database,
+  userId: string,
+  tenantId: string,
+): Promise<boolean> {
+  const row = await db
+    .prepare("SELECT 1 AS one FROM membership WHERE user_id = ? AND tenant_id = ? LIMIT 1")
+    .bind(userId, tenantId)
+    .first<{ one: number }>();
+  return row !== null;
+}
+
+/**
+ * Ensure the user has a tenant; create one on demand if not. Idempotent —
+ * concurrent invocations with the same userId may race on tenant creation
+ * but only one wins, the loser re-reads and returns the existing tenantId.
+ *
+ * Used by:
+ *   - databaseHooks.user.create.after (sign-up path)
+ *   - apps/main/src/auth.ts cookie path (self-heal for legacy users whose
+ *     sign-up predated this hook, or whose hook-time INSERT failed silently)
+ *
+ * Writes:
+ *   - `tenant`     row in env.MAIN_DB (global control plane, not sharded)
+ *   - `tenant_shard` row in env.ROUTER_DB (assigns this tenant to a shard
+ *      via least-loaded placement)
+ *   - `user.tenantId` UPDATE in env.MAIN_DB
+ *   - `membership` row in env.MAIN_DB
+ *
+ * Shard assignment MUST land before the user's first authenticated request,
+ * otherwise tenantDbMiddleware finds no tenant_shard row and falls back to
+ * MAIN_DB defaultBinding. The fallback is then cached for the isolate's
+ * lifetime — wrong-shard reads/writes follow until worker restart. Doing
+ * the assign here (synchronously inside the signup path) closes that race.
+ */
+export async function ensureTenant(
+  env: Env,
+  userId: string,
+  userName: string | null | undefined,
+  userEmail: string | null | undefined,
+): Promise<string> {
+  const db = env.MAIN_DB;
+  const existing = await getTenantId(db, userId);
+  if (existing) return existing;
+
+  const tenantId = `tn_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+  const now = Math.floor(Date.now() / 1000);
+  // Display name resolution, in priority order:
+  //   1. user.name        (email/password signup with fallback, Google profile)
+  //   2. email local-part (OTP signup, social signups w/o name claim)
+  //   3. literal "User"   (truly empty signup — shouldn't happen, but defensive)
+  // Never produces "'s workspace" — that bug came from blindly substituting
+  // an empty name into the template.
+  const trimmedName = (userName ?? "").trim();
+  const emailPrefix = (userEmail ?? "").split("@")[0]?.trim() ?? "";
+  const display = trimmedName || emailPrefix || "User";
+  const tenantName = `${display}'s workspace`;
+  await db
+    .prepare("INSERT INTO tenant (id, name, createdAt, updatedAt) VALUES (?, ?, ?, ?)")
+    .bind(tenantId, tenantName, now, now)
+    .run();
+
+  // Shard assignment.
+  //
+  // Single-D1 mode (auto-detected when AUTH_DB_01 binding isn't present):
+  // there's only one D1 to assign to. Skip the shard_pool query — a fresh
+  // self-host has no rows there yet — and write the tenant_shard row
+  // directly with the MAIN_DB binding name. ROUTER_DB falls back to
+  // MAIN_DB itself in this mode, so the row lives in the same DB as the
+  // tenant data — fine for single-D1 deployments.
+  //
+  // Multi-shard mode (openma.dev's --env production): pickShardForNewTenant
+  // returns the open shard with lowest tenant_count; null when no shards
+  // open → fall back to AUTH_DB_00 (= shard 0, the original openma-auth)
+  // so signup never blocks on shard-pool exhaustion.
+  const envBag = env as unknown as Record<string, unknown>;
+  const isSingleD1 = !envBag.AUTH_DB_01;
+  const controlPlaneDb = env.ROUTER_DB ?? env.MAIN_DB;
+  const tenantShardDirectory = createCfTenantShardDirectoryService({ controlPlaneDb });
+  let bindingName: string;
+  if (isSingleD1) {
+    bindingName = "MAIN_DB";
+    await tenantShardDirectory.assign({ tenantId, bindingName });
+  } else {
+    const shardPool = createCfShardPoolService({ controlPlaneDb });
+    const pick = await shardPool.pickShardForNewTenant();
+    bindingName = pick?.bindingName ?? "AUTH_DB_00";
+    await tenantShardDirectory.assign({ tenantId, bindingName });
+    await shardPool.incrementTenantCount(bindingName);
+  }
+
+  await db
+    .prepare("UPDATE user SET tenantId = ?, role = ? WHERE id = ? AND tenantId IS NULL")
+    .bind(tenantId, "owner", userId)
+    .run();
+  // Write the membership row too. INSERT OR IGNORE so a concurrent caller
+  // that lost the tenantId race doesn't double-insert.
+  await db
+    .prepare(
+      "INSERT OR IGNORE INTO membership (user_id, tenant_id, role, created_at) VALUES (?, ?, 'owner', ?)",
+    )
+    .bind(userId, tenantId, now)
+    .run();
+  // Re-read in case a concurrent caller won the race — UPDATE's WHERE clause
+  // ensures we never overwrite an existing tenantId with our orphan.
+  const final = await getTenantId(db, userId);
+  return final ?? tenantId;
+}

@@ -1,0 +1,17 @@
+{
+  "name": "@open-managed-agents/kv-store",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./adapters/cf": "./src/adapters/cf.ts",
+    "./adapters/in-memory": "./src/adapters/in-memory.ts",
+    "./adapters/sql": "./src/adapters/sql.ts"
+  },
+  "dependencies": {
+    "@open-managed-agents/db-schema": "workspace:*",
+    "@open-managed-agents/shared": "workspace:*",
+    "drizzle-orm": "^0.45.2"
+  }
+}

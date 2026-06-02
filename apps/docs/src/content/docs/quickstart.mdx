@@ -1,0 +1,100 @@
+---
+title: Quickstart
+description: Sign up, get an API key, and run your first agent session in under five minutes.
+---
+
+import { Steps, Tabs, TabItem, Aside, LinkCard } from '@astrojs/starlight/components';
+
+This walks you through the **hosted path** — fastest way from zero to a running agent. If you want to self-host instead, jump to [Self-host → Overview](/self-host/overview/).
+
+## Prerequisites
+
+- A web browser
+- `curl` (or Postman, or any HTTP client)
+- About 5 minutes
+
+## Steps
+
+<Steps>
+
+1. **Create an account.**
+
+   Go to [app.openma.dev](https://app.openma.dev) and sign up with email, email-OTP, or Google. Your tenant is created automatically on first sign-in — no manual setup.
+
+2. **Create an API key.**
+
+   In the Console, open **API Keys → New key**. Copy it now; you won't see it again.
+
+   ```bash
+   export OMA_BASE_URL="https://app.openma.dev"
+   export OMA_API_KEY="oma_..."     # the key you just copied
+   ```
+
+3. **Create your first agent.**
+
+   ```bash
+   curl -X POST "$OMA_BASE_URL/v1/agents" \
+     -H "x-api-key: $OMA_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{
+       "name": "hello-agent",
+       "model": "claude-sonnet-4-6",
+       "system": "You are a friendly assistant. Keep replies under 3 sentences.",
+       "tools": []
+     }'
+   ```
+
+   Save the returned `id` — you'll need it next.
+
+4. **Start a session and stream a turn.**
+
+   ```bash
+   AGENT_ID="agent_..."   # from previous step
+   ENV_ID="env_..."       # any environment in your tenant; create one in the Console if you don't have one yet
+
+   curl -X POST "$OMA_BASE_URL/v1/sessions" \
+     -H "x-api-key: $OMA_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d "{ \"agent\": \"$AGENT_ID\", \"environment_id\": \"$ENV_ID\", \"title\": \"hello\" }"
+   ```
+
+   The response includes a session `id`. Post a user turn AND stream the reply token-by-token in one shot:
+
+   ```bash
+   SESSION_ID="sess_..."
+
+   curl -N -X POST "$OMA_BASE_URL/v1/sessions/$SESSION_ID/messages" \
+     -H "x-api-key: $OMA_API_KEY" \
+     -H "Content-Type: application/json" \
+     -d '{ "content": "What is 2+2?" }'
+   ```
+
+   You'll see Server-Sent Events for the user echo, every model token, every tool call, and every tool result. The connection auto-closes when the turn finishes (`session.status_idle`). For long-lived sessions use `GET /v1/sessions/$SESSION_ID/events/stream` instead — never closes, replays history on connect.
+
+5. **Check it in the Console.**
+
+   Back in [app.openma.dev](https://app.openma.dev), open **Sessions** → click your new session. You'll see the full event stream, including the model's reply.
+
+</Steps>
+
+<Aside type="tip" title="That's the whole loop">
+  Every richer feature — sandboxed code execution, MCP servers, custom skills, Linear/GitHub/Slack integrations — works through the same `agents` + `sessions` shape. Add tools, add a sandbox `environment`, plug in an `integration`, and the rest follows.
+</Aside>
+
+## Where to go next
+
+<LinkCard
+  title="Concepts"
+  href="/concepts/"
+  description="Learn the nouns: Agent, Session, Environment, Vault, Skill, Tool, Harness, Integration."
+/>
+<LinkCard
+  title="Use the Console"
+  href="/console/getting-started/"
+  description="Create agents, sessions, environments, and skills from the UI instead of the API."
+/>
+<LinkCard
+  title="Build with the API"
+  href="/build/api/"
+  description="REST surface, auth, SSE streaming, the CLI, and the SDK types package."
+/>

@@ -1,0 +1,91 @@
+---
+title: OAuth Apps
+description: How Linear / GitHub / Slack integrations bootstrap on a self-host deployment — per-publication Apps, not deploy-wide secrets.
+---
+
+import { Steps, Aside, Tabs, TabItem, LinkCard } from '@astrojs/starlight/components';
+
+**Big picture: there is no deploy-wide OAuth App to register.** Linear / GitHub / Slack integrations are **per-publication** — every agent publication registers its own Linear OAuth App / GitHub App / Slack App at install time, via the Console wizard. Credentials are stored encrypted on the publication row under `PLATFORM_ROOT_SECRET`. The operator's job is just to make the integrations gateway publicly reachable.
+
+What you (the operator) need to do once for the whole deployment:
+
+1. Set `GATEWAY_ORIGIN` (or `PUBLIC_BASE_URL` — gateway falls back to it) to the **public HTTPS URL** of `apps/integrations`. Slack and GitHub both verify webhook + OAuth URLs before letting an install complete, so a localhost or self-signed setup will fail.
+2. Set `PLATFORM_ROOT_SECRET` (required for any install — see [Configuration](/reference/configuration/)).
+3. Set `INTEGRATIONS_INTERNAL_SECRET` so `apps/main` and `apps/integrations` can talk.
+4. (Optional) Set `INTEGRATIONS_INTERNAL_TOKEN` if you want the GitHub refresh-by-vault path.
+
+That's it. Per-publication credentials are pasted in by the agent owner during the Console wizard — `LINEAR_OAUTH_CLIENT_ID/SECRET`, `GITHUB_APP_ID/PRIVATE_KEY/WEBHOOK_SECRET`, `SLACK_CLIENT_ID/SECRET/SIGNING_SECRET` env vars are **not** read by the publication-first flow.
+
+<Aside type="caution" title="Migrating from a pre-publication-first deploy?">
+  Old shared-App env vars (`LINEAR_CLIENT_ID`, `GITHUB_APP_ID`, `SLACK_CLIENT_ID`, etc.) are ignored by the current code. The `/start-a1` install endpoint returns `410 linear_legacy_install_removed`. Re-register each publication via the Console.
+</Aside>
+
+## Linear
+
+Two install paths, both per-publication:
+
+| Path | When to pick | Operator setup |
+|---|---|---|
+| **Personal API Key (PAT)** | Single workspace, no OAuth dance, fastest path | none — agent owner runs `oma linear install-pat` with their PAT |
+| **Dedicated OAuth App** | Multi-workspace, proper bot identity, OAuth refresh | none — agent owner registers their own OAuth App at `linear.app/settings/api`, pastes credentials into the Console wizard |
+
+For the OAuth path, the agent owner gets a pre-filled callback URL + webhook URL from the Console wizard (both keyed on the publication id, e.g. `https://integrations.example.com/linear/oauth/pub/<pubId>/callback`), pastes them into Linear's OAuth App form, then pastes the resulting client id / secret back into the Console. **The agent owner does this, not the operator.**
+
+See the agent-side playbook at [`skills/openma/integrations-linear.md`](https://github.com/open-ma/open-managed-agents/blob/main/skills/openma/integrations-linear.md) for the full step-by-step.
+
+## GitHub
+
+Per-publication **GitHub App** registered via the [App Manifest flow](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest) — one-click registration with redirect URL + webhook URL + recommended permissions baked in. The agent owner runs `oma github bind <agent-id> --env <env-id>` (or the Console wizard), gets a `manifestStartUrl`, clicks through GitHub's confirm screen, picks which repos to install on, and the publication flips to `live`.
+
+What the operator does NOT need to do (despite what older docs might say):
+
+- Register a GitHub App on github.com — agents register their own.
+- Set `GITHUB_APP_ID`, `GITHUB_PRIVATE_KEY`, `GITHUB_WEBHOOK_SECRET` as Worker secrets — these env vars are not read by the publication-first flow. Credentials are per-publication, stored encrypted on the `github_publications` row.
+
+Optional operator knob: `GITHUB_MCP_URL` if you want to point at a self-hosted GitHub MCP server instead of `https://api.githubcopilot.com/mcp/`.
+
+## Slack
+
+Per-publication **Slack App** registered via Slack's "Create from manifest" URL flow. The agent owner runs `oma slack publish <agent-id>` (or the Console wizard) and gets a `manifestLaunchUrl` that opens `api.slack.com/apps` with a pre-filled manifest — redirect URL `/slack/oauth/pub/<pubId>/callback` and Events Request URL `/slack/webhook/pub/<pubId>` are both baked in, so refresh / retry doesn't break them.
+
+From the new Slack App's **Basic Information** page, the agent owner copies **Client ID**, **Client Secret**, and **Signing Secret** into the Console wizard. Submit → install-to-workspace → publication is `live`.
+
+What the operator does NOT need to do:
+
+- Register a single shared Slack App with `app_mention` / `message.*` events — every agent has its own.
+- Set `SLACK_CLIENT_ID/SECRET/SIGNING_SECRET` as Worker secrets — per-publication, stored encrypted on `slack_publications`.
+
+The one hard operator requirement is that `GATEWAY_ORIGIN` resolves to publicly-reachable HTTPS. Slack will not accept a manifest whose URLs it can't pre-verify, so localhost / `*.local` / self-signed certs are non-starters. Use a tunnel (`cloudflared tunnel`, `ngrok http`) for dev.
+
+## Custom OAuth (Google sign-in for the Console)
+
+This one IS deploy-wide — Google sign-in adds an SSO path to the Console alongside email + password / email-OTP.
+
+<Steps>
+
+1. Go to [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials) → **Create Credentials → OAuth client ID → Web application**.
+
+2. **Authorized redirect URI:** `https://app.yourdomain.com/api/auth/callback/google`
+
+3. Capture client ID + secret. Set:
+   ```bash
+   npx wrangler secret put GOOGLE_CLIENT_ID
+   npx wrangler secret put GOOGLE_CLIENT_SECRET
+   ```
+
+4. Redeploy main worker.
+
+</Steps>
+
+## Where to go next
+
+<LinkCard
+  title="Operations"
+  href="/self-host/operations/"
+  description="Custom domains, observability, multi-tenant config, troubleshooting."
+/>
+<LinkCard
+  title="Custom Integrations"
+  href="/build/integrations/"
+  description="Add a non-shipped integration (Jira, Discord, your internal tool)."
+/>

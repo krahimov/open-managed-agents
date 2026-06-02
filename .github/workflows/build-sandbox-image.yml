@@ -1,0 +1,50 @@
+name: Build Sandbox Base Image
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'apps/agent/Dockerfile'
+    branches: [main]
+
+env:
+  IMAGE_NAME: openma/sandbox-base
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract sandbox SDK version from Dockerfile
+        id: ver
+        run: |
+          V=$(grep -oE 'cloudflare/sandbox:[0-9]+\.[0-9]+\.[0-9]+' apps/agent/Dockerfile | head -1 | cut -d: -f2)
+          test -n "$V" || { echo "Could not extract version"; exit 1; }
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Extracted: $V"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: apps/agent
+          file: apps/agent/Dockerfile
+          push: true
+          tags: |
+            docker.io/${{ env.IMAGE_NAME }}:latest
+            docker.io/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            docker.io/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64

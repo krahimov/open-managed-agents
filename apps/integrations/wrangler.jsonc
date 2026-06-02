@@ -1,0 +1,129 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "managed-agents-integrations",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-04-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // ─────────────────────────────────────────────────────────────────────
+  // SELF-HOST BASELINE (integrations gateway worker)
+  // ─────────────────────────────────────────────────────────────────────
+  // Top-level config = single-D1 self-host shape: MAIN_DB +
+  // INTEGRATIONS_DB only, no shards. openma.dev's multi-shard prod
+  // lives in env.production overlay below.
+  // ─────────────────────────────────────────────────────────────────────
+
+  // Public origin where this gateway is reachable. Used to build OAuth
+  // callback / webhook URLs the gateway hands to Linear. No trailing slash.
+  // For self-host: typically https://integrations.<your-domain> or the
+  // integrations *.workers.dev URL. setup-cf.sh fills it in.
+  "vars": {
+    "GATEWAY_ORIGIN": "<set-by-setup-cf-sh>"
+  },
+
+  // Keep the *.workers.dev URL alive alongside the custom domain — useful
+  // for incident debugging when the zone is having issues, and the only
+  // reachable URL when self-hosters don't bring a custom domain.
+  "workers_dev": true,
+
+  // Two D1 bindings:
+  //   - MAIN_DB         : control-plane (user / tenant lookup, vault refs).
+  //   - INTEGRATIONS_DB : integration subsystem tables (linear_* / github_*
+  //                        / slack_*).
+  "d1_databases": [
+    { "binding": "MAIN_DB",         "database_name": "openma-auth",         "database_id": "<set-by-setup-cf-sh>" },
+    { "binding": "INTEGRATIONS_DB", "database_name": "openma-integrations", "database_id": "<set-by-setup-cf-sh>" }
+  ],
+
+  // Service binding back to the main worker for session creation / resume.
+  "services": [
+    { "binding": "MAIN", "service": "managed-agents" }
+  ],
+
+  "observability": { "enabled": true },
+
+  // Linear dispatch sweep — runs every minute. The sweep itself is cheap
+  // (a handful of D1 queries + Linear GraphQL fetches per due rule), but
+  // each rule's `poll_interval_seconds` field gates real work, so most
+  // ticks are no-ops. Bumping to */1 for tight feedback during evaluation;
+  // can relax to */5 later if it ever becomes a noisy-neighbor problem.
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
+
+  // Per-IP and per-tenant rate limit on webhook receivers. Public endpoints
+  // (Linear / GitHub / Slack POST here unauthenticated and we sig-verify),
+  // so an attacker can flood with garbage payloads (per-IP catches it) and
+  // a misconfigured legit workspace can flood from real upstream IPs
+  // (per-tenant catches that — applied AFTER sig verify exposes the tenant).
+  // Soft-pass when binding absent (matches OSS / dev convention).
+  "ratelimits": [
+    { "name": "RL_WEBHOOK_IP",     "namespace_id": "3001", "simple": { "limit": 30, "period": 10 } },
+    { "name": "RL_WEBHOOK_TENANT", "namespace_id": "3003", "simple": { "limit": 60, "period": 60 } }
+  ],
+
+  // ─────────────────────────────────────────────────────────────────────
+  // ENVIRONMENT OVERLAYS (hosted)
+  // ─────────────────────────────────────────────────────────────────────
+  "env": {
+    "production": {
+      "name": "managed-agents-integrations",
+      "vars": {
+        "GATEWAY_ORIGIN": "https://integrations.openma.dev"
+      },
+      "workers_dev": true,
+      "routes": [
+        { "pattern": "integrations.openma.dev", "custom_domain": true }
+      ],
+      "d1_databases": [
+        { "binding": "MAIN_DB",         "database_name": "openma-auth",          "database_id": "dbb5f01c-7016-4157-945d-f8ff9fbda967" },
+        { "binding": "ROUTER_DB",       "database_name": "openma-router",        "database_id": "6ddad512-7976-4912-8003-7746ba1e4cb6" },
+        { "binding": "AUTH_DB_00",      "database_name": "openma-auth",          "database_id": "dbb5f01c-7016-4157-945d-f8ff9fbda967" },
+        { "binding": "AUTH_DB_01",      "database_name": "openma-auth-shard-01", "database_id": "37a3138c-8d1e-4258-8a0d-e0da511b0175" },
+        { "binding": "AUTH_DB_02",      "database_name": "openma-auth-shard-02", "database_id": "254c56dc-2a99-4266-87ae-9ff46355eb75" },
+        { "binding": "AUTH_DB_03",      "database_name": "openma-auth-shard-03", "database_id": "a4f72551-7ce7-4da3-a33e-f4abb00bb86f" },
+        { "binding": "INTEGRATIONS_DB", "database_name": "openma-integrations",  "database_id": "36f67512-b0d7-4300-9d57-f265cd9d3075" }
+      ],
+      "services": [
+        { "binding": "MAIN", "service": "managed-agents" }
+      ],
+      "observability": { "enabled": true },
+      "triggers": {
+        "crons": ["* * * * *"]
+      },
+      "ratelimits": [
+        { "name": "RL_WEBHOOK_IP",     "namespace_id": "3001", "simple": { "limit": 30, "period": 10 } },
+        { "name": "RL_WEBHOOK_TENANT", "namespace_id": "3003", "simple": { "limit": 60, "period": 60 } }
+      ]
+    },
+    "staging": {
+      "name": "managed-agents-integrations-staging",
+      "vars": {
+        "GATEWAY_ORIGIN": "https://integrations.staging.openma.dev"
+      },
+      "routes": [
+        { "pattern": "integrations.staging.openma.dev", "custom_domain": true }
+      ],
+      "d1_databases": [
+        { "binding": "MAIN_DB",         "database_name": "openma-auth-staging",          "database_id": "aff5dbb7-36f9-46b7-b82f-4513e5603ac6" },
+        { "binding": "ROUTER_DB",       "database_name": "openma-router-staging",        "database_id": "c238a338-9b6e-40c5-aaaa-48d4fe6dc63d" },
+        { "binding": "AUTH_DB_00",      "database_name": "openma-auth-staging",          "database_id": "aff5dbb7-36f9-46b7-b82f-4513e5603ac6" },
+        { "binding": "AUTH_DB_01",      "database_name": "openma-auth-shard-01-staging", "database_id": "fe6a34d1-cd8a-48a1-bff1-29032026d006" },
+        { "binding": "AUTH_DB_02",      "database_name": "openma-auth-shard-02-staging", "database_id": "8636a018-8ac6-48c2-ae95-2f70919c8aab" },
+        { "binding": "AUTH_DB_03",      "database_name": "openma-auth-shard-03-staging", "database_id": "8ce8f17d-7527-4a5a-b097-ce73251be55a" },
+        { "binding": "INTEGRATIONS_DB", "database_name": "openma-integrations-staging",  "database_id": "e7247e7e-e60c-4c8e-ac1c-5eff7ad8cb95" }
+      ],
+      "services": [
+        { "binding": "MAIN", "service": "managed-agents-staging" }
+      ],
+      "observability": { "enabled": true },
+      "triggers": {
+        "crons": ["* * * * *"]
+      },
+      "ratelimits": [
+        { "name": "RL_WEBHOOK_IP",     "namespace_id": "3002", "simple": { "limit": 30, "period": 10 } },
+        { "name": "RL_WEBHOOK_TENANT", "namespace_id": "3004", "simple": { "limit": 60, "period": 60 } }
+      ]
+    }
+  }
+}
