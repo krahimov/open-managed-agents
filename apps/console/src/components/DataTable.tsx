@@ -283,7 +283,7 @@ export function DataTable<T>({
       {loading ? (
         <SkeletonRows colSpan={visibleColumnCount} />
       ) : isEmpty ? (
-        <div className="pl-3 pr-4 py-4">
+        <div className="pl-4 pr-5 py-4">
           <EmptyState
             title={emptyTitle}
             body={emptySubtitle}
@@ -294,7 +294,7 @@ export function DataTable<T>({
           />
         </div>
       ) : (
-        <div id="dt-body-scroll" className="pl-3 pr-4 pb-4 overflow-x-auto">
+        <div id="dt-body-scroll" className="pl-4 pr-5 pb-5 overflow-x-auto">
           {/* Body sits flush against the frozen header in the slot —
               no extra top padding so the gap between header and first
               row is only the row pill's own `border-spacing-y-1.5`
@@ -311,10 +311,10 @@ export function DataTable<T>({
                     key={row.id}
                     onClick={onRowClick ? () => onRowClick(row.original) : undefined}
                     className={cn(
-                      "bg-bg-surface/60 hover:bg-bg-surface transition-colors",
+                      "bg-bg-surface shadow-[var(--shadow-sm)] hover:bg-brand-subtle/45 transition-colors",
                       "[&>td]:bg-transparent [&>td]:px-3 [&>td]:py-2 [&>td]:align-middle [&>td]:text-sm",
-                      "[&>td:first-child]:rounded-l-lg",
-                      "[&>td:last-child]:rounded-r-lg",
+                      "[&>td:first-child]:rounded-l-md",
+                      "[&>td:last-child]:rounded-r-md",
                       onRowClick && "cursor-pointer",
                     )}
                   >
@@ -359,7 +359,7 @@ function ColumnVisibilityMenu<T>({ table }: { table: TanstackTable<T> }) {
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-48">
-        <DropdownMenuLabel className="text-[11px] uppercase tracking-wider text-fg-subtle font-medium">
+        <DropdownMenuLabel className="text-[11px] uppercase text-fg-subtle font-medium">
           Visible columns
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
@@ -401,17 +401,17 @@ function ColumnVisibilityMenu<T>({ table }: { table: TanstackTable<T> }) {
 function SkeletonRows({ colSpan }: { colSpan: number }) {
   const cols = colSpan || 4;
   return (
-    <div className="pl-3 pr-4 pb-4">
+    <div className="pl-4 pr-5 pb-5">
       <table className="w-full table-fixed border-separate border-spacing-y-1.5">
         <tbody>
           {Array.from({ length: 10 }).map((_, rowIdx) => (
             <tr
               key={`sk-${rowIdx}`}
               className={cn(
-                "bg-bg-surface/60",
+                "bg-bg-surface",
                 "[&>td]:bg-transparent [&>td]:px-3 [&>td]:py-2 [&>td]:align-middle",
-                "[&>td:first-child]:rounded-l-lg",
-                "[&>td:last-child]:rounded-r-lg",
+                "[&>td:first-child]:rounded-l-md",
+                "[&>td:last-child]:rounded-r-md",
               )}
             >
               {Array.from({ length: cols }).map((_, colIdx) => {

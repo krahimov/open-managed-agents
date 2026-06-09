@@ -613,7 +613,7 @@ export function SkillsList() {
                       <div className="bg-bg-surface px-3 py-1.5 border-b border-border text-xs font-mono text-fg-muted flex items-center justify-between">
                         <span className="truncate">{f.filename}</span>
                         {f.encoding === "base64" && (
-                          <span className="ml-2 text-[10px] uppercase tracking-wider text-fg-subtle">
+                          <span className="ml-2 text-[10px] uppercase text-fg-subtle">
                             binary
                           </span>
                         )}
@@ -693,7 +693,7 @@ export function SkillsList() {
                 <div className="border border-border rounded-lg overflow-x-auto">
                   <table className="w-full text-sm">
                     <thead>
-                      <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase tracking-wider">
+                      <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase">
                         <th className="text-left px-4 py-2">Version</th>
                         <th className="text-left px-4 py-2">Created</th>
                       </tr>

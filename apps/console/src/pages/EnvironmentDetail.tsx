@@ -229,7 +229,7 @@ export function EnvironmentDetail() {
               className="border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] w-full sm:w-72"
               placeholder="environment name"
             />
-            <span className="text-[11px] px-2 py-0.5 rounded border border-border bg-bg-surface text-fg-muted font-medium uppercase tracking-wider">
+            <span className="text-[11px] px-2 py-0.5 rounded border border-border bg-bg-surface text-fg-muted font-medium uppercase">
               Cloud
             </span>
             <span className="text-fg-subtle" aria-hidden="true">

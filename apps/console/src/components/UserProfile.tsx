@@ -21,6 +21,7 @@ import { useAuth } from "../lib/auth";
 import { useTheme } from "../lib/theme";
 import { authClient } from "../lib/auth-client";
 import { Avatar } from "./Avatar";
+import { BRAND_DOCS_URL } from "../lib/brand";
 
 /**
  * Bottom-of-sidebar user profile menu. Single click target opens a
@@ -34,7 +35,7 @@ import { Avatar } from "./Avatar";
  * SidebarHeader uses — `h-11 px-3 flex items-center gap-2` with the
  * avatar fixed at x=12 and the text collapsing via
  * `group-data-[collapsible=icon]:hidden`. When the sidebar narrows to
- * icon mode the avatar stays put and the openma-style row visually
+ * icon mode the avatar stays put and the compact row visually
  * mirrors the brand row at the top.
  */
 const THEME_OPTIONS = [
@@ -62,7 +63,7 @@ export function UserProfile() {
         <button
           type="button"
           aria-label="Account menu"
-          className="w-full h-11 px-3 flex items-center gap-2 hover:bg-sidebar-accent transition-colors text-left"
+          className="mx-2 mb-2 w-[calc(100%-1rem)] h-9 rounded-md px-2 flex items-center gap-2 text-left text-fg-muted hover:bg-bg-surface hover:text-fg transition-colors"
         >
           <Avatar name={label} size="sm" />
           <div className="flex-1 min-w-0 text-left leading-tight group-data-[collapsible=icon]:hidden">
@@ -102,7 +103,7 @@ export function UserProfile() {
         <DropdownMenuGroup>
           <DropdownMenuItem asChild>
             <a
-              href="https://docs.openma.dev"
+              href={BRAND_DOCS_URL}
               target="_blank"
               rel="noopener noreferrer"
             >
@@ -114,7 +115,7 @@ export function UserProfile() {
 
         <DropdownMenuSeparator />
 
-        <DropdownMenuLabel className="text-[11px] uppercase tracking-wider text-fg-subtle font-medium">
+        <DropdownMenuLabel className="text-[11px] uppercase text-fg-subtle font-medium">
           Theme
         </DropdownMenuLabel>
         <DropdownMenuGroup>

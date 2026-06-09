@@ -8,42 +8,39 @@
 
 /* ---------- Light theme (default) ---------- */
 :root {
-  --brand: oklch(0.68 0.19 25);        /* #FF6B50 in oklch */
-  --brand-hover: oklch(0.62 0.19 25);  /* darker coral */
-  --brand-subtle: oklch(0.96 0.03 25); /* barely-there coral tint */
-  /* Dark warm tone that pairs with brand for AA contrast (~5.4:1 on coral).
-     White on coral is only 2.96:1 — fails AA-normal at every UI text size,
-     so brand-fg is dark, not white. Visually keeps brand "warm" not "stark". */
-  --brand-fg: #3d2520;
+  --brand: #5e6ad2;
+  --brand-hover: #4f5ec4;
+  --brand-subtle: #eef0ff;
+  --brand-fg: #ffffff;
 
-  --bg: #fefefe;
-  --bg-sidebar: #f8f8f7;
-  --bg-surface: #f3f3f1;
-  --bg-overlay: oklch(0 0 0 / 0.3);
+  --bg: #fbfbfc;
+  --bg-sidebar: #f4f4f6;
+  --bg-surface: #ffffff;
+  --bg-overlay: oklch(0 0 0 / 0.28);
 
-  --fg: #1a1a1a;
-  --fg-muted: #6b6b6b;
-  --fg-subtle: #a1a1a1;
+  --fg: #17171a;
+  --fg-muted: #6a6b72;
+  --fg-subtle: #a0a1a9;
 
-  --border: #e4e4e2;
-  --border-strong: #d0d0ce;
+  --border: #e6e7eb;
+  --border-strong: #cacdd5;
 
-  --success: oklch(0.6 0.18 145);
-  --success-subtle: oklch(0.96 0.04 145);
-  --warning: oklch(0.7 0.16 75);
-  --warning-subtle: oklch(0.96 0.04 75);
-  --danger: oklch(0.58 0.22 25);
-  --danger-subtle: oklch(0.96 0.04 25);
-  --info: oklch(0.58 0.16 260);
-  --info-subtle: oklch(0.96 0.03 260);
-  --accent-violet: oklch(0.55 0.2 300);
-  --accent-violet-subtle: oklch(0.96 0.03 300);
+  --success: #178a55;
+  --success-subtle: #eaf7f0;
+  --warning: #a56315;
+  --warning-subtle: #fff3df;
+  --danger: #c93d47;
+  --danger-subtle: #fff0f1;
+  --info: #2f6fed;
+  --info-subtle: #edf4ff;
+  --accent-violet: #7c5cff;
+  --accent-violet-subtle: #f3f0ff;
 
   /* Surface elevation — single shadow token, theme-aware. Light mode
      uses near-black at 10% opacity; dark mode bumps to 50% so drop
      shadows actually read against the dark surface. */
-  --shadow-md: 0 4px 12px -4px rgb(0 0 0 / 0.12);
-  --shadow-sm: 0 1px 2px -1px rgb(0 0 0 / 0.08);
+  --shadow-md: 0 14px 34px -28px rgb(23 23 26 / 0.32);
+  --shadow-sm: 0 1px 2px rgb(23 23 26 / 0.04), 0 1px 1px rgb(23 23 26 / 0.03);
 
   /* Motion tokens. Default Tailwind transitions feel "computer-y" (linear
      timing-function, 150ms blanket duration). These curves + scale give
@@ -66,39 +63,37 @@
 
 /* ---------- Dark theme ---------- */
 .dark {
-  --brand: oklch(0.7 0.18 25);         /* slightly brighter coral for dark bg */
-  --brand-hover: oklch(0.76 0.16 25);
-  --brand-subtle: oklch(0.25 0.06 25);
-  /* Same dark warm tone in dark mode — brand stays coral, fg stays dark.
-     #3d2520 on coral is ~5.4:1 (AA-pass); white would be ~2.96:1 (AA-fail). */
-  --brand-fg: #3d2520;
+  --brand: #8c93ff;
+  --brand-hover: #a3a8ff;
+  --brand-subtle: #232640;
+  --brand-fg: #0d0f1d;
 
-  --bg: #151515;
-  --bg-sidebar: #1a1a1a;
-  --bg-surface: #222220;
+  --bg: #111113;
+  --bg-sidebar: #17171a;
+  --bg-surface: #1c1c20;
   --bg-overlay: oklch(0 0 0 / 0.6);
 
-  --fg: #ececec;
-  --fg-muted: #a0a0a0;
-  --fg-subtle: #888;
+  --fg: #f1f1f3;
+  --fg-muted: #a5a7af;
+  --fg-subtle: #777a84;
 
-  --border: #2e2e2c;
-  --border-strong: #404040;
+  --border: #2c2d33;
+  --border-strong: #434652;
 
-  --success: oklch(0.76 0.16 145);
-  --success-subtle: oklch(0.22 0.05 145);
-  --warning: oklch(0.8 0.14 75);
-  --warning-subtle: oklch(0.22 0.05 75);
-  --danger: oklch(0.72 0.18 25);
-  --danger-subtle: oklch(0.22 0.05 25);
-  --info: oklch(0.72 0.14 260);
-  --info-subtle: oklch(0.22 0.04 260);
-  --accent-violet: oklch(0.72 0.16 300);
-  --accent-violet-subtle: oklch(0.22 0.05 300);
+  --success: #53d18c;
+  --success-subtle: #163325;
+  --warning: #f0ad4e;
+  --warning-subtle: #352817;
+  --danger: #ff7782;
+  --danger-subtle: #371d21;
+  --info: #80a9ff;
+  --info-subtle: #172644;
+  --accent-violet: #b09cff;
+  --accent-violet-subtle: #261f40;
 
   /* Dark-mode shadow — needs more opacity to register against #151515. */
-  --shadow-md: 0 4px 12px -2px rgb(0 0 0 / 0.5);
-  --shadow-sm: 0 1px 2px -1px rgb(0 0 0 / 0.4);
+  --shadow-md: 0 18px 42px -28px rgb(0 0 0 / 0.85);
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.45);
 
   --ring: var(--brand);
   color-scheme: dark;
@@ -107,8 +102,8 @@
 /* ---------- Tailwind theme tokens ---------- */
 @theme {
   /* Fonts */
-  --font-display: "Source Serif 4", Georgia, "Times New Roman", serif;
-  --font-sans: "DM Sans", -apple-system, "Segoe UI", sans-serif;
+  --font-display: "Geist Variable", -apple-system, "Segoe UI", sans-serif;
+  --font-sans: "Geist Variable", -apple-system, "Segoe UI", sans-serif;
   --font-mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
 
   /* Color palette — resolves dynamically via :root / .dark vars */
@@ -148,10 +143,10 @@
      aliases Tailwind v4 emits no rule for `bg-secondary`, `text-muted-
      foreground`, `bg-popover`, `border-input` (the lookup just silently
      yields nothing) and the lifted shadcn surfaces render unstyled.
-     Mapping straight onto the existing OMA palette keeps the chat surface
+     Mapping straight onto the console palette keeps the chat surface
      visually consistent with the rest of the console — no second palette
      to maintain. Both themes (light + dark) get correct values automatically
-     because the OMA tokens above are theme-aware. */
+     because the tokens above are theme-aware. */
   --color-background: var(--bg);
   --color-foreground: var(--fg);
   --color-card: var(--bg);
@@ -171,16 +166,16 @@
   --color-input: var(--border);
 
   /* shadcn primitives derive button + input rounding from --radius
-     via `rounded-[min(var(--radius-md),12px)]` and similar. OMA's
+     via `rounded-[min(var(--radius-md),12px)]` and similar. The console's
      existing rounded utilities use the Tailwind defaults, so pin a
      value that matches our existing chat bubble feel (rounded-lg). */
-  --radius: 0.5rem;
-  --radius-md: 0.5rem;
+  --radius: 0.4375rem;
+  --radius-md: 0.4375rem;
 
   /* shadcn `Sidebar` primitive lookups. The sidebar component reaches
      for its own --sidebar* family so its theming can drift from the
      main canvas (typical use: subtly different bg, darker borders).
-     OMA wants the sidebar to share the existing palette, so we alias
+     The console wants the sidebar to share the existing palette, so we alias
      straight through — bg-sidebar / fg / brand are all already
      theme-aware via :root / .dark. */
   --color-sidebar: var(--bg-sidebar);

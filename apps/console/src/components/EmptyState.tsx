@@ -1,5 +1,6 @@
 import type { ComponentType, ReactNode } from "react";
 import { BrandLoader } from "./BrandLoader";
+import { Logo } from "./Logo";
 import {
   EmptyAgentIcon,
   EmptyApiKeyIcon,
@@ -16,14 +17,12 @@ import {
 
 /**
  * Zero-data placeholder. Renders an entity-specific illustration (when
- * `kind` or `icon` is provided) or the brand mark `[ ]` (the
- * BrandLoader pulsing version when `loading`) plus a title + body +
+ * `kind` or `icon` is provided) or the product mark plus a title + body +
  * optional CTA slot.
  *
  * Used wherever a list / detail / dashboard panel has no content to show.
- * The illustration anchors the empty space so it doesn't read as a broken
- * page; falling back to the bracket vocabulary signals "openma" the way a
- * hand-drawn illustration signals personality elsewhere.
+ * The illustration anchors the empty space so it reads as an intentional
+ * system state instead of a broken page.
  *
  * Sizes:
  *   - sm  → fits inside table-empty rows or panel slots
@@ -32,11 +31,11 @@ import {
  */
 const SIZE: Record<
   "sm" | "md" | "lg",
-  { wrap: string; mark: string; icon: string; gap: string; title: string; body: string }
+  { wrap: string; icon: string; gap: string; title: string; body: string }
 > = {
-  sm: { wrap: "py-6 px-4", mark: "text-base", icon: "w-7 h-7", gap: "mb-2", title: "text-sm", body: "text-xs" },
-  md: { wrap: "py-10 px-6", mark: "text-lg", icon: "w-9 h-9", gap: "mb-3", title: "text-sm", body: "text-[13px]" },
-  lg: { wrap: "py-16 px-8", mark: "text-2xl", icon: "w-10 h-10", gap: "mb-4", title: "text-base", body: "text-sm" },
+  sm: { wrap: "py-6 px-4", icon: "w-7 h-7", gap: "mb-2", title: "text-sm", body: "text-xs" },
+  md: { wrap: "py-10 px-6", icon: "w-9 h-9", gap: "mb-3", title: "text-sm", body: "text-[13px]" },
+  lg: { wrap: "py-16 px-8", icon: "w-10 h-10", gap: "mb-4", title: "text-base", body: "text-sm" },
 };
 
 /** Entities that have a hand-drawn illustration. Anything not listed
@@ -102,9 +101,10 @@ export function EmptyState({
 }: EmptyStateProps) {
   const s = SIZE[size];
   const KindIcon = kind ? KIND_ICONS[kind] : null;
+  const logoSize = size === "lg" ? "lg" : size === "sm" ? "sm" : "md";
   return (
     <div
-      className={`border border-border rounded-lg bg-bg-surface/30 text-center ${s.wrap} ${className}`.trim()}
+      className={`border border-border rounded-lg bg-bg-surface text-center shadow-[var(--shadow-sm)] ${s.wrap} ${className}`.trim()}
     >
       <div className={`flex justify-center ${s.gap}`}>
         {loading ? (
@@ -116,12 +116,7 @@ export function EmptyState({
         ) : KindIcon ? (
           <KindIcon className={`${s.icon} text-fg-subtle`} />
         ) : (
-          <span
-            aria-hidden="true"
-            className={`font-mono font-bold text-fg-subtle select-none ${s.mark}`}
-          >
-            [&nbsp;&nbsp;]
-          </span>
+          <Logo size={logoSize} className="text-fg-subtle" />
         )}
       </div>
       <p className={`text-fg ${s.title} font-medium`}>{title}</p>

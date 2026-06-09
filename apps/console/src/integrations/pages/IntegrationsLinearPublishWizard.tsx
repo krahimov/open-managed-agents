@@ -8,6 +8,7 @@ import type {
 import { SecretInput, TextInput } from "../../components/Input";
 import { Combobox } from "../../components/Combobox";
 import { Field } from "../../components/Field";
+import { BRAND_NAME } from "../../lib/brand";
 
 const api = new IntegrationsApi();
 
@@ -218,7 +219,7 @@ export function IntegrationsLinearPublishWizard({
         </Link>
 
         <header className="mt-3 mb-6">
-          <h1 className="font-display text-[28px] leading-tight font-semibold tracking-tight text-fg">
+          <h1 className="font-display text-[28px] leading-tight font-semibold text-fg">
             Publish agent to Linear
           </h1>
           <p className="mt-1.5 text-[14px] text-fg-muted">
@@ -303,7 +304,7 @@ function StepIndicator({ current }: { current: Step }) {
                 )}
               </div>
               <span
-                className={`text-[12px] font-medium uppercase tracking-wider truncate ${
+                className={`text-[12px] font-medium uppercase truncate ${
                   state === "current"
                     ? "text-fg"
                     : state === "done"
@@ -444,7 +445,7 @@ function CredentialsStep(props: {
           <CopyRow label="Developer URL" value={window.location.origin} />
           <CopyRow
             label="Description"
-            value={`OMA-managed agent — ${props.shell.suggested_app_name}.`}
+            value={`${BRAND_NAME}-managed agent — ${props.shell.suggested_app_name}.`}
           />
           <CopyRow label="Callback URLs" value={props.shell.callback_url} />
           <CopyRow label="Webhook URL" value={props.shell.webhook_url} />
@@ -453,7 +454,7 @@ function CredentialsStep(props: {
           <li>
             <strong className="text-fg">GitHub username</strong> — leave empty.
             Only relevant if you also bind this OAuth app to a GitHub App with
-            <code className="mx-0.5">actor=app</code>; not used by OMA's
+            <code className="mx-0.5">actor=app</code>; not used by {BRAND_NAME}'s
             Linear-only flow.
           </li>
           <li>
@@ -462,7 +463,7 @@ function CredentialsStep(props: {
           </li>
           <li>
             <strong className="text-fg">Client credentials</strong> — leave OFF.
-            OMA uses the standard authorization-code OAuth flow.
+            {BRAND_NAME} uses the standard authorization-code OAuth flow.
           </li>
           <li>
             <strong className="text-fg">Webhooks</strong> — toggle ON, paste the
@@ -567,7 +568,7 @@ function CopyRow({ label, value, secret = false }: { label: string; value: strin
   const display = secret && !reveal ? "•".repeat(Math.min(value.length, 28)) : value;
   return (
     <div className="flex items-center gap-3 px-3 py-2">
-      <span className="text-[11px] text-fg-muted font-mono uppercase tracking-wider w-28 shrink-0">
+      <span className="text-[11px] text-fg-muted font-mono uppercase w-28 shrink-0">
         {label}
       </span>
       <code className="flex-1 text-[12px] font-mono text-fg truncate select-all">

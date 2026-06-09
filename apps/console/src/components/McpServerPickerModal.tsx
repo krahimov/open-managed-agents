@@ -17,7 +17,7 @@
 
 import { useState, type JSX } from "react";
 import { Modal } from "./Modal";
-import { MCP_REGISTRY, type McpRegistryEntry } from "../data/mcp-registry";
+import { MCP_REGISTRY, type McpRegistryEntry } from "../lib/mcp-registry";
 
 const inputCls =
   "w-full border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";

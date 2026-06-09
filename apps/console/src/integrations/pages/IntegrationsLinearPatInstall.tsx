@@ -98,7 +98,7 @@ export function IntegrationsLinearPatInstall({ loadAgents, loadEnvironments }: P
     <div className="flex-1 overflow-y-auto">
       <div className="max-w-[720px] mx-auto px-4 sm:px-8 lg:px-10 py-10 lg:py-12">
         <header className="mb-8">
-          <h1 className="font-display text-[28px] leading-tight font-semibold tracking-tight text-fg">
+          <h1 className="font-display text-[28px] leading-tight font-semibold text-fg">
             Install Linear via Personal API Key
           </h1>
           <p className="mt-1.5 text-[14px] text-fg-muted max-w-xl">

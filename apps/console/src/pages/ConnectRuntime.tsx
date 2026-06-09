@@ -3,6 +3,7 @@ import { useApi } from "../lib/api";
 import { useApiQuery } from "../lib/useApiQuery";
 import { Button } from "@/components/ui/button";
 import { Logo } from "../components/Logo";
+import { BRAND_NAME } from "../lib/brand";
 
 /** Browser-side handler for `oma bridge setup`. The CLI binds a random
  *  127.0.0.1 port and opens this URL with `?cb=http://127.0.0.1:<port>/cb&state=<nonce>`.
@@ -115,12 +116,12 @@ export function ConnectRuntime() {
 
   return (
     <div className="min-h-screen bg-bg flex items-center justify-center px-4">
-      <div className="w-full max-w-md bg-bg-surface border border-border rounded-xl p-8 shadow-sm">
+      <div className="w-full max-w-md bg-bg-surface border border-border rounded-lg p-8 shadow-[var(--shadow-md)]">
         <div className="flex items-center gap-3 mb-6">
           <Logo size="md" />
           <div>
-            <h1 className="font-display text-lg font-semibold">Connect machine</h1>
-            <div className="text-xs text-fg-subtle">openma local runtime</div>
+            <h1 className="text-lg font-semibold">Connect machine</h1>
+            <div className="text-xs text-fg-subtle">{BRAND_NAME} local runtime</div>
           </div>
         </div>
 
@@ -144,7 +145,7 @@ export function ConnectRuntime() {
         {!loading && !authNeeded && me && callbackOk && (
           <>
             <p className="text-sm text-fg-muted mb-2">
-              Allow this machine to attach to OMA as{" "}
+              Allow this machine to attach to {BRAND_NAME} as{" "}
               <span className="font-mono text-fg">
                 {me.user?.email ?? me.user?.id ?? "this user"}
               </span>{" "}

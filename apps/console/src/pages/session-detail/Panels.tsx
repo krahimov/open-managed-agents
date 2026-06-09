@@ -65,7 +65,7 @@ export function ResourcePanel({
     <aside className="w-[420px] shrink-0 bg-bg-surface/30 flex flex-col min-h-0">
       <div className="px-4 py-3 flex items-start gap-3 shrink-0">
         <div className="min-w-0 flex-1">
-          <div className="text-[10px] uppercase tracking-wide text-fg-subtle font-mono">
+          <div className="text-[10px] uppercase text-fg-subtle font-mono">
             {titleKind}
           </div>
           <div className="text-base font-semibold text-fg truncate">{displayName}</div>
@@ -145,7 +145,7 @@ export function FilesPanel({
     <aside className="w-[420px] shrink-0 bg-bg-surface/30 flex flex-col min-h-0">
       <div className="px-4 py-3 flex items-start gap-3 shrink-0">
         <div className="min-w-0 flex-1">
-          <div className="text-[10px] uppercase tracking-wide text-fg-subtle font-mono">
+          <div className="text-[10px] uppercase text-fg-subtle font-mono">
             Files
           </div>
           <div className="text-base font-semibold text-fg">Session outputs</div>

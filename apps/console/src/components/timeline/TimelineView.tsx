@@ -106,7 +106,7 @@ function DetailPanel({
     >
       <div className="px-4 py-3 border-b border-border flex items-center gap-3 shrink-0">
         <div className="min-w-0 flex-1">
-          <div className="text-[10px] uppercase tracking-wide text-fg-subtle font-mono">
+          <div className="text-[10px] uppercase text-fg-subtle font-mono">
             {selection.events.length === 1
               ? "source event"
               : `source events (${selection.events.length})`}

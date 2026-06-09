@@ -28,7 +28,7 @@ export function Page({ header, children, className = "" }: PageProps) {
   return (
     <>
       {header}
-      <div className={`pl-3 pr-4 pb-4 ${className}`.trim()}>{children}</div>
+      <div className={`pl-4 pr-5 pb-5 ${className}`.trim()}>{children}</div>
     </>
   );
 }

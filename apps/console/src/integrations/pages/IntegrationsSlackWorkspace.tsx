@@ -70,7 +70,7 @@ export function IntegrationsSlackWorkspace() {
         {installation && (
           <header className="mt-3 mb-7 flex items-end justify-between gap-6">
             <div className="min-w-0">
-              <h1 className="font-display text-[28px] leading-tight font-semibold tracking-tight text-fg truncate">
+              <h1 className="font-display text-[28px] leading-tight font-semibold text-fg truncate">
                 {installation.workspace_name}
               </h1>
               <p className="mt-1.5 text-[14px] text-fg-muted">
@@ -181,7 +181,7 @@ function PublicationCard({
           )}
           <div className="min-w-0">
             <div className="text-[15px] font-medium text-fg truncate">{pub.persona.name}</div>
-            <div className="text-[11px] text-fg-muted font-mono uppercase tracking-wider">
+            <div className="text-[11px] text-fg-muted font-mono uppercase">
               {pub.status}
             </div>
           </div>
@@ -230,7 +230,7 @@ function PublicationCard({
             <div className="grid sm:grid-cols-2 gap-x-6 gap-y-4">
               {CAPABILITY_GROUPS.map((g) => (
                 <div key={g.label}>
-                  <div className="font-mono text-[10px] tracking-wider text-fg-subtle uppercase mb-1.5">
+                  <div className="font-mono text-[10px] text-fg-subtle uppercase mb-1.5">
                     {g.label}
                   </div>
                   <div className="space-y-1">

@@ -944,7 +944,7 @@ export function SessionDetail() {
             )}
           </span>
           {slack.eventKind && (
-            <span className="opacity-60 font-mono uppercase tracking-wider text-[10px]">
+            <span className="opacity-60 font-mono uppercase text-[10px]">
               {slack.eventKind}
             </span>
           )}
@@ -1163,7 +1163,7 @@ export function SessionDetail() {
                   <ToolContent>
                     {partial && (
                       <div className="space-y-2 overflow-hidden">
-                        <h4 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">
+                        <h4 className="font-medium text-muted-foreground text-xs uppercase">
                           Streaming input
                         </h4>
                         <div className="rounded-md bg-muted/50">

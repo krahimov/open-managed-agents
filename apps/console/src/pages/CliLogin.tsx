@@ -3,6 +3,7 @@ import { useApi } from "../lib/api";
 import { useApiQuery } from "../lib/useApiQuery";
 import { Button } from "@/components/ui/button";
 import { Logo } from "../components/Logo";
+import { BRAND_NAME } from "../lib/brand";
 
 // Browser-side handler for `oma auth login`. The CLI opens this URL with
 // callback + state in the query string, the user authenticates (cookie
@@ -211,12 +212,12 @@ export function CliLogin() {
 
   return (
     <div className="min-h-screen bg-bg flex items-center justify-center px-4">
-      <div className="w-full max-w-md bg-bg-surface border border-border rounded-xl p-8 shadow-sm">
+      <div className="w-full max-w-md bg-bg-surface border border-border rounded-lg p-8 shadow-[var(--shadow-md)]">
         <div className="flex items-center gap-3 mb-6">
           <Logo size="md" />
           <div>
-            <h1 className="font-display text-lg font-semibold">Authorize CLI</h1>
-            <div className="text-xs text-fg-subtle">openma command-line client</div>
+            <h1 className="text-lg font-semibold">Authorize CLI</h1>
+            <div className="text-xs text-fg-subtle">{BRAND_NAME} command-line client</div>
           </div>
         </div>
 
@@ -259,7 +260,7 @@ export function CliLogin() {
               </div>
             ) : me.tenants.length === 1 ? (
               <div className="mb-5">
-                <div className="block text-xs uppercase tracking-wider text-fg-subtle mb-2">
+                <div className="block text-xs uppercase text-fg-subtle mb-2">
                   Workspace
                 </div>
                 <div className="bg-bg border border-border rounded-lg px-3 py-2.5 text-sm flex items-center gap-2">
@@ -268,7 +269,7 @@ export function CliLogin() {
                   </div>
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-fg">{tenantDisplayName(me.tenants[0])}</div>
-                    <div className="text-[10px] text-fg-subtle font-mono uppercase tracking-wider">
+                    <div className="text-[10px] text-fg-subtle font-mono uppercase">
                       {me.tenants[0].role}
                     </div>
                   </div>
@@ -277,7 +278,7 @@ export function CliLogin() {
             ) : (
               <div className="mb-5">
                 <div className="flex items-center justify-between mb-2">
-                  <div className="text-xs uppercase tracking-wider text-fg-subtle">
+                  <div className="text-xs uppercase text-fg-subtle">
                     Workspaces ({selected.size}/{me.tenants.length})
                   </div>
                   <div className="flex items-center gap-2 text-xs">

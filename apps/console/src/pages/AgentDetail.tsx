@@ -243,7 +243,7 @@ export function AgentDetail() {
           <div className="border border-border rounded-lg overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
-                <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase tracking-wider">
+                <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase">
                   <th className="text-left px-4 py-2">Version</th>
                   <th className="text-left px-4 py-2">Model</th>
                   <th className="text-left px-4 py-2">System Prompt</th>

@@ -905,6 +905,14 @@ v1.route("/vaults", buildVaultRoutes({
   composio: { apiKey: process.env.COMPOSIO_API_KEY },
 }));
 v1.route("/oauth", buildNodeOAuthRoutes({ services, env: process.env }));
+v1.get("/composio/status", (c) =>
+  c.json({
+    configured: !!process.env.COMPOSIO_API_KEY,
+    message: process.env.COMPOSIO_API_KEY
+      ? null
+      : "COMPOSIO_API_KEY is not configured",
+  }),
+);
 v1.get("/composio/toolkits", async (c) => {
   if (!process.env.COMPOSIO_API_KEY) {
     return c.json({ error: "COMPOSIO_API_KEY is not configured" }, 503);

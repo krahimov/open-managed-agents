@@ -57,12 +57,12 @@ export function PageHeader({
   if (!hasTopRow && !toolbar && !tableHeader) return null;
 
   return createPortal(
-    <div className={cn("bg-bg", className)}>
+    <div className={cn("bg-bg/92 backdrop-blur supports-[backdrop-filter]:bg-bg/86", className)}>
       {hasTopRow && (
-        <div className="flex items-start gap-4 pl-3 pr-4 pt-3">
+        <div className="flex items-start gap-4 pl-4 pr-5 pt-3">
           <div className="min-w-0 flex-1">
             {title && (
-              <h1 className="text-xl font-semibold tracking-tight truncate">
+              <h1 className="text-lg font-semibold truncate">
                 {title}
               </h1>
             )}
@@ -76,12 +76,12 @@ export function PageHeader({
         </div>
       )}
       {toolbar && (
-        <div className="flex items-center gap-2 pl-3 pr-4 py-3 overflow-x-auto">
+        <div className="flex items-center gap-2 pl-4 pr-5 py-3 overflow-x-auto">
           {toolbar}
         </div>
       )}
       {tableHeader && (
-        <div className="pl-3 pr-4">
+        <div className="pl-4 pr-5">
           {tableHeader}
         </div>
       )}

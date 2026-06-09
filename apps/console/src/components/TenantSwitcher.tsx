@@ -98,7 +98,7 @@ export function TenantSwitcher() {
             type="button"
             aria-label="Switch workspace"
             disabled={!ready}
-            className="w-full h-11 px-3 flex items-center gap-2 hover:bg-sidebar-accent transition-colors text-left disabled:cursor-default disabled:hover:bg-transparent outline-none focus-visible:bg-sidebar-accent"
+            className="mx-2 w-[calc(100%-1rem)] h-9 rounded-md px-2 flex items-center gap-2 text-left text-fg-muted hover:bg-bg-surface hover:text-fg transition-colors disabled:cursor-default disabled:hover:bg-transparent outline-none focus-visible:bg-bg-surface"
           >
             {ready ? (
               <Avatar name={current.name} size="sm" squared />
@@ -110,7 +110,7 @@ export function TenantSwitcher() {
                 {ready ? displayName(current) : " "}
               </div>
               {ready && tenants.length > 1 && (
-                <div className="text-[10px] text-fg-subtle uppercase tracking-wider">
+                <div className="text-[10px] text-fg-subtle uppercase">
                   {current.role}
                 </div>
               )}
@@ -217,7 +217,7 @@ function CreateTenantModal({
           and integrations. You'll be the owner of the new one.
         </p>
         <div>
-          <label htmlFor="tenant-create-name" className="block text-xs uppercase tracking-wider text-fg-subtle mb-1">
+          <label htmlFor="tenant-create-name" className="block text-xs uppercase text-fg-subtle mb-1">
             Name
           </label>
           <input

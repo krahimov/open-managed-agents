@@ -9,6 +9,7 @@ import { DataTable, type ColumnDef } from "../components/DataTable";
 import { FacetedFilter } from "../components/FacetedFilter";
 import { FilterChip } from "../components/FilterChip";
 import { RowActionsMenu } from "../components/RowActionsMenu";
+import { BRAND_NAME } from "../lib/brand";
 
 interface LocalSkill {
   id: string;
@@ -118,7 +119,7 @@ export function RuntimesList() {
                     {Object.entries(r.local_skills ?? {}).map(([acpId, skills]) =>
                       !skills?.length ? null : (
                         <div key={acpId}>
-                          <div className="text-fg-subtle text-[10px] uppercase tracking-wider mb-0.5">
+                          <div className="text-fg-subtle text-[10px] uppercase mb-0.5">
                             for {acpId}
                           </div>
                           <ul className="space-y-0.5">
@@ -292,7 +293,7 @@ export function RuntimesList() {
           </p>
           <div>
             <p className="text-fg-muted text-xs mb-1.5">
-              <strong>★ Featured agents</strong> — OMA's recommended set:
+              <strong>★ Featured agents</strong> — {BRAND_NAME}'s recommended set:
             </p>
             <ul className="text-xs text-fg-muted space-y-1 ml-4 list-disc font-mono">
               <li><span className="text-fg">claude-acp</span> · <code className="bg-bg-surface px-1 rounded">npx -y @agentclientprotocol/claude-agent-acp</code> (auto-installed if <code className="bg-bg-surface px-1 rounded">claude</code> is on PATH)</li>

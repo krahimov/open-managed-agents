@@ -212,7 +212,7 @@ export function IntegrationsSlackPublishWizard({
         </Link>
 
         <header className="mt-3 mb-6">
-          <h1 className="font-display text-[28px] leading-tight font-semibold tracking-tight text-fg">
+          <h1 className="font-display text-[28px] leading-tight font-semibold text-fg">
             Publish agent to Slack
           </h1>
           <p className="mt-1.5 text-[14px] text-fg-muted">
@@ -339,7 +339,7 @@ function StepIndicator({ current }: { current: Step }) {
                 )}
               </div>
               <span
-                className={`text-[12px] font-medium uppercase tracking-wider truncate ${
+                className={`text-[12px] font-medium uppercase truncate ${
                   state === "current"
                     ? "text-fg"
                     : state === "done"
@@ -702,7 +702,7 @@ function CopyRow({ label, value, secret = false }: { label: string; value: strin
   const display = secret && !reveal ? "•".repeat(Math.min(value.length, 28)) : value;
   return (
     <div className="flex items-center gap-3 px-3 py-2">
-      <span className="text-[11px] text-fg-muted font-mono uppercase tracking-wider w-28 shrink-0">
+      <span className="text-[11px] text-fg-muted font-mono uppercase w-28 shrink-0">
         {label}
       </span>
       <code className="flex-1 text-[12px] font-mono text-fg truncate select-all">

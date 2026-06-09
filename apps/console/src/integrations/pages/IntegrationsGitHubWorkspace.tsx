@@ -184,7 +184,7 @@ function BotIdentityCard({
         <div className="flex items-start gap-4 min-w-0">
           <BotAvatar login={installation.bot_login} />
           <div className="min-w-0">
-            <h1 className="font-display text-[26px] leading-tight font-semibold tracking-tight text-fg truncate">
+            <h1 className="font-display text-[26px] leading-tight font-semibold text-fg truncate">
               {installation.workspace_name}
             </h1>
             <p className="mt-1 text-[13px] text-fg-muted">
@@ -261,7 +261,7 @@ function computeWorkspaceStatus(
 function SectionHeading({ title, hint }: { title: string; hint?: string }) {
   return (
     <div className="flex items-baseline justify-between mb-3">
-      <h2 className="font-display text-[18px] font-semibold text-fg tracking-tight">
+      <h2 className="font-display text-[18px] font-semibold text-fg">
         {title}
       </h2>
       {hint && <span className="text-[12px] text-fg-muted">{hint}</span>}
@@ -272,7 +272,7 @@ function SectionHeading({ title, hint }: { title: string; hint?: string }) {
 function WakesUpOn() {
   return (
     <section>
-      <h2 className="font-display text-[18px] font-semibold text-fg tracking-tight mb-3">
+      <h2 className="font-display text-[18px] font-semibold text-fg mb-3">
         Wakes up on
       </h2>
       <ul className="space-y-3">
@@ -490,7 +490,7 @@ function PublicationCard({
             if (g.caps.length === 0) return null;
             return (
               <div key={g.label}>
-                <h3 className="text-[10px] uppercase tracking-wider text-fg-subtle font-mono mb-2">
+                <h3 className="text-[10px] uppercase text-fg-subtle font-mono mb-2">
                   {g.label}
                 </h3>
                 <div className="flex flex-wrap gap-1">

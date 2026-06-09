@@ -1,15 +1,5 @@
-/**
- * Brand mark — `[horse]` logo. Inlined as React SVG (no `<img>` round-
- * trip and no width/height-attr-vs-CSS-class mismatch that previously
- * caused an 8-px collapse on first paint when CSS resized 32×32 →
- * 24×24).
- *
- * Artwork copied verbatim from `public/logo.svg` (horse paths + mask)
- * — same visual identity as before. JetBrains Mono brackets render
- * via the bundled font (`@fontsource-variable/jetbrains-mono` imported
- * from main.tsx), so the glyphs are ready synchronously with the JS
- * bundle and don't race a Google Fonts request.
- */
+import { BRAND_NAME } from "@/lib/brand";
+
 const SIZE_PX = {
   sm: 24,
   md: 28,
@@ -27,59 +17,33 @@ export function Logo({ size = "sm", className = "" }: LogoProps) {
     <svg
       width={px}
       height={px}
-      viewBox="196 55 162 113"
+      viewBox="0 0 32 32"
       role="img"
-      aria-label="openma"
-      className={`shrink-0 ${className}`.trim()}
+      aria-label={BRAND_NAME}
+      className={`shrink-0 text-brand ${className}`.trim()}
       xmlns="http://www.w3.org/2000/svg"
     >
-      <defs>
-        <mask id="oma-logo-mask" maskUnits="userSpaceOnUse">
-          <rect x="-200" y="-200" width="900" height="900" fill="white" />
-          <rect x="-4" y="16.4" width="62.2" height="108.8" fill="black" rx="2" />
-          <rect x="96" y="16.4" width="62.2" height="108.8" fill="black" rx="2" />
-        </mask>
-      </defs>
-      <g
-        transform="translate(200, 40)"
+      <rect
+        x="5"
+        y="5"
+        width="22"
+        height="22"
+        rx="6"
+        fill="currentColor"
+        opacity="0.12"
+      />
+      <path
+        d="M10 21.5 15.2 10.5 18.7 18.2 22 12.2"
         fill="none"
-        stroke="#FF6B50"
-        strokeWidth="4.5"
+        stroke="currentColor"
+        strokeWidth="2.25"
         strokeLinecap="round"
         strokeLinejoin="round"
-      >
-        <text
-          fontFamily="'JetBrains Mono Variable', 'JetBrains Mono', 'SF Mono', monospace"
-          fontSize="90"
-          fontWeight="800"
-          fill="#FF6B50"
-          stroke="none"
-          x="0"
-          y="102"
-        >
-          [
-        </text>
-        <g transform="translate(52, 10)">
-          <path d="M30,50 Q28,30 22,8 Q35,20 40,45" mask="url(#oma-logo-mask)" />
-          <path
-            d="M30,50 Q28,58 30,65"
-            strokeWidth="3"
-            mask="url(#oma-logo-mask)"
-          />
-          <circle cx="34" cy="52" r="3.5" fill="#FF6B50" stroke="none" />
-        </g>
-        <text
-          fontFamily="'JetBrains Mono Variable', 'JetBrains Mono', 'SF Mono', monospace"
-          fontSize="90"
-          fontWeight="800"
-          fill="#FF6B50"
-          stroke="none"
-          x="100"
-          y="102"
-        >
-          ]
-        </text>
-      </g>
+      />
+      <circle cx="10" cy="21.5" r="2" fill="currentColor" />
+      <circle cx="15.2" cy="10.5" r="2" fill="currentColor" />
+      <circle cx="18.7" cy="18.2" r="2" fill="currentColor" />
+      <circle cx="22" cy="12.2" r="2" fill="currentColor" />
     </svg>
   );
 }

@@ -6,6 +6,7 @@ import { toast } from "sonner";
 import { StatusPill } from "../components/Badge";
 import { EmptyState } from "../components/EmptyState";
 import { Skeleton } from "../components/Skeleton";
+import { BRAND_NAME } from "../lib/brand";
 
 interface Stats {
   agents: number;
@@ -54,12 +55,12 @@ export function Dashboard() {
     <button
       key={label}
       onClick={() => nav(to)}
-      className="group relative text-left px-4 py-3.5 border border-border rounded-md bg-bg hover:border-border-strong hover:bg-bg-surface/40 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+      className="group relative text-left px-4 py-3.5 border border-border rounded-md bg-bg-surface shadow-[var(--shadow-sm)] hover:border-border-strong hover:bg-brand-subtle/45 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
     >
       <div className="font-display text-[28px] leading-none font-semibold text-fg group-hover:text-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] tabular-nums">
         {value ?? "–"}
       </div>
-      <div className="mt-2 text-[11px] uppercase tracking-[0.08em] text-fg-muted font-medium">
+      <div className="mt-2 text-[11px] uppercase text-fg-muted font-medium">
         {label}
       </div>
     </button>
@@ -77,37 +78,37 @@ export function Dashboard() {
   const cmd = "npx -y -p @openma/cli oma";
   const cmdGlobal = "npm i -g @openma/cli";
   const examplePrompt =
-    "Use oma to create a research agent that monitors arXiv for new ML papers daily";
+    `Use ${BRAND_NAME} to create a research agent that monitors arXiv for new ML papers daily`;
 
   return (
     <div className="flex-1 overflow-y-auto">
-      <div className="pl-3 pr-4 py-6 space-y-10">
+      <div className="pl-4 pr-5 py-6 space-y-10">
         {/* Header */}
         <header>
-          <h1 className="font-display text-[32px] leading-tight font-semibold tracking-tight text-fg">
-            Get started with openma
+          <h1 className="text-[30px] leading-tight font-semibold text-fg">
+            Get started with {BRAND_NAME}
           </h1>
           <p className="mt-1.5 text-[15px] text-fg-muted">
-            Hand the platform to your agent — install the CLI, mint a key, point them at it.
+            Install the CLI, mint a key, and let agents operate against your control plane.
           </p>
         </header>
 
         {/* Quickstart — single panel with three rows, no per-step cards */}
-        <section className="border border-border rounded-lg overflow-hidden">
+        <section className="border border-border rounded-lg bg-bg-surface shadow-[var(--shadow-sm)] overflow-hidden">
           {/* Step 1 */}
           <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6 border-b border-border">
             <div>
-              <div className="font-mono text-[11px] tracking-wider text-brand">STEP 01</div>
+              <div className="font-mono text-[11px] text-brand">STEP 01</div>
               <div className="mt-1 font-medium text-fg text-[15px]">Install the CLI</div>
             </div>
             <div className="space-y-2.5 min-w-0">
               <p className="text-sm text-fg-muted">
-                The <code className="font-mono text-[13px] text-fg">oma</code> CLI lets your
+                The command-line client lets your
                 agent (or you) drive the platform from the terminal.
               </p>
               <button
                 onClick={() => copy(cmd, "cmd")}
-                className="group w-full sm:w-auto sm:inline-flex items-center gap-3 pl-3 pr-2 py-2 rounded-md border border-border bg-bg-surface/50 hover:border-border-strong transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] text-left"
+                className="group flex w-full sm:w-auto sm:inline-flex items-center gap-3 pl-3 pr-2 py-2 rounded-md border border-border bg-bg hover:border-border-strong hover:bg-brand-subtle/45 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] text-left"
               >
                 <span className="text-fg-subtle select-none font-mono text-xs">›</span>
                 <span className="font-mono text-[13px] text-fg flex-1 truncate">{cmd}</span>
@@ -134,7 +135,7 @@ export function Dashboard() {
           {/* Step 2 */}
           <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6 border-b border-border">
             <div>
-              <div className="font-mono text-[11px] tracking-wider text-brand">STEP 02</div>
+              <div className="font-mono text-[11px] text-brand">STEP 02</div>
               <div className="mt-1 font-medium text-fg text-[15px]">Mint an API key</div>
             </div>
             <div className="space-y-2.5">
@@ -154,20 +155,19 @@ export function Dashboard() {
           {/* Step 3 */}
           <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6">
             <div>
-              <div className="font-mono text-[11px] tracking-wider text-brand">STEP 03</div>
-              <div className="mt-1 font-medium text-fg text-[15px]">Hand it the reins</div>
+              <div className="font-mono text-[11px] text-brand">STEP 03</div>
+              <div className="mt-1 font-medium text-fg text-[15px]">Give it the task</div>
             </div>
             <div className="space-y-2.5">
               <p className="text-sm text-fg-muted">
-                Point your agent at the <code className="font-mono text-[13px] text-fg">openma-cli</code>{" "}
-                or <code className="font-mono text-[13px] text-fg">openma-api</code> skill, then
+                Point your agent at the CLI or API skill, then
                 ask for what you want:
               </p>
               <button
                 onClick={() => copy(examplePrompt, "prompt")}
-                className="group w-full text-left rounded-md border border-border bg-bg-surface/50 hover:border-border-strong transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] p-3 flex items-start gap-3"
+                className="group w-full text-left rounded-md border border-border bg-bg hover:border-border-strong hover:bg-brand-subtle/45 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] p-3 flex items-start gap-3"
               >
-                <span className="shrink-0 mt-0.5 font-mono text-[10px] tracking-wider text-fg-subtle">
+                <span className="shrink-0 mt-0.5 font-mono text-[10px] text-fg-subtle">
                   PROMPT
                 </span>
                 <span className="flex-1 text-[13px] text-fg leading-snug">{examplePrompt}</span>
@@ -215,7 +215,7 @@ export function Dashboard() {
             </div>
           ) : recentSessions.length === 0 ? (
             <EmptyState
-              title="No sessions yet — the stable's empty."
+              title="No sessions yet"
               body={
                 <>
                   Tell your agent to start one, or visit the{" "}
@@ -230,10 +230,10 @@ export function Dashboard() {
               }
             />
           ) : (
-            <div className="border border-border rounded-lg overflow-x-auto">
+            <div className="border border-border rounded-lg bg-bg-surface shadow-[var(--shadow-sm)] overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
-                  <tr className="bg-bg-surface/40 text-fg-subtle text-[11px] uppercase tracking-[0.08em]">
+                  <tr className="bg-bg text-fg-subtle text-[11px] uppercase">
                     <th className="text-left px-4 py-2.5 font-medium">Title</th>
                     <th className="text-left px-4 py-2.5 font-medium">Status</th>
                     <th className="text-left px-4 py-2.5 font-medium">Agent</th>
@@ -245,7 +245,7 @@ export function Dashboard() {
                     <tr
                       key={s.id}
                       onClick={() => nav(`/sessions/${s.id}`)}
-                      className="border-t border-border hover:bg-bg-surface/40 cursor-pointer transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+                      className="border-t border-border hover:bg-brand-subtle/45 cursor-pointer transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
                     >
                       <td className="px-4 py-2.5 text-fg">{s.title || "Untitled"}</td>
                       <td className="px-4 py-2.5">

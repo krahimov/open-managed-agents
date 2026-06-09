@@ -9,6 +9,7 @@ import {
   buildApiKeyRoutes,
   buildMeRoutes,
   buildTenantRoutes,
+  listComposioToolkits,
   mintApiKeyOnStorage,
 } from "@open-managed-agents/http-routes";
 import {
@@ -209,6 +210,38 @@ const vaultsRoutes = new Hono<{ Bindings: Env; Variables: { tenant_id: string } 
   return invokePackage(c, app);
 });
 
+const composioRoutes = new Hono<{
+  Bindings: Env;
+  Variables: { tenant_id: string; user_id?: string };
+}>();
+composioRoutes.get("/status", (c) =>
+  c.json({
+    configured: !!c.env.COMPOSIO_API_KEY,
+    message: c.env.COMPOSIO_API_KEY
+      ? null
+      : "COMPOSIO_API_KEY is not configured",
+  }),
+);
+composioRoutes.get("/toolkits", async (c) => {
+  if (!c.env.COMPOSIO_API_KEY) {
+    return c.json({ error: "COMPOSIO_API_KEY is not configured" }, 503);
+  }
+  try {
+    const catalog = await listComposioToolkits(
+      { apiKey: c.env.COMPOSIO_API_KEY },
+      {
+        search: c.req.query("q") || undefined,
+        category: c.req.query("category") || undefined,
+        cursor: c.req.query("cursor") || undefined,
+        limit: Number.parseInt(c.req.query("limit") || "300", 10),
+      },
+    );
+    return c.json(catalog);
+  } catch (err) {
+    return c.json({ error: `Failed to fetch Composio toolkits: ${(err as Error).message}` }, 502);
+  }
+});
+
 const apiKeysRoutes = new Hono<{
   Bindings: Env;
   Variables: { tenant_id: string; user_id?: string };
@@ -376,6 +409,7 @@ app.route("/v1/agents", agentsRoutes);
 app.route("/v1/environments", environmentsRoutes);
 app.route("/v1/sessions", sessionsRoutes);
 app.route("/v1/vaults", vaultsRoutes);
+app.route("/v1/composio", composioRoutes);
 app.route("/v1/oauth", oauthRoutes);
 app.route("/v1/cap-cli/oauth", capCliOauthRoutes);
 app.route("/v1/memory_stores", memoryRoutes);

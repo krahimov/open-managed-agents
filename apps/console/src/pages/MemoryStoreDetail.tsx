@@ -247,7 +247,7 @@ function MemoriesPanel({ storeId, archived }: { storeId: string; archived: boole
         <div className="border border-border rounded-lg overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
-              <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase tracking-wider">
+              <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase">
                 <th className="text-left px-4 py-2.5">Path</th>
                 <th className="text-left px-4 py-2.5">Size</th>
                 <th className="text-left px-4 py-2.5">SHA-256</th>
@@ -481,7 +481,7 @@ function MemoryDetailDialog({
         <div className="mt-4 border border-border rounded-lg overflow-x-auto">
           <table className="w-full text-xs">
             <thead>
-              <tr className="bg-bg-surface/60 text-fg-muted uppercase tracking-wider">
+              <tr className="bg-bg-surface/60 text-fg-muted uppercase">
                 <th className="text-left px-3 py-2">When</th>
                 <th className="text-left px-3 py-2">Op</th>
                 <th className="text-left px-3 py-2">Actor</th>
@@ -555,7 +555,7 @@ function VersionsPanel({ storeId }: { storeId: string }) {
     <div className="border border-border rounded-lg overflow-x-auto">
       <table className="w-full text-sm">
         <thead>
-          <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase tracking-wider">
+          <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase">
             <th className="text-left px-4 py-2.5">When</th>
             <th className="text-left px-4 py-2.5">Op</th>
             <th className="text-left px-4 py-2.5">Path</th>
@@ -589,23 +589,23 @@ function SettingsPanel({ store, archived }: { store: MemoryStore; archived: bool
   return (
     <div className="space-y-4 text-sm">
       <div>
-        <div className="text-fg-muted text-xs uppercase tracking-wider mb-1">Store ID</div>
+        <div className="text-fg-muted text-xs uppercase mb-1">Store ID</div>
         <code className="font-mono text-xs">{store.id}</code>
       </div>
       <div>
-        <div className="text-fg-muted text-xs uppercase tracking-wider mb-1">Mount path</div>
+        <div className="text-fg-muted text-xs uppercase mb-1">Mount path</div>
         <code className="font-mono text-xs">/mnt/memory/{store.name}/</code>
         <p className="text-fg-subtle text-xs mt-1">
           When this store is attached to a session, the agent reads/writes under this path with standard file tools.
         </p>
       </div>
       <div>
-        <div className="text-fg-muted text-xs uppercase tracking-wider mb-1">Created</div>
+        <div className="text-fg-muted text-xs uppercase mb-1">Created</div>
         <span>{new Date(store.created_at).toLocaleString()}</span>
       </div>
       {archived && (
         <div>
-          <div className="text-fg-muted text-xs uppercase tracking-wider mb-1">Archived</div>
+          <div className="text-fg-muted text-xs uppercase mb-1">Archived</div>
           <span>{new Date(store.archived_at!).toLocaleString()}</span>
           <p className="text-fg-subtle text-xs mt-1">Archived stores are read-only and cannot be attached to new sessions.</p>
         </div>
@@ -674,7 +674,7 @@ function WriteMemoryDialog({
     >
       {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
 
-      <label htmlFor="new-memory-path" className="block text-xs font-medium uppercase tracking-wider text-fg-muted mb-1">Path</label>
+      <label htmlFor="new-memory-path" className="block text-xs font-medium uppercase text-fg-muted mb-1">Path</label>
       <input
         id="new-memory-path"
         placeholder="/preferences/formatting.md"
@@ -683,7 +683,7 @@ function WriteMemoryDialog({
         className="w-full font-mono border border-border rounded-lg px-3 py-2 text-sm mb-3 bg-bg text-fg outline-none focus:border-border-strong"
       />
 
-      <label htmlFor="new-memory-content" className="block text-xs font-medium uppercase tracking-wider text-fg-muted mb-1">Content (max 100KB)</label>
+      <label htmlFor="new-memory-content" className="block text-xs font-medium uppercase text-fg-muted mb-1">Content (max 100KB)</label>
       <textarea
         id="new-memory-content"
         value={content}

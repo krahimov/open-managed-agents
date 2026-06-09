@@ -10,13 +10,15 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectGroup, SelectGroupLabel, SelectOption } from "../../components/Select";
 import { Combobox } from "../../components/Combobox";
 import { McpServerPickerModal } from "../../components/McpServerPickerModal";
-import { AGENT_TEMPLATES, type AgentTemplate } from "../../data/templates";
+import { AGENT_TEMPLATES, type AgentTemplate } from "../../lib/agent-templates";
 import {
+  COMPOSIO_NOT_CONFIGURED_MESSAGE,
   composioEntriesFromCatalog,
   composioIntegrationIcon,
   filterComposioEntries,
   type ComposioToolkitCatalogResponse,
   type ComposioIntegrationEntry,
+  type ComposioStatusResponse,
 } from "../../lib/composio-integrations";
 import type { ModelCard } from "@open-managed-agents/api-types";
 import {
@@ -24,6 +26,7 @@ import {
   resolveKnownAgent,
 } from "@open-managed-agents/acp-runtime/known-agents";
 import type { AgentRecord as Agent } from "../../types/agent";
+import { BRAND_NAME } from "../../lib/brand";
 
 interface McpEntry {
   name: string;
@@ -228,6 +231,11 @@ export function AgentFormDialog({
   const [composioConnections, setComposioConnections] =
     useState<ComposioConnectionState>({});
   const [connectingIntegration, setConnectingIntegration] = useState<string | null>(null);
+  const { data: composioStatus, isLoading: composioStatusLoading } =
+    useApiQuery<ComposioStatusResponse>("/v1/composio/status", undefined, {
+      enabled: open,
+    });
+  const composioConfigured = composioStatus?.configured === true;
 
   const createDialogRef = useRef<HTMLDivElement>(null);
   const createPreviousFocus = useRef<HTMLElement | null>(null);
@@ -436,6 +444,10 @@ export function AgentFormDialog({
   };
 
   const connectComposioToolkit = async (entry: ComposioIntegrationEntry) => {
+    if (!composioConfigured) {
+      toast.error(COMPOSIO_NOT_CONFIGURED_MESSAGE);
+      return;
+    }
     const slug = normalizeToolkitSlug(entry.slug);
     const popup = window.open("", `composio-${slug}`, "width=600,height=720,popup=yes");
     setConnectingIntegration(slug);
@@ -493,6 +505,9 @@ export function AgentFormDialog({
 
   const ensureComposioCredentialForAgent = async (): Promise<string[]> => {
     if (form.composioToolkits.length === 0) return form.defaultVaultIds;
+    if (!composioConfigured) {
+      throw new Error(COMPOSIO_NOT_CONFIGURED_MESSAGE);
+    }
     const missing = form.composioToolkits.filter(
       (slug) => composioConnections[slug]?.status !== "connected",
     );
@@ -1068,6 +1083,8 @@ export function AgentFormDialog({
                     setSearch={setIntegrationSearch}
                     connections={composioConnections}
                     connecting={connectingIntegration}
+                    composioConfigured={composioConfigured}
+                    composioStatusLoading={composioStatusLoading}
                     onToggle={toggleIntegration}
                     onConnect={(entry) => void connectComposioToolkit(entry)}
                   />
@@ -1319,9 +1336,11 @@ function BasicTab({
                   acpAgentId: rid && first ? first : form.acpAgentId,
                 });
               }}
-              placeholder="— Cloud (run on OMA) —"
+              placeholder={`— Cloud (run on ${BRAND_NAME}) —`}
             >
-              <SelectOption value="__cloud__">— Cloud (run on OMA) —</SelectOption>
+              <SelectOption value="__cloud__">
+                — Cloud (run on {BRAND_NAME}) —
+              </SelectOption>
               {runtimeRows.map((r) => (
                 <SelectOption key={r.id} value={r.id} disabled={r.status !== "online"}>
                   {r.hostname} ({r.status}
@@ -1488,6 +1507,8 @@ function IntegrationsTab({
   setSearch,
   connections,
   connecting,
+  composioConfigured,
+  composioStatusLoading,
   onToggle,
   onConnect,
 }: {
@@ -1496,11 +1517,15 @@ function IntegrationsTab({
   setSearch: (value: string) => void;
   connections: ComposioConnectionState;
   connecting: string | null;
+  composioConfigured: boolean;
+  composioStatusLoading: boolean;
   onToggle: (entry: ComposioIntegrationEntry) => void;
   onConnect: (entry: ComposioIntegrationEntry) => void;
 }) {
   const { data: catalogRes, isLoading: catalogLoading } =
-    useApiQuery<ComposioToolkitCatalogResponse>("/v1/composio/toolkits?limit=500");
+    useApiQuery<ComposioToolkitCatalogResponse>("/v1/composio/toolkits?limit=500", undefined, {
+      enabled: composioConfigured,
+    });
   const catalogEntries = useMemo(() => composioEntriesFromCatalog(catalogRes), [catalogRes]);
   const filtered = useMemo(
     () => filterComposioEntries(catalogEntries, search),
@@ -1514,7 +1539,9 @@ function IntegrationsTab({
           <div className="text-sm font-medium text-fg">Connected apps</div>
           <div className="text-xs text-fg-subtle">
             {form.composioToolkits.length} selected
-            {catalogLoading ? " · loading catalog" : ` · ${catalogEntries.length} available`}
+            {composioStatusLoading || (composioConfigured && catalogLoading)
+              ? " · loading catalog"
+              : ` · ${catalogEntries.length} available`}
           </div>
         </div>
         <input
@@ -1524,6 +1551,12 @@ function IntegrationsTab({
           className="w-full sm:w-64 border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-brand placeholder:text-fg-subtle"
         />
       </div>
+
+      {!composioStatusLoading && !composioConfigured && (
+        <div className="rounded-md border border-warning/30 bg-warning-subtle px-3 py-2 text-sm text-warning">
+          {COMPOSIO_NOT_CONFIGURED_MESSAGE}
+        </div>
+      )}
 
       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
         {filtered.map((entry) => {
@@ -1589,7 +1622,7 @@ function IntegrationsTab({
                       onConnect(entry);
                     }
                   }}
-                  disabled={!!connecting}
+                  disabled={!composioConfigured || !!connecting}
                   className="gap-1.5"
                 >
                   {connected ? <CheckIcon className="w-3.5 h-3.5" /> : <ExternalLinkIcon className="w-3.5 h-3.5" />}

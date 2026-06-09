@@ -4,6 +4,7 @@ import { IntegrationsApi } from "../api/client";
 import type { GitHubA1FormStep, GitHubA1InstallLink } from "../api/types";
 import { Combobox } from "../../components/Combobox";
 import { Field } from "../../components/Field";
+import { BRAND_NAME } from "../../lib/brand";
 
 const api = new IntegrationsApi();
 
@@ -267,7 +268,7 @@ export function IntegrationsGitHubBindWizard({ loadAgents, loadEnvironments }: P
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="max-w-[680px] mx-auto px-4 sm:px-8 lg:px-10 py-10 lg:py-12">
-        <h1 className="font-display text-[28px] leading-tight font-semibold tracking-tight text-fg mb-2">
+        <h1 className="font-display text-[28px] leading-tight font-semibold text-fg mb-2">
           Bind agent to GitHub
         </h1>
         <p className="text-[14px] text-fg-muted mb-8">
@@ -458,8 +459,8 @@ function ConfigForm({
             label trigger.)
           </li>
           <li>
-            On install, OMA auto-creates the label in your selected repos. If
-            you delete it, OMA won't recreate it.
+            On install, {BRAND_NAME} auto-creates the label in your selected repos. If
+            you delete it, {BRAND_NAME} won't recreate it.
           </li>
           <li>
             Removing the label from an issue stops further auto-wakeups on

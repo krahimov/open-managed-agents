@@ -8,11 +8,8 @@ import {
   type UIMatch,
 } from "react-router";
 import { QueryClientProvider } from "@tanstack/react-query";
-// Bundled font (woff2 shipped with the app) so Logo's `[ ]` brackets render
-// in JetBrains Mono on first paint — Google Fonts `display=swap` would
-// otherwise render the brackets in SF Mono first, then re-render in
-// JetBrains Mono when the network fetch resolves, producing a visible
-// width shift in the sidebar header.
+// Bundled fonts keep first paint stable without waiting on Google Fonts.
+import "@fontsource-variable/geist";
 import "@fontsource-variable/jetbrains-mono";
 import "./index.css";
 import { AuthProvider } from "./lib/auth";

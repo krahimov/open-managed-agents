@@ -36,7 +36,6 @@ import { AppBreadcrumb } from "./AppBreadcrumb";
 import { BrandLoader } from "./BrandLoader";
 import { CommandPalette } from "./CommandPalette";
 import { NavigationProgress } from "./NavigationProgress";
-import { Logo } from "./Logo";
 
 /**
  * AppShell — sidebar + main outlet.
@@ -60,8 +59,8 @@ import { Logo } from "./Logo";
  *     `group-data-[side=left]:border-r` leaves a hairline at the seam
  *     that anti-aliases into a visible dark line against the rounded
  *     corner next door.
- *   - Top header is `h-11 bg-sidebar shrink-0` — same baseline as the
- *     sidebar brand row so `[ logo openma ]` and `[ trigger / crumb ]`
+ *   - Top header is `h-12 bg-sidebar shrink-0` — same baseline as the
+ *     sidebar brand row so brand + trigger / crumb align
  *     align horizontally on one shared 44-px band.
  *   - PageHeader is portaled into a `shrink-0` slot that sits ABOVE
  *     `<main>` (the scroll context) — slot literally cannot scroll,
@@ -124,7 +123,7 @@ export function AppShell() {
         className="h-svh overflow-hidden"
         style={{
           // 224px expanded, 52px collapsed-icon — matches benchmark.
-          "--sidebar-width": "14rem",
+          "--sidebar-width": "14.75rem",
           "--sidebar-width-icon": "3.25rem",
         } as React.CSSProperties}
       >
@@ -160,12 +159,12 @@ export function AppShell() {
           <AppSidebar />
 
           <div className="flex-1 min-w-0 flex flex-col min-h-0">
-            <header className="h-11 flex items-center gap-1.5 pl-2 pr-4 bg-sidebar shrink-0">
+            <header className="h-12 flex items-center gap-1.5 pl-2 pr-4 bg-sidebar shrink-0">
               <SidebarTrigger className="h-6 w-6 text-fg-muted hover:text-fg hover:bg-sidebar-accent" />
               <AppBreadcrumb />
             </header>
 
-            <div className="flex-1 min-h-0 rounded-tl-lg bg-bg flex flex-col overflow-hidden">
+            <div className="flex-1 min-h-0 rounded-tl-lg border-l border-t border-border bg-bg flex flex-col overflow-hidden shadow-[var(--shadow-md)]">
               <div
                 ref={setPageHeaderSlot}
                 className={[

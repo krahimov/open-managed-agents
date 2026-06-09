@@ -8,11 +8,13 @@ import { PageHeader } from "../components/PageHeader";
 import { useApi } from "../lib/api";
 import { useApiQuery } from "../lib/useApiQuery";
 import {
+  COMPOSIO_NOT_CONFIGURED_MESSAGE,
   composioEntriesFromCatalog,
   composioIntegrationIcon,
   filterComposioEntries,
   type ComposioToolkitCatalogResponse,
   type ComposioIntegrationEntry,
+  type ComposioStatusResponse,
 } from "../lib/composio-integrations";
 
 interface Vault {
@@ -27,10 +29,16 @@ export function IntegrationsApps() {
   const { data: vaultsRes, refetch } = useApiQuery<{ data: Vault[] }>(
     "/v1/vaults?status=active&limit=100",
   );
+  const { data: composioStatus, isLoading: composioStatusLoading } =
+    useApiQuery<ComposioStatusResponse>("/v1/composio/status");
+  const composioConfigured = composioStatus?.configured === true;
   const { data: catalogRes, isLoading: catalogLoading } =
-    useApiQuery<ComposioToolkitCatalogResponse>("/v1/composio/toolkits?limit=500");
+    useApiQuery<ComposioToolkitCatalogResponse>("/v1/composio/toolkits?limit=500", undefined, {
+      enabled: composioConfigured,
+    });
   const [connecting, setConnecting] = useState<string | null>(null);
   const [search, setSearch] = useState("");
+  const composioLoading = composioStatusLoading || (composioConfigured && catalogLoading);
 
   const activeVaults = useMemo(
     () => (vaultsRes?.data ?? []).filter((v) => !v.archived_at),
@@ -53,6 +61,10 @@ export function IntegrationsApps() {
   };
 
   const connect = async (entry: ComposioIntegrationEntry) => {
+    if (!composioConfigured) {
+      toast.error(COMPOSIO_NOT_CONFIGURED_MESSAGE);
+      return;
+    }
     setConnecting(entry.slug);
     try {
       const vault = await ensureVault();
@@ -69,7 +81,13 @@ export function IntegrationsApps() {
       header={
         <PageHeader
           title="Apps"
-          subtitle={catalogLoading ? "Composio catalog loading..." : `${catalogEntries.length} Composio apps`}
+          subtitle={
+            composioLoading
+              ? "Composio catalog loading..."
+              : composioConfigured
+                ? `${catalogEntries.length} Composio apps`
+                : "Composio not configured"
+          }
           toolbar={
             <input
               value={search}
@@ -81,6 +99,11 @@ export function IntegrationsApps() {
         />
       }
     >
+      {!composioStatusLoading && !composioConfigured && (
+        <div className="mb-4 rounded-md border border-warning/30 bg-warning-subtle px-3 py-2 text-sm text-warning">
+          {COMPOSIO_NOT_CONFIGURED_MESSAGE}
+        </div>
+      )}
       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
         {filtered.map((entry) => (
           <div
@@ -112,7 +135,7 @@ export function IntegrationsApps() {
               variant="outline"
               size="sm"
               onClick={() => void connect(entry)}
-              disabled={!!connecting}
+              disabled={!composioConfigured || !!connecting}
             >
               Connect
             </Button>

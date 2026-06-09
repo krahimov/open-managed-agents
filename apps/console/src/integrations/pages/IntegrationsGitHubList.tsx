@@ -61,7 +61,7 @@ export function IntegrationsGitHubList() {
       <div className="max-w-[1100px] mx-auto px-4 sm:px-8 lg:px-10 py-10 lg:py-12">
         <header className="flex items-start justify-between gap-6 mb-8">
           <div className="min-w-0">
-            <h1 className="font-display text-[28px] leading-tight font-semibold tracking-tight text-fg">
+            <h1 className="font-display text-[28px] leading-tight font-semibold text-fg">
               GitHub integrations
             </h1>
             <p className="mt-1.5 text-[14px] text-fg-muted max-w-xl">
@@ -87,7 +87,7 @@ export function IntegrationsGitHubList() {
 
         {pending.length > 0 && (
           <section className="mb-6">
-            <h2 className="text-[12px] font-medium text-fg-muted uppercase tracking-wider mb-2">
+            <h2 className="text-[12px] font-medium text-fg-muted uppercase mb-2">
               In-progress installs
             </h2>
             <ul className="space-y-2">
@@ -196,7 +196,7 @@ function WorkspaceCard({
             <h2 className="text-[15px] font-medium text-fg truncate">
               {installation.workspace_name}
             </h2>
-            <span className="text-[11px] text-fg-subtle font-mono uppercase tracking-wider">
+            <span className="text-[11px] text-fg-subtle font-mono uppercase">
               org · @{installation.bot_login}
             </span>
           </div>

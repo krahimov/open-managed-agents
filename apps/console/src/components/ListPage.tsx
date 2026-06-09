@@ -195,7 +195,10 @@ export function ListPage<T>({
           {/* Skeleton rows — clamped to 10 so empty workspaces don't
               stretch a half-page of empty bars. */}
           {Array.from({ length: 10 }).map((_, rowIdx) => (
-            <TableRow key={`sk-${rowIdx}`}>
+            <TableRow
+              key={`sk-${rowIdx}`}
+              className="border-0 bg-bg-surface shadow-[var(--shadow-sm)] hover:bg-bg-surface [&>td:first-child]:rounded-l-md [&>td:last-child]:rounded-r-md"
+            >
               {columns.map((col, colIdx) => {
                 const widthClass = (() => {
                   if (colIdx === 0) return rowIdx % 2 === 0 ? "w-[55%]" : "w-[42%]";
@@ -213,7 +216,7 @@ export function ListPage<T>({
           ))}
         </TableShell>
       ) : data.length === 0 ? (
-        <div className="pl-3 pr-4 py-4">
+        <div className="pl-4 pr-5 py-4">
           <EmptyState
             title={emptyTitle}
             body={emptySubtitle}
@@ -224,13 +227,17 @@ export function ListPage<T>({
           />
         </div>
       ) : (
-        <div className="pl-3 pr-4">
+        <div className="pl-4 pr-5">
           <TableShell columns={columns} headSticky={tableHeadSticky}>
             {data.map((item) => (
               <TableRow
                 key={getRowKey(item)}
                 onClick={onRowClick ? () => onRowClick(item) : undefined}
-                className={onRowClick ? "cursor-pointer" : undefined}
+                className={[
+                  "border-0 bg-bg-surface shadow-[var(--shadow-sm)] hover:bg-brand-subtle/45",
+                  "[&>td:first-child]:rounded-l-md [&>td:last-child]:rounded-r-md",
+                  onRowClick ? "cursor-pointer" : "",
+                ].join(" ")}
               >
                 {columns.map((col) => (
                   <TableCell key={col.key} className={col.className}>
@@ -265,17 +272,17 @@ interface TableShellProps<T> {
 
 function TableShell<T>({ columns, headSticky, children }: TableShellProps<T>) {
   return (
-    <Table>
+    <Table className="border-separate border-spacing-y-1.5">
       {/* Cleaner thead — normal-case xs text with a bg tint that matches
           the rest of the canvas (bg-bg/95 + backdrop-blur lets the row
           beneath bleed through faintly as the user scrolls under it).
-          The previous uppercase tracking-wider treatment read as
+          The previous uppercase treatment read as
           dashboard-y / Bootstrap-era; modern app tables (Linear, Vercel,
           Plane) use plain case + subtle weight. */}
       <TableHeader
         className={`${headSticky} bg-bg/95 backdrop-blur supports-[backdrop-filter]:bg-bg/80 text-fg-muted`}
       >
-        <TableRow className="border-b border-border hover:bg-transparent">
+        <TableRow className="border-0 hover:bg-transparent">
           {columns.map((col) => (
             <TableHead key={col.key} className={`h-9 text-xs font-medium ${col.className ?? ""}`}>
               {col.label}

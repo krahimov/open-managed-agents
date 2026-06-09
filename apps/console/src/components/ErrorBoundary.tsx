@@ -49,7 +49,7 @@ export class ErrorBoundary extends Component<Props, State> {
 function DefaultFallback({ error, reset }: { error: Error; reset: () => void }) {
   return (
     <div className="flex flex-col items-center justify-center min-h-[60vh] px-6 text-center">
-      <div className="text-fg-subtle text-xs font-mono mb-3 tracking-wider">
+      <div className="text-fg-subtle text-xs font-mono mb-3">
         [ ERR ]
       </div>
       <h2 className="font-display text-lg font-semibold mb-1">

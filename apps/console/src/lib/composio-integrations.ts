@@ -29,6 +29,14 @@ export interface ComposioToolkitCatalogResponse {
   total_items?: number;
 }
 
+export interface ComposioStatusResponse {
+  configured: boolean;
+  message?: string | null;
+}
+
+export const COMPOSIO_NOT_CONFIGURED_MESSAGE =
+  "COMPOSIO_API_KEY is not configured on the API server.";
+
 function favicon(domain: string): string {
   return `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
 }

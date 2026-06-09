@@ -7,6 +7,8 @@ import { Turnstile } from "../components/Turnstile";
 import { Logo } from "../components/Logo";
 import { setActiveTenantId } from "../lib/api";
 import { useApiQuery } from "../lib/useApiQuery";
+import { BrandLoader } from "../components/BrandLoader";
+import { BRAND_NAME, BRAND_TAGLINE } from "../lib/brand";
 
 // Clear browser-cached tenant pin on every successful auth transition.
 // The pin is per-user — different login → different membership set →
@@ -325,19 +327,19 @@ export function Login() {
   if (isLoading) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-bg">
-        <div className="text-fg-subtle text-sm">Loading...</div>
+        <BrandLoader size="lg" label="Loading session" />
       </div>
     );
   }
 
   const inputCls =
-    "w-full border border-border rounded-md px-3 py-2.5 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
+    "w-full border border-border rounded-md px-3 py-2.5 text-sm bg-bg-surface text-fg shadow-[var(--shadow-sm)] outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
 
   const isOtpMode = mode === "verify-signup" || mode === "verify-login" || mode === "reset-otp";
 
   const titles: Record<Mode, string> = {
     login: "Welcome back",
-    signup: "Create your account",
+    signup: "Create your workspace",
     "otp-login": "Sign in with email code",
     "verify-signup": "Verify your email",
     "verify-login": "Enter your code",
@@ -346,8 +348,8 @@ export function Login() {
   };
 
   const subtitles: Record<Mode, string> = {
-    login: "Sign in to your workspace",
-    signup: "Get started with openma",
+    login: `Sign in to ${BRAND_NAME}`,
+    signup: `Get started with ${BRAND_NAME}`,
     "otp-login": "We'll send a 6-digit code to your email",
     "verify-signup": `We sent a code to ${email}`,
     "verify-login": `We sent a code to ${email}`,
@@ -356,12 +358,15 @@ export function Login() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-bg p-4">
-      <div className="w-full max-w-sm space-y-6">
+    <div className="min-h-screen flex items-center justify-center bg-sidebar p-4">
+      <div className="w-full max-w-[380px] rounded-lg border border-border bg-bg p-6 shadow-[var(--shadow-md)]">
         {/* Header */}
-        <div className="text-center">
+        <div className="text-center mb-6">
           <Logo size="lg" className="mx-auto" />
-          <h1 className="font-display text-xl font-semibold text-fg mt-4">
+          <div className="mt-3 text-[11px] font-semibold uppercase text-fg-subtle">
+            {BRAND_TAGLINE}
+          </div>
+          <h1 className="text-xl font-semibold text-fg mt-2">
             {titles[mode]}
           </h1>
           <p className="text-sm text-fg-muted mt-1">{subtitles[mode]}</p>
@@ -370,10 +375,10 @@ export function Login() {
         {/* Google (only on login/signup/otp-login) */}
         {googleEnabled &&
           (mode === "login" || mode === "signup" || mode === "otp-login") && (
-            <>
+            <div className="mb-4 space-y-3">
               <button
                 onClick={handleGoogle}
-                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 border border-border rounded-md text-sm text-fg hover:bg-bg-surface transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 border border-border rounded-md bg-bg-surface text-sm text-fg shadow-[var(--shadow-sm)] hover:border-border-strong hover:bg-bg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
               >
                 <svg className="w-4 h-4" viewBox="0 0 24 24">
                   <path
@@ -400,7 +405,7 @@ export function Login() {
                 <span className="text-xs text-fg-subtle">or</span>
                 <div className="flex-1 h-px bg-border" />
               </div>
-            </>
+            </div>
           )}
 
         {/* Form */}
@@ -503,7 +508,7 @@ export function Login() {
                 onChange={(e) =>
                   setOtp(e.target.value.replace(/\D/g, "").slice(0, 6))
                 }
-                className={`${inputCls} text-center text-2xl tracking-[0.5em] font-mono`}
+                className={`${inputCls} text-center text-2xl font-mono`}
                 placeholder="000000"
                 required
                 autoComplete="one-time-code"
@@ -563,7 +568,7 @@ export function Login() {
               ((mode === "login" || mode === "signup") && !password) ||
               (mode === "reset-otp" && !password)
             }
-            className="w-full px-4 py-2.5 bg-brand text-brand-fg rounded-md text-sm font-medium hover:bg-brand-hover disabled:opacity-50 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+            className="w-full px-4 py-2.5 bg-brand text-brand-fg rounded-md text-sm font-medium shadow-[var(--shadow-sm)] hover:bg-brand-hover disabled:opacity-50 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
           >
             {loading
               ? "Loading..."
@@ -583,7 +588,7 @@ export function Login() {
 
         {/* Resend for OTP modes */}
         {isOtpMode && (
-          <p className="text-sm text-fg-muted text-center">
+          <p className="mt-4 text-sm text-fg-muted text-center">
             Didn't receive the code?{" "}
             <button
               onClick={handleResend}
@@ -596,7 +601,7 @@ export function Login() {
         )}
 
         {/* Mode switchers */}
-        <p className="text-sm text-fg-muted text-center">
+        <p className="mt-5 text-sm text-fg-muted text-center">
           {mode === "login" && (
             <>
               <button
