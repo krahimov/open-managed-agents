@@ -670,6 +670,20 @@ const services: RouteServices = {
   },
   sessionRegistry: {
     enqueueUserMessage: (sid, tenantId, agentId, ev) => {
+      // Auto-title on first message — "Untitled" rows are unscannable in
+      // session lists. Best-effort; never blocks the turn.
+      void (async () => {
+        const s = await sessionsService.get({ tenantId, sessionId: sid }).catch(() => null);
+        if (!s || s.title) return;
+        const text = ((ev as { content?: Array<{ type?: string; text?: string }> }).content ?? [])
+          .map((b) => (b?.type === "text" ? (b.text ?? "") : ""))
+          .join(" ")
+          .replace(/\s+/g, " ")
+          .trim();
+        if (!text) return;
+        const title = text.length > 48 ? `${text.slice(0, 48).trimEnd()}…` : text;
+        await sessionsService.update({ tenantId, sessionId: sid, title }).catch(() => {});
+      })();
       void sessionWorkQueue
         .enqueue({
           tenantId,
@@ -2206,7 +2220,7 @@ function mountNodeStatsRoutes(v1App: NodeV1App): void {
       sessions,
       environments,
       vaults,
-      skills: 0,
+      skills: (await skillStore.list(tenantId)).length,
       model_cards: modelCards.filter((card) => !card.archived_at).length,
       api_keys: apiKeys.length,
     });

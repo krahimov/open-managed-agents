@@ -30,6 +30,7 @@ export function Dashboard() {
   const nav = useNavigate();
   const { user: _user } = useAuth();
   const [copied, setCopied] = useState<string | null>(null);
+  const [showGuide, setShowGuide] = useState(false);
 
   // Headline cards + recent panel each ride their own TQ query so the
   // dashboard renders the parts it has — a flaky /v1/stats no longer
@@ -42,6 +43,8 @@ export function Dashboard() {
     { limit: "5" },
   );
   const stats = statsQuery.data ?? null;
+  const workspaceActive = (stats?.agents ?? 0) > 0;
+  const guideVisible = !workspaceActive || showGuide;
   const recentSessions = sessionsQuery.data?.data.slice(0, 5) ?? [];
 
   const copy = (text: string, key: string) => {
@@ -83,17 +86,32 @@ export function Dashboard() {
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="pl-4 pr-5 py-6 space-y-10">
-        {/* Header */}
-        <header>
-          <h1 className="text-[20px] leading-tight font-semibold text-fg">
-            Get started with {BRAND_NAME}
-          </h1>
-          <p className="mt-1.5 text-[15px] text-fg-muted">
-            Install the CLI, mint a key, and let agents operate against your control plane.
-          </p>
+        {/* Header — onboarding voice only until the workspace has agents;
+            after that the dashboard is an instrument, with the guide one
+            quiet toggle away. */}
+        <header className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-[20px] leading-tight font-semibold text-fg">
+              {workspaceActive ? "Overview" : `Get started with ${BRAND_NAME}`}
+            </h1>
+            <p className="mt-1.5 text-[15px] text-fg-muted">
+              {workspaceActive
+                ? "Workspace activity at a glance."
+                : "Install the CLI, mint a key, and let agents operate against your control plane."}
+            </p>
+          </div>
+          {workspaceActive && (
+            <button
+              onClick={() => setShowGuide((v) => !v)}
+              className="shrink-0 text-[12px] text-fg-muted hover:text-fg border border-border rounded-md px-2.5 py-1.5 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+            >
+              {showGuide ? "Hide setup guide" : "Setup guide"}
+            </button>
+          )}
         </header>
 
         {/* Quickstart — single panel with three rows, no per-step cards */}
+        {guideVisible && (
         <section className="border border-border rounded-lg bg-bg-surface shadow-[var(--shadow-sm)] overflow-hidden">
           {/* Step 1 */}
           <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6 border-b border-border">
@@ -182,6 +200,7 @@ export function Dashboard() {
             </div>
           </div>
         </section>
+        )}
 
         {/* Stats — number-forward, no decorative icons */}
         <section>

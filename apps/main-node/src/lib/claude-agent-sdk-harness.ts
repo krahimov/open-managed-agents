@@ -34,6 +34,15 @@ import { generateId } from "@open-managed-agents/shared";
 /** OMA session id → SDK session id, for `resume` continuity across turns. */
 const sdkSessions = new Map<string, string>();
 
+/** Footgun guidance appended to every SDK-harness system prompt — distilled
+ *  from real failed sessions (see git history for the gh api 404 incident). */
+const CLI_NOTES = [
+  "CLI usage notes:",
+  "- `gh api`: quote any path containing `?`, and pass `-X GET` whenever you",
+  "  use `-f`/`-F` for query params — otherwise gh switches the request to",
+  "  POST and valid GET routes return 404.",
+].join("\n");
+
 /** Subset of NodeMcpProxyTarget the harness needs (defined in index.ts). */
 export interface McpTarget {
   upstreamUrl: string;
@@ -192,9 +201,13 @@ export class ClaudeAgentSdkHarness {
           resume: sdkSessions.get(sessionId),
           model,
           mcpServers,
-          systemPrompt: ctx.systemPrompt
-            ? { type: "preset", preset: "claude_code", append: ctx.systemPrompt }
-            : { type: "preset", preset: "claude_code" },
+          systemPrompt: {
+            type: "preset",
+            preset: "claude_code",
+            // CLI_NOTES: observed footguns in headless sessions (e.g. `gh api`
+            // with -f/-F silently switches GET→POST → bogus 404s).
+            append: [ctx.systemPrompt, CLI_NOTES].filter(Boolean).join("\n\n"),
+          },
           // Headless: OMA has no tool-confirmation round-trip on this path
           // yet, and the child is already scoped to a per-session workdir.
           permissionMode: "bypassPermissions",

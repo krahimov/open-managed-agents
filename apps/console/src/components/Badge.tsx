@@ -9,23 +9,37 @@ import type { ReactNode } from "react";
  */
 export type StatusTone = "idle" | "running" | "completed" | "errored" | "terminated" | "neutral";
 
-const TONE_CLASS: Record<StatusTone, string> = {
-  idle: "bg-bg-surface text-fg-muted",
-  running: "bg-info-subtle text-info",
-  completed: "bg-success-subtle text-success",
-  errored: "bg-danger-subtle text-danger",
-  terminated: "bg-danger-subtle text-danger",
-  neutral: "bg-bg-surface text-fg-muted",
+/* Quiet dot+text status — color appears as a 6px dot, not a filled chip,
+ * so state reads at a glance without competing with the accent. `running`
+ * pulses; everything else is static. */
+const TONE_TEXT: Record<StatusTone, string> = {
+  idle: "text-fg-muted",
+  running: "text-info",
+  completed: "text-success",
+  errored: "text-danger",
+  terminated: "text-danger",
+  neutral: "text-fg-muted",
+};
+
+const TONE_DOT: Record<StatusTone, string> = {
+  idle: "bg-fg-subtle",
+  running: "bg-info",
+  completed: "bg-success",
+  errored: "bg-danger",
+  terminated: "bg-danger",
+  neutral: "bg-fg-subtle",
 };
 
 export function StatusPill({ status, label }: { status: StatusTone | string; label?: string }) {
-  const tone: StatusTone = (TONE_CLASS as Record<string, unknown>)[status] ? (status as StatusTone) : "neutral";
+  const tone: StatusTone = (TONE_TEXT as Record<string, unknown>)[status] ? (status as StatusTone) : "neutral";
   const text = label ?? (status[0]?.toUpperCase() + status.slice(1));
   return (
-    <span className={`text-[11px] px-2 py-0.5 rounded font-medium ${TONE_CLASS[tone]}`}>
-      {tone === "running" && (
-        <span className="inline-block w-1.5 h-1.5 rounded-full bg-info animate-pulse mr-1.5 align-middle" />
-      )}
+    <span className={`inline-flex items-center gap-1.5 text-[11px] font-medium ${TONE_TEXT[tone]}`}>
+      <span
+        className={`inline-block w-1.5 h-1.5 rounded-full ${TONE_DOT[tone]} ${
+          tone === "running" ? "animate-pulse" : ""
+        }`}
+      />
       {text}
     </span>
   );
