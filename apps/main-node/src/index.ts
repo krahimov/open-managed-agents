@@ -64,6 +64,7 @@ import { SqlEventLog } from "@open-managed-agents/event-log/sql";
 import type { AgentConfig, CredentialConfig, EnvironmentConfig, SessionEvent } from "@open-managed-agents/shared";
 import { generateEventId } from "@open-managed-agents/shared";
 import { DefaultHarness } from "@open-managed-agents/agent/harness/default-loop";
+import { ClaudeAgentSdkHarness } from "./lib/claude-agent-sdk-harness.js";
 import { buildTools } from "@open-managed-agents/agent/harness/tools";
 import { resolveModel, type ApiCompat } from "@open-managed-agents/agent/harness/provider";
 import { composeSystemPrompt } from "@open-managed-agents/agent/harness/platform-guidance";
@@ -314,6 +315,16 @@ const modelCardService = createSqliteModelCardService(
 );
 await seedEnvModelCard();
 
+// ─── Outbound webhooks (requires PLATFORM_ROOT_SECRET for secret storage) ──
+const { WebhookStore, startWebhookDeliveryPoller, WEBHOOK_EVENT_TYPES } = await import(
+  "./lib/webhooks.js"
+);
+const webhookStore = platformRootSecret
+  ? new WebhookStore(sql, dialect, new WebCryptoAesGcm(platformRootSecret, "webhooks.signing_secrets"))
+  : null;
+if (webhookStore) await webhookStore.ensureSchema();
+if (webhookStore) startWebhookDeliveryPoller({ store: webhookStore });
+
 let memoryBlobs: import("@open-managed-agents/memory-store").BlobStore;
 let memoryBlobDescription: string;
 let memoryBlobLocalDir: string | null = null;
@@ -528,6 +539,11 @@ async function buildSandbox(
 const sessionRegistry = new SessionRegistry({
   sql,
   hub,
+  onSessionEvent: webhookStore
+    ? (tenantId, sessionId, event) => {
+        void webhookStore.enqueueFor(tenantId, sessionId, event).catch(() => {});
+      }
+    : undefined,
   agentsService,
   memoryService,
   sandboxOrchestrator,
@@ -558,8 +574,17 @@ const sessionRegistry = new SessionRegistry({
     });
   },
   buildHarness: () => {
-    const h = new DefaultHarness();
-    return { run: (ctx: unknown) => h.run(ctx as HarnessContext) };
+    const def = new DefaultHarness();
+    const sdk = new ClaudeAgentSdkHarness({ resolveMcpTarget: resolveNodeMcpProxyTarget });
+    return {
+      run: (ctx: unknown) => {
+        const c = ctx as HarnessContext;
+        // Per-agent harness wins; OMA_DEFAULT_HARNESS covers agents that
+        // never set one (e.g. console quick-create flows).
+        const harness = c.agent?.harness ?? process.env.OMA_DEFAULT_HARNESS;
+        return harness === "claude-agent-sdk" ? sdk.run(c) : def.run(c);
+      },
+    };
   },
   buildHarnessContext: async (input) => {
     const creds = await resolveNodeModelCredentials(input.agent);
@@ -978,6 +1003,39 @@ mountNodeModelsRoutes(v1);
 mountNodeEnvironmentRoutes(v1);
 mountNodeStatsRoutes(v1);
 mountNodeSandboxConfigRoutes(v1);
+
+// Outbound webhook endpoints — thin CRUD. The signing secret is returned
+// ONCE on create; receivers verify `x-oma-webhook-signature` (see
+// lib/webhooks.ts verifyWebhook).
+v1.get("/webhook_endpoints", async (c) => {
+  if (!webhookStore) return c.json({ error: "webhooks require PLATFORM_ROOT_SECRET" }, 503);
+  return c.json({ data: await webhookStore.list(c.get("tenant_id")) });
+});
+v1.post("/webhook_endpoints", async (c) => {
+  if (!webhookStore) return c.json({ error: "webhooks require PLATFORM_ROOT_SECRET" }, 503);
+  const body = await c.req.json<{ url?: string; event_types?: string[] }>().catch(() => null);
+  if (!body?.url || !Array.isArray(body.event_types) || body.event_types.length === 0) {
+    return c.json({ error: "url and non-empty event_types[] required" }, 400);
+  }
+  const bad = body.event_types.filter((t) => !WEBHOOK_EVENT_TYPES.includes(t));
+  if (bad.length > 0) {
+    return c.json(
+      { error: `unknown event_types: ${bad.join(", ")} — valid: ${WEBHOOK_EVENT_TYPES.join(", ")}` },
+      400,
+    );
+  }
+  const { endpoint, secret } = await webhookStore.create({
+    tenantId: c.get("tenant_id"),
+    url: body.url,
+    eventTypes: body.event_types,
+  });
+  return c.json({ ...endpoint, secret }, 201);
+});
+v1.delete("/webhook_endpoints/:id", async (c) => {
+  if (!webhookStore) return c.json({ error: "webhooks require PLATFORM_ROOT_SECRET" }, 503);
+  const ok = await webhookStore.delete(c.get("tenant_id"), c.req.param("id"));
+  return ok ? c.body(null, 204) : c.json({ error: "not found" }, 404);
+});
 
 // Stubs for routes the console hits but main-node doesn't yet implement.
 v1.get("/runtimes", (c) => {
