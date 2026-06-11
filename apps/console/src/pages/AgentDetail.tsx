@@ -1,9 +1,12 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useParams, Link, useNavigate } from "react-router";
 import { useApi } from "../lib/api";
 import { useApiQuery } from "../lib/useApiQuery";
 import { GitHubIcon, LinearIcon, SlackIcon } from "../components/icons";
 import { Page } from "../components/Page";
+import { Modal } from "../components/Modal";
+import { Field } from "../components/Field";
 import { PageHeader } from "../components/PageHeader";
 import { Button } from "@/components/ui/button";
 import type { AgentRecord as Agent } from "../types/agent";
@@ -26,6 +29,7 @@ export function AgentDetail() {
   const { id } = useParams();
   const { api } = useApi();
   const nav = useNavigate();
+  const [editing, setEditing] = useState(false);
 
   // Single-resource fetches via TQ. `enabled: !!id` defers until the route
   // param is available; the publication queries inherit the same gate.
@@ -116,6 +120,9 @@ export function AgentDetail() {
           title={agent.name}
           actions={
             <>
+              <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
+                Edit
+              </Button>
               <Button
                 variant="outline"
                 size="sm"
@@ -135,6 +142,9 @@ export function AgentDetail() {
       }
     >
       <div className="space-y-6">
+        {editing && (
+          <EditAgentModal agent={agent} onClose={() => setEditing(false)} />
+        )}
         {/* Properties grid */}
         <div className="grid grid-cols-[140px_1fr] gap-x-4 gap-y-2 max-w-2xl text-sm">
           <span className="text-fg-muted">ID</span><span className="font-mono text-xs">{agent.id}</span>
@@ -334,5 +344,161 @@ function IntegrationFold({
         )}
       </div>
     </details>
+  );
+}
+
+
+/**
+ * Edit modal — drives POST /v1/agents/:id (each save creates a new agent
+ * version; running sessions keep their pinned snapshot). Sends the full
+ * config with unedited fields passed through so the versioned update
+ * never drops tools / mcp_servers / metadata.
+ */
+function EditAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void }) {
+  const { api } = useApi();
+  const qc = useQueryClient();
+  const { data: skillsRes } = useApiQuery<{
+    data: Array<{ id: string; name: string; description: string }>;
+  }>("/v1/skills");
+  const allSkills = skillsRes?.data ?? [];
+
+  const initialModel =
+    typeof agent.model === "string" ? agent.model : ((agent.model as { id?: string })?.id ?? "");
+  const [name, setName] = useState(agent.name);
+  const [model, setModel] = useState(initialModel);
+  const [system, setSystem] = useState(agent.system ?? "");
+  const [harness, setHarness] = useState(agent._oma?.harness ?? "default");
+  const [skillIds, setSkillIds] = useState<Set<string>>(
+    () =>
+      new Set(
+        ((agent.skills ?? []) as Array<{ skill_id?: string }>)
+          .map((s) => s?.skill_id)
+          .filter((x): x is string => !!x),
+      ),
+  );
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const toggleSkill = (sid: string) =>
+    setSkillIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(sid)) next.delete(sid);
+      else next.add(sid);
+      return next;
+    });
+
+  const save = async () => {
+    setSaving(true);
+    setErr(null);
+    try {
+      const body: Record<string, unknown> = {
+        name,
+        model,
+        system,
+        tools: agent.tools,
+        mcp_servers: agent.mcp_servers,
+        metadata: (agent as { metadata?: Record<string, unknown> }).metadata,
+        skills: [...skillIds].map((skill_id) => ({ type: "custom", skill_id })),
+        _oma: { ...(agent._oma ?? {}), harness },
+      };
+      for (const k of Object.keys(body)) {
+        if (body[k] === undefined || body[k] === null) delete body[k];
+      }
+      await api(`/v1/agents/${agent.id}`, { method: "POST", body: JSON.stringify(body) });
+      await qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}`] });
+      await qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}/versions`] });
+      onClose();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Save failed");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title="Edit agent"
+      subtitle={`Saving creates version ${agent.version + 1}; running sessions keep their snapshot.`}
+      footer={
+        <div className="flex items-center gap-2 justify-end w-full">
+          {err && <span className="text-danger text-xs mr-auto">{err}</span>}
+          <Button variant="outline" size="sm" onClick={onClose} disabled={saving}>
+            Cancel
+          </Button>
+          <Button size="sm" onClick={save} disabled={saving || !name.trim() || !model.trim()}>
+            {saving ? "Saving…" : "Save changes"}
+          </Button>
+        </div>
+      }
+    >
+      <div className="space-y-4">
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Name">
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className="w-full px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg"
+            />
+          </Field>
+          <Field label="Model">
+            <input
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              className="w-full px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg font-mono text-xs text-fg"
+            />
+          </Field>
+        </div>
+        <Field label="Harness">
+          <select
+            value={harness}
+            onChange={(e) => setHarness(e.target.value)}
+            className="w-full px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg"
+          >
+            <option value="default">default — platform loop, model-card API billing</option>
+            <option value="claude-agent-sdk">claude-agent-sdk — local Claude Code, subscription billing</option>
+            <option value="acp-proxy">acp-proxy — delegate to a registered local runtime</option>
+          </select>
+        </Field>
+        <Field label="System prompt">
+          <textarea
+            value={system}
+            onChange={(e) => setSystem(e.target.value)}
+            rows={7}
+            className="w-full px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg font-mono text-xs leading-relaxed text-fg resize-y"
+          />
+        </Field>
+        <Field label={`Skills (${skillIds.size} attached)`}>
+          {allSkills.length === 0 ? (
+            <p className="text-xs text-fg-subtle">
+              No skills in this workspace yet — import one on the Skills page.
+            </p>
+          ) : (
+            <div className="max-h-44 overflow-y-auto border border-border rounded-md divide-y divide-border">
+              {allSkills.map((sk) => (
+                <label
+                  key={sk.id}
+                  className="flex items-start gap-2.5 px-3 py-2 cursor-pointer hover:bg-bg-surface transition-colors duration-[var(--dur-quick)]"
+                >
+                  <input
+                    type="checkbox"
+                    checked={skillIds.has(sk.id)}
+                    onChange={() => toggleSkill(sk.id)}
+                    className="mt-0.5 accent-[var(--brand)]"
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-sm text-fg">{sk.name}</span>
+                    <span className="block text-xs text-fg-subtle truncate">
+                      {sk.description || "—"}
+                    </span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          )}
+        </Field>
+      </div>
+    </Modal>
   );
 }
