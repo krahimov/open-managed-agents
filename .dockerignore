@@ -1,0 +1,12 @@
+node_modules
+**/node_modules
+.git
+**/data
+*.db
+.env
+.env.*
+.dev.vars
+.claude
+.wrangler
+**/dist
+apps/docs
