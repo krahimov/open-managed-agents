@@ -590,7 +590,22 @@ const sessionRegistry = new SessionRegistry({
         // Per-agent harness wins; OMA_DEFAULT_HARNESS covers agents that
         // never set one (e.g. console quick-create flows).
         const harness = c.agent?.harness ?? process.env.OMA_DEFAULT_HARNESS;
-        return harness === "claude-agent-sdk" ? sdk.run(c) : def.run(c);
+        if (harness === "claude-agent-sdk") {
+          // Hard gate: this harness spawns Claude Code ON THE HOST with
+          // tool permissions bypassed — single-operator/self-host only.
+          // A hosted multi-tenant deploy must never route tenants here,
+          // so it's opt-in via env rather than reachable by agent config.
+          if (process.env.OMA_ENABLE_CLAUDE_AGENT_SDK !== "1") {
+            const msg =
+              "claude-agent-sdk harness is disabled on this deployment — " +
+              "it runs Claude Code on the host and is intended for " +
+              "single-operator self-hosting. Set OMA_ENABLE_CLAUDE_AGENT_SDK=1 to enable.";
+            c.runtime.broadcast({ type: "session.error", error: msg } as SessionEvent);
+            return Promise.reject(new Error(msg));
+          }
+          return sdk.run(c);
+        }
+        return def.run(c);
       },
     };
   },
