@@ -85,7 +85,7 @@ export function Dashboard() {
       <div className="pl-4 pr-5 py-6 space-y-10">
         {/* Header */}
         <header>
-          <h1 className="text-[30px] leading-tight font-semibold text-fg">
+          <h1 className="text-[20px] leading-tight font-semibold text-fg">
             Get started with {BRAND_NAME}
           </h1>
           <p className="mt-1.5 text-[15px] text-fg-muted">
@@ -98,7 +98,7 @@ export function Dashboard() {
           {/* Step 1 */}
           <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6 border-b border-border">
             <div>
-              <div className="font-mono text-[11px] text-brand">STEP 01</div>
+              <div className="font-mono text-[11px] text-fg-subtle tracking-wider">STEP 01</div>
               <div className="mt-1 font-medium text-fg text-[15px]">Install the CLI</div>
             </div>
             <div className="space-y-2.5 min-w-0">
@@ -135,7 +135,7 @@ export function Dashboard() {
           {/* Step 2 */}
           <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6 border-b border-border">
             <div>
-              <div className="font-mono text-[11px] text-brand">STEP 02</div>
+              <div className="font-mono text-[11px] text-fg-subtle tracking-wider">STEP 02</div>
               <div className="mt-1 font-medium text-fg text-[15px]">Mint an API key</div>
             </div>
             <div className="space-y-2.5">
@@ -155,7 +155,7 @@ export function Dashboard() {
           {/* Step 3 */}
           <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6">
             <div>
-              <div className="font-mono text-[11px] text-brand">STEP 03</div>
+              <div className="font-mono text-[11px] text-fg-subtle tracking-wider">STEP 03</div>
               <div className="mt-1 font-medium text-fg text-[15px]">Give it the task</div>
             </div>
             <div className="space-y-2.5">

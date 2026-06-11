@@ -8,14 +8,18 @@
 
 /* ---------- Light theme (default) ---------- */
 :root {
-  --brand: #5e6ad2;
-  --brand-hover: #4f5ec4;
-  --brand-subtle: #eef0ff;
+  /* Single accent: coral. Reserved for primary actions, focus, active nav —
+     never decoration. (Design direction: cool near-monochrome + one accent.) */
+  --brand: #d9564a;
+  --brand-hover: #c74b40;
+  --brand-subtle: #fdefed;
   --brand-fg: #ffffff;
 
   --bg: #fbfbfc;
   --bg-sidebar: #f4f4f6;
   --bg-surface: #ffffff;
+  /* One step BELOW the page — code wells, stat insets, terminal chrome. */
+  --bg-inset: #f1f2f4;
   --bg-overlay: oklch(0 0 0 / 0.28);
 
   --fg: #17171a;
@@ -63,22 +67,25 @@
 
 /* ---------- Dark theme ---------- */
 .dark {
-  --brand: #8c93ff;
-  --brand-hover: #a3a8ff;
-  --brand-subtle: #232640;
-  --brand-fg: #0d0f1d;
+  --brand: #ff8d7e;
+  --brand-hover: #ffa294;
+  --brand-subtle: #36211d;
+  --brand-fg: #1c0f0c;
 
   --bg: #111113;
   --bg-sidebar: #17171a;
   --bg-surface: #1c1c20;
+  /* One step below the page for inset wells. */
+  --bg-inset: #0c0c0e;
   --bg-overlay: oklch(0 0 0 / 0.6);
 
   --fg: #f1f1f3;
   --fg-muted: #a5a7af;
   --fg-subtle: #777a84;
 
-  --border: #2c2d33;
-  --border-strong: #434652;
+  /* Hairlines as alpha so they sit on any surface step without banding. */
+  --border: oklch(1 0 0 / 0.09);
+  --border-strong: oklch(1 0 0 / 0.18);
 
   --success: #53d18c;
   --success-subtle: #163325;
@@ -91,9 +98,11 @@
   --accent-violet: #b09cff;
   --accent-violet-subtle: #261f40;
 
-  /* Dark-mode shadow — needs more opacity to register against #151515. */
+  /* Dark-mode shadow — needs more opacity to register against #151515.
+     shadow-sm carries a 1px top glint so raised surfaces read as lit
+     from above (the cheap trick behind "rich" dark UIs). */
   --shadow-md: 0 18px 42px -28px rgb(0 0 0 / 0.85);
-  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.45);
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.45), inset 0 1px 0 rgb(255 255 255 / 0.04);
 
   --ring: var(--brand);
   color-scheme: dark;
@@ -115,6 +124,7 @@
   --color-bg: var(--bg);
   --color-bg-sidebar: var(--bg-sidebar);
   --color-bg-surface: var(--bg-surface);
+  --color-bg-inset: var(--bg-inset);
   --color-bg-overlay: var(--bg-overlay);
 
   --color-fg: var(--fg);
@@ -193,8 +203,16 @@ body {
   font-family: var(--font-sans);
   font-size: 0.875rem; /* 14px base for app UI */
   line-height: 1.6;
+  /* Numbers align in tables, stats, timestamps — app-wide instrument feel. */
+  font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+/* Display headings track tighter — large Geist at default tracking reads
+   airy/marketing; tools read tight. */
+h1, h2, h3 {
+  letter-spacing: -0.02em;
 }
 
 /* Lock the viewport — the AppShell sidebar + breadcrumb header are
