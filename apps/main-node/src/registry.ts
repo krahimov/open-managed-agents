@@ -54,6 +54,10 @@ const log = getLogger("session-registry");
 export interface SessionRegistryDeps {
   sql: SqlClient;
   hub: EventStreamHub;
+  /** Optional tap on machine-published session events (status transitions,
+   *  errors) with tenant context — used by outbound webhooks. Must not
+   *  throw; failures are swallowed so event delivery never blocks a turn. */
+  onSessionEvent?: (tenantId: string, sessionId: string, event: SessionEvent) => void;
   agentsService: AgentService;
   memoryService: MemoryStoreService;
   /** Sandbox provisioning — vault outbound, mounts, backup-restore.
@@ -279,6 +283,34 @@ export class SessionRegistry {
         // Node has no eviction — leave hintTurnInFlight unset.
       });
 
+      // Status transitions on Node are DB writes, not published events —
+      // tap the adapter so onSessionEvent consumers (outbound webhooks)
+      // see them as synthesized session.status_* events.
+      if (this.deps.onSessionEvent) {
+        const tap = (type: SessionEvent["type"]) => {
+          try {
+            this.deps.onSessionEvent?.(tenantId, sessionId, { type } as SessionEvent);
+          } catch {
+            // never let webhook fan-out break a turn
+          }
+        };
+        const beginTurn = adapter.beginTurn.bind(adapter);
+        adapter.beginTurn = async (sid, turnId) => {
+          await beginTurn(sid, turnId);
+          tap("session.status_running");
+        };
+        const endTurn = adapter.endTurn.bind(adapter);
+        adapter.endTurn = async (sid, turnId, status) => {
+          await endTurn(sid, turnId, status);
+          tap(status === "idle" ? "session.status_idle" : "session.status_terminated");
+        };
+        const terminate = adapter.terminate.bind(adapter);
+        adapter.terminate = async (sid, reason) => {
+          await terminate(sid, reason);
+          tap("session.status_terminated");
+        };
+      }
+
       const machine = new SessionStateMachine({
         sessionId,
         tenantId,
@@ -303,7 +335,14 @@ export class SessionRegistry {
             sessionId,
             eventLog,
           }),
-        publish: (event: SessionEvent) => this.deps.hub.publish(sessionId, event),
+        publish: (event: SessionEvent) => {
+          this.deps.hub.publish(sessionId, event);
+          try {
+            this.deps.onSessionEvent?.(tenantId, sessionId, event);
+          } catch {
+            // webhook fan-out must never break the turn pipeline
+          }
+        },
       });
 
       return { machine, sandbox, eventLog };
