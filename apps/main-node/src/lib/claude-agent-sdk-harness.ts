@@ -24,7 +24,7 @@
  * login) is the only path left.
  */
 
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { HarnessContext } from "@open-managed-agents/agent/harness/interface";
@@ -54,6 +54,17 @@ export interface ClaudeAgentSdkHarnessDeps {
     sessionId: string,
     serverName: string,
   ) => Promise<McpTarget | null>;
+  /**
+   * Resolve the agent's skill refs ({type:"custom", skill_id}) to SKILL.md
+   * documents. When provided, attached skills are materialized into the
+   * session cwd at .claude/skills/<name>/SKILL.md and project-scope
+   * discovery is enabled for that cwd (settingSources: ["project"] — the
+   * `skills:` option alone cannot enable discovery).
+   */
+  resolveSkills?: (
+    tenantId: string,
+    refs: Array<{ skill_id: string; type: string }> | undefined,
+  ) => Promise<Array<{ name: string; content: string }>>;
 }
 
 function workdirFor(sessionId: string): string {
@@ -154,6 +165,23 @@ export class ClaudeAgentSdkHarness {
 
     const mcpServers = await this.#mcpServersFor(ctx, sessionId);
 
+    // Materialize attached skills into <cwd>/.claude/skills/<name>/SKILL.md.
+    // Idempotent per turn (overwrite) so skill edits apply on the next turn.
+    const skillNames: string[] = [];
+    if (this.#deps.resolveSkills && ctx.tenant_id) {
+      try {
+        const skills = await this.#deps.resolveSkills(ctx.tenant_id, ctx.agent.skills);
+        for (const s of skills) {
+          const dir = path.join(cwd, ".claude", "skills", s.name);
+          await mkdir(dir, { recursive: true });
+          await writeFile(path.join(dir, "SKILL.md"), s.content, "utf8");
+          skillNames.push(s.name);
+        }
+      } catch {
+        // missing/broken skills must not block the turn
+      }
+    }
+
     try {
       const stream = query({
         prompt: textOfUserMessage(ctx),
@@ -170,8 +198,12 @@ export class ClaudeAgentSdkHarness {
           // Headless: OMA has no tool-confirmation round-trip on this path
           // yet, and the child is already scoped to a per-session workdir.
           permissionMode: "bypassPermissions",
-          // Don't inherit this machine's personal CLAUDE.md / settings.
-          settingSources: [],
+          // Project scope only when skills are attached (discovery is
+          // governed by settingSources; the cwd is platform-owned so
+          // "project" exposes exactly what we materialized). Never "user" —
+          // this machine's personal CLAUDE.md/settings stay invisible.
+          settingSources: skillNames.length > 0 ? ["project"] : [],
+          skills: skillNames.length > 0 ? skillNames : undefined,
           maxTurns: 50,
         },
       });

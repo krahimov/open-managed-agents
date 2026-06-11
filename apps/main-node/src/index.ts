@@ -325,6 +325,11 @@ const webhookStore = platformRootSecret
 if (webhookStore) await webhookStore.ensureSchema();
 if (webhookStore) startWebhookDeliveryPoller({ store: webhookStore });
 
+// ─── Skills (SKILL.md storage + GitHub import) ─────────────────────────────
+const { SkillStore } = await import("./lib/skills.js");
+const skillStore = new SkillStore(sql);
+await skillStore.ensureSchema();
+
 let memoryBlobs: import("@open-managed-agents/memory-store").BlobStore;
 let memoryBlobDescription: string;
 let memoryBlobLocalDir: string | null = null;
@@ -575,7 +580,10 @@ const sessionRegistry = new SessionRegistry({
   },
   buildHarness: () => {
     const def = new DefaultHarness();
-    const sdk = new ClaudeAgentSdkHarness({ resolveMcpTarget: resolveNodeMcpProxyTarget });
+    const sdk = new ClaudeAgentSdkHarness({
+      resolveMcpTarget: resolveNodeMcpProxyTarget,
+      resolveSkills: (tenantId, refs) => skillStore.resolveRefs(tenantId, refs),
+    });
     return {
       run: (ctx: unknown) => {
         const c = ctx as HarnessContext;
@@ -1042,7 +1050,35 @@ v1.get("/runtimes", (c) => {
   const runtimes: unknown[] = [];
   return c.json({ runtimes, data: runtimes });
 });
-v1.get("/skills", (c) => c.json({ data: [] }));
+// Skills — SKILL.md storage, agent-attachable, importable from GitHub.
+v1.get("/skills", async (c) => c.json({ data: await skillStore.list(c.get("tenant_id")) }));
+v1.post("/skills", async (c) => {
+  const body = await c.req.json<{ content?: string; name?: string }>().catch(() => null);
+  if (!body?.content) return c.json({ error: "content (SKILL.md text) required" }, 400);
+  try {
+    return c.json(await skillStore.create({ tenantId: c.get("tenant_id"), content: body.content, name: body.name }), 201);
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : "create failed" }, 400);
+  }
+});
+v1.post("/skills/import", async (c) => {
+  const body = await c.req.json<{ source?: string }>().catch(() => null);
+  if (!body?.source) return c.json({ error: "source required (URL or owner/repo[/path])" }, 400);
+  try {
+    const rows = await skillStore.importFromSource(c.get("tenant_id"), body.source);
+    return c.json({ imported: rows.length, data: rows }, 201);
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : "import failed" }, 400);
+  }
+});
+v1.get("/skills/:id", async (c) => {
+  const row = await skillStore.get(c.get("tenant_id"), c.req.param("id"));
+  return row ? c.json(row) : c.json({ error: "not found" }, 404);
+});
+v1.delete("/skills/:id", async (c) => {
+  const ok = await skillStore.delete(c.get("tenant_id"), c.req.param("id"));
+  return ok ? c.body(null, 204) : c.json({ error: "not found" }, 404);
+});
 v1.get("/integrations/github/credentials", (c) => c.json({ data: [] }));
 v1.get("/integrations/linear/credentials", (c) => c.json({ data: [] }));
 v1.get("/integrations/slack/credentials", (c) => c.json({ data: [] }));
