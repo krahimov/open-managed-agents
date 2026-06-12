@@ -2061,27 +2061,9 @@ async function buildNodeMemoryPromptContext(
   const session = await sessionsService.get({ tenantId, sessionId }).catch(() => null);
   await addEnvironmentMemoryPromptBindings(attachments, tenantId, session?.environment_snapshot);
 
-  if (dialect === "postgres") {
-    const resourceRows = await sql
-      .prepare(
-        `SELECT memory_store_id, access, instructions FROM session_resources
-         WHERE session_id = ? AND type = 'memory_store'`,
-      )
-      .bind(sessionId)
-      .all<{ memory_store_id: string | null; access: string | null; instructions: string | null }>()
-      .catch(() => ({ results: [] }));
-    for (const row of resourceRows.results ?? []) {
-      if (!row.memory_store_id) continue;
-      attachments.set(row.memory_store_id, {
-        storeId: row.memory_store_id,
-        access: row.access === "read_only" ? "read_only" : "read_write",
-        instructions:
-          typeof row.instructions === "string"
-            ? row.instructions.slice(0, 4096)
-            : undefined,
-      });
-    }
-  } else {
+  {
+    // Both dialects use the shared service (JSON `config` blob) since
+    // migration 0002 reconciled PG session_resources with the cf-auth shape.
     const resources = await sessionsService
       .listResourcesBySession({ sessionId })
       .catch(() => []);

@@ -1740,6 +1740,14 @@ function EventRender({
       return (
         <div className="max-w-2xl bg-danger-subtle rounded-lg px-4 py-2.5 text-sm text-danger">
           <div>Error: {event.error}</div>
+          {/* Server attaches the underlying failure as `message` (real DB /
+              provider error) — surface it so turns are debuggable from the
+              UI instead of server logs. */}
+          {(event as { message?: string }).message && (
+            <div className="mt-1.5 pt-1.5 text-[12px] opacity-90 font-mono break-all">
+              {(event as { message?: string }).message}
+            </div>
+          )}
           {modelErrorCause && (
             <div className="mt-1.5 pt-1.5 text-[12px] opacity-90">
               <span className="font-medium">Cause</span>

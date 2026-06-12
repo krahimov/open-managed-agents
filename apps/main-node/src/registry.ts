@@ -402,25 +402,9 @@ export class SessionRegistry {
       });
     }
 
-    if ((this.deps.sqlDialect ?? "sqlite") === "postgres") {
-      const resourceRows = await this.deps.sql
-        .prepare(
-          `SELECT memory_store_id, access FROM session_resources
-           WHERE session_id = ? AND type = 'memory_store'`,
-        )
-        .bind(sessionId)
-        .all<{ memory_store_id: string | null; access: string | null }>();
-      for (const row of resourceRows.results ?? []) {
-        const storeId = row.memory_store_id ?? undefined;
-        if (!storeId) continue;
-        byStore.set(storeId, {
-          store_id: storeId,
-          access: row.access === "read_only" ? "read_only" : "read_write",
-        });
-      }
-      return [...byStore.values()];
-    }
-
+    // Both dialects store session_resources as a JSON `config` blob since
+    // migration 0002 reconciled PG with the cf-auth shape — the old PG
+    // exploded-columns fork (SELECT memory_store_id, ...) is gone.
     const resourceRows = await this.deps.sql
       .prepare(`SELECT config FROM session_resources WHERE session_id = ? AND type = 'memory_store'`)
       .bind(sessionId)

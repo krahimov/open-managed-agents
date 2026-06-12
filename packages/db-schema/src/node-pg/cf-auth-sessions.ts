@@ -39,25 +39,20 @@ export const sessions = pgTable(
 export const session_resources = pgTable(
   "session_resources",
   {
+    // Reconciled with cf-auth/sessions (2026-06-13): the shared
+    // sql-session-repo reads/writes a single JSON `config` blob — the old
+    // exploded-typed-columns PG shape 42703'd every resource insert, so
+    // attaching files/repos/memory stores to sessions never worked on PG.
     id: text("id").primaryKey().notNull(),
     session_id: text("session_id").notNull(),
     type: text("type").notNull(),
-    // PG variant per applySchema() explodes the resource config across
-    // typed columns (memory_store_id, mount_path, etc.) rather than a
-    // single JSON `config` blob like CF. Keep parity here.
-    memory_store_id: text("memory_store_id"),
-    mount_path: text("mount_path"),
-    access: text("access"),
-    instructions: text("instructions"),
-    url: text("url"),
-    checkout_type: text("checkout_type"),
-    checkout_name: text("checkout_name"),
-    checkout_sha: text("checkout_sha"),
-    name: text("name"),
-    value: text("value"),
+    config: text("config").notNull(),
     created_at: bigint("created_at", { mode: "number" }).notNull(),
   },
-  (t) => [index("idx_session_resources_session").on(t.session_id, t.type)],
+  (t) => [
+    index("idx_session_resources_session").on(t.session_id, t.created_at),
+    index("idx_session_resources_session_type").on(t.session_id, t.type),
+  ],
 );
 
 export const session_memory_stores = pgTable(
