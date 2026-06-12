@@ -231,10 +231,13 @@ export function AgentFormDialog({
   const [composioConnections, setComposioConnections] =
     useState<ComposioConnectionState>({});
   const [connectingIntegration, setConnectingIntegration] = useState<string | null>(null);
-  const { data: composioStatus, isLoading: composioStatusLoading } =
-    useApiQuery<ComposioStatusResponse>("/v1/composio/status", undefined, {
-      enabled: open,
-    });
+  const {
+    data: composioStatus,
+    isLoading: composioStatusLoading,
+    refetch: refetchComposioStatus,
+  } = useApiQuery<ComposioStatusResponse>("/v1/composio/status", undefined, {
+    enabled: open,
+  });
   const composioConfigured = composioStatus?.configured === true;
 
   const createDialogRef = useRef<HTMLDivElement>(null);
@@ -1085,6 +1088,7 @@ export function AgentFormDialog({
                     connecting={connectingIntegration}
                     composioConfigured={composioConfigured}
                     composioStatusLoading={composioStatusLoading}
+                    onComposioConnected={() => void refetchComposioStatus()}
                     onToggle={toggleIntegration}
                     onConnect={(entry) => void connectComposioToolkit(entry)}
                   />
@@ -1509,6 +1513,7 @@ function IntegrationsTab({
   connecting,
   composioConfigured,
   composioStatusLoading,
+  onComposioConnected,
   onToggle,
   onConnect,
 }: {
@@ -1519,9 +1524,32 @@ function IntegrationsTab({
   connecting: string | null;
   composioConfigured: boolean;
   composioStatusLoading: boolean;
+  onComposioConnected: () => void;
   onToggle: (entry: ComposioIntegrationEntry) => void;
   onConnect: (entry: ComposioIntegrationEntry) => void;
 }) {
+  const { api } = useApi();
+  const [composioKeyInput, setComposioKeyInput] = useState("");
+  const [savingComposioKey, setSavingComposioKey] = useState(false);
+
+  const saveComposioKey = async () => {
+    const apiKey = composioKeyInput.trim();
+    if (!apiKey) return;
+    setSavingComposioKey(true);
+    try {
+      await api(`/v1/composio/key`, {
+        method: "PUT",
+        body: JSON.stringify({ api_key: apiKey }),
+      });
+      setComposioKeyInput("");
+      toast.success("Composio connected — loading the app catalog");
+      onComposioConnected();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to save Composio key");
+    } finally {
+      setSavingComposioKey(false);
+    }
+  };
   const { data: catalogRes, isLoading: catalogLoading } =
     useApiQuery<ComposioToolkitCatalogResponse>("/v1/composio/toolkits?limit=500", undefined, {
       enabled: composioConfigured,
@@ -1553,8 +1581,44 @@ function IntegrationsTab({
       </div>
 
       {!composioStatusLoading && !composioConfigured && (
-        <div className="rounded-md border border-warning/30 bg-warning-subtle px-3 py-2 text-sm text-warning">
-          {COMPOSIO_NOT_CONFIGURED_MESSAGE}
+        <div className="rounded-md border border-border bg-bg-surface p-3 shadow-sm">
+          <div className="text-sm font-medium text-fg">Connect Composio</div>
+          <p className="mt-1 text-[13px] leading-relaxed text-fg-muted">
+            Integrations are powered by Composio. Paste an API key from{" "}
+            <a
+              href="https://app.composio.dev"
+              target="_blank"
+              rel="noreferrer"
+              className="text-brand hover:underline"
+            >
+              app.composio.dev
+            </a>{" "}
+            — stored encrypted in your workspace, used only for your agents.
+          </p>
+          <div className="mt-2.5 flex gap-2">
+            <input
+              type="password"
+              value={composioKeyInput}
+              onChange={(e) => setComposioKeyInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void saveComposioKey();
+                }
+              }}
+              placeholder="Composio API key"
+              autoComplete="off"
+              className="flex-1 border border-border rounded-md px-3 py-1.5 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle font-mono"
+            />
+            <Button
+              type="button"
+              size="sm"
+              onClick={() => void saveComposioKey()}
+              disabled={savingComposioKey || !composioKeyInput.trim()}
+            >
+              {savingComposioKey ? "Verifying…" : "Connect"}
+            </Button>
+          </div>
         </div>
       )}
 
