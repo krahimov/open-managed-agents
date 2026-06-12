@@ -194,8 +194,25 @@ let drizzleDb: OmaDb<Record<string, unknown>>;
 if (usePostgres) {
   sql = await createPostgresSqlClient(dbUrl);
   const { drizzle: drizzlePostgresJs } = await import("drizzle-orm/postgres-js");
-  const postgresMod = (await import("postgres" as string)) as { default: (dsn: string) => unknown };
-  const pgClient = postgresMod.default(dbUrl);
+  const postgresMod = (await import("postgres" as string)) as {
+    default: (dsn: string, opts?: unknown) => unknown;
+  };
+  // Coerce int8/BIGINT (OID 20) to JS number — postgres.js returns bigint as
+  // a string by default, and drizzle's `mode:"number"` does not re-coerce it,
+  // so msToIso(created_at) saw "1781293530632" and threw "Invalid time value"
+  // on the first Postgres boot. Mirrors the same parser in
+  // packages/sql-client/src/adapters/postgres.ts. Safe: every bigint column in
+  // the node-pg schema (ms timestamps, versions, flags) is within 2^53.
+  const pgClient = postgresMod.default(dbUrl, {
+    types: {
+      bigint: {
+        to: 20,
+        from: [20],
+        serialize: (v: number) => v.toString(),
+        parse: (v: string) => Number(v),
+      },
+    },
+  });
   drizzleDb = drizzlePostgresJs(pgClient as never) as unknown as OmaDb<Record<string, unknown>>;
   const u = new URL(dbUrl);
   backendDescription = `postgres ${u.hostname}:${u.port || 5432}${u.pathname}`;

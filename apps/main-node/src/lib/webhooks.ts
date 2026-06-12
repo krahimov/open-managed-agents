@@ -63,16 +63,19 @@ export class WebhookStore {
   ) {}
 
   async ensureSchema(): Promise<void> {
-    const blob = this.dialect === "postgres" ? "text" : "text";
+    // Epoch-ms columns MUST be bigint: on Postgres `integer` is int4 (max
+    // ~2.1e9) and a Date.now() value (~1.78e12) overflows. `bigint` also
+    // works on SQLite (INTEGER affinity, 64-bit), so the DDL stays dialect-
+    // agnostic. Small counters/flags stay integer.
     await this.sql.exec(`CREATE TABLE IF NOT EXISTS webhook_endpoints (
       id text PRIMARY KEY,
       tenant_id text NOT NULL,
       url text NOT NULL,
       event_types text NOT NULL,
-      secret_cipher ${blob} NOT NULL,
+      secret_cipher text NOT NULL,
       disabled integer NOT NULL DEFAULT 0,
       failure_count integer NOT NULL DEFAULT 0,
-      created_at integer NOT NULL
+      created_at bigint NOT NULL
     )`);
     await this.sql.exec(
       `CREATE INDEX IF NOT EXISTS idx_webhook_endpoints_tenant ON webhook_endpoints (tenant_id, disabled)`,
@@ -83,9 +86,9 @@ export class WebhookStore {
       tenant_id text NOT NULL,
       body text NOT NULL,
       attempt integer NOT NULL DEFAULT 0,
-      next_attempt_at integer NOT NULL,
-      delivered_at integer,
-      failed_at integer,
+      next_attempt_at bigint NOT NULL,
+      delivered_at bigint,
+      failed_at bigint,
       last_status text
     )`);
     await this.sql.exec(

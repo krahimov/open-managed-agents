@@ -8,6 +8,13 @@
       "when": 1779348643561,
       "tag": "0000_consolidated",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1781290000000,
+      "tag": "0001_model_cards_model_column",
+      "breakpoints": true
     }
   ]
 }

@@ -1,9 +1,9 @@
 // Model cards (Node-PG variant of cf-auth/model-cards).
 //
-// Diverges from CF: Node-PG path predates the 0015 handle rename — it
-// keeps `display_name` and DOES NOT have a `model` column. Phase 3
-// reconciliation will land both columns. Until then, ports here
-// match what packages/schema/src/index.ts ships.
+// Reconciled with CF's 0015 handle rename (2026-06-12): `display_name`
+// dropped, `model` added — the shared SqlModelCardRepo selects `model`
+// unconditionally, so the PG schema must carry it (a stale PG baseline
+// crash-looped the first Railway deploy at seedEnvModelCard).
 
 import { sql } from "drizzle-orm";
 import { bigint, index, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
@@ -15,8 +15,9 @@ export const model_cards = pgTable(
     tenant_id: text("tenant_id").notNull(),
     model_id: text("model_id").notNull(),
     provider: text("provider").notNull(),
-    // PG-side keeps display_name (CF dropped it in 0015). Drift tracked.
-    display_name: text("display_name").notNull(),
+    // Raw LLM model string the card resolves to (0015 rename: replaced
+    // display_name; model_id is the customer-facing handle).
+    model: text("model").notNull().default(""),
     base_url: text("base_url"),
     custom_headers: text("custom_headers"),
     api_key_cipher: text("api_key_cipher").notNull(),

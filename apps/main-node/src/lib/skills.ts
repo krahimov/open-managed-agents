@@ -62,7 +62,7 @@ export class SkillStore {
       description text NOT NULL DEFAULT '',
       source text NOT NULL DEFAULT '',
       content text NOT NULL,
-      created_at integer NOT NULL
+      created_at bigint NOT NULL
     )`);
     await this.sql.exec(
       `CREATE INDEX IF NOT EXISTS idx_skills_tenant ON skills (tenant_id, name)`,
