@@ -31,11 +31,14 @@ export interface ComposioToolkitCatalogResponse {
 
 export interface ComposioStatusResponse {
   configured: boolean;
+  /** Where the active key came from: the tenant's own pasted key, the
+   *  operator-level fallback, or null when unconfigured. */
+  source?: "tenant" | "platform" | null;
   message?: string | null;
 }
 
 export const COMPOSIO_NOT_CONFIGURED_MESSAGE =
-  "COMPOSIO_API_KEY is not configured on the API server.";
+  "Composio isn't connected for this workspace yet — add your API key in Apps.";
 
 function favicon(domain: string): string {
   return `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;

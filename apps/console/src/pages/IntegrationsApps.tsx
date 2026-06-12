@@ -29,9 +29,36 @@ export function IntegrationsApps() {
   const { data: vaultsRes, refetch } = useApiQuery<{ data: Vault[] }>(
     "/v1/vaults?status=active&limit=100",
   );
-  const { data: composioStatus, isLoading: composioStatusLoading } =
-    useApiQuery<ComposioStatusResponse>("/v1/composio/status");
+  const {
+    data: composioStatus,
+    isLoading: composioStatusLoading,
+    refetch: refetchComposioStatus,
+  } = useApiQuery<ComposioStatusResponse>("/v1/composio/status");
   const composioConfigured = composioStatus?.configured === true;
+  const composioKeySource = composioStatus?.source ?? null;
+  const [keyInput, setKeyInput] = useState("");
+  const [savingKey, setSavingKey] = useState(false);
+  const [showKeyForm, setShowKeyForm] = useState(false);
+
+  const saveComposioKey = async () => {
+    const apiKey = keyInput.trim();
+    if (!apiKey) return;
+    setSavingKey(true);
+    try {
+      await api(`/v1/composio/key`, {
+        method: "PUT",
+        body: JSON.stringify({ api_key: apiKey }),
+      });
+      setKeyInput("");
+      setShowKeyForm(false);
+      toast.success("Composio connected — loading your app catalog");
+      await refetchComposioStatus();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to save Composio key");
+    } finally {
+      setSavingKey(false);
+    }
+  };
   const { data: catalogRes, isLoading: catalogLoading } =
     useApiQuery<ComposioToolkitCatalogResponse>("/v1/composio/toolkits?limit=500", undefined, {
       enabled: composioConfigured,
@@ -86,7 +113,7 @@ export function IntegrationsApps() {
               ? "Composio catalog loading..."
               : composioConfigured
                 ? `${catalogEntries.length} Composio apps`
-                : "Composio not configured"
+                : "Connect Composio to get started"
           }
           toolbar={
             <input
@@ -99,9 +126,56 @@ export function IntegrationsApps() {
         />
       }
     >
-      {!composioStatusLoading && !composioConfigured && (
-        <div className="mb-4 rounded-md border border-warning/30 bg-warning-subtle px-3 py-2 text-sm text-warning">
-          {COMPOSIO_NOT_CONFIGURED_MESSAGE}
+      {!composioStatusLoading && (!composioConfigured || showKeyForm) && (
+        <div className="mb-4 max-w-xl rounded-md border border-border bg-bg-surface p-4 shadow-sm">
+          <div className="text-sm font-medium text-fg">Connect Composio</div>
+          <p className="mt-1 text-[13px] leading-relaxed text-fg-muted">
+            Powers the app catalog and account connections (Gmail, GitHub, Calendar, …).
+            Paste an API key from{" "}
+            <a
+              href="https://app.composio.dev"
+              target="_blank"
+              rel="noreferrer"
+              className="text-brand hover:underline"
+            >
+              app.composio.dev
+            </a>{" "}
+            — it&apos;s stored encrypted in your workspace and only used for your agents.
+          </p>
+          <div className="mt-3 flex gap-2">
+            <input
+              type="password"
+              value={keyInput}
+              onChange={(e) => setKeyInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void saveComposioKey();
+              }}
+              placeholder="Composio API key"
+              autoComplete="off"
+              className="flex-1 border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle font-mono"
+            />
+            <Button onClick={() => void saveComposioKey()} disabled={savingKey || !keyInput.trim()}>
+              {savingKey ? "Verifying…" : "Connect"}
+            </Button>
+            {showKeyForm && (
+              <Button variant="outline" onClick={() => setShowKeyForm(false)}>
+                Cancel
+              </Button>
+            )}
+          </div>
+        </div>
+      )}
+      {!composioStatusLoading && composioConfigured && composioKeySource === "tenant" && !showKeyForm && (
+        <div className="mb-4 flex items-center gap-2 text-[13px] text-fg-muted">
+          <span className="inline-block size-1.5 rounded-full bg-success" />
+          Using your Composio key
+          <button
+            type="button"
+            onClick={() => setShowKeyForm(true)}
+            className="text-brand hover:underline"
+          >
+            Replace
+          </button>
         </div>
       )}
       <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">

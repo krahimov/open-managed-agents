@@ -158,11 +158,37 @@ function toApiCred<T extends CredRowSliced>(c: T) {
 export interface VaultRoutesDeps {
   services: RouteServicesArg;
   composio?: {
+    /** Operator-level fallback key (self-host convenience). */
     apiKey?: string;
     baseUrl?: string;
     fetcher?: typeof fetch;
+    /** Per-tenant key override (managed-first: tenants paste their own key
+     *  in the console). When it returns a key, it wins over `apiKey`. */
+    resolveApiKey?: (tenantId: string) => Promise<string | null>;
   };
 }
+
+/** Resolve the Composio credentials for this request's tenant: tenant key
+ *  first, operator fallback second, null when neither exists. */
+async function composioForTenant(
+  deps: VaultRoutesDeps,
+  tenantId: string,
+): Promise<
+  | {
+      creds: NonNullable<VaultRoutesDeps["composio"]> & { apiKey: string };
+      source: "tenant" | "platform";
+    }
+  | null
+> {
+  const base = deps.composio;
+  if (!base) return null;
+  const tenantKey = (await base.resolveApiKey?.(tenantId).catch(() => null)) ?? null;
+  if (tenantKey) return { creds: { ...base, apiKey: tenantKey }, source: "tenant" };
+  if (base.apiKey) return { creds: { ...base, apiKey: base.apiKey }, source: "platform" };
+  return null;
+}
+
+const COMPOSIO_NOT_CONNECTED = "Composio is not connected — add your API key in Apps.";
 
 function normalizeComposioToolkitSlug(slug: string): string {
   return slug.trim().toLowerCase();
@@ -532,8 +558,9 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
     if (!(await services.vaults.exists({ tenantId, vaultId }))) {
       return c.json({ error: "Vault not found" }, 404);
     }
-    if (!deps.composio?.apiKey) {
-      return c.json({ error: "COMPOSIO_API_KEY is not configured" }, 503);
+    const composio = await composioForTenant(deps, tenantId);
+    if (!composio) {
+      return c.json({ error: COMPOSIO_NOT_CONNECTED }, 503);
     }
     const body = await c.req.json<{
       display_name?: string;
@@ -566,11 +593,16 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
     if (body.connected_accounts) sessionPayload.connected_accounts = body.connected_accounts;
 
     try {
-      const session = await createComposioToolRouterSession(deps.composio, sessionPayload);
+      const session = await createComposioToolRouterSession(composio.creds, sessionPayload);
       const auth: CredentialAuth = {
         type: "composio_mcp",
         mcp_server_url: session.mcp.url,
-        api_key_env: "COMPOSIO_API_KEY",
+        // Tenant-sourced keys are stored inline so the MCP proxy resolves
+        // them without any server env; the operator-fallback path keeps the
+        // env reference (self-host, key rotates without touching rows).
+        ...(composio.source === "tenant"
+          ? { api_key: composio.creds.apiKey }
+          : { api_key_env: "COMPOSIO_API_KEY" }),
         composio_user_id: composioUserId,
         composio_session_id: session.session_id,
         composio_toolkits: enabledToolkits.length > 0 ? enabledToolkits : undefined,
@@ -621,11 +653,12 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
     if (!(await services.vaults.exists({ tenantId, vaultId }))) {
       return c.json({ error: "Vault not found" }, 404);
     }
-    if (!deps.composio?.apiKey) {
-      return c.json({ error: "COMPOSIO_API_KEY is not configured" }, 503);
+    const composio = await composioForTenant(deps, tenantId);
+    if (!composio) {
+      return c.json({ error: COMPOSIO_NOT_CONNECTED }, 503);
     }
     try {
-      const catalog = await listComposioToolkits(deps.composio, {
+      const catalog = await listComposioToolkits(composio.creds, {
         search: c.req.query("q") || undefined,
         category: c.req.query("category") || undefined,
         cursor: c.req.query("cursor") || undefined,
@@ -644,12 +677,13 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
     if (!(await services.vaults.exists({ tenantId, vaultId }))) {
       return c.json({ error: "Vault not found" }, 404);
     }
-    if (!deps.composio?.apiKey) {
-      return c.json({ error: "COMPOSIO_API_KEY is not configured" }, 503);
+    const composio = await composioForTenant(deps, tenantId);
+    if (!composio) {
+      return c.json({ error: COMPOSIO_NOT_CONNECTED }, 503);
     }
     const userId = c.req.query("user_id") || `oma:${tenantId}:${vaultId}`;
     try {
-      const accounts = await listComposioConnectedAccounts(deps.composio, {
+      const accounts = await listComposioConnectedAccounts(composio.creds, {
         userId,
         toolkit: c.req.query("toolkit") || undefined,
         limit: Number.parseInt(c.req.query("limit") || "100", 10),
@@ -667,8 +701,9 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
     if (!(await services.vaults.exists({ tenantId, vaultId }))) {
       return c.json({ error: "Vault not found" }, 404);
     }
-    if (!deps.composio?.apiKey) {
-      return c.json({ error: "COMPOSIO_API_KEY is not configured" }, 503);
+    const composio = await composioForTenant(deps, tenantId);
+    if (!composio) {
+      return c.json({ error: COMPOSIO_NOT_CONNECTED }, 503);
     }
     const body = await c.req.json<{
       toolkit?: string;
@@ -680,7 +715,7 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
     if (!body.toolkit) return c.json({ error: "toolkit is required" }, 400);
     const userId = body.user_id || `oma:${tenantId}:${vaultId}`;
     try {
-      const link = await createComposioConnectedAccountLink(deps.composio, {
+      const link = await createComposioConnectedAccountLink(composio.creds, {
         userId,
         toolkitSlug: body.toolkit,
         callbackUrl: body.callback_url,

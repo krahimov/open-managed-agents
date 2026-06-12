@@ -981,24 +981,124 @@ v1.route("/sessions", buildSessionRoutes({
 }));
 v1.route("/vaults", buildVaultRoutes({
   services,
-  composio: { apiKey: process.env.COMPOSIO_API_KEY },
+  composio: {
+    apiKey: process.env.COMPOSIO_API_KEY,
+    // Managed-first: a tenant's pasted key (vault credential) wins over the
+    // operator env fallback. Hoisted function declaration defined below.
+    resolveApiKey: async (tenantId) =>
+      (await resolveTenantComposioKey(tenantId))?.apiKey ?? null,
+  },
 }));
 v1.route("/oauth", buildNodeOAuthRoutes({ services, env: process.env }));
-v1.get("/composio/status", (c) =>
-  c.json({
-    configured: !!process.env.COMPOSIO_API_KEY,
-    message: process.env.COMPOSIO_API_KEY
+// ── Composio key resolution ────────────────────────────────────────────────
+// Managed-first: tenants paste their own Composio key in the console (stored
+// as a composio_mcp vault credential — same shape the MCP proxy already
+// resolves, so sessions need zero extra wiring). The operator-level
+// COMPOSIO_API_KEY env var remains as a self-host convenience fallback;
+// a tenant key always wins so multi-user instances stay isolated.
+const COMPOSIO_TOOL_ROUTER_URL = "https://app.composio.dev/tool_router/v3/session/mcp";
+
+async function resolveTenantComposioKey(tenantId: string): Promise<{
+  apiKey: string;
+  vaultId: string;
+  credentialId: string;
+} | null> {
+  const vaults = await vaultService.list({ tenantId }).catch(() => []);
+  if (vaults.length === 0) return null;
+  const grouped = await credentialService
+    .listByVaults({ tenantId, vaultIds: vaults.map((v) => v.id) })
+    .catch(() => []);
+  const candidates = grouped
+    .flatMap((g) => g.credentials.map((cred) => ({ vaultId: g.vault_id, cred })))
+    .filter(({ cred }) => !(cred as { archived_at?: string | null }).archived_at)
+    .filter(({ cred }) => {
+      const auth = (cred as { auth?: { type?: string; api_key?: string } }).auth;
+      return auth?.type === "composio_mcp" && typeof auth.api_key === "string" && auth.api_key.length > 0;
+    })
+    .sort((a, b) => {
+      // created_at is ISO on CredentialRow; tolerate epoch-ms too.
+      const ts = (x: unknown) => {
+        const v = (x as { created_at?: number | string }).created_at;
+        return typeof v === "number" ? v : v ? Date.parse(v) : 0;
+      };
+      return ts(b.cred) - ts(a.cred); // newest wins — a re-pasted key replaces a stale one
+    });
+  const top = candidates[0];
+  if (!top) return null;
+  const auth = (top.cred as { auth?: { api_key?: string } }).auth;
+  return {
+    apiKey: auth!.api_key!,
+    vaultId: top.vaultId,
+    credentialId: (top.cred as { id: string }).id,
+  };
+}
+
+async function composioKeyForTenant(
+  tenantId: string,
+): Promise<{ apiKey: string; source: "tenant" | "platform" } | null> {
+  const tenant = await resolveTenantComposioKey(tenantId);
+  if (tenant) return { apiKey: tenant.apiKey, source: "tenant" };
+  if (process.env.COMPOSIO_API_KEY) {
+    return { apiKey: process.env.COMPOSIO_API_KEY, source: "platform" };
+  }
+  return null;
+}
+
+v1.get("/composio/status", async (c) => {
+  const key = await composioKeyForTenant(c.get("tenant_id"));
+  return c.json({
+    configured: !!key,
+    source: key?.source ?? null,
+    message: key
       ? null
-      : "COMPOSIO_API_KEY is not configured",
-  }),
-);
+      : "Connect your Composio account — paste an API key from app.composio.dev.",
+  });
+});
+v1.put("/composio/key", async (c) => {
+  const tenantId = c.get("tenant_id");
+  const body = await c.req
+    .json<{ api_key?: string; mcp_server_url?: string }>()
+    .catch(() => null);
+  const apiKey = body?.api_key?.trim();
+  if (!apiKey) return c.json({ error: "api_key required" }, 400);
+  const mcpServerUrl = body?.mcp_server_url?.trim() || COMPOSIO_TOOL_ROUTER_URL;
+  // Validate against Composio BEFORE persisting — a typo'd key failing later
+  // inside an agent session is far harder to debug than a 422 here.
+  try {
+    await listComposioToolkits({ apiKey }, { limit: 1 });
+  } catch {
+    return c.json({ error: "Composio rejected this API key — check it at app.composio.dev" }, 422);
+  }
+  const auth = { type: "composio_mcp", mcp_server_url: mcpServerUrl, api_key: apiKey };
+  const existing = await resolveTenantComposioKey(tenantId);
+  if (existing) {
+    await credentialService.update({
+      tenantId,
+      vaultId: existing.vaultId,
+      credentialId: existing.credentialId,
+      auth: auth as never,
+    });
+    return c.json({ vault_id: existing.vaultId, credential_id: existing.credentialId, updated: true });
+  }
+  const vaults = await vaultService.list({ tenantId }).catch(() => []);
+  let vault = vaults.find((v) => !v.archived_at && v.name === "integrations") ?? vaults.find((v) => !v.archived_at) ?? null;
+  if (!vault) vault = await vaultService.create({ tenantId, name: "integrations" });
+  const cred = await credentialService.create({
+    tenantId,
+    vaultId: vault.id,
+    displayName: "Composio",
+    auth: auth as never,
+  });
+  return c.json({ vault_id: vault.id, credential_id: cred.id, created: true }, 201);
+});
 v1.get("/composio/toolkits", async (c) => {
-  if (!process.env.COMPOSIO_API_KEY) {
-    return c.json({ error: "COMPOSIO_API_KEY is not configured" }, 503);
+  const key = await composioKeyForTenant(c.get("tenant_id"));
+  if (!key) {
+    return c.json({ error: "Composio is not connected — add your API key in Apps." }, 503);
   }
   try {
     const catalog = await listComposioToolkits(
-      { apiKey: process.env.COMPOSIO_API_KEY },
+      { apiKey: key.apiKey },
       {
         search: c.req.query("q") || undefined,
         category: c.req.query("category") || undefined,
