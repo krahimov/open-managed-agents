@@ -11,6 +11,7 @@
 // "sign up auto-creates a workspace" flow runs on either runtime.
 
 import { betterAuth } from "better-auth";
+import { dash } from "@better-auth/infra";
 import { emailOTP } from "better-auth/plugins";
 import type { EmailSender } from "@open-managed-agents/email";
 import type { SqlClient } from "@open-managed-agents/sql-client";
@@ -30,9 +31,15 @@ export interface BuildBetterAuthOpts {
    *  CF prod always passes a real sender; self-host without SMTP passes
    *  null. */
   sender: EmailSender | null;
-  /** Optional Google OAuth. */
+  /** Optional social OAuth providers for console sign-in. */
   googleClientId?: string;
   googleClientSecret?: string;
+  githubClientId?: string;
+  githubClientSecret?: string;
+  /** Optional Better Auth Infrastructure dashboard/audit-log connection. */
+  betterAuthInfraApiKey?: string;
+  betterAuthInfraApiUrl?: string;
+  betterAuthInfraKvUrl?: string;
   /** When true, sign-up requires email verification before the user is
    *  signed in. Default: false on self-host (no SMTP path), true on CF prod. */
   requireEmailVerify?: boolean;
@@ -73,34 +80,50 @@ export function buildBetterAuth(opts: BuildBetterAuthOpts) {
       clientSecret: opts.googleClientSecret,
     };
   }
+  if (opts.githubClientId && opts.githubClientSecret) {
+    socialProviders.github = {
+      clientId: opts.githubClientId,
+      clientSecret: opts.githubClientSecret,
+    };
+  }
 
   const sender = opts.sender;
   const requireVerify = !!opts.requireEmailVerify;
 
-  const plugins: unknown[] = [];
-  if (sender) {
-    plugins.push(
-      emailOTP({
-        otpLength: 6,
-        expiresIn: 300,
-        sendVerificationOnSignUp: requireVerify,
-        async sendVerificationOTP({ email, otp, type }) {
-          const labels: Record<string, string> = {
-            "sign-in": "Your sign-in code",
-            "email-verification": "Verify your email",
-            "forget-password": "Your password reset code",
-          };
-          const label = labels[type] ?? "Your verification code";
-          await sender.send({
-            to: email,
-            subject: `${label} — openma`,
-            html: otpEmailHtml(otp, label),
-            text: `${label}: ${otp}`,
-          });
-        },
-      }),
-    );
-  }
+  const plugins = [
+    ...(opts.betterAuthInfraApiKey
+      ? [
+          dash({
+            apiKey: opts.betterAuthInfraApiKey,
+            apiUrl: opts.betterAuthInfraApiUrl,
+            kvUrl: opts.betterAuthInfraKvUrl,
+          }),
+        ]
+      : []),
+    ...(sender
+      ? [
+          emailOTP({
+            otpLength: 6,
+            expiresIn: 300,
+            sendVerificationOnSignUp: requireVerify,
+            async sendVerificationOTP({ email, otp, type }) {
+              const labels: Record<string, string> = {
+                "sign-in": "Your sign-in code",
+                "email-verification": "Verify your email",
+                "forget-password": "Your password reset code",
+              };
+              const label = labels[type] ?? "Your verification code";
+              await sender.send({
+                to: email,
+                subject: `${label} — openma`,
+                html: otpEmailHtml(otp, label),
+                text: `${label}: ${otp}`,
+              });
+            },
+          }),
+        ]
+      : []),
+  ];
 
   const emailVerification = sender
     ? {
@@ -139,7 +162,7 @@ export function buildBetterAuth(opts: BuildBetterAuthOpts) {
       ...(sendResetPassword ? { sendResetPassword } : {}),
     },
     ...(emailVerification ? { emailVerification } : {}),
-    plugins: plugins as never,
+    plugins,
     socialProviders,
     trustedOrigins: opts.baseURL ? [opts.baseURL] : ["*"],
     ...(opts.cookieDomain

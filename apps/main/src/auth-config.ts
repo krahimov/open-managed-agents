@@ -1,4 +1,5 @@
 import { betterAuth } from "better-auth";
+import { dash } from "@better-auth/infra";
 import { drizzle } from "drizzle-orm/d1";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { emailOTP } from "better-auth/plugins";
@@ -49,6 +50,44 @@ export function createAuth(env: Env) {
       clientSecret: env.GOOGLE_CLIENT_SECRET,
     };
   }
+  if (env.GITHUB_AUTH_CLIENT_ID && env.GITHUB_AUTH_CLIENT_SECRET) {
+    socialProviders.github = {
+      clientId: env.GITHUB_AUTH_CLIENT_ID,
+      clientSecret: env.GITHUB_AUTH_CLIENT_SECRET,
+    };
+  }
+
+  const plugins = [
+    ...(env.BETTER_AUTH_API_KEY
+      ? [
+          dash({
+            apiKey: env.BETTER_AUTH_API_KEY,
+            apiUrl: env.BETTER_AUTH_API_URL,
+            kvUrl: env.BETTER_AUTH_KV_URL,
+          }),
+        ]
+      : []),
+    emailOTP({
+      otpLength: 6,
+      expiresIn: 300,
+      sendVerificationOnSignUp: true,
+      async sendVerificationOTP({ email, otp, type }) {
+        const labels: Record<string, string> = {
+          "sign-in": "Your sign-in code",
+          "email-verification": "Verify your email",
+          "forget-password": "Your password reset code",
+        };
+        const label = labels[type] ?? "Your verification code";
+        await sendEmail(
+          env,
+          email,
+          `${label} — openma`,
+          otpEmailHtml(otp, label),
+          `${label}: ${otp}`,
+        );
+      },
+    }),
+  ];
 
   return betterAuth({
     basePath: "/auth",
@@ -79,28 +118,7 @@ export function createAuth(env: Env) {
       sendOnSignUp: true,
       autoSignInAfterVerification: true,
     },
-    plugins: [
-      emailOTP({
-        otpLength: 6,
-        expiresIn: 300,
-        sendVerificationOnSignUp: true,
-        async sendVerificationOTP({ email, otp, type }) {
-          const labels: Record<string, string> = {
-            "sign-in": "Your sign-in code",
-            "email-verification": "Verify your email",
-            "forget-password": "Your password reset code",
-          };
-          const label = labels[type] ?? "Your verification code";
-          await sendEmail(
-            env,
-            email,
-            `${label} — openma`,
-            otpEmailHtml(otp, label),
-            `${label}: ${otp}`,
-          );
-        },
-      }),
-    ],
+    plugins,
     socialProviders,
     database: drizzleAdapter(db, { provider: "sqlite", schema }),
     trustedOrigins: ["*"],

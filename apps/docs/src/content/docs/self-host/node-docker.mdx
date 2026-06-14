@@ -106,6 +106,8 @@ email + password — sign-up creates a session immediately, no OTP screen.
 | **AUTH_DISABLED=1** | "I'm the only user, skip auth entirely" | `echo "AUTH_DISABLED=1" >> .env`, restart. Every request becomes `tenant_id=default`. |
 | **email + OTP gate** | Real prod, you wired up SMTP | `AUTH_REQUIRE_EMAIL_VERIFY=1`, override `sendVerificationOTP` in `apps/main-node/src/auth/config.ts` to call Resend / SES / SMTP / Postmark / etc. |
 | **Google OAuth** | Team SSO | `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` in `.env`. Console renders Google button automatically. |
+| **GitHub OAuth** | Team SSO | `GITHUB_AUTH_CLIENT_ID` + `GITHUB_AUTH_CLIENT_SECRET` in `.env`. Console renders GitHub button automatically. |
+| **Better Auth Infrastructure** | Optional hosted dashboard/audit logs | `BETTER_AUTH_API_KEY` in `.env`. `BETTER_AUTH_API_URL`/`BETTER_AUTH_KV_URL` usually stay unset unless Better Auth gives custom endpoints. |
 
 ## Sandbox modes
 

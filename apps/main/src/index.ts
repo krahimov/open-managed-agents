@@ -118,6 +118,9 @@ app.get("/auth-info", (c) => {
   if (c.env.GOOGLE_CLIENT_ID && c.env.GOOGLE_CLIENT_SECRET) {
     providers.push("google");
   }
+  if (c.env.GITHUB_AUTH_CLIENT_ID && c.env.GITHUB_AUTH_CLIENT_SECRET) {
+    providers.push("github");
+  }
   return c.json({
     auth_disabled: false,
     providers,

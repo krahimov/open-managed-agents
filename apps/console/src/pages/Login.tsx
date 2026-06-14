@@ -20,6 +20,37 @@ function onLoginSuccess(redirect: () => void) {
   redirect();
 }
 
+function GoogleIcon() {
+  return (
+    <svg className="w-4 h-4" viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"
+        fill="#4285F4"
+      />
+      <path
+        d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
+        fill="#34A853"
+      />
+      <path
+        d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
+        fill="#FBBC05"
+      />
+      <path
+        d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
+        fill="#EA4335"
+      />
+    </svg>
+  );
+}
+
+function GitHubIcon() {
+  return (
+    <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M12 2C6.48 2 2 6.58 2 12.26c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-1.04-.01-1.88-2.78.62-3.37-1.21-3.37-1.21-.45-1.18-1.11-1.49-1.11-1.49-.91-.64.07-.63.07-.63 1 .07 1.53 1.06 1.53 1.06.9 1.57 2.35 1.12 2.93.86.09-.67.35-1.12.63-1.38-2.22-.26-4.56-1.14-4.56-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.27 2.75 1.05A9.37 9.37 0 0112 7.01c.85 0 1.7.12 2.5.34 1.9-1.32 2.74-1.05 2.74-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.8-4.57 5.06.36.32.68.95.68 1.92 0 1.38-.01 2.5-.01 2.84 0 .27.18.59.69.49A10.14 10.14 0 0022 12.26C22 6.58 17.52 2 12 2z" />
+    </svg>
+  );
+}
+
 type Mode =
   | "login"
   | "signup"
@@ -40,14 +71,17 @@ export function Login() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   // /auth-info is a public unauthenticated endpoint advertising which
-  // providers (google / email-otp) are wired up and the Turnstile public
+  // providers (google / github / email-otp) are wired up and the Turnstile public
   // site key. TQ keeps the result cached + deduped across this page's
   // re-mounts so a navigation between modes doesn't refetch.
   const { data: authInfo } = useApiQuery<{
     providers?: string[];
     turnstile_site_key?: string | null;
   }>("/auth-info");
-  const googleEnabled = !!authInfo?.providers?.includes("google");
+  const socialProviders = [
+    { id: "google" as const, label: "Google" },
+    { id: "github" as const, label: "GitHub" },
+  ].filter((provider) => authInfo?.providers?.includes(provider.id));
   // Whether the backend gates sign-up behind an email-OTP verification.
   // /auth-info advertises "email-otp" iff AUTH_REQUIRE_EMAIL_VERIFY=1 on
   // the server. When absent (default self-host), the sign-up flow does
@@ -317,9 +351,9 @@ export function Login() {
     }
   };
 
-  const handleGoogle = async () => {
+  const handleSocialSignIn = async (provider: "google" | "github") => {
     await authClient.signIn.social({
-      provider: "google",
+      provider,
       callbackURL: nextUrl,
     });
   };
@@ -372,34 +406,24 @@ export function Login() {
           <p className="text-sm text-fg-muted mt-1">{subtitles[mode]}</p>
         </div>
 
-        {/* Google (only on login/signup/otp-login) */}
-        {googleEnabled &&
+        {/* Social sign-in (only on login/signup/otp-login) */}
+        {socialProviders.length > 0 &&
           (mode === "login" || mode === "signup" || mode === "otp-login") && (
             <div className="mb-4 space-y-3">
-              <button
-                onClick={handleGoogle}
-                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 border border-border rounded-md bg-bg-surface text-sm text-fg shadow-[var(--shadow-sm)] hover:border-border-strong hover:bg-bg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-              >
-                <svg className="w-4 h-4" viewBox="0 0 24 24">
-                  <path
-                    d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"
-                    fill="#4285F4"
-                  />
-                  <path
-                    d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
-                    fill="#34A853"
-                  />
-                  <path
-                    d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"
-                    fill="#FBBC05"
-                  />
-                  <path
-                    d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
-                    fill="#EA4335"
-                  />
-                </svg>
-                Continue with Google
-              </button>
+              {socialProviders.map((provider) => (
+                <button
+                  key={provider.id}
+                  onClick={() => void handleSocialSignIn(provider.id)}
+                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 border border-border rounded-md bg-bg-surface text-sm text-fg shadow-[var(--shadow-sm)] hover:border-border-strong hover:bg-bg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+                >
+                  {provider.id === "google" ? (
+                    <GoogleIcon />
+                  ) : (
+                    <GitHubIcon />
+                  )}
+                  Continue with {provider.label}
+                </button>
+              ))}
               <div className="flex items-center gap-3">
                 <div className="flex-1 h-px bg-border" />
                 <span className="text-xs text-fg-subtle">or</span>

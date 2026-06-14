@@ -77,6 +77,12 @@ export interface Env {
   TURNSTILE_SECRET_KEY?: string;
   API_KEY: string;
   BETTER_AUTH_SECRET: string;
+  /** Optional Better Auth Infrastructure dashboard/audit-log connection.
+   *  BETTER_AUTH_API_KEY is secret; API/KV URLs are normally omitted unless
+   *  the dashboard project gives custom endpoints. */
+  BETTER_AUTH_API_KEY?: string;
+  BETTER_AUTH_API_URL?: string;
+  BETTER_AUTH_KV_URL?: string;
   /** When set, the better-auth session cookie is scoped to this domain
    *  (leading dot for cross-subdomain). Typical value on hosted:
    *  ".openma.dev" so app.openma.dev's auth cookie is also visible from
@@ -86,6 +92,11 @@ export interface Env {
   AUTH_COOKIE_NAME?: string;
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
+  /** GitHub OAuth App used for better-auth console sign-in.
+   *  Separate from GITHUB_OAUTH_* below, which is for GitHub MCP/integration
+   *  onboarding callbacks. */
+  GITHUB_AUTH_CLIENT_ID?: string;
+  GITHUB_AUTH_CLIENT_SECRET?: string;
   // Pre-registered OAuth client_id/secret per provider, for MCP servers
   // whose authorization server doesn't expose a working DCR endpoint.
   // Operator workflow: register an OAuth App with the provider, set

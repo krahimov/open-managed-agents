@@ -5,6 +5,8 @@
   "type": "module",
   "main": "src/index.ts",
   "dependencies": {
+    "@better-auth/infra": "^0.2.14",
+    "@better-auth/sso": "1.6.3",
     "@cloudflare/containers": "^0.0.25",
     "@cloudflare/sandbox": "^0.9.1",
     "@open-managed-agents/acp-runtime": "workspace:*",

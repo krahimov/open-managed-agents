@@ -7,6 +7,8 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@better-auth/infra": "^0.2.14",
+    "@better-auth/sso": "1.6.3",
     "@open-managed-agents/email": "workspace:*",
     "@open-managed-agents/sql-client": "workspace:*",
     "better-auth": "^1.6.3"
