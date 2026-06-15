@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router";
+import { Check, Copy, Terminal } from "lucide-react";
 import { useAuth } from "../lib/auth";
 import { useApiQuery } from "../lib/useApiQuery";
 import { toast } from "sonner";
@@ -7,6 +8,10 @@ import { StatusPill } from "../components/Badge";
 import { EmptyState } from "../components/EmptyState";
 import { Skeleton } from "../components/Skeleton";
 import { BRAND_NAME } from "../lib/brand";
+import {
+  HARNESS_AGENT_BUILDER_PROMPT,
+  HARNESS_AGENT_BUILDER_SKILL,
+} from "../lib/harness-agent-builder-skill";
 
 interface Stats {
   agents: number;
@@ -53,11 +58,34 @@ export function Dashboard() {
   const guideVisible = !statsPending && (!workspaceActive || showGuide);
   const recentSessions = sessionsQuery.data?.data.slice(0, 5) ?? [];
 
-  const copy = (text: string, key: string) => {
-    navigator.clipboard.writeText(text);
-    setCopied(key);
-    toast.success("Copied");
-    setTimeout(() => setCopied(null), 1600);
+  const copy = async (text: string, key: string) => {
+    try {
+      const fallbackCopy = () => {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.setAttribute("readonly", "");
+        textarea.style.position = "fixed";
+        textarea.style.left = "-9999px";
+        document.body.appendChild(textarea);
+        textarea.select();
+        const copiedFallback = document.execCommand("copy");
+        textarea.remove();
+        if (!copiedFallback) throw new Error("Clipboard fallback failed");
+      };
+
+      try {
+        if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
+        await navigator.clipboard.writeText(text);
+      } catch {
+        fallbackCopy();
+      }
+
+      setCopied(key);
+      toast.success("Copied");
+      setTimeout(() => setCopied(null), 1600);
+    } catch {
+      toast.error("Copy failed");
+    }
   };
 
   const stat = (label: string, value: number | undefined, to: string) => (
@@ -88,6 +116,7 @@ export function Dashboard() {
   const cmdGlobal = "npm i -g @openma/cli";
   const examplePrompt =
     `Use ${BRAND_NAME} to create a research agent that monitors arXiv for new ML papers daily`;
+  const skillPreview = HARNESS_AGENT_BUILDER_SKILL.split("\n").slice(0, 28).join("\n");
 
   return (
     <div className="flex-1 overflow-y-auto">
@@ -207,6 +236,89 @@ export function Dashboard() {
           </div>
         </section>
         )}
+
+        {/* Agent builder skill — copyable handoff for external coding agents */}
+        <section className="border border-border rounded-lg bg-bg-surface shadow-[var(--shadow-sm)] overflow-hidden">
+          <div className="grid lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+            <div className="p-5 md:p-6 border-b lg:border-b-0 lg:border-r border-border min-w-0">
+              <div className="inline-flex items-center gap-1.5 rounded-md border border-border bg-bg px-2 py-1 text-[11px] font-medium uppercase text-fg-subtle">
+                <Terminal className="size-3.5" />
+                Codex / Claude Code
+              </div>
+              <h2 className="mt-4 font-display text-xl font-semibold text-fg">
+                Agent builder skill
+              </h2>
+              <p className="mt-2 text-sm text-fg-muted leading-6 max-w-[56ch]">
+                Paste this into your coding agent so it can create Harness Studio
+                agents, trigger CLI sign-in, route app OAuth, apply manifests,
+                and verify sessions.
+              </p>
+
+              <div className="mt-5 flex flex-col sm:flex-row gap-2">
+                <button
+                  onClick={() => copy(HARNESS_AGENT_BUILDER_SKILL, "agent-builder-skill")}
+                  className="inline-flex items-center justify-center gap-2 px-3.5 py-2 bg-brand text-brand-fg rounded-md text-[13px] font-medium hover:bg-brand-hover transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+                >
+                  {copied === "agent-builder-skill" ? (
+                    <Check className="size-4" />
+                  ) : (
+                    <Copy className="size-4" />
+                  )}
+                  Copy full skill
+                </button>
+                <button
+                  onClick={() => copy(HARNESS_AGENT_BUILDER_PROMPT, "agent-builder-prompt")}
+                  className="inline-flex items-center justify-center gap-2 px-3.5 py-2 rounded-md border border-border bg-bg hover:border-border-strong hover:bg-brand-subtle/45 text-[13px] font-medium text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+                >
+                  {copied === "agent-builder-prompt" ? (
+                    <Check className="size-4" />
+                  ) : (
+                    <Copy className="size-4" />
+                  )}
+                  Copy starter prompt
+                </button>
+              </div>
+
+              <ol className="mt-5 grid sm:grid-cols-3 gap-x-4 gap-y-2 text-[12px] text-fg-muted">
+                {["CLI sign-in", "OAuth handoff", "Smoke test"].map((item, index) => (
+                  <li key={item} className="flex items-center gap-2 min-w-0">
+                    <span className="font-mono text-[11px] text-brand">
+                      {String(index + 1).padStart(2, "0")}
+                    </span>
+                    <span className="truncate">{item}</span>
+                  </li>
+                ))}
+              </ol>
+            </div>
+
+            <div className="bg-bg min-w-0">
+              <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-border">
+                <div className="min-w-0">
+                  <p className="text-[11px] uppercase font-medium text-fg-subtle">
+                    SKILL.md preview
+                  </p>
+                  <p className="text-[12px] text-fg-muted truncate">
+                    Self-contained paste target
+                  </p>
+                </div>
+                <button
+                  onClick={() => copy(HARNESS_AGENT_BUILDER_SKILL, "agent-builder-skill-preview")}
+                  className="inline-flex items-center justify-center size-8 rounded-md border border-border text-fg-muted hover:text-fg hover:bg-bg-surface transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+                  aria-label="Copy agent builder skill"
+                >
+                  {copied === "agent-builder-skill-preview" ? (
+                    <Check className="size-4" />
+                  ) : (
+                    <Copy className="size-4" />
+                  )}
+                </button>
+              </div>
+              <pre className="max-h-[360px] overflow-auto p-4 text-[12px] leading-5 text-fg-muted font-mono whitespace-pre-wrap break-words">
+                {skillPreview}
+              </pre>
+            </div>
+          </div>
+        </section>
 
         {/* Stats — number-forward, no decorative icons */}
         <section>
