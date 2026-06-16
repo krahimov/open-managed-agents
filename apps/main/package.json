@@ -7,8 +7,8 @@
   "dependencies": {
     "@better-auth/infra": "^0.2.14",
     "@better-auth/sso": "1.6.3",
-    "@cloudflare/containers": "^0.0.25",
-    "@cloudflare/sandbox": "^0.9.1",
+    "@cloudflare/containers": "^0.3.7",
+    "@cloudflare/sandbox": "^0.12.1",
     "@open-managed-agents/acp-runtime": "workspace:*",
     "@open-managed-agents/agents-store": "workspace:*",
     "@open-managed-agents/blob-store": "workspace:*",
