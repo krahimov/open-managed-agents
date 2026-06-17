@@ -610,6 +610,17 @@ const sessionRegistry = new SessionRegistry({
     const sdk = new ClaudeAgentSdkHarness({
       resolveMcpTarget: resolveNodeMcpProxyTarget,
       resolveSkills: (tenantId, refs) => skillStore.resolveRefs(tenantId, refs),
+      // Setup-session support: the in-process oma_setup MCP server stages the
+      // agent's refined harness in session metadata and, on finish, applies it
+      // to the agent it belongs to.
+      readSessionMetadata: async (tenantId, sessionId) =>
+        (await sessionsService.get({ tenantId, sessionId }))?.metadata ?? null,
+      patchSessionMetadata: async (tenantId, sessionId, patch) => {
+        await sessionsService.update({ tenantId, sessionId, metadata: patch });
+      },
+      updateAgent: async (tenantId, agentId, patch) => {
+        return await agentsService.update({ tenantId, agentId, input: patch });
+      },
     });
     return {
       run: (ctx: unknown) => {

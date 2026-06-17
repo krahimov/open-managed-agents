@@ -214,7 +214,12 @@ export function useApi() {
       // Successful response — clear the self-heal sentinel so a future stale
       // tenant can self-heal again later in the same browser session.
       sessionStorage.removeItem("oma_tenant_self_heal");
-      return res.json() as Promise<T>;
+      // Some endpoints return a success with no body (e.g. POST /events → 202,
+      // 204 No Content). res.json() rejects on an empty string, which would
+      // turn a successful write into a thrown error for the caller. Parse
+      // defensively: empty body → undefined.
+      const text = await res.text();
+      return (text ? JSON.parse(text) : undefined) as T;
     },
     [],
   );

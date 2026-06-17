@@ -87,6 +87,17 @@ const protectedRoutes: RouteObject[] = [
     children: [
       { index: true, element: <AgentsList /> },
       {
+        // Agent setup session — the agent's first session, where it reads its
+        // own harness and interviews the user to refine it. Lazy (pulls in
+        // ai-elements + Shiki like SessionDetail), so keep it out of the list bundle.
+        path: ":id/setup",
+        handle: { crumb: "Setup" },
+        lazy: async () => {
+          const { AgentSetup } = await import("./pages/agents/AgentSetup");
+          return { Component: AgentSetup };
+        },
+      },
+      {
         path: ":id",
         element: <AgentDetail />,
         handle: { crumb: (m: UIMatch) => (m.params.id as string | undefined) ?? "Agent" },

@@ -543,6 +543,46 @@ export function AgentFormDialog({
     return hasComposio ? form.mcpServers : [COMPOSIO_MCP_SERVER, ...form.mcpServers];
   };
 
+  // After an agent is created, drop the user into its first session in SETUP
+  // MODE: the agent reads its own harness (the YAML) and interviews the user to
+  // refine it live. Falls back to the agent page if a session can't be started.
+  const goToSetup = async (agent: Agent) => {
+    try {
+      const environmentId =
+        form.environmentId ||
+        (await api<{ data?: Array<{ id: string }> }>("/v1/environments?limit=1")).data?.[0]?.id;
+      const session = await api<{ id: string }>("/v1/sessions", {
+        method: "POST",
+        body: JSON.stringify({
+          agent: agent.id,
+          ...(environmentId ? { environment_id: environmentId } : {}),
+          metadata: { oma_setup: true },
+        }),
+      });
+      // Kick off the interview so the agent speaks first.
+      await api(`/v1/sessions/${session.id}/events`, {
+        method: "POST",
+        body: JSON.stringify({
+          events: [
+            {
+              type: "user.message",
+              content: [
+                {
+                  type: "text",
+                  text:
+                    "I just created you from a template. Walk me through setting up your harness — ask me what you should do, and refine your config as we go.",
+                },
+              ],
+            },
+          ],
+        }),
+      });
+      nav(`/agents/${agent.id}/setup?session=${session.id}`);
+    } catch {
+      nav(`/agents/${agent.id}`);
+    }
+  };
+
   const create = async () => {
     setCreateError("");
     try {
@@ -592,7 +632,7 @@ export function AgentFormDialog({
       });
       closeCreate();
       onCreated?.();
-      nav(`/agents/${agent.id}`);
+      await goToSetup(agent);
     } catch (e: any) {
       setCreateError(e?.message || "Failed to create agent");
     }
@@ -812,7 +852,7 @@ export function AgentFormDialog({
       });
       closeCreate();
       onCreated?.();
-      nav(`/agents/${agent.id}`);
+      await goToSetup(agent);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Invalid config";
       setCreateError(msg);

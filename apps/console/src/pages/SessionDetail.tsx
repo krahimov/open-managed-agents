@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from "react";
 import { useParams, Link } from "react-router";
 import yaml from "js-yaml";
+import { OMA_SETUP_HARNESS } from "@open-managed-agents/api-types";
 import { useApi } from "../lib/api";
 import { toast } from "sonner";
 import { Markdown } from "../components/Markdown";
@@ -1614,6 +1615,16 @@ function EventRender({
     }
 
     case "agent.message": {
+      // Agent setup harness markers ride on agent.message (empty content +
+      // metadata.harness) per the EventBase metadata convention. They're
+      // consumed by the setup view's harness pane — skip them here so the raw
+      // session viewer doesn't render empty bubbles.
+      if (
+        (event.metadata as { harness?: string } | undefined)?.harness ===
+        OMA_SETUP_HARNESS
+      ) {
+        return null;
+      }
       const text = (Array.isArray(event.content) ? event.content : [])
         .map((b) => b.text)
         .join("");

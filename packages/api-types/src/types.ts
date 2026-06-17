@@ -950,6 +950,18 @@ export function isSpecEvent(type: string): boolean {
   return SPEC_EVENT_TYPES.has(type);
 }
 
+/**
+ * OMA agent setup-session event markers. When a newly-created agent runs its
+ * first "setup" session, it refines its OWN harness; each change is broadcast
+ * on `agent.message` (a spec event — passes the SSE filter, no wire-compat
+ * break) tagged under `metadata`, per the {@link EventBase} metadata
+ * convention, instead of a new top-level event type. Consumers key off
+ * `metadata.harness === OMA_SETUP_HARNESS` plus `metadata.kind`:
+ *   - harness_updated → `metadata.harness_config` (the refined harness) + `metadata.changed` (string[])
+ */
+export const OMA_SETUP_HARNESS = "oma_setup";
+export const OMA_SETUP_KIND_HARNESS_UPDATED = "harness_updated";
+
 // --- Vault ---
 
 export interface VaultConfig {
