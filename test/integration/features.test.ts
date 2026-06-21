@@ -43,7 +43,7 @@ describe("Agent update (PUT)", () => {
       name: "Updatable",
       model: "claude-sonnet-4-6",
       system: "original system",
-      harness: "noop-test",
+      _oma: { harness: "noop-test" },
     });
     agentId = ((await res.json()) as any).id;
   });
@@ -94,7 +94,7 @@ describe("Agent update (PUT)", () => {
 // ============================================================
 describe("Agent delete (DELETE)", () => {
   it("deletes an agent", async () => {
-    const createRes = await post("/v1/agents", { name: "ToDelete", model: "claude-sonnet-4-6", harness: "noop-test" });
+    const createRes = await post("/v1/agents", { name: "ToDelete", model: "claude-sonnet-4-6", _oma: { harness: "noop-test" } });
     const agent = (await createRes.json()) as any;
 
     const delRes = await del(`/v1/agents/${agent.id}`);
@@ -117,7 +117,7 @@ describe("Agent delete (DELETE)", () => {
 // ============================================================
 describe("Agent archive", () => {
   it("archives an agent", async () => {
-    const createRes = await post("/v1/agents", { name: "ToArchive", model: "claude-sonnet-4-6", harness: "noop-test" });
+    const createRes = await post("/v1/agents", { name: "ToArchive", model: "claude-sonnet-4-6", _oma: { harness: "noop-test" } });
     const agent = (await createRes.json()) as any;
     expect(agent.archived_at).toBeFalsy();
 
@@ -145,7 +145,7 @@ describe("Agent version history", () => {
   let agentId: string;
 
   beforeAll(async () => {
-    const res = await post("/v1/agents", { name: "Versioned", model: "claude-sonnet-4-6", system: "v1", harness: "noop-test" });
+    const res = await post("/v1/agents", { name: "Versioned", model: "claude-sonnet-4-6", system: "v1", _oma: { harness: "noop-test" } });
     agentId = ((await res.json()) as any).id;
     // Create 3 versions
     await put(`/v1/agents/${agentId}`, { system: "v2" });
@@ -189,7 +189,7 @@ describe("Agent list filters", () => {
   beforeAll(async () => {
     // Create a few agents
     for (let i = 0; i < 3; i++) {
-      await post("/v1/agents", { name: `ListTest-${i}`, model: "claude-sonnet-4-6", harness: "noop-test" });
+      await post("/v1/agents", { name: `ListTest-${i}`, model: "claude-sonnet-4-6", _oma: { harness: "noop-test" } });
     }
   });
 
@@ -205,11 +205,14 @@ describe("Agent list filters", () => {
     expect(body.data.length).toBe(2);
   });
 
-  it("orders ascending", async () => {
+  it("ignores legacy order param (always created_at desc, AMA parity)", async () => {
+    // The pre-redesign API supported `?order=asc`; AMA list endpoints are
+    // cursor-paginated and always newest-first. The param is now ignored.
     const res = await get("/v1/agents?order=asc&limit=50");
+    expect(res.status).toBe(200);
     const body = (await res.json()) as any;
     for (let i = 1; i < body.data.length; i++) {
-      expect(body.data[i].created_at >= body.data[i - 1].created_at).toBe(true);
+      expect(body.data[i].created_at <= body.data[i - 1].created_at).toBe(true);
     }
   });
 });
@@ -278,7 +281,7 @@ describe("Session update/delete/archive", () => {
   let envId: string;
 
   beforeAll(async () => {
-    const a = await post("/v1/agents", { name: "SA", model: "claude-sonnet-4-6", harness: "noop-test" });
+    const a = await post("/v1/agents", { name: "SA", model: "claude-sonnet-4-6", _oma: { harness: "noop-test" } });
     agentId = ((await a.json()) as any).id;
     const e = await post("/v1/environments", { name: "se", config: { type: "cloud" } });
     envId = ((await e.json()) as any).id;
@@ -343,9 +346,9 @@ describe("Session list filters", () => {
   let envId: string;
 
   beforeAll(async () => {
-    const a1 = await post("/v1/agents", { name: "Filter1", model: "claude-sonnet-4-6", harness: "noop-test" });
+    const a1 = await post("/v1/agents", { name: "Filter1", model: "claude-sonnet-4-6", _oma: { harness: "noop-test" } });
     agentId1 = ((await a1.json()) as any).id;
-    const a2 = await post("/v1/agents", { name: "Filter2", model: "claude-sonnet-4-6", harness: "noop-test" });
+    const a2 = await post("/v1/agents", { name: "Filter2", model: "claude-sonnet-4-6", _oma: { harness: "noop-test" } });
     agentId2 = ((await a2.json()) as any).id;
     const e = await post("/v1/environments", { name: "filt-env", config: { type: "cloud" } });
     envId = ((await e.json()) as any).id;
@@ -363,7 +366,9 @@ describe("Session list filters", () => {
   it("filters by agent_id", async () => {
     const res = await get(`/v1/sessions?agent_id=${agentId1}`);
     const body = (await res.json()) as any;
-    expect(body.data.every((s: any) => s.agent_id === agentId1)).toBe(true);
+    // AMA wire shape: sessions carry a nested `agent: {type,id,version,…}`
+    // snapshot instead of a flat agent_id.
+    expect(body.data.every((s: any) => s.agent?.id === agentId1)).toBe(true);
     expect(body.data.length).toBeGreaterThanOrEqual(2);
   });
 
@@ -394,7 +399,7 @@ describe("New event types", () => {
   let sessionId: string;
 
   beforeAll(async () => {
-    const a = await post("/v1/agents", { name: "Evt", model: "claude-sonnet-4-6", harness: "echo-test" });
+    const a = await post("/v1/agents", { name: "Evt", model: "claude-sonnet-4-6", _oma: { harness: "echo-test" } });
     const e = await post("/v1/environments", { name: "evt-env", config: { type: "cloud" } });
     const s = await post("/v1/sessions", {
       agent: ((await a.json()) as any).id,
@@ -471,7 +476,7 @@ describe("Events pagination", () => {
   let sessionId: string;
 
   beforeAll(async () => {
-    const a = await post("/v1/agents", { name: "Pag", model: "claude-sonnet-4-6", harness: "noop-test" });
+    const a = await post("/v1/agents", { name: "Pag", model: "claude-sonnet-4-6", _oma: { harness: "noop-test" } });
     const e = await post("/v1/environments", { name: "pag-env", config: { type: "cloud" } });
     const s = await post("/v1/sessions", {
       agent: ((await a.json()) as any).id,
@@ -539,7 +544,7 @@ describe("Session agent snapshot", () => {
       name: "Snapshot Agent",
       model: "claude-sonnet-4-6",
       system: "snapshot v1",
-      harness: "noop-test",
+      _oma: { harness: "noop-test" },
     });
     const agent = (await a.json()) as any;
     const e = await post("/v1/environments", { name: "snap-env", config: { type: "cloud" } });
@@ -565,7 +570,7 @@ describe("Session agent snapshot", () => {
 // ============================================================
 describe("Session harness status flow", () => {
   it("emits running → idle events during processing", async () => {
-    const a = await post("/v1/agents", { name: "Status", model: "claude-sonnet-4-6", harness: "echo-test" });
+    const a = await post("/v1/agents", { name: "Status", model: "claude-sonnet-4-6", _oma: { harness: "echo-test" } });
     const e = await post("/v1/environments", { name: "stat-env", config: { type: "cloud" } });
     const s = await post("/v1/sessions", {
       agent: ((await a.json()) as any).id,
@@ -605,7 +610,7 @@ describe("Session harness status flow", () => {
   });
 
   it("idle event has stop_reason", async () => {
-    const a = await post("/v1/agents", { name: "StopR", model: "claude-sonnet-4-6", harness: "echo-test" });
+    const a = await post("/v1/agents", { name: "StopR", model: "claude-sonnet-4-6", _oma: { harness: "echo-test" } });
     const e = await post("/v1/environments", { name: "stop-env", config: { type: "cloud" } });
     const s = await post("/v1/sessions", {
       agent: ((await a.json()) as any).id,
@@ -646,7 +651,7 @@ describe("Harness crash recovery", () => {
       async run() { throw new Error("boom v2"); },
     }));
 
-    const a = await post("/v1/agents", { name: "Crash", model: "claude-sonnet-4-6", harness: "crash-v2" });
+    const a = await post("/v1/agents", { name: "Crash", model: "claude-sonnet-4-6", _oma: { harness: "crash-v2" } });
     const e = await post("/v1/environments", { name: "crash-env", config: { type: "cloud" } });
     const s = await post("/v1/sessions", {
       agent: ((await a.json()) as any).id,
@@ -658,9 +663,9 @@ describe("Harness crash recovery", () => {
       events: [{ type: "user.message", content: [{ type: "text", text: "crash" }] }],
     });
 
-    // Wait for crash
-    for (let i = 0; i < 20; i++) {
-      await new Promise((r) => setTimeout(r, 100));
+    // Wait for crash (mirror session-harness.test.ts waitForIdle: up to 5s)
+    for (let i = 0; i < 25; i++) {
+      await new Promise((r) => setTimeout(r, 200));
       const doId = env.SESSION_DO!.idFromName(session.id);
       const stub = env.SESSION_DO!.get(doId);
       const statusRes = await stub.fetch(new Request("http://internal/status"));

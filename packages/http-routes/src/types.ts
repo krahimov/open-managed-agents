@@ -96,6 +96,24 @@ export interface RouteServices {
    *  backend is configured (legacy fixtures); the harness silently
    *  skips browser tool registration. */
   browser?: BrowserHarness | null;
+  /** File metadata lookup — used by POST /v1/sessions/:id/resources to 404
+   *  on unknown file_ids before persisting the attachment. Optional so
+   *  legacy fixtures without a files store keep the old skip-check
+   *  behavior. */
+  files?: {
+    get(opts: { tenantId: string; fileId: string }): Promise<unknown | null>;
+  } | null;
+  /** Opaque per-session secrets for resources such as github_repository.
+   *  Optional so lightweight route fixtures can omit it; production CF wires
+   *  the KV-backed service. */
+  sessionSecrets?: {
+    put(opts: {
+      tenantId: string;
+      sessionId: string;
+      resourceId: string;
+      value: string;
+    }): Promise<void>;
+  } | null;
 }
 
 /** Per-request services accessor. CF passes a callback that resolves

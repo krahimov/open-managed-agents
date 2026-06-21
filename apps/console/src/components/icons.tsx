@@ -112,6 +112,12 @@ export function ModelCardsIcon({ className }: IconProps) {
   return <StrokeIcon className={className} d="M9 3v2m6-2v2M9 19v2m6-2v2M5 9H3m2 6H3m18-6h-2m2 6h-2M7 19h10a2 2 0 002-2V7a2 2 0 00-2-2H7a2 2 0 00-2 2v10a2 2 0 002 2zM9 9h6v6H9V9z" />;
 }
 
+/** Deployments — cloud with an upward arrow ("ship it"). Heroicons
+ *  cloud-upload outline, matching the rest of the nav stroke set. */
+export function DeploymentsIcon({ className }: IconProps) {
+  return <StrokeIcon className={className} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />;
+}
+
 export function ApiKeysIcon({ className }: IconProps) {
   return <StrokeIcon className={className} d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z" />;
 }

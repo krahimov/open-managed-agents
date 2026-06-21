@@ -12,9 +12,9 @@
 // SESSION_DO stub, and use runInDurableObject to invoke the schedule tool
 // the same way the AI SDK does when the model emits a tool call.
 
-import { env } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll } from "vitest";
 import { registerHarness } from "../../apps/agent/src/harness/registry";
 import type { HarnessInterface, HarnessContext } from "../../apps/agent/src/harness/interface";
 import { buildTools } from "../../apps/agent/src/harness/tools";
@@ -26,6 +26,15 @@ class NoopHarness implements HarnessInterface {
 registerHarness("noop", () => new NoopHarness());
 
 const TOOL_EXEC_OPTS = { toolCallId: "tc_test", messages: [], abortSignal: undefined as any };
+
+// Even though these tests drive the DO directly, SessionDO._hasInflightTurn
+// reads the unified `sessions` table in MAIN_DB — hit the main worker once so
+// test-worker.ts ensureMigrations applies the consolidated D1 schema first.
+beforeAll(async () => {
+  await exports.default.fetch(
+    new Request("http://localhost/v1/agents", { headers: { "x-api-key": "test-key" } }),
+  );
+});
 
 const AGENT_CFG = {
   id: "agent_sched_test",

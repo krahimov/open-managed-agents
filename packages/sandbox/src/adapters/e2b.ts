@@ -19,6 +19,7 @@
 
 import type { ProcessHandle, SandboxExecutor, SandboxFactory } from "../ports";
 import { readS3MemoryBucket } from "../ports";
+import { withSessionProxyContext } from "./outbound-proxy";
 
 // Structural types so this file compiles without `e2b` installed. The
 // driver shape is matched at runtime; mismatches surface as adapter
@@ -161,7 +162,7 @@ export class E2BSandboxExecutor implements SandboxExecutor {
     this.commandSecrets.push({ prefix: commandPrefix, secrets });
   }
 
-  async setOutboundContext(_opts?: { tenantId: string; sessionId: string }): Promise<void> {
+  async setOutboundContext(opts?: { tenantId: string; sessionId: string }): Promise<void> {
     // Wire HTTPS_PROXY → oma-vault sidecar + upload its self-signed CA so
     // node/curl/python trust the MITM cert. Requires (a) OMA_VAULT_PROXY_URL
     // reachable from the E2B sandbox network — set to a public URL or a
@@ -179,11 +180,12 @@ export class E2BSandboxExecutor implements SandboxExecutor {
     }
     this.pendingCaUpload = { hostPath: caCertPath };
     const inBoxCaPath = "/etc/ssl/oma-vault-ca.crt";
+    const scopedProxyUrl = withSessionProxyContext(proxyUrl, opts);
     await this.setEnvVars({
-      HTTP_PROXY: proxyUrl,
-      HTTPS_PROXY: proxyUrl,
-      http_proxy: proxyUrl,
-      https_proxy: proxyUrl,
+      HTTP_PROXY: scopedProxyUrl,
+      HTTPS_PROXY: scopedProxyUrl,
+      http_proxy: scopedProxyUrl,
+      https_proxy: scopedProxyUrl,
       NODE_EXTRA_CA_CERTS: inBoxCaPath,
       SSL_CERT_FILE: inBoxCaPath,
       CURL_CA_BUNDLE: inBoxCaPath,

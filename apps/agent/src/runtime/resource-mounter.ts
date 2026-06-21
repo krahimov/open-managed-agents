@@ -7,7 +7,7 @@ import { logWarn } from "@open-managed-agents/shared";
  *
  * Resource types (aligned with Anthropic + our extensions):
  * - file:              Mount file content at a path
- * - github_repository: Clone repo with auth, checkout branch/commit
+ * - github_repository: Clone repo with auth, checkout branch/commit/PR ref
  * - memory_store:      Mount /mnt/memory/<store_name>/ from MEMORY_BUCKET (R2)
  * - env:               Set process env vars (was env_secret pre-rename)
  *
@@ -234,6 +234,14 @@ async function mountGitRepo(
     if (branch) {
       await sandbox.exec(
         `cd ${targetDir} && (git fetch origin ${branch}:refs/remotes/origin/${branch} 2>/dev/null && git checkout ${branch}) || git checkout -b ${branch}`,
+        60000,
+      );
+    }
+  } else if (checkout?.type === "pull_request" && checkout.name) {
+    const prNumber = checkout.name.replace(/[^0-9]/g, "");
+    if (prNumber) {
+      await sandbox.exec(
+        `cd ${targetDir} && git fetch origin refs/pull/${prNumber}/head:refs/remotes/origin/pr/${prNumber} && git checkout -B pr-${prNumber} refs/remotes/origin/pr/${prNumber}`,
         60000,
       );
     }

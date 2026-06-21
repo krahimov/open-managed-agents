@@ -244,6 +244,181 @@ function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values.filter(Boolean)));
 }
 
+function secretResourceId(
+  row: { id?: string; resource: SessionResource },
+): string | null {
+  const resourceId = (row.resource as { id?: unknown }).id;
+  if (typeof resourceId === "string" && resourceId.length > 0) return resourceId;
+  return typeof row.id === "string" && row.id.length > 0 ? row.id : null;
+}
+
+async function persistGithubRepositoryResourceSecrets(input: {
+  services: ReturnType<typeof resolveServices>;
+  tenantId: string;
+  sessionId: string;
+  createdResources: Array<{ id: string; type: string; resource: SessionResource }>;
+  githubTokensByRepoUrl: Map<string, string>;
+}): Promise<void> {
+  if (input.githubTokensByRepoUrl.size === 0) return;
+  const secrets = input.services.sessionSecrets;
+  if (!secrets) {
+    input.services.logger?.warn?.(
+      {
+        op: "sessions.github_resource_secret_store_missing",
+        session_id: input.sessionId,
+        token_count: input.githubTokensByRepoUrl.size,
+      },
+      "github_repository token could not be persisted because sessionSecrets is not configured",
+    );
+    return;
+  }
+
+  for (const row of input.createdResources) {
+    const resource = row.resource as SessionResource & {
+      type?: string;
+      url?: string;
+      repo_url?: string;
+    };
+    if (resource.type !== "github_repository") continue;
+    const repoUrl = resource.url || resource.repo_url;
+    if (!repoUrl) continue;
+    const token = input.githubTokensByRepoUrl.get(repoUrl);
+    if (!token) continue;
+    const resourceId = secretResourceId(row);
+    if (!resourceId) continue;
+    await secrets.put({
+      tenantId: input.tenantId,
+      sessionId: input.sessionId,
+      resourceId,
+      value: token,
+    });
+  }
+}
+
+type McpServer = NonNullable<AgentConfig["mcp_servers"]>[number];
+type VaultCredentialSnapshot = Array<{ vault_id: string; credentials: CredentialConfig[] }>;
+type VaultCredentialSnapshotInput = Array<{
+  vault_id: string;
+  credentials: Array<
+    Omit<CredentialConfig, "updated_at" | "archived_at"> & {
+      updated_at?: string | null;
+      archived_at?: string | null;
+    }
+  >;
+}>;
+
+function normalizeVaultCredentialSnapshot(
+  snapshot: VaultCredentialSnapshotInput,
+): VaultCredentialSnapshot {
+  return snapshot.map((vault) => ({
+    vault_id: vault.vault_id,
+    credentials: vault.credentials.map((credential) => ({
+      id: credential.id,
+      vault_id: credential.vault_id,
+      display_name: credential.display_name,
+      auth: credential.auth,
+      created_at: credential.created_at,
+      updated_at: credential.updated_at ?? undefined,
+      archived_at: credential.archived_at ?? undefined,
+    })),
+  }));
+}
+
+function withVaultMcpServers(
+  agent: AgentConfig,
+  vaultCredentials: VaultCredentialSnapshot,
+): AgentConfig {
+  const inferred = inferMcpServersFromVaultCredentials(agent.mcp_servers ?? [], vaultCredentials);
+  if (inferred.length === 0) return agent;
+  return {
+    ...agent,
+    mcp_servers: [...(agent.mcp_servers ?? []), ...inferred],
+  };
+}
+
+function inferMcpServersFromVaultCredentials(
+  existingServers: McpServer[],
+  vaultCredentials: VaultCredentialSnapshot,
+): McpServer[] {
+  const existingUrls = new Set(
+    existingServers
+      .map((server) => server.url)
+      .filter((url): url is string => typeof url === "string" && url.length > 0)
+      .map(normalizeMcpUrlForSessionSnapshot)
+      .filter((url): url is string => Boolean(url)),
+  );
+  const usedNames = new Set(existingServers.map((server) => server.name).filter(Boolean));
+  const inferred: McpServer[] = [];
+
+  for (const vault of vaultCredentials) {
+    for (const credential of vault.credentials) {
+      if (credential.archived_at) continue;
+      const auth = credential.auth;
+      const url = auth.mcp_server_url;
+      if (!url || !isMcpCredentialType(auth.type)) continue;
+
+      const normalizedUrl = normalizeMcpUrlForSessionSnapshot(url);
+      if (normalizedUrl && existingUrls.has(normalizedUrl)) continue;
+      if (normalizedUrl) existingUrls.add(normalizedUrl);
+
+      inferred.push({
+        name: uniqueMcpServerName(mcpServerNameBase(auth, url), usedNames),
+        type: "url",
+        url,
+      });
+    }
+  }
+
+  return inferred;
+}
+
+function isMcpCredentialType(type: CredentialConfig["auth"]["type"]): boolean {
+  return type === "mcp_oauth" || type === "static_bearer" || type === "composio_mcp";
+}
+
+function mcpServerNameBase(auth: CredentialConfig["auth"], url: string): string {
+  if (auth.type === "composio_mcp") {
+    const toolkits = Array.isArray(auth.composio_toolkits)
+      ? auth.composio_toolkits
+          .map((toolkit) => toolkit.toLowerCase().replace(/[^a-z0-9]+/g, "_"))
+          .filter(Boolean)
+      : [];
+    return ["composio", ...toolkits.slice(0, 3)].join("_");
+  }
+  try {
+    return new URL(url).hostname.split(".").filter(Boolean)[0] || "mcp";
+  } catch {
+    return "mcp";
+  }
+}
+
+function uniqueMcpServerName(base: string, usedNames: Set<string>): string {
+  const cleanBase = (base || "mcp").toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "") || "mcp";
+  const trimmedBase = cleanBase.slice(0, 48);
+  if (!usedNames.has(trimmedBase)) {
+    usedNames.add(trimmedBase);
+    return trimmedBase;
+  }
+  for (let i = 2; ; i++) {
+    const suffix = `_${i}`;
+    const candidate = `${trimmedBase.slice(0, 48 - suffix.length)}${suffix}`;
+    if (!usedNames.has(candidate)) {
+      usedNames.add(candidate);
+      return candidate;
+    }
+  }
+}
+
+function normalizeMcpUrlForSessionSnapshot(raw: string): string | null {
+  try {
+    const url = new URL(raw);
+    const path = url.pathname.replace(/\/+$/, "") || "/";
+    return `${url.origin}${path}`;
+  } catch {
+    return null;
+  }
+}
+
 function toApiSession(row: {
   id: string;
   tenant_id?: string;
@@ -384,7 +559,10 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
     ]);
 
     // GitHub fast-path: pre-mint installation tokens for unbound repo refs.
-    const fastPathTokens = new Map<string, string>();
+    // Tokens are stored only as per-session resource secrets after the
+    // resource rows exist; they are never copied into resource metadata or
+    // returned from the API.
+    const githubTokensByRepoUrl = new Map<string, string>();
     if (deps.lifecycle?.githubBindingFastPath && body.resources?.length) {
       for (const res of body.resources) {
         if (
@@ -398,7 +576,7 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
             repoUrl,
           });
           if (fast) {
-            fastPathTokens.set(repoUrl, fast.token);
+            githubTokensByRepoUrl.set(repoUrl, fast.token);
             if (!vaultIds.includes(fast.vaultId)) vaultIds.push(fast.vaultId);
           }
         }
@@ -413,9 +591,15 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
         })
       : [];
 
-    const vaultCreds = deps.fetchVaultCredentials
+    const vaultCreds = normalizeVaultCredentialSnapshot(deps.fetchVaultCredentials
       ? await deps.fetchVaultCredentials({ tenantId: t, vaultIds })
-      : [];
+      : vaultIds.length > 0
+        ? await services.credentials.listByVaults({ tenantId: t, vaultIds })
+        : []);
+    const sessionAgentSnapshot = withVaultMcpServers(
+      agentSnapshot as AgentConfig,
+      vaultCreds,
+    );
 
     // Build initial resource inputs (non-file).
     const nonFileInputs: Array<{
@@ -439,6 +623,9 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
         (res.url || res.repo_url)
       ) {
         const repoUrl = res.url || res.repo_url!;
+        if (typeof res.authorization_token === "string" && res.authorization_token.length > 0) {
+          githubTokensByRepoUrl.set(repoUrl, res.authorization_token);
+        }
         nonFileInputs.push({
           type: "github_repository",
           url: repoUrl,
@@ -460,7 +647,7 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
         environmentId: envId,
         title: body.title || "",
         vaultIds,
-        agentSnapshot: agentSnapshot as AgentConfig,
+        agentSnapshot: sessionAgentSnapshot,
         environmentSnapshot: envSnap ?? undefined,
         resources: nonFileInputs as never,
       });
@@ -471,6 +658,14 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
     }
     const sessionId = session.id;
 
+    await persistGithubRepositoryResourceSecrets({
+      services,
+      tenantId: t,
+      sessionId,
+      createdResources,
+      githubTokensByRepoUrl,
+    });
+
     // Init the runtime layer (DO PUT /init or Node warm + init events).
     const initParams: SessionInitParams = {
       agentId,
@@ -478,7 +673,7 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
       title: body.title || "",
       tenantId: t,
       vaultIds,
-      agentSnapshot: agentSnapshot as AgentConfig,
+      agentSnapshot: sessionAgentSnapshot,
       environmentSnapshot: envSnap ?? undefined,
       vaultCredentials: vaultCreds,
       initEvents: refreshEvents,
@@ -530,6 +725,7 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
     const limit = c.req.query("limit") ? Number(c.req.query("limit")) : 50;
     const cursor = c.req.query("cursor") ?? c.req.query("page");
     const q = c.req.query("q") ?? undefined;
+    const includeArchived = c.req.query("include_archived") === "true";
 
     // status: session lifecycle filter (idle | running | rescheduling |
     // terminated). Whitelist strictly — unknown value is a 400, NOT a
@@ -564,6 +760,7 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
       agentId: agentIdFilter,
       limit,
       cursor: cursor ?? undefined,
+      ...(includeArchived ? { includeArchived } : {}),
       ...(status ? { status } : {}),
       ...(q ? { q } : {}),
     });
@@ -795,6 +992,8 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
               return;
             }
           }
+        } catch (err) {
+          if (!isExpectedStreamCloseError(err)) throw err;
         } finally {
           closeOnce();
         }
@@ -1021,6 +1220,7 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
   // ── Resources ─────────────────────────────────────────────────────────
   app.post("/:id/resources", async (c) => {
     const services = resolveServices(deps.services, c);
+    const router = resolveRouter(deps.router, c);
     const sessionId = c.req.param("id");
     const t = c.var.tenant_id;
     const body = await c.req.json<{
@@ -1034,6 +1234,12 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
     if (!body.type) return c.json({ error: "type is required" }, 400);
     if (body.type === "file") {
       if (!body.file_id) return c.json({ error: "file_id is required for file resources" }, 400);
+      // 404 unknown file_ids up front — otherwise a dangling attachment row
+      // is persisted and only fails much later at sandbox mount time.
+      if (services.files) {
+        const file = await services.files.get({ tenantId: t, fileId: body.file_id });
+        if (!file) return c.json({ error: "File not found" }, 404);
+      }
     }
     if (body.type === "memory_store" && !body.memory_store_id) {
       return c.json({ error: "memory_store_id is required for memory_store resources" }, 400);
@@ -1058,6 +1264,12 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
               ? body.instructions.slice(0, 4096)
               : undefined,
         } as never,
+      });
+      await router.refreshResources?.(sessionId).catch((err) => {
+        services.logger?.warn?.(
+          { err, op: "sessions.resources.refresh_failed", session_id: sessionId },
+          "failed to refresh live session resources",
+        );
       });
       return c.json(added.resource, 201);
     } catch (err) {
@@ -1095,16 +1307,24 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
 
   app.post("/:id/resources/:resource_id", async (c) => {
     const services = resolveServices(deps.services, c);
+    const router = resolveRouter(deps.router, c);
     try {
+      const sessionId = c.req.param("id");
       const body = await c.req.json<SessionResource>();
       if (!body || typeof body !== "object" || !body.type) {
         return c.json({ error: "resource body with `type` field is required" }, 400);
       }
       const row = await services.sessions.updateResource({
         tenantId: c.var.tenant_id,
-        sessionId: c.req.param("id"),
+        sessionId,
         resourceId: c.req.param("resource_id"),
         resource: body,
+      });
+      await router.refreshResources?.(sessionId).catch((err) => {
+        services.logger?.warn?.(
+          { err, op: "sessions.resources.refresh_failed", session_id: sessionId },
+          "failed to refresh live session resources",
+        );
       });
       return c.json(row.resource);
     } catch (err) {
@@ -1293,6 +1513,8 @@ async function openSse(
           const idLine = seq !== undefined ? `id: ${seq}\n` : "";
           controller.enqueue(enc.encode(`${eventLine}${idLine}data: ${frame.data}\n\n`));
         }
+      } catch (err) {
+        if (!isExpectedStreamCloseError(err)) throw err;
       } finally {
         try {
           controller.close();
@@ -1311,4 +1533,11 @@ async function openSse(
       "x-accel-buffering": "no",
     },
   });
+}
+
+function isExpectedStreamCloseError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return /stream was cancelled|controller is already closed|invalid state/i.test(
+    err.message,
+  );
 }

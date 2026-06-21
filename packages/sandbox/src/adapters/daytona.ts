@@ -33,6 +33,7 @@ import type { ProcessHandle, SandboxExecutor, SandboxFactory } from "../ports";
 import { readS3MemoryBucket } from "../ports";
 import { promises as fs } from "node:fs";
 import { getLogger } from "@open-managed-agents/observability";
+import { withSessionProxyContext } from "./outbound-proxy";
 
 const moduleLogger = getLogger("daytona-sandbox");
 const DEFAULT_MAX_FILE_BYTES = 512 * 1024 * 1024;
@@ -231,7 +232,7 @@ export class DaytonaSandbox implements SandboxExecutor {
     this.commandSecrets.push({ prefix: commandPrefix, secrets });
   }
 
-  async setOutboundContext(_opts?: { tenantId: string; sessionId: string }): Promise<void> {
+  async setOutboundContext(opts?: { tenantId: string; sessionId: string }): Promise<void> {
     const proxyUrl = process.env.OMA_VAULT_PROXY_URL;
     const caCertPath = process.env.OMA_VAULT_CA_CERT;
     if (!proxyUrl || !caCertPath) return;
@@ -249,11 +250,12 @@ export class DaytonaSandbox implements SandboxExecutor {
     }
     this.pendingCaUpload = { hostPath: caCertPath };
     const inBoxCaPath = "/etc/ssl/oma-vault-ca.crt";
+    const scopedProxyUrl = withSessionProxyContext(proxyUrl, opts);
     await this.setEnvVars({
-      HTTP_PROXY: proxyUrl,
-      HTTPS_PROXY: proxyUrl,
-      http_proxy: proxyUrl,
-      https_proxy: proxyUrl,
+      HTTP_PROXY: scopedProxyUrl,
+      HTTPS_PROXY: scopedProxyUrl,
+      http_proxy: scopedProxyUrl,
+      https_proxy: scopedProxyUrl,
       NODE_EXTRA_CA_CERTS: inBoxCaPath,
       SSL_CERT_FILE: inBoxCaPath,
       CURL_CA_BUNDLE: inBoxCaPath,

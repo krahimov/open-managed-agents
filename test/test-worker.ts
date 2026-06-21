@@ -48,18 +48,23 @@ const ROUTER_MIGRATIONS_RAW: string[] = [routerSchema as string];
 
 let migrationsApplied = false;
 async function ensureMigrations(env: {
+  MAIN_DB?: D1Database;
   AUTH_DB?: D1Database;
   INTEGRATIONS_DB?: D1Database;
   ROUTER_DB?: D1Database;
 }): Promise<void> {
-  if (migrationsApplied || !env.AUTH_DB) return;
-  await applyMigrations(env.AUTH_DB, MIGRATIONS_RAW, "auth");
+  // MAIN_DB is what apps/main reads; AUTH_DB is the legacy test alias bound
+  // to the same database_id in wrangler.test.jsonc.
+  const mainDb = env.MAIN_DB ?? env.AUTH_DB;
+  if (migrationsApplied || !mainDb) return;
+  await applyMigrations(mainDb, MIGRATIONS_RAW, "auth");
   if (env.INTEGRATIONS_DB) {
     await applyMigrations(env.INTEGRATIONS_DB, INTEGRATIONS_MIGRATIONS_RAW, "integrations");
   }
-  if (env.ROUTER_DB) {
-    await applyMigrations(env.ROUTER_DB, ROUTER_MIGRATIONS_RAW, "router");
-  }
+  // apps/main falls back to MAIN_DB for the router tables when ROUTER_DB is
+  // unbound (single-D1 self-host baseline) — apply the router schema to the
+  // same DB the app will actually hit.
+  await applyMigrations(env.ROUTER_DB ?? mainDb, ROUTER_MIGRATIONS_RAW, "router");
   migrationsApplied = true;
 }
 

@@ -2544,12 +2544,14 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   async webSocketClose(
-    ws: WebSocket,
+    _ws: WebSocket,
     _code: number,
     _reason: string,
     _wasClean: boolean
   ) {
-    ws.close();
+    // The runtime invokes this after the socket has already started closing.
+    // Calling close() again can surface as an unhandled "Stream was cancelled"
+    // rejection in workerd tests.
   }
 
   /**

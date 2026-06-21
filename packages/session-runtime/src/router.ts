@@ -119,6 +119,10 @@ export interface SessionRouter {
    *  sandbox.destroy + clear registry entry. */
   destroy(sessionId: string): Promise<void>;
 
+  /** Refresh live session resources after POST/PUT /resources. Runtime
+   *  implementations may no-op when the sandbox is not realized. */
+  refreshResources?(sessionId: string): Promise<void>;
+
   /** Submit a user.* event. Returns the underlying status + body so
    *  routes can pass non-202 (terminated 409) verbatim. */
   appendEvent(

@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 import yaml from "js-yaml";
 import { CheckIcon, ExternalLinkIcon, RefreshCwIcon, XCircleIcon } from "lucide-react";
 import { toast } from "sonner";
 
-import { useApi } from "../../lib/api";
+import { getActiveTenantId, readApiErrorMessage, useApi } from "../../lib/api";
 import { useApiQuery } from "../../lib/useApiQuery";
 import { Button } from "@/components/ui/button";
 import { Select, SelectGroup, SelectGroupLabel, SelectOption } from "../../components/Select";
@@ -98,6 +98,30 @@ type ComposioConnectionState = Record<
     redirectUrl?: string;
   }
 >;
+interface ComposioAuthCompletion {
+  toolkit?: string;
+  connectedAccountId?: string;
+  authConfigId?: string;
+}
+interface ComposioConnectedAccountItem {
+  id: string;
+  status?: string;
+  auth_config?: { id?: string };
+}
+interface ComposioConnectedAccountsResponse {
+  items?: ComposioConnectedAccountItem[];
+}
+interface VaultCredentialLite {
+  id: string;
+  archived_at?: string | null;
+  auth?: {
+    type?: string;
+    composio_toolkits?: string[];
+  };
+}
+interface VaultCredentialsResponse {
+  data?: VaultCredentialLite[];
+}
 
 const COMPOSIO_MCP_SERVER: McpEntry = {
   name: "composio",
@@ -219,7 +243,7 @@ export function AgentFormDialog({
   const [templateSearch, setTemplateSearch] = useState("");
   const [form, setForm] = useState({ ...INITIAL_FORM });
   const [tab, setTab] = useState<
-    "basic" | "integrations" | "tools" | "skills" | "sandbox" | "mcp" | "agents"
+    "basic" | "integrations" | "vaults" | "tools" | "skills" | "sandbox" | "mcp" | "agents"
   >("basic");
   const [createMode, setCreateMode] = useState<"form" | "yaml" | "json">("form");
   const [codeValue, setCodeValue] = useState("");
@@ -242,6 +266,86 @@ export function AgentFormDialog({
 
   const createDialogRef = useRef<HTMLDivElement>(null);
   const createPreviousFocus = useRef<HTMLElement | null>(null);
+  const composioConnectionsRef = useRef<ComposioConnectionState>({});
+  const composioAuthWaitersRef = useRef<
+    Map<string, Set<(completion: ComposioAuthCompletion) => void>>
+  >(new Map());
+  const composioAuthFailureWaitersRef = useRef<Map<string, Set<(err: Error) => void>>>(
+    new Map(),
+  );
+
+  const setComposioConnectionsSynced = useCallback(
+    (
+      updater:
+        | ComposioConnectionState
+        | ((prev: ComposioConnectionState) => ComposioConnectionState),
+    ) => {
+      const next =
+        typeof updater === "function"
+          ? updater(composioConnectionsRef.current)
+          : updater;
+      composioConnectionsRef.current = next;
+      setComposioConnections(next);
+    },
+    [],
+  );
+
+  const markComposioConnected = useCallback(
+    (completion: ComposioAuthCompletion) => {
+      const toolkit = completion.toolkit ? normalizeToolkitSlug(completion.toolkit) : "";
+      setComposioConnectionsSynced((prev) => {
+        const next = { ...prev };
+        const targetSlugs =
+          toolkit && next[toolkit]
+            ? [toolkit]
+            : Object.keys(next).filter((slug) => next[slug].status === "pending");
+        for (const slug of targetSlugs) {
+          const current = next[slug];
+          next[slug] = {
+            ...current,
+            connectedAccountId: completion.connectedAccountId || current.connectedAccountId,
+            authConfigId: completion.authConfigId || current.authConfigId,
+            status: "connected",
+          };
+        }
+        return next;
+      });
+    },
+    [setComposioConnectionsSynced],
+  );
+
+  const notifyComposioAuthComplete = useCallback(
+    (completion: ComposioAuthCompletion) => {
+      const toolkit = completion.toolkit ? normalizeToolkitSlug(completion.toolkit) : "";
+      const notify = (slug: string) => {
+        const waiters = composioAuthWaitersRef.current.get(slug);
+        if (!waiters) return;
+        composioAuthWaitersRef.current.delete(slug);
+        for (const waiter of waiters) waiter(completion);
+      };
+      if (toolkit) notify(toolkit);
+      else {
+        for (const slug of Array.from(composioAuthWaitersRef.current.keys())) notify(slug);
+      }
+      markComposioConnected(completion);
+    },
+    [markComposioConnected],
+  );
+
+  const notifyComposioAuthFailed = useCallback((toolkit: string | undefined, error: string) => {
+    const slug = toolkit ? normalizeToolkitSlug(toolkit) : "";
+    const err = new Error(`Provider OAuth failed: ${error}`);
+    const notify = (key: string) => {
+      const waiters = composioAuthFailureWaitersRef.current.get(key);
+      if (!waiters) return;
+      composioAuthFailureWaitersRef.current.delete(key);
+      for (const waiter of waiters) waiter(err);
+    };
+    if (slug) notify(slug);
+    else {
+      for (const key of Array.from(composioAuthFailureWaitersRef.current.keys())) notify(key);
+    }
+  }, []);
 
   // Pre-select default model card when entering the form step. (tenant_id,
   // model_id) is UNIQUE in DB, so picking a card uniquely determines the
@@ -292,7 +396,9 @@ export function AgentFormDialog({
     setCreateMode("form");
     setCodeValue("");
     setIntegrationSearch("");
-    setComposioConnections({});
+    setComposioConnectionsSynced({});
+    composioAuthWaitersRef.current.clear();
+    composioAuthFailureWaitersRef.current.clear();
     setConnectingIntegration(null);
     onClose();
   };
@@ -355,24 +461,27 @@ export function AgentFormDialog({
             type?: string;
             toolkit?: string;
             connected_account_id?: string;
+            auth_config_id?: string;
+            error?: string;
           };
         }
       ).data;
       if (data?.type !== "composio_auth_complete") return;
-      const toolkit = data.toolkit ? normalizeToolkitSlug(data.toolkit) : "";
+      if ("error" in data && typeof data.error === "string" && data.error) {
+        const toolkit = data.toolkit ? normalizeToolkitSlug(data.toolkit) : undefined;
+        setConnectingIntegration(null);
+        notifyComposioAuthFailed(toolkit, data.error);
+        toast.error(`Provider OAuth failed: ${data.error}`);
+        return;
+      }
+      const toolkit = data.toolkit ? normalizeToolkitSlug(data.toolkit) : undefined;
       setConnectingIntegration(null);
-      setComposioConnections((prev) => {
-        const next = { ...prev };
-        if (toolkit && next[toolkit]) {
-          next[toolkit] = { ...next[toolkit], status: "connected" };
-        } else {
-          for (const slug of Object.keys(next)) {
-            if (next[slug].status === "pending") {
-              next[slug] = { ...next[slug], status: "connected" };
-            }
-          }
-        }
-        return next;
+      notifyComposioAuthComplete({
+        toolkit,
+        connectedAccountId:
+          typeof data.connected_account_id === "string" ? data.connected_account_id : undefined,
+        authConfigId:
+          typeof data.auth_config_id === "string" ? data.auth_config_id : undefined,
       });
       toast.success("Provider account connected.");
     };
@@ -391,7 +500,7 @@ export function AgentFormDialog({
         bc.close();
       }
     };
-  }, [open]);
+  }, [notifyComposioAuthComplete, notifyComposioAuthFailed, open]);
 
   // Serialize the form's tool-policy state into the AMA-shape
   // `tools` array. Always emits exactly one toolset entry of type
@@ -435,7 +544,22 @@ export function AgentFormDialog({
     ];
   };
 
+  const selectedDefaultVaultIds = () => uniqueStrings(form.defaultVaultIds.map((id) => id.trim()));
+
+  const getVaultForComposio = async (vaultId: string): Promise<VaultLite> => {
+    const existing = vaults.find((v) => v.id === vaultId);
+    if (existing) return existing;
+    const fetched = await api<VaultLite>(`/v1/vaults/${encodeURIComponent(vaultId)}`);
+    if (fetched.archived_at) {
+      throw new Error(`Selected vault ${vaultId} is archived.`);
+    }
+    setVaults((prev) => (prev.some((v) => v.id === fetched.id) ? prev : [fetched, ...prev]));
+    return fetched;
+  };
+
   const ensureIntegrationVault = async (): Promise<VaultLite> => {
+    const selectedVaultId = selectedDefaultVaultIds()[0];
+    if (selectedVaultId) return getVaultForComposio(selectedVaultId);
     const preferred = vaults.find((v) => v.name === "Connected Apps") ?? vaults[0];
     if (preferred) return preferred;
     const created = await api<VaultLite>("/v1/vaults", {
@@ -446,13 +570,144 @@ export function AgentFormDialog({
     return created;
   };
 
-  const connectComposioToolkit = async (entry: ComposioIntegrationEntry) => {
+  const findConnectedComposioAccount = async (
+    vaultId: string,
+    toolkit: string,
+    expectedAccountId?: string,
+    fallbackAuthConfigId?: string,
+  ): Promise<ComposioConnectionState[string] | null> => {
+    const slug = normalizeToolkitSlug(toolkit);
+    const params = new URLSearchParams({ toolkit: slug, limit: "100" });
+    const accounts = await fetchJsonQuiet<ComposioConnectedAccountsResponse>(
+      `/v1/vaults/${vaultId}/credentials/composio_accounts?${params.toString()}`,
+    );
+    const readyAccounts = (accounts.items ?? []).filter(isComposioAccountReady);
+    const account =
+      (expectedAccountId
+        ? readyAccounts.find((item) => item.id === expectedAccountId)
+        : undefined) ?? readyAccounts[0];
+    if (!account) return null;
+    return {
+      connectedAccountId: account.id,
+      authConfigId: account.auth_config?.id || fallbackAuthConfigId || "",
+      status: "connected",
+    };
+  };
+
+  const waitForComposioConnection = async (opts: {
+    vaultId: string;
+    toolkit: string;
+    connectedAccountId: string;
+    authConfigId: string;
+    popup?: Window | null;
+    timeoutMs?: number;
+  }): Promise<ComposioConnectionState[string]> => {
+    const slug = normalizeToolkitSlug(opts.toolkit);
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let pollInFlight = false;
+      let pollTimer = 0;
+      let closeTimer = 0;
+      let timeoutTimer = 0;
+      let firstPollTimer = 0;
+
+      const cleanup = () => {
+        const waiters = composioAuthWaitersRef.current.get(slug);
+        if (waiters) {
+          waiters.delete(onComplete);
+          if (waiters.size === 0) composioAuthWaitersRef.current.delete(slug);
+        }
+        const failureWaiters = composioAuthFailureWaitersRef.current.get(slug);
+        if (failureWaiters) {
+          failureWaiters.delete(onFailure);
+          if (failureWaiters.size === 0) composioAuthFailureWaitersRef.current.delete(slug);
+        }
+        window.clearInterval(pollTimer);
+        window.clearInterval(closeTimer);
+        window.clearTimeout(timeoutTimer);
+        window.clearTimeout(firstPollTimer);
+      };
+
+      const finish = (connection: ComposioConnectionState[string]) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(connection);
+      };
+
+      const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(err);
+      };
+
+      const onComplete = (completion: ComposioAuthCompletion) => {
+        finish({
+          connectedAccountId: completion.connectedAccountId || opts.connectedAccountId,
+          authConfigId: completion.authConfigId || opts.authConfigId,
+          status: "connected",
+        });
+      };
+      const onFailure = (err: Error) => fail(err);
+
+      const waiters = composioAuthWaitersRef.current.get(slug) ?? new Set();
+      waiters.add(onComplete);
+      composioAuthWaitersRef.current.set(slug, waiters);
+      const failureWaiters = composioAuthFailureWaitersRef.current.get(slug) ?? new Set();
+      failureWaiters.add(onFailure);
+      composioAuthFailureWaitersRef.current.set(slug, failureWaiters);
+
+      const pollOnce = async () => {
+        if (settled || pollInFlight) return;
+        pollInFlight = true;
+        try {
+          const account = await findConnectedComposioAccount(
+            opts.vaultId,
+            slug,
+            opts.connectedAccountId,
+            opts.authConfigId,
+          );
+          if (account) finish(account);
+        } catch {
+          // Keep waiting. The popup callback is the primary signal; polling is
+          // a backup for browsers that sever opener messaging.
+        } finally {
+          pollInFlight = false;
+        }
+      };
+
+      firstPollTimer = window.setTimeout(() => void pollOnce(), 1200);
+      pollTimer = window.setInterval(() => void pollOnce(), 2000);
+      closeTimer = window.setInterval(() => {
+        if (!opts.popup?.closed) return;
+        void pollOnce().finally(() => {
+          if (!settled) fail(new Error(`Authentication window closed before ${slug} connected.`));
+        });
+      }, 1000);
+      timeoutTimer = window.setTimeout(() => {
+        fail(new Error(`Timed out waiting for ${slug} authentication.`));
+      }, opts.timeoutMs ?? 5 * 60 * 1000);
+    });
+  };
+
+  const startComposioToolkitAuth = async (
+    toolkitSlug: string,
+    opts: {
+      wait?: boolean;
+      popup?: Window | null;
+      keepCallbackOpen?: boolean;
+    } = {},
+  ): Promise<ComposioConnectionState[string]> => {
     if (!composioConfigured) {
-      toast.error(COMPOSIO_NOT_CONFIGURED_MESSAGE);
-      return;
+      throw new Error(COMPOSIO_NOT_CONFIGURED_MESSAGE);
     }
-    const slug = normalizeToolkitSlug(entry.slug);
-    const popup = window.open("", `composio-${slug}`, "width=600,height=720,popup=yes");
+    const slug = normalizeToolkitSlug(toolkitSlug);
+    const popup =
+      opts.popup ?? window.open("", `composio-${slug}`, "width=600,height=720,popup=yes");
+    if (!popup) {
+      throw new Error("Allow pop-ups for this site to connect the selected app.");
+    }
     setConnectingIntegration(slug);
     setForm((f) => ({
       ...f,
@@ -462,7 +717,9 @@ export function AgentFormDialog({
     }));
     try {
       const vault = await ensureIntegrationVault();
-      const callbackUrl = `${window.location.origin}/composio/callback?toolkit=${encodeURIComponent(slug)}`;
+      const callbackParams = new URLSearchParams({ toolkit: slug });
+      if (opts.keepCallbackOpen) callbackParams.set("keep_open", "1");
+      const callbackUrl = `${window.location.origin}/composio/callback?${callbackParams.toString()}`;
       const link = await api<{
         redirect_url: string;
         connected_account_id: string;
@@ -471,24 +728,44 @@ export function AgentFormDialog({
         method: "POST",
         body: JSON.stringify({ toolkit: slug, callback_url: callbackUrl }),
       });
-      setComposioConnections((prev) => ({
+      const pendingConnection = {
+        connectedAccountId: link.connected_account_id,
+        authConfigId: link.auth_config_id,
+        status: "pending" as const,
+        redirectUrl: link.redirect_url,
+      };
+      setComposioConnectionsSynced((prev) => ({
         ...prev,
-        [slug]: {
-          connectedAccountId: link.connected_account_id,
-          authConfigId: link.auth_config_id,
-          status: "pending",
-          redirectUrl: link.redirect_url,
-        },
+        [slug]: pendingConnection,
       }));
-      if (popup) {
-        popup.location.href = link.redirect_url;
-      } else {
-        window.open(link.redirect_url, `composio-${slug}`, "width=600,height=720,popup=yes");
+      popup.location.href = link.redirect_url;
+      if (!opts.wait) {
+        return pendingConnection;
       }
-      setConnectingIntegration(null);
+      const connected = await waitForComposioConnection({
+        vaultId: vault.id,
+        toolkit: slug,
+        connectedAccountId: link.connected_account_id,
+        authConfigId: link.auth_config_id,
+        popup,
+      });
+      setComposioConnectionsSynced((prev) => ({
+        ...prev,
+        [slug]: connected,
+      }));
+      return connected;
     } catch (err) {
-      popup?.close();
+      if (!opts.popup && !popup.closed) popup.close();
+      throw err;
+    } finally {
       setConnectingIntegration(null);
+    }
+  };
+
+  const connectComposioToolkit = async (entry: ComposioIntegrationEntry) => {
+    try {
+      await startComposioToolkitAuth(entry.slug);
+    } catch (err) {
       toast.error(err instanceof Error ? err.message : "Failed to start provider OAuth");
     }
   };
@@ -506,33 +783,115 @@ export function AgentFormDialog({
     });
   };
 
+  const vaultHasComposioCredential = async (
+    vaultId: string,
+    selectedToolkits: string[],
+  ): Promise<boolean> => {
+    const creds = await fetchJsonQuiet<VaultCredentialsResponse>(
+      `/v1/vaults/${encodeURIComponent(vaultId)}/credentials`,
+    );
+    return (creds.data ?? []).some((cred) =>
+      composioCredentialCoversToolkits(cred, selectedToolkits),
+    );
+  };
+
   const ensureComposioCredentialForAgent = async (): Promise<string[]> => {
     if (form.composioToolkits.length === 0) return form.defaultVaultIds;
     if (!composioConfigured) {
       throw new Error(COMPOSIO_NOT_CONFIGURED_MESSAGE);
     }
-    const missing = form.composioToolkits.filter(
-      (slug) => composioConnections[slug]?.status !== "connected",
+    const selectedToolkits = uniqueStrings(form.composioToolkits.map(normalizeToolkitSlug));
+    const selectedVaultIds = selectedDefaultVaultIds();
+    for (const vaultId of selectedVaultIds) {
+      if (await vaultHasComposioCredential(vaultId, selectedToolkits)) {
+        return selectedVaultIds;
+      }
+    }
+
+    const initiallyMissing = selectedToolkits.filter(
+      (slug) => composioConnectionsRef.current[slug]?.status !== "connected",
     );
-    if (missing.length > 0) {
-      throw new Error(`Connect selected apps first: ${missing.join(", ")}`);
+    const authPopup =
+      initiallyMissing.length > 0
+        ? window.open("", "composio-agent-auth", "width=600,height=720,popup=yes")
+        : null;
+    if (authPopup) {
+      try {
+        authPopup.document.title = "Connect app";
+        authPopup.document.body.innerHTML =
+          '<div style="font-family:system-ui,sans-serif;padding:24px;color:#111">Preparing authentication...</div>';
+      } catch {
+        // Some browser policies restrict writing to popup documents.
+      }
     }
     const vault = await ensureIntegrationVault();
-    const linkedEntries = Object.entries(composioConnections).filter(([slug]) =>
-      form.composioToolkits.includes(slug),
+    if (
+      !selectedVaultIds.includes(vault.id) &&
+      (await vaultHasComposioCredential(vault.id, selectedToolkits))
+    ) {
+      return uniqueStrings([...form.defaultVaultIds, vault.id]);
+    }
+    for (const slug of initiallyMissing) {
+      const existing = await findConnectedComposioAccount(vault.id, slug);
+      if (!existing) continue;
+      setComposioConnectionsSynced((prev) => ({
+        ...prev,
+        [slug]: existing,
+      }));
+    }
+
+    const missing = selectedToolkits.filter(
+      (slug) => composioConnectionsRef.current[slug]?.status !== "connected",
     );
+    if (missing.length > 0) {
+      setTab("integrations");
+      if (!authPopup) {
+        throw new Error("Allow pop-ups for this site to connect the selected apps.");
+      }
+      toast.info(`Connect ${missing.join(", ")} to finish creating this agent.`);
+      try {
+        for (const slug of missing) {
+          await startComposioToolkitAuth(slug, {
+            wait: true,
+            popup: authPopup,
+            keepCallbackOpen: missing.length > 1,
+          });
+        }
+      } finally {
+        if (!authPopup.closed) authPopup.close();
+      }
+    } else if (authPopup && !authPopup.closed) {
+      authPopup.close();
+    }
+
+    const linkedEntries = selectedToolkits
+      .map((slug) => [slug, composioConnectionsRef.current[slug]] as const)
+      .filter((entry): entry is readonly [string, ComposioConnectionState[string]] => {
+        return entry[1]?.status === "connected";
+      });
+    if (linkedEntries.length !== selectedToolkits.length) {
+      const missingAfterAuth = selectedToolkits.filter(
+        (slug) => composioConnectionsRef.current[slug]?.status !== "connected",
+      );
+      throw new Error(`Connect selected apps first: ${missingAfterAuth.join(", ")}`);
+    }
+    const connectedAccounts = Object.fromEntries(
+      linkedEntries.map(([slug, link]) => [slug, link.connectedAccountId]),
+    );
+    const authConfigs = Object.fromEntries(
+      linkedEntries
+        .filter(([, link]) => Boolean(link.authConfigId))
+        .map(([slug, link]) => [slug, link.authConfigId]),
+    );
+    const credentialBody: Record<string, unknown> = {
+      display_name: `Composio Tool Router (${form.name || "Agent"})`,
+      toolkits: { enable: selectedToolkits },
+      connected_accounts: connectedAccounts,
+    };
+    if (Object.keys(authConfigs).length > 0) credentialBody.auth_configs = authConfigs;
     await api(`/v1/vaults/${vault.id}/credentials/composio_tool_router_session`, {
       method: "POST",
-      body: JSON.stringify({
-        display_name: `Composio Tool Router (${form.name || "Agent"})`,
-        toolkits: { enable: form.composioToolkits },
-        connected_accounts: Object.fromEntries(
-          linkedEntries.map(([slug, link]) => [slug, link.connectedAccountId]),
-        ),
-        auth_configs: Object.fromEntries(
-          linkedEntries.map(([slug, link]) => [slug, link.authConfigId]),
-        ),
-      }),
+      body: JSON.stringify(credentialBody),
     });
     return uniqueStrings([...form.defaultVaultIds, vault.id]);
   };
@@ -984,6 +1343,20 @@ export function AgentFormDialog({
                     </button>
                     <button
                       role="tab"
+                      aria-selected={tab === "vaults"}
+                      tabIndex={tab === "vaults" ? 0 : -1}
+                      onClick={() => setTab("vaults")}
+                      className={tabCls("vaults")}
+                    >
+                      Vaults{" "}
+                      {form.defaultVaultIds.length > 0 && (
+                        <span className="ml-1 text-xs opacity-60">
+                          ({form.defaultVaultIds.length})
+                        </span>
+                      )}
+                    </button>
+                    <button
+                      role="tab"
                       aria-selected={tab === "tools"}
                       tabIndex={tab === "tools" ? 0 : -1}
                       onClick={() => setTab("tools")}
@@ -1094,6 +1467,15 @@ export function AgentFormDialog({
                   />
                 )}
 
+                {createMode === "form" && tab === "vaults" && (
+                  <VaultsTab
+                    form={form}
+                    setForm={setForm}
+                    vaults={vaults}
+                    inputCls={inputCls}
+                  />
+                )}
+
                 {createMode === "form" && tab === "tools" && (
                   <ToolsTab form={form} setForm={setForm} createError={createError} />
                 )}
@@ -1124,7 +1506,6 @@ export function AgentFormDialog({
                     setForm={setForm}
                     environments={environments}
                     sandboxConfig={sandboxConfig}
-                    inputCls={inputCls}
                   />
                 )}
 
@@ -1148,6 +1529,9 @@ export function AgentFormDialog({
                       )}
                       {form.environmentId && (
                         <span className="mr-3">sandbox selected</span>
+                      )}
+                      {form.defaultVaultIds.length > 0 && (
+                        <span className="mr-3">{form.defaultVaultIds.length} vaults</span>
                       )}
                       {form.skills.length > 0 && (
                         <span className="mr-3">{form.skills.length} skills</span>
@@ -1707,18 +2091,115 @@ function IntegrationsTab({
   );
 }
 
+function VaultsTab({
+  form,
+  setForm,
+  vaults,
+  inputCls,
+}: {
+  form: FormState;
+  setForm: FormSetter;
+  vaults: VaultLite[];
+  inputCls: string;
+}) {
+  const selectedVaults = new Set(form.defaultVaultIds);
+  const setVaultIds = (ids: string[]) => {
+    setForm({ ...form, defaultVaultIds: uniqueStrings(ids.map((id) => id.trim())) });
+  };
+  const toggleVault = (vaultId: string) => {
+    setVaultIds(
+      selectedVaults.has(vaultId)
+        ? form.defaultVaultIds.filter((id) => id !== vaultId)
+        : [...form.defaultVaultIds, vaultId],
+    );
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="text-sm font-medium text-fg">Credential vaults</div>
+          <div className="text-xs text-fg-subtle mt-1">
+            Selected vaults are attached to every new session created from this agent.
+          </div>
+        </div>
+        <a href="/vaults" className="text-xs text-brand hover:underline">
+          Manage vaults
+        </a>
+      </div>
+
+      {vaults.length === 0 ? (
+        <div className="border border-border rounded-md px-3 py-4 text-sm text-fg-subtle">
+          No active vaults. Create a vault first, then select it here.
+        </div>
+      ) : (
+        <div className="border border-border rounded-md divide-y divide-border overflow-hidden">
+          {vaults.map((vault) => {
+            const selected = selectedVaults.has(vault.id);
+            return (
+              <button
+                key={vault.id}
+                type="button"
+                onClick={() => toggleVault(vault.id)}
+                className={`w-full flex items-center gap-3 px-3 py-3 text-left transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
+                  selected ? "bg-brand-subtle" : "hover:bg-bg-surface"
+                }`}
+              >
+                <span
+                  className={`inline-flex size-5 items-center justify-center rounded border shrink-0 ${
+                    selected
+                      ? "border-brand bg-brand text-brand-fg"
+                      : "border-border bg-bg"
+                  }`}
+                  aria-hidden="true"
+                >
+                  {selected && <CheckIcon className="w-3.5 h-3.5" />}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block text-sm font-medium text-fg truncate">
+                    {vault.name}
+                  </span>
+                  <span className="block text-xs font-mono text-fg-subtle truncate">
+                    {vault.id}
+                  </span>
+                </span>
+                <span className="text-xs text-fg-muted shrink-0">
+                  {selected ? "Attached" : "Attach"}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      <div>
+        <label className="text-sm font-medium text-fg block mb-1">
+          Manual vault IDs
+        </label>
+        <input
+          value={form.defaultVaultIds.join(", ")}
+          onChange={(e) => setVaultIds(e.target.value.split(/[,\s]+/))}
+          className={inputCls}
+          placeholder="vlt-..."
+        />
+        <p className="text-xs text-fg-subtle mt-1">
+          Use this only for vaults that are not listed above.
+        </p>
+      </div>
+    </div>
+  );
+}
+
 function SandboxTab({
   form,
   setForm,
   environments,
   sandboxConfig,
-  inputCls,
 }: {
   form: FormState;
   setForm: FormSetter;
   environments: EnvironmentLite[];
   sandboxConfig: SandboxConfig | null;
-  inputCls: string;
 }) {
   const { api } = useApi();
   const selected = environments.find((env) => env.id === form.environmentId);
@@ -1869,25 +2350,6 @@ function SandboxTab({
         </div>
       )}
 
-      <div>
-        <label className="text-sm font-medium text-fg block mb-1">
-          Default vault IDs
-        </label>
-        <input
-          value={form.defaultVaultIds.join(", ")}
-          onChange={(e) =>
-            setForm({
-              ...form,
-              defaultVaultIds: e.target.value
-                .split(/[,\s]+/)
-                .map((v) => v.trim())
-                .filter(Boolean),
-            })
-          }
-          className={inputCls}
-          placeholder="vault-..."
-        />
-      </div>
     </div>
   );
 }
@@ -2331,6 +2793,18 @@ function uniqueStrings(values: string[]): string[] {
   return Array.from(new Set(values.filter(Boolean)));
 }
 
+function composioCredentialCoversToolkits(
+  cred: VaultCredentialLite,
+  selectedToolkits: string[],
+): boolean {
+  if (cred.archived_at || cred.auth?.type !== "composio_mcp") return false;
+  const credentialToolkits = Array.isArray(cred.auth.composio_toolkits)
+    ? uniqueStrings(cred.auth.composio_toolkits.map(normalizeToolkitSlug))
+    : [];
+  if (credentialToolkits.length === 0) return true;
+  return selectedToolkits.every((slug) => credentialToolkits.includes(slug));
+}
+
 function isComposioMcpUrl(url?: string): boolean {
   if (!url) return false;
   try {
@@ -2344,6 +2818,36 @@ function isComposioMcpUrl(url?: string): boolean {
   } catch {
     return false;
   }
+}
+
+async function fetchJsonQuiet<T>(path: string): Promise<T> {
+  const activeTenant = getActiveTenantId();
+  const res = await fetch(path, {
+    credentials: "include",
+    headers: activeTenant ? { "x-active-tenant": activeTenant } : undefined,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(readApiErrorMessage(body, res.status));
+  }
+  return res.json() as Promise<T>;
+}
+
+function isComposioAccountReady(account: ComposioConnectedAccountItem): boolean {
+  const status = account.status?.trim().toUpperCase();
+  if (!status) return true;
+  if (["ACTIVE", "CONNECTED", "SUCCESS", "COMPLETED", "ENABLED", "READY"].includes(status)) {
+    return true;
+  }
+  if (
+    status.includes("PENDING") ||
+    status.includes("INITIATED") ||
+    status.includes("PROCESSING") ||
+    status.includes("IN_PROGRESS")
+  ) {
+    return false;
+  }
+  return !["FAILED", "ERROR", "DISABLED", "EXPIRED"].includes(status);
 }
 
 function providerLabel(provider: string): string {

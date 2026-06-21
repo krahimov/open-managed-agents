@@ -1,0 +1,56 @@
+{
+  "apiVersion": "harness.studio/v1alpha1",
+  "kind": "AgentProject",
+  "metadata": {
+    "name": "email-manager",
+    "description": "Gmail triage and Slack coordination agent"
+  },
+  "agent": {
+    "name": "Email Manager",
+    "description": "Triage Gmail, prepare replies, and coordinate with Slack.",
+    "model": "claude-sonnet-4-6",
+    "system_file": "./system.md",
+    "tools": [
+      {
+        "type": "agent_toolset_20260401",
+        "default_config": {
+          "enabled": true,
+          "permission_policy": { "type": "always_ask" }
+        }
+      },
+      {
+        "type": "mcp_toolset",
+        "mcp_server_name": "composio",
+        "default_config": {
+          "permission_policy": { "type": "always_allow" }
+        }
+      }
+    ],
+    "mcpServers": [
+      {
+        "name": "composio",
+        "type": "url",
+        "url": "https://app.composio.dev/tool_router/v3/session/mcp"
+      }
+    ]
+  },
+  "apps": {
+    "gmail": {
+      "provider": "composio",
+      "toolkit": "gmail",
+      "requiredAuth": "browser_oauth"
+    }
+  },
+  "publications": {
+    "slack": {
+      "provider": "slack",
+      "persona": "Email Manager"
+    }
+  },
+  "tests": [
+    {
+      "name": "tool-presence",
+      "prompt": "List the email and Slack-related tools you can access. Do not send or modify anything."
+    }
+  ]
+}

@@ -10,6 +10,10 @@
   ],
 
   "d1_databases": [
+    // MAIN_DB is the binding apps/main reads at runtime; AUTH_DB is the
+    // legacy alias some unit tests still reach for. Both point at the same
+    // database_id so they share one miniflare-backed store.
+    { "binding": "MAIN_DB", "database_name": "test-auth-db", "database_id": "test-auth-db-id", "migrations_dir": "apps/main/migrations" },
     { "binding": "AUTH_DB", "database_name": "test-auth-db", "database_id": "test-auth-db-id", "migrations_dir": "apps/main/migrations" },
     { "binding": "INTEGRATIONS_DB", "database_name": "test-integrations-db", "database_id": "test-integrations-db-id", "migrations_dir": "apps/main/migrations-integrations" }
   ],

@@ -29,6 +29,7 @@ import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { getLogger } from "@open-managed-agents/observability";
+import { withSessionProxyContext } from "./outbound-proxy";
 
 const moduleLogger = getLogger("litebox-sandbox");
 
@@ -122,20 +123,21 @@ export class LiteBoxSandbox implements SandboxExecutor {
     this.commandSecrets.push({ prefix: commandPrefix, secrets });
   }
 
-  async setOutboundContext(_opts?: { tenantId: string; sessionId: string }): Promise<void> {
+  async setOutboundContext(opts?: { tenantId: string; sessionId: string }): Promise<void> {
     // BoxLite supports network — we route via env vars same as the
     // LocalSubprocess path. The CA cert lives on the host though, so
     // copy it into the box on first exec via ensureBox.
     const proxyUrl = process.env.OMA_VAULT_PROXY_URL;
     const caCertPath = process.env.OMA_VAULT_CA_CERT;
     if (!proxyUrl || !caCertPath) return;
+    const scopedProxyUrl = withSessionProxyContext(proxyUrl, opts);
 
     const inBoxCaPath = "/etc/ssl/oma-vault-ca.crt";
     await this.setEnvVars({
-      HTTP_PROXY: proxyUrl,
-      HTTPS_PROXY: proxyUrl,
-      http_proxy: proxyUrl,
-      https_proxy: proxyUrl,
+      HTTP_PROXY: scopedProxyUrl,
+      HTTPS_PROXY: scopedProxyUrl,
+      http_proxy: scopedProxyUrl,
+      https_proxy: scopedProxyUrl,
       NODE_EXTRA_CA_CERTS: inBoxCaPath,
       SSL_CERT_FILE: inBoxCaPath,
       CURL_CA_BUNDLE: inBoxCaPath,

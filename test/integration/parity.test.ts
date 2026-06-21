@@ -1,9 +1,9 @@
 // @ts-nocheck
 import { env, exports } from "cloudflare:workers";
-import { describe, it, expect, beforeAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll } from "vitest";
 import { registerHarness } from "../../apps/agent/src/harness/registry";
 import type { HarnessContext } from "../../apps/agent/src/harness/interface";
-import { isRateLimited, windows } from "../../apps/main/src/rate-limit";
+import { MemoryRateLimitGate } from "../../packages/rate-limit/src/adapters/memory";
 
 const H = { "x-api-key": "test-key", "Content-Type": "application/json" };
 function api(path: string, init?: RequestInit) {
@@ -31,32 +31,33 @@ registerHarness("parity-echo", () => ({
 }));
 
 // ============================================================
-// Rate Limiting — unit tests on isRateLimited
+// Rate Limiting — unit tests on the token-bucket gate
+// (the old in-memory isRateLimited/windows API was replaced by
+// packages/rate-limit gates + CF Workers Rate Limiting bindings)
 // ============================================================
 describe("Rate limiting", () => {
-  beforeEach(() => {
-    windows.clear();
-  });
-
-  it("allows requests under the limit", () => {
+  it("allows requests under the limit", async () => {
+    const gate = new MemoryRateLimitGate(5, 60);
     for (let i = 0; i < 5; i++) {
-      expect(isRateLimited("test-key", 5, 60000)).toBe(false);
+      expect((await gate.consume("test-key")).ok).toBe(true);
     }
   });
 
-  it("blocks requests over the limit", () => {
+  it("blocks requests over the limit", async () => {
+    const gate = new MemoryRateLimitGate(5, 60);
     for (let i = 0; i < 5; i++) {
-      isRateLimited("block-key", 5, 60000);
+      await gate.consume("block-key");
     }
-    expect(isRateLimited("block-key", 5, 60000)).toBe(true);
+    expect((await gate.consume("block-key")).ok).toBe(false);
   });
 
-  it("uses separate buckets for different keys", () => {
+  it("uses separate buckets for different keys", async () => {
+    const gate = new MemoryRateLimitGate(3, 60);
     for (let i = 0; i < 3; i++) {
-      isRateLimited("key-a", 3, 60000);
+      await gate.consume("key-a");
     }
-    expect(isRateLimited("key-a", 3, 60000)).toBe(true);
-    expect(isRateLimited("key-b", 3, 60000)).toBe(false);
+    expect((await gate.consume("key-a")).ok).toBe(false);
+    expect((await gate.consume("key-b")).ok).toBe(true);
   });
 
   it("rate limit middleware is wired — normal requests succeed", async () => {
@@ -75,7 +76,7 @@ describe("user.define_outcome event", () => {
     const a = await post("/v1/agents", {
       name: "OutcomeAgent",
       model: "claude-sonnet-4-6",
-      harness: "parity-noop",
+      _oma: { harness: "parity-noop" },
     });
     const e = await post("/v1/environments", {
       name: "outcome-env",
@@ -89,26 +90,26 @@ describe("user.define_outcome event", () => {
   });
 
   it("accepts user.define_outcome event", async () => {
+    // AMA shape: top-level description + at least one of rubric|verifier.
     const res = await post(`/v1/sessions/${sessionId}/events`, {
       events: [
         {
           type: "user.define_outcome",
-          outcome: { description: "Create a working fibonacci script" },
+          description: "Create a working fibonacci script",
+          rubric: "Script prints the first 10 fibonacci numbers",
         },
       ],
     });
     expect(res.status).toBe(202);
   });
 
-  it("accepts user.define_outcome with criteria", async () => {
+  it("accepts user.define_outcome with structured rubric", async () => {
     const res = await post(`/v1/sessions/${sessionId}/events`, {
       events: [
         {
           type: "user.define_outcome",
-          outcome: {
-            description: "Build a REST API",
-            criteria: ["Has GET /health", "Returns JSON"],
-          },
+          description: "Build a REST API",
+          rubric: { type: "text", content: "Has GET /health; returns JSON" },
         },
       ],
     });
@@ -140,13 +141,14 @@ describe("user.define_outcome event", () => {
       (e) => e.type === "user.define_outcome"
     );
     expect(outcomeEvents.length).toBe(2);
-    expect(outcomeEvents[0].outcome.description).toBe(
+    expect(outcomeEvents[0].description).toBe(
       "Create a working fibonacci script"
     );
-    expect(outcomeEvents[1].outcome.criteria).toEqual([
-      "Has GET /health",
-      "Returns JSON",
-    ]);
+    expect(outcomeEvents[0].outcome_id).toMatch(/^outc_/);
+    expect(outcomeEvents[1].rubric).toEqual({
+      type: "text",
+      content: "Has GET /health; returns JSON",
+    });
   });
 });
 

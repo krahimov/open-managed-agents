@@ -36,14 +36,33 @@ The CLI lives in this repo (`packages/cli`).
 
 ### Configure
 
-The CLI reads two env vars:
+For an interactive machine or coding agent, sign in through the browser
+handoff:
+
+```bash
+oma auth ensure
+```
+
+If no local credentials are stored, the CLI opens Harness Studio in the
+browser, waits for the loopback callback, and stores tenant-scoped credentials
+under your local `oma` config directory. Future CLI calls from Codex, Claude
+Code, or a shell can reuse those credentials.
+
+For self-hosters or staging deployments, point the sign-in at your deployment:
+
+```bash
+oma auth ensure --base-url "https://app.openma.dev"
+```
+
+For non-interactive scripts, you can still provide an API key explicitly:
 
 ```bash
 export OMA_BASE_URL="https://app.openma.dev"
 export OMA_API_KEY="oma_..."
 ```
 
-For self-hosters, point `OMA_BASE_URL` at your own deployment.
+Set `OMA_AUTH_AUTO_LOGIN=0` when a script should fail fast instead of opening
+the browser sign-in fallback.
 
 ### Common commands
 
@@ -51,7 +70,19 @@ For self-hosters, point `OMA_BASE_URL` at your own deployment.
 # List agents
 oma agents list
 
-# Create an agent from a JSON file
+# Verify platform auth, opening browser sign-in if needed
+oma auth ensure
+
+# Preview how a JSON agent/project file will be applied
+oma agents plan -f ./my-agent.json
+
+# Create or update an agent from a JSON file
+oma agents apply -f ./my-agent.json
+
+# Skip browser/OAuth app setup in CI or mock tests
+oma agents apply -f ./my-agent.json --no-auth
+
+# Force-create a new agent from a JSON file
 oma agents create -f ./my-agent.json
 
 # Start a session

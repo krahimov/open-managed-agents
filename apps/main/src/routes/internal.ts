@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { Env } from "@open-managed-agents/shared";
-import type { AgentConfig, EnvironmentConfig, VaultConfig, CredentialConfig } from "@open-managed-agents/shared";
+import type { AgentConfig, EnvironmentConfig, VaultConfig, CredentialConfig, SessionResource } from "@open-managed-agents/shared";
 import { generateVaultId } from "@open-managed-agents/shared";
 import type { Services } from "@open-managed-agents/services";
 import { forEachShardServices } from "@open-managed-agents/services";
@@ -163,6 +163,14 @@ interface CreateSessionBody {
   vaultIds?: string[];
   mcpServers?: Array<{ name: string; url: string; type?: string }>;
   metadata?: Record<string, unknown>;
+  resources?: Array<{
+    type: "github_repository";
+    repo_url?: string;
+    url?: string;
+    mount_path?: string;
+    checkout?: { type?: string; name?: string; sha?: string };
+    authorization_token?: string;
+  }>;
   initialEvent?: { type: string; content: unknown[]; metadata?: Record<string, unknown> };
   /**
    * Optional prose appended to agent_snapshot.system before persistence.
@@ -176,6 +184,73 @@ interface ResumeSessionBody {
   /** Session owner; required to resolve tenantId in O(1) without scanning. */
   userId: string;
   event: { type: string; content: unknown[]; metadata?: Record<string, unknown> };
+}
+
+function normalizeGitHubSessionResources(
+  resources: CreateSessionBody["resources"] | undefined,
+): {
+  resources: Array<{
+    type: "github_repository";
+    url: string;
+    repo_url: string;
+    mount_path?: string;
+    checkout?: { type?: string; name?: string; sha?: string };
+  }>;
+  tokensByRepoUrl: Map<string, string>;
+} {
+  const out: Array<{
+    type: "github_repository";
+    url: string;
+    repo_url: string;
+    mount_path?: string;
+    checkout?: { type?: string; name?: string; sha?: string };
+  }> = [];
+  const tokensByRepoUrl = new Map<string, string>();
+  for (const resource of resources ?? []) {
+    if (resource.type !== "github_repository") continue;
+    const repoUrl = resource.repo_url || resource.url;
+    if (!repoUrl) continue;
+    out.push({
+      type: "github_repository",
+      url: repoUrl,
+      repo_url: repoUrl,
+      ...(resource.mount_path ? { mount_path: resource.mount_path } : {}),
+      ...(resource.checkout ? { checkout: resource.checkout } : {}),
+    });
+    if (resource.authorization_token) {
+      tokensByRepoUrl.set(repoUrl, resource.authorization_token);
+    }
+  }
+  return { resources: out, tokensByRepoUrl };
+}
+
+async function persistGitHubSessionResourceSecrets(input: {
+  services: Services;
+  tenantId: string;
+  sessionId: string;
+  createdResources: Array<{ id: string; resource: SessionResource }>;
+  tokensByRepoUrl: Map<string, string>;
+}): Promise<void> {
+  if (input.tokensByRepoUrl.size === 0) return;
+  for (const row of input.createdResources) {
+    const resource = row.resource as SessionResource & {
+      type?: string;
+      url?: string;
+      repo_url?: string;
+      id?: string;
+    };
+    if (resource.type !== "github_repository") continue;
+    const repoUrl = resource.url || resource.repo_url;
+    if (!repoUrl) continue;
+    const token = input.tokensByRepoUrl.get(repoUrl);
+    if (!token) continue;
+    await input.services.sessionSecrets.put({
+      tenantId: input.tenantId,
+      sessionId: input.sessionId,
+      resourceId: resource.id || row.id,
+      value: token,
+    });
+  }
 }
 
 interface CreateVaultCredentialBody {
@@ -274,7 +349,8 @@ app.post("/sessions", async (c) => {
   // id generation. Linear MCP wiring below augments the snapshot + metadata
   // and we re-persist via service.update to keep the row consistent.
   const initialMetadata: Record<string, unknown> = { ...(body.metadata ?? {}) };
-  const { session: createdSession } = await c.var.services.sessions.create({
+  const githubResources = normalizeGitHubSessionResources(body.resources);
+  const { session: createdSession, resources: createdResources } = await c.var.services.sessions.create({
     tenantId,
     agentId: body.agentId,
     environmentId: body.environmentId,
@@ -283,8 +359,17 @@ app.post("/sessions", async (c) => {
     agentSnapshot,
     environmentSnapshot: toEnvironmentConfig(envRow),
     metadata: Object.keys(initialMetadata).length === 0 ? undefined : initialMetadata,
+    resources: githubResources.resources as never,
   });
   const sessionId = createdSession.id;
+
+  await persistGitHubSessionResourceSecrets({
+    services: c.var.services,
+    tenantId,
+    sessionId,
+    createdResources: createdResources as never,
+    tokensByRepoUrl: githubResources.tokensByRepoUrl,
+  });
 
   // Pre-fetch vault credentials so SessionDO can serve them from state
   // instead of reading CONFIG_KV (which may be a different namespace if

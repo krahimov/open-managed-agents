@@ -14,9 +14,18 @@
 //     refuses to archive sthr_primary
 //   - POST /event with archived session_thread_id returns 409
 
-import { env } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll } from "vitest";
+
+// These tests drive the DO directly, but drainEventQueue / schedule paths
+// read the unified `sessions` table in MAIN_DB — hit the main worker once
+// so test-worker.ts ensureMigrations applies the consolidated D1 schema.
+beforeAll(async () => {
+  await exports.default.fetch(
+    new Request("http://localhost/v1/agents", { headers: { "x-api-key": "test-key" } }),
+  );
+});
 
 function freshDoStub(idHint: string) {
   const id = `${idHint}_${Math.random().toString(36).slice(2, 10)}`;
@@ -547,22 +556,24 @@ describe("threads HTTP endpoints", () => {
       expect([200, 202]).toContain(r.status);
     }
 
-    // All 5 should be in the events table. processed_at may be NULL
-    // (still pending) or set (drain caught up) — both are valid;
-    // what matters is none silently dropped.
+    // Dual-table contract: user events land in `pending_events` at POST
+    // time and are only promoted into `events` (with processed_at set)
+    // when the drain pulls them. Either location is valid — what matters
+    // is none of the 5 silently dropped.
     const rows = await runInDurableObject(stub, async (_inst, state) => {
-      const out: Array<{ seq: number; type: string; data: string; processed: boolean }> = [];
+      const out: Array<{ data: string; processed: boolean }> = [];
       for (const row of state.storage.sql.exec(
-        `SELECT seq, type, data, processed_at FROM events
-           WHERE type = 'user.message' AND session_thread_id = 'sthr_primary'
-           ORDER BY seq`,
+        `SELECT data, processed_at FROM events
+           WHERE type = 'user.message' AND session_thread_id = 'sthr_primary'`,
       )) {
-        out.push({
-          seq: row.seq as number,
-          type: row.type as string,
-          data: row.data as string,
-          processed: row.processed_at != null,
-        });
+        out.push({ data: row.data as string, processed: row.processed_at != null });
+      }
+      for (const row of state.storage.sql.exec(
+        `SELECT data FROM pending_events
+           WHERE type = 'user.message' AND session_thread_id = 'sthr_primary'
+             AND cancelled_at IS NULL`,
+      )) {
+        out.push({ data: row.data as string, processed: false });
       }
       return out;
     });
@@ -780,12 +791,17 @@ describe("threads HTTP endpoints", () => {
          VALUES ('sthr_subC', 'agent_worker', 'WorkerC', 'sthr_primary', ?)`,
         Date.now() - 1000,
       );
+      // Dual-table contract: the pending queue lives in `pending_events`
+      // (events.processed_at IS NULL rows are pre-refactor legacy and are
+      // intentionally NOT re-run by drain).
       for (const tid of ["sthr_primary", "sthr_subA", "sthr_subC"]) {
         sql.exec(
-          `INSERT INTO events (type, data, processed_at, session_thread_id)
-           VALUES ('user.message', ?, NULL, ?)`,
-          JSON.stringify({ type: "user.message", content: [{ type: "text", text: `pending on ${tid}` }] }),
+          `INSERT INTO pending_events (enqueued_at, session_thread_id, type, event_id, data)
+           VALUES (?, ?, 'user.message', ?, ?)`,
+          Date.now(),
           tid,
+          `sevt-pending-${tid}`,
+          JSON.stringify({ type: "user.message", content: [{ type: "text", text: `pending on ${tid}` }] }),
         );
       }
 
@@ -842,17 +858,22 @@ describe("threads HTTP endpoints", () => {
     const result = await runInDurableObject(stub, async (instance) => {
       const sql = (instance as { ctx: { storage: { sql: SqlStorage } } }).ctx.storage.sql;
       // 5 pending on primary + 3 pending on subA = 8 rows, 2 threads.
+      // Dual-table contract: pending rows live in `pending_events`.
       for (let i = 0; i < 5; i++) {
         sql.exec(
-          `INSERT INTO events (type, data, processed_at, session_thread_id)
-           VALUES ('user.message', ?, NULL, 'sthr_primary')`,
+          `INSERT INTO pending_events (enqueued_at, session_thread_id, type, event_id, data)
+           VALUES (?, 'sthr_primary', 'user.message', ?, ?)`,
+          Date.now(),
+          `sevt-p${i}`,
           JSON.stringify({ type: "user.message", content: [{ type: "text", text: `p${i}` }] }),
         );
       }
       for (let i = 0; i < 3; i++) {
         sql.exec(
-          `INSERT INTO events (type, data, processed_at, session_thread_id)
-           VALUES ('user.message', ?, NULL, 'sthr_subA')`,
+          `INSERT INTO pending_events (enqueued_at, session_thread_id, type, event_id, data)
+           VALUES (?, 'sthr_subA', 'user.message', ?, ?)`,
+          Date.now(),
+          `sevt-a${i}`,
           JSON.stringify({ type: "user.message", content: [{ type: "text", text: `a${i}` }] }),
         );
       }

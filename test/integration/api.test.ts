@@ -678,8 +678,9 @@ describe("SSE endpoints", () => {
 describe("SSE endpoint matrix", () => {
   // Read raw SSE frames off a Response body, parsing each `data:` JSON
   // payload until either `closeOnType` matches OR `timeoutMs` elapses.
-  // Returns the array of parsed events. Cancels the reader on exit so
-  // the underlying connection doesn't leak between tests.
+  // Returns the array of parsed events. Do not cancel the reader here:
+  // workerd surfaces local test-stream cancellation as an unhandled
+  // "Stream was cancelled" rejection even when the cancel promise is caught.
   async function readSse(
     res: Response,
     opts: { closeOnType?: string; timeoutMs?: number } = {},
@@ -690,40 +691,37 @@ describe("SSE endpoint matrix", () => {
     const dec = new TextDecoder();
     let buf = "";
     let done = false;
-    // Fire a timer that cancels the reader; the in-flight read() then
-    // resolves with done=true (because we cancelled) and the loop exits.
-    const timer = setTimeout(() => {
-      reader.cancel().catch(() => undefined);
-    }, opts.timeoutMs ?? 500);
-    try {
-      while (!done) {
-        let r: ReadableStreamReadResult<Uint8Array>;
-        try {
-          r = await reader.read();
-        } catch {
-          break;
-        }
-        if (r.done) break;
-        buf += dec.decode(r.value, { stream: true });
-        let i: number;
-        while ((i = buf.indexOf("\n\n")) !== -1) {
-          const block = buf.slice(0, i);
-          buf = buf.slice(i + 2);
-          const line = block.split("\n").find((l) => l.startsWith("data: "));
-          if (!line) continue;
-          try {
-            const ev = JSON.parse(line.slice(6));
-            events.push(ev);
-            if (opts.closeOnType && ev.type === opts.closeOnType) {
-              done = true;
-              break;
-            }
-          } catch { /* skip malformed */ }
-        }
+    const timeoutAt = Date.now() + (opts.timeoutMs ?? 500);
+    while (!done) {
+      const remaining = timeoutAt - Date.now();
+      if (remaining <= 0) break;
+
+      const read = reader
+        .read()
+        .catch(() => ({ done: true, value: undefined }) as ReadableStreamReadResult<Uint8Array>);
+      const timeout = new Promise<"timeout">((resolve) => {
+        setTimeout(() => resolve("timeout"), remaining);
+      });
+      const r = await Promise.race([read, timeout]);
+      if (r === "timeout" || r.done) {
+        break;
       }
-    } finally {
-      clearTimeout(timer);
-      try { await reader.cancel(); } catch { /* already closed */ }
+      buf += dec.decode(r.value, { stream: true });
+      let i: number;
+      while ((i = buf.indexOf("\n\n")) !== -1) {
+        const block = buf.slice(0, i);
+        buf = buf.slice(i + 2);
+        const line = block.split("\n").find((l) => l.startsWith("data: "));
+        if (!line) continue;
+        try {
+          const ev = JSON.parse(line.slice(6));
+          events.push(ev);
+          if (opts.closeOnType && ev.type === opts.closeOnType) {
+            done = true;
+            break;
+          }
+        } catch { /* skip malformed */ }
+      }
     }
     return events;
   }

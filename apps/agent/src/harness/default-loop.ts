@@ -935,7 +935,7 @@ function estimateMessagesTokens(messages: ModelMessage[]): number {
 function resolveContextWindowTokens(model: LanguageModel): number {
   const id = (model as any)?.modelId ?? (typeof model === "string" ? model : "");
   if (typeof id !== "string") return 200_000;
-  if (id.includes("opus-4-7") || id.includes("opus-4-6") || id.includes("sonnet-4-6")) return 1_000_000;
+  if (id.includes("opus-4-8") || id.includes("opus-4-7") || id.includes("opus-4-6") || id.includes("sonnet-4-6")) return 1_000_000;
   if (id.includes("haiku-4-5")) return 200_000;
   if (id.includes("opus") || id.includes("sonnet")) return 200_000;
   if (id.includes("MiniMax")) return 1_000_000;

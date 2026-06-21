@@ -419,6 +419,13 @@ export async function forEachShardServices<T>(
   const controlPlaneDb = env.ROUTER_DB ?? env.MAIN_DB;
   const pool = createCfShardPoolService({ controlPlaneDb });
   const shards = await pool.listAll();
+  // N=1 baseline: nothing registered in shard_pool means every tenant lives
+  // on MAIN_DB (mirrors the tenant-db middleware's MAIN_DB fallback). Without
+  // this, cron sweeps / eval-runner would silently no-op on single-D1 deploys.
+  if (shards.length === 0) {
+    if (!env.MAIN_DB) return [];
+    return [await fn(buildCfServices(env, env.MAIN_DB), "MAIN_DB")];
+  }
   const envBindings = env as unknown as Record<string, D1Database | undefined>;
   return Promise.all(
     shards.map(async (shard) => {

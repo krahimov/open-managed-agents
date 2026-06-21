@@ -1023,6 +1023,7 @@ export class GitHubProvider implements IntegrationProvider {
     const installation = await this.container.installations.get(publication.installationId);
     const vaultIds = installation?.vaultId ? [installation.vaultId] : [];
     const mcpServers = [{ name: "github", url: this.config.mcpServerUrl }];
+    let refreshedInstallationToken: string | null = null;
 
     // Refresh the installation token before handing the session a vault.
     // GitHub installation tokens last ~1 hour; without rotation the bot
@@ -1030,7 +1031,7 @@ export class GitHubProvider implements IntegrationProvider {
     // session started >1h after install.
     if (installation?.vaultId && installation.appId) {
       try {
-        await this.refreshInstallationToken(installation);
+        refreshedInstallationToken = await this.refreshInstallationToken(installation);
       } catch (err) {
         // Don't kill the dispatch on refresh failure — the existing token
         // may still be valid (we refresh proactively, not reactively).
@@ -1039,6 +1040,10 @@ export class GitHubProvider implements IntegrationProvider {
         );
       }
     }
+    const resources = this.githubRepositoryResourcesForEvent(
+      event,
+      refreshedInstallationToken,
+    );
 
     const sessionEvent = {
       type: "user.message" as const,
@@ -1057,6 +1062,8 @@ export class GitHubProvider implements IntegrationProvider {
           eventType: event.eventType,
           deliveryId: event.deliveryId,
           htmlUrl: event.htmlUrl,
+          pullRequestHeadSha: event.pullRequestHeadSha,
+          pullRequestHeadRef: event.pullRequestHeadRef,
         },
       },
     };
@@ -1124,6 +1131,7 @@ export class GitHubProvider implements IntegrationProvider {
           metadata: {
             github: { issueKey, repository: event.repository },
           },
+          resources,
           initialEvent: sessionEvent,
           additionalSystemPrompt: GITHUB_ENGAGEMENT_PROMPT,
         });
@@ -1155,10 +1163,42 @@ export class GitHubProvider implements IntegrationProvider {
       vaultIds,
       mcpServers,
       metadata: { github: { repository: event.repository } },
+      resources,
       initialEvent: sessionEvent,
       additionalSystemPrompt: GITHUB_ENGAGEMENT_PROMPT,
     });
     return created.sessionId;
+  }
+
+  private githubRepositoryResourcesForEvent(
+    event: NormalizedWebhookEvent,
+    token: string | null,
+  ): Array<{
+    type: "github_repository";
+    repo_url: string;
+    mount_path: string;
+    checkout: { type: "pull_request"; name: string; sha?: string };
+    authorization_token: string;
+  }> {
+    if (
+      !token ||
+      event.itemKind !== "pull_request" ||
+      !event.repository ||
+      event.itemNumber == null
+    ) return [];
+    return [
+      {
+        type: "github_repository",
+        repo_url: `https://github.com/${event.repository}`,
+        mount_path: "/workspace/repo",
+        checkout: {
+          type: "pull_request",
+          name: String(event.itemNumber),
+          ...(event.pullRequestHeadSha ? { sha: event.pullRequestHeadSha } : {}),
+        },
+        authorization_token: token,
+      },
+    ];
   }
 
   private renderEventAsUserMessage(event: NormalizedWebhookEvent): string {
@@ -1190,13 +1230,13 @@ export class GitHubProvider implements IntegrationProvider {
     workspaceId: string;
     appId: string | null;
     vaultId: string | null;
-  }): Promise<void> {
-    if (!installation.appId || !installation.vaultId) return;
+  }): Promise<string | null> {
+    if (!installation.appId || !installation.vaultId) return null;
 
     // Resolve App numeric id + private key. Prefer the publication row
     // (new flow); fall back to github_apps (legacy installs).
     const app = await this.container.githubApps.get(installation.appId);
-    if (!app) return;
+    if (!app) return null;
     let privateKey: string | null = null;
     if (app.publicationId) {
       privateKey = await this.container.publications.getPrivateKey(app.publicationId);
@@ -1204,7 +1244,7 @@ export class GitHubProvider implements IntegrationProvider {
     if (!privateKey) {
       privateKey = await this.container.githubApps.getPrivateKey(app.id);
     }
-    if (!privateKey) return;
+    if (!privateKey) return null;
 
     const appJwt = await mintAppJwt(privateKey, { appId: app.appId });
     const tokReq = buildInstallationTokenRequest(appJwt, installation.workspaceId);
@@ -1232,6 +1272,7 @@ export class GitHubProvider implements IntegrationProvider {
       cliId: "gh",
       newToken: fresh.token,
     });
+    return fresh.token;
   }
 
   // ─── Trigger label seeding ──────────────────────────────────────────

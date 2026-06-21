@@ -54,6 +54,9 @@ importers:
       fflate:
         specifier: ^0.8.2
         version: 0.8.2
+      hono:
+        specifier: ^4.12.12
+        version: 4.12.12
       jsonc-parser:
         specifier: ^3.3.1
         version: 3.3.1
@@ -788,6 +791,12 @@ importers:
         version: 22.19.17
       typescript:
         specifier: ^5.8.0
+        version: 5.9.3
+
+  packages/agent-sdk:
+    devDependencies:
+      typescript:
+        specifier: ^5.7.0
         version: 5.9.3
 
   packages/agents-store:

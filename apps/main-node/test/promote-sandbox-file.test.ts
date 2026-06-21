@@ -31,6 +31,7 @@ async function startMainNode(opts: { dataDir: string }): Promise<ProcessHandle> 
     cwd: REPO_ROOT,
     env: {
       ...process.env,
+      DATABASE_URL: "",
       PORT: String(port),
       DATABASE_PATH: join(opts.dataDir, "oma.db"),
       AUTH_DATABASE_PATH: join(opts.dataDir, "auth.db"),
@@ -38,6 +39,7 @@ async function startMainNode(opts: { dataDir: string }): Promise<ProcessHandle> 
       MEMORY_BLOB_DIR: join(opts.dataDir, "memory-blobs"),
       FILES_BLOB_DIR: join(opts.dataDir, "files-blobs"),
       SESSION_OUTPUTS_DIR: join(opts.dataDir, "outputs"),
+      SANDBOX_PROVIDER: "subprocess",
       AUTH_DISABLED: "1",
       BETTER_AUTH_SECRET: "test-secret-only-for-vitest",
       NODE_ENV: "test",
@@ -180,5 +182,38 @@ describe("Node POST /v1/sessions/:id/files (promoteSandboxFile)", () => {
     const contentRes = await fetch(`${base}/files/${fileRecord.id}/content`);
     expect(contentRes.status).toBe(200);
     expect(await contentRes.text()).toBe("hello-from-sandbox");
+
+    // 7. Attach the promoted file as a live session resource. The sandbox
+    //    is already warm from the /exec and /files calls above, so this
+    //    specifically verifies post-create resource refresh.
+    const attachRes = await fetch(`${base}/sessions/${session.id}/resources`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        type: "file",
+        file_id: fileRecord.id,
+        mount_path: "/workspace/reference/greeting.txt",
+      }),
+    });
+    if (attachRes.status !== 201) {
+      const body = await attachRes.text();
+      throw new Error(`file resource attach expected 201; got ${attachRes.status} ${body}`);
+    }
+
+    const readMountedRes = await fetch(`${base}/sessions/${session.id}/exec`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        command: "cat reference/greeting.txt",
+        timeout_ms: 30_000,
+      }),
+    });
+    expect(readMountedRes.status).toBe(200);
+    const mounted = (await readMountedRes.json()) as {
+      exit_code: number;
+      output: string;
+    };
+    expect(mounted.exit_code).toBe(0);
+    expect(mounted.output).toBe("hello-from-sandbox");
   }, 60_000);
 });

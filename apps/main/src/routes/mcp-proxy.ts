@@ -132,15 +132,28 @@ function isComposioMcpUrl(raw: string): boolean {
   }
 }
 
+function isGenericComposioMcpUrl(raw: string): boolean {
+  try {
+    const url = new URL(raw);
+    const path = url.pathname.replace(/\/+$/, "");
+    if (url.hostname === "connect.composio.dev" && path === "/mcp") return true;
+    return url.hostname === "app.composio.dev" && path === "/tool_router/v3/session/mcp";
+  } catch {
+    return false;
+  }
+}
+
 function credentialMatchesServerUrl(
   auth: { type?: string; mcp_server_url?: string },
   serverUrl: string,
 ): boolean {
   if (!auth.mcp_server_url) return false;
   if (auth.mcp_server_url === serverUrl) return true;
+  const authUrl = normalizeMcpUrlForMatch(auth.mcp_server_url);
+  const server = normalizeMcpUrlForMatch(serverUrl);
+  if (authUrl && server && authUrl === server) return true;
   if (auth.type !== "composio_mcp") return false;
-  if (isComposioMcpUrl(auth.mcp_server_url) && isComposioMcpUrl(serverUrl)) return true;
-  return normalizeMcpUrlForMatch(auth.mcp_server_url) === normalizeMcpUrlForMatch(serverUrl);
+  return isGenericComposioMcpUrl(serverUrl) && isComposioMcpUrl(auth.mcp_server_url);
 }
 
 async function sha256(input: string): Promise<string> {

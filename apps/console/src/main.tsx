@@ -21,6 +21,7 @@ import { Login } from "./pages/Login";
 import { Dashboard } from "./pages/Dashboard";
 import { AgentsList } from "./pages/AgentsList";
 import { AgentDetail } from "./pages/AgentDetail";
+import { DeploymentsList } from "./pages/DeploymentsList";
 import { SessionsList } from "./pages/SessionsList";
 import { FilesList } from "./pages/FilesList";
 import { EnvironmentsList } from "./pages/EnvironmentsList";
@@ -93,6 +94,7 @@ const protectedRoutes: RouteObject[] = [
       },
     ],
   },
+  { path: "deployments", element: <DeploymentsList />, handle: { crumb: "Deployments" } },
   {
     path: "sessions",
     handle: { crumb: "Sessions" },

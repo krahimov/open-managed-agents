@@ -35,6 +35,7 @@ import {
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import type { ProcessHandle, SandboxExecutor, SandboxFactory } from "../ports";
 import { getLogger } from "@open-managed-agents/observability";
+import { withSessionProxyContext } from "./outbound-proxy";
 
 const moduleLogger = getLogger("local-sandbox");
 
@@ -186,7 +187,7 @@ export class LocalSubprocessSandbox implements SandboxExecutor {
     this.commandSecrets.push({ prefix: commandPrefix, secrets });
   }
 
-  async setOutboundContext(_opts?: { tenantId: string; sessionId: string }): Promise<void> {
+  async setOutboundContext(opts?: { tenantId: string; sessionId: string }): Promise<void> {
     // Wire outbound credential injection through the oma-vault sidecar
     // (apps/oma-vault). The sidecar runs a mockttp HTTPS MITM proxy with a
     // self-signed CA; we point the subprocess at it via standard
@@ -200,12 +201,13 @@ export class LocalSubprocessSandbox implements SandboxExecutor {
     const proxyUrl = process.env.OMA_VAULT_PROXY_URL;
     const caCertPath = process.env.OMA_VAULT_CA_CERT;
     if (!proxyUrl || !caCertPath) return;
+    const scopedProxyUrl = withSessionProxyContext(proxyUrl, opts);
 
     const env: Record<string, string> = {
-      HTTP_PROXY: proxyUrl,
-      HTTPS_PROXY: proxyUrl,
-      http_proxy: proxyUrl,
-      https_proxy: proxyUrl,
+      HTTP_PROXY: scopedProxyUrl,
+      HTTPS_PROXY: scopedProxyUrl,
+      http_proxy: scopedProxyUrl,
+      https_proxy: scopedProxyUrl,
       // Node TLS: trust the vault CA in addition to system roots.
       NODE_EXTRA_CA_CERTS: caCertPath,
       // curl & python's `requests` (when REQUESTS_CA_BUNDLE not set).

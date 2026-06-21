@@ -59,10 +59,19 @@ export function requestMetrics(opts: RequestMetricsOptions): MiddlewareHandler {
           (Date.now() - start) / 1000,
           tags,
         );
+        // Hono ≥4 catches handler throws at the route's own dispatch level
+        // (compose.ts wraps every handler when onError is set), so `next()`
+        // resolves with a 500 instead of rejecting into our catch above.
+        // The original Error is preserved on `c.error` — surface its
+        // message so thrown handlers still record what blew up.
+        const handlerError = c.error;
         recorder.recordEvent({
           op: `http.${c.req.method}.${route}`,
           error_name:
             status >= 500 ? `${status}` : status >= 400 ? `${status}` : "",
+          ...(handlerError instanceof Error
+            ? { error_message: handlerError.message }
+            : {}),
           duration_ms: Date.now() - start,
         });
       }

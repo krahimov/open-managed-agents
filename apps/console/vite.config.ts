@@ -36,10 +36,13 @@ export default defineConfig({
       "/auth": proxyOpts,
       "/auth-info": proxyOpts,
       "/health": proxyOpts,
+      "/public": proxyOpts,
       "/linear": proxyOpts,
       "/linear-setup": proxyOpts,
       "/github": proxyOpts,
       "/github-setup": proxyOpts,
+      "/slack": proxyOpts,
+      "/slack-setup": proxyOpts,
     },
   },
 });
