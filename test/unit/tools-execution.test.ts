@@ -960,16 +960,26 @@ describe("Event IDs on history", () => {
   it("events get stamped with id and processed_at on append", () => {
     const history = new InMemoryHistory();
 
-    const event: any = {
+    // Agent output: appending IS the processing → processed_at stamps now.
+    const agentEvent: any = {
+      type: "agent.message",
+      content: [{ type: "text", text: "hi" }],
+    };
+    history.append(agentEvent);
+
+    // Dual-table contract: user.message stays pending until the queue
+    // drain hands it to the model — processed_at is NOT stamped at append.
+    const userEvent: any = {
       type: "user.message",
       content: [{ type: "text", text: "hello" }],
     };
-    history.append(event);
+    history.append(userEvent);
 
     const events = history.getEvents();
-    expect(events[0].id).toBeDefined();
     expect((events[0] as any).id).toMatch(/^sevt-/);
     expect((events[0] as any).processed_at).toBeDefined();
+    expect((events[1] as any).id).toMatch(/^sevt-/);
+    expect((events[1] as any).processed_at).toBeUndefined();
   });
 
   it("preserves existing id if already set", () => {

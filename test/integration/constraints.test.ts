@@ -51,7 +51,7 @@ async function createAgent(overrides?: Record<string, unknown>) {
     model: "claude-sonnet-4-6",
     system: "You are helpful.",
     tools: [{ type: "agent_toolset_20260401" }],
-    harness: "constraint-test",
+    _oma: { harness: "constraint-test" },
     ...overrides,
   });
   return (await res.json()) as any;
@@ -138,7 +138,7 @@ describe("Constraint validations", () => {
     });
     expect(createRes.status).toBe(400);
     const body = (await createRes.json()) as any;
-    expect(body.error).toContain("100KB");
+    expect(body.error.message).toContain("100KB");
 
     // Content exactly at limit should succeed
     const okContent = "x".repeat(100 * 1024);
@@ -156,7 +156,7 @@ describe("Constraint validations", () => {
     );
     expect(updateRes.status).toBe(400);
     const updateBody = (await updateRes.json()) as any;
-    expect(updateBody.error).toContain("100KB");
+    expect(updateBody.error.message).toContain("100KB");
   });
 
   // ----------------------------------------------------------
@@ -190,7 +190,7 @@ describe("Constraint validations", () => {
     });
     expect(overRes.status).toBe(400);
     const overBody = (await overRes.json()) as any;
-    expect(overBody.error).toContain("20");
+    expect(overBody.error.message).toContain("20");
   });
 
   // ----------------------------------------------------------
@@ -216,7 +216,7 @@ describe("Constraint validations", () => {
     });
     expect(dup.status).toBe(409);
     const dupBody = (await dup.json()) as any;
-    expect(dupBody.error).toContain("mcp_server_url");
+    expect(dupBody.error.message).toContain("mcp_server_url");
   });
 
   // ----------------------------------------------------------
@@ -234,7 +234,7 @@ describe("Constraint validations", () => {
     const deleteRes = await del(`/v1/environments/${env.id}`);
     expect(deleteRes.status).toBe(409);
     const deleteBody = (await deleteRes.json()) as any;
-    expect(deleteBody.error).toContain("sessions");
+    expect(deleteBody.error.message).toContain("sessions");
 
     // After archiving the session, delete should succeed
     await post(`/v1/sessions/${session.id}/archive`, {});
@@ -280,7 +280,7 @@ describe("Constraint validations", () => {
     });
     expect(overRes.status).toBe(400);
     const overBody = (await overRes.json()) as any;
-    expect(overBody.error).toContain("100");
+    expect(overBody.error.message).toContain("100");
   });
 
   // ----------------------------------------------------------
@@ -381,17 +381,19 @@ describe("Constraint validations", () => {
     // ----------------------------------------------------------
     // callable_agents
     // ----------------------------------------------------------
-    it("agent with callable_agents is stored and retrieved", async () => {
-      const callableAgents = [
+    it("agent with multiagent roster is stored and retrieved", async () => {
+      // AMA wire shape: roster goes in `multiagent: {type:"coordinator",
+      // agents:[...]}` (internal storage still uses callable_agents).
+      const roster = [
         { type: "agent", id: "agent_abc123", version: 1 },
         { type: "agent", id: "agent_def456", version: 2 },
       ];
-      const agent = await createAgent({ callable_agents: callableAgents });
-      expect(agent.callable_agents).toEqual(callableAgents);
+      const agent = await createAgent({ multiagent: { type: "coordinator", agents: roster } });
+      expect(agent.multiagent).toEqual({ type: "coordinator", agents: roster });
 
       const getRes = await api(`/v1/agents/${agent.id}`, { headers: HEADERS });
       const fetched = (await getRes.json()) as any;
-      expect(fetched.callable_agents).toEqual(callableAgents);
+      expect(fetched.multiagent).toEqual({ type: "coordinator", agents: roster });
     });
 
     // ----------------------------------------------------------
@@ -453,15 +455,18 @@ describe("Constraint validations", () => {
     // ----------------------------------------------------------
     // PUT adds callable_agents
     // ----------------------------------------------------------
-    it("agent update adds callable_agents", async () => {
+    it("agent update adds multiagent roster", async () => {
       const agent = await createAgent();
-      expect(agent.callable_agents).toEqual([]);
+      // No roster → multiagent is null on the wire (AMA shape).
+      expect(agent.multiagent).toBeNull();
 
-      const callableAgents = [{ type: "agent", id: "agent_xyz789", version: 3 }];
-      const updateRes = await put(`/v1/agents/${agent.id}`, { callable_agents: callableAgents });
+      const roster = [{ type: "agent", id: "agent_xyz789", version: 3 }];
+      const updateRes = await put(`/v1/agents/${agent.id}`, {
+        multiagent: { type: "coordinator", agents: roster },
+      });
       expect(updateRes.status).toBe(200);
       const updated = (await updateRes.json()) as any;
-      expect(updated.callable_agents).toEqual(callableAgents);
+      expect(updated.multiagent).toEqual({ type: "coordinator", agents: roster });
       expect(updated.version).toBe(2);
     });
 
@@ -501,16 +506,16 @@ describe("Constraint validations", () => {
     // ----------------------------------------------------------
     // Version history preserves extended fields
     // ----------------------------------------------------------
-    it("version history preserves mcp_servers/skills/callable_agents", async () => {
+    it("version history preserves mcp_servers/skills/multiagent", async () => {
       const originalMcp = [{ name: "github", type: "sse", url: "https://mcp.github.com/sse" }];
       const originalSkills = [{ type: "anthropic", skill_id: "web_research" }];
-      const originalCallable = [{ type: "agent", id: "agent_old", version: 1 }];
+      const originalRoster = [{ type: "agent", id: "agent_old", version: 1 }];
 
       const agent = await createAgent({
         description: "v1 agent",
         mcp_servers: originalMcp,
         skills: originalSkills,
-        callable_agents: originalCallable,
+        multiagent: { type: "coordinator", agents: originalRoster },
         metadata: { release: "v1" },
       });
       expect(agent.version).toBe(1);
@@ -520,7 +525,7 @@ describe("Constraint validations", () => {
         description: "v2 agent",
         mcp_servers: [{ name: "slack", type: "sse", url: "https://mcp.slack.com/sse" }],
         skills: [{ type: "custom", skill_id: "custom_skill", version: "2.0" }],
-        callable_agents: [{ type: "agent", id: "agent_new", version: 5 }],
+        multiagent: { type: "coordinator", agents: [{ type: "agent", id: "agent_new", version: 5 }] },
         metadata: { release: "v2" },
       });
       expect(updateRes.status).toBe(200);
@@ -535,7 +540,7 @@ describe("Constraint validations", () => {
       expect(v1.description).toBe("v1 agent");
       expect(v1.mcp_servers).toEqual(originalMcp);
       expect(v1.skills).toEqual(originalSkills);
-      expect(v1.callable_agents).toEqual(originalCallable);
+      expect(v1.multiagent).toEqual({ type: "coordinator", agents: originalRoster });
       expect(v1.metadata).toEqual({ release: "v1" });
 
       // Verify current version has updated fields
@@ -545,7 +550,7 @@ describe("Constraint validations", () => {
       expect(current.description).toBe("v2 agent");
       expect(current.mcp_servers).toEqual([{ name: "slack", type: "sse", url: "https://mcp.slack.com/sse" }]);
       expect(current.skills).toEqual([{ type: "custom", skill_id: "custom_skill", version: "2.0" }]);
-      expect(current.callable_agents).toEqual([{ type: "agent", id: "agent_new", version: 5 }]);
+      expect(current.multiagent).toEqual({ type: "coordinator", agents: [{ type: "agent", id: "agent_new", version: 5 }] });
       expect(current.metadata).toEqual({ release: "v2" });
     });
   });

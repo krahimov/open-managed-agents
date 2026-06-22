@@ -25,7 +25,9 @@ export function cfRouteServices(c: Context<AppContextLike>): RouteServices {
     credentials: services.credentials,
     memory: services.memory,
     sessions: services.sessions,
+    sessionSecrets: services.sessionSecrets,
     kv: services.kv,
+    files: services.files,
     // The http-routes session package uses these for SSE + event-log writes.
     // CF doesn't read events from SQL — events live in SessionDO storage.
     // Sessions extraction routes events through SessionRouter, which means

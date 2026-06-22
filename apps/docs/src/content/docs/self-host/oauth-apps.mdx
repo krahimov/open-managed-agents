@@ -57,21 +57,31 @@ What the operator does NOT need to do:
 
 The one hard operator requirement is that `GATEWAY_ORIGIN` resolves to publicly-reachable HTTPS. Slack will not accept a manifest whose URLs it can't pre-verify, so localhost / `*.local` / self-signed certs are non-starters. Use a tunnel (`cloudflared tunnel`, `ngrok http`) for dev.
 
-## Custom OAuth (Google sign-in for the Console)
+## Custom OAuth (Console sign-in)
 
-This one IS deploy-wide — Google sign-in adds an SSO path to the Console alongside email + password / email-OTP.
+This one IS deploy-wide — Google or GitHub sign-in adds an SSO path to the Console alongside email + password / email-OTP.
 
 <Steps>
 
-1. Go to [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials) → **Create Credentials → OAuth client ID → Web application**.
+1. Create an OAuth app with your provider:
+   - Google: [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials) → **Create Credentials → OAuth client ID → Web application**
+   - GitHub: [github.com/settings/developers](https://github.com/settings/developers) → **OAuth Apps → New OAuth App**
 
-2. **Authorized redirect URI:** `https://app.yourdomain.com/api/auth/callback/google`
+2. Set the authorized callback URL:
+   - Google: `https://app.yourdomain.com/auth/callback/google`
+   - GitHub: `https://app.yourdomain.com/auth/callback/github`
 
 3. Capture client ID + secret. Set:
    ```bash
    npx wrangler secret put GOOGLE_CLIENT_ID
    npx wrangler secret put GOOGLE_CLIENT_SECRET
+   npx wrangler secret put GITHUB_CLIENT_ID
+   npx wrangler secret put GITHUB_CLIENT_SECRET
    ```
+
+   Set only the provider you intend to enable. `GITHUB_CLIENT_ID` /
+   `GITHUB_CLIENT_SECRET` are for Console sign-in; `GITHUB_OAUTH_*` is a
+   separate downstream integration/vault flow.
 
 4. Redeploy main worker.
 

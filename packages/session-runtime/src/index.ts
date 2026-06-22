@@ -17,6 +17,8 @@ export type { RuntimeAdapter, TurnId, OrphanTurn } from "./ports";
 export { RuntimeAdapterImpl, type RuntimeAdapterOptions } from "./adapter";
 export {
   SessionStateMachine,
+  SESSION_ERROR_EMITTED_MARKER,
+  sessionErrorAlreadyEmitted,
   type SessionMachineDeps,
   type HarnessRunFn,
 } from "./machine";
@@ -33,4 +35,3 @@ export type {
   SessionStreamHandle,
   FileIdResolver,
 } from "./router";
-

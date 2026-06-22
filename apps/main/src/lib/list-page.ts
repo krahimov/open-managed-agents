@@ -53,7 +53,12 @@ export function parsePageQuery(c: Context): PageQuery {
   // both. If both are set, prefer `cursor` so old code that explicitly chose
   // it doesn't silently flip behavior.
   const cursor = c.req.query("cursor") || c.req.query("page") || undefined;
-  const includeArchived = c.req.query("include_archived") === "true";
+  // Tri-state: absent must stay `undefined` so the service layer's own
+  // default applies (environments/model_cards default to "any"). Coercing
+  // absent → false here silently forced status=active on every list.
+  const includeArchivedRaw = c.req.query("include_archived");
+  const includeArchived =
+    includeArchivedRaw === undefined ? undefined : includeArchivedRaw === "true";
   const limit = limitParam ? parseInt(limitParam, 10) : undefined;
   const qRaw = c.req.query("q");
   const q = qRaw && qRaw.trim() ? qRaw.trim() : undefined;

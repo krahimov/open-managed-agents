@@ -507,6 +507,39 @@ Max 20 credentials per vault. Each forward emits a structured `op:"mcp_proxy.for
 
 ---
 
+## Deployments — connect your frontend
+
+Publish an agent and get a **publishable key** (`oma_pk_...`) that's safe to
+ship in a browser bundle — it can only start and drive sessions of that one
+agent through the public gateway (`/public/v1`), never read or mutate
+anything else. Think Stripe publishable keys, for agents.
+
+```bash
+# Publish (Console: Agents → Deploy, or API):
+curl -X POST $OMA/v1/deployments -H "x-api-key: $KEY" \
+  -d '{"agent_id":"agent_abc","environment_id":"env_abc","allowed_origins":["https://app.example.com"]}'
+# → { ..., "key": "oma_pk_..." }   # shown once; rotate any time
+```
+
+```ts
+// In your app — npm install @openma/agent-sdk
+import { AgentClient } from "@openma/agent-sdk";
+
+const client = new AgentClient({ baseUrl: "https://your-oma-host", deploymentKey: "oma_pk_..." });
+const session = await client.createSession({ title: "Support chat" });
+for await (const ev of session.chat("Hello!")) {
+  if (ev.type === "agent.message_chunk") render(ev.delta);
+}
+```
+
+The gateway pins the agent/environment server-side, allowlists event types
+(`user.message`, `interrupt`, `tool_confirmation`, `custom_tool_result`),
+scopes each key to the sessions it created, sanitizes responses (no system
+prompt / tool config leaks), and enforces per-deployment CORS. Details:
+[`docs/agent-deployments.md`](docs/agent-deployments.md).
+
+---
+
 ## Integrations
 
 Publish an agent into a third-party tool and have it act as a real teammate there — assigned, mentioned, replied to like any other user.

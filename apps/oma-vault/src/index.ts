@@ -169,6 +169,11 @@ interface MatchedCred {
   injectHeader: { name: string; value: string };
 }
 
+interface ProxySessionContext {
+  tenantId: string;
+  sessionId: string;
+}
+
 /**
  * Find the active credential whose mcp_server_url host matches the request
  * host. Returns the header to inject, or null when no credential applies.
@@ -202,13 +207,22 @@ interface MatchedCred {
  * only — recommended for prod multi-user deploys until per-session
  * attribution lands.
  */
-async function findCredentialForUrl(url: string): Promise<MatchedCred | null> {
+async function findCredentialForUrl(
+  url: string,
+  sessionContext?: ProxySessionContext | null,
+): Promise<MatchedCred | null> {
   let host: string;
   try {
     host = new URL(url).host;
   } catch {
     return null;
   }
+
+  if (sessionContext) {
+    const sessionScoped = await findGithubSessionCredentialForUrl(url, sessionContext);
+    if (sessionScoped) return sessionScoped;
+  }
+
   // Cross-tenant lookup against the partial unique index
   // idx_credentials_mcp_url_active. The index contains hostname-as-substring
   // (LIKE) is unindexed; we materialize candidates by parsing mcp_server_url.
@@ -243,6 +257,162 @@ async function findCredentialForUrl(url: string): Promise<MatchedCred | null> {
     };
   }
   return null;
+}
+
+async function findGithubSessionCredentialForUrl(
+  url: string,
+  ctx: ProxySessionContext,
+): Promise<MatchedCred | null> {
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    return null;
+  }
+  const hostname = parsedUrl.hostname.toLowerCase();
+  if (hostname !== "github.com" && hostname !== "api.github.com") return null;
+
+  const session = await sql
+    .prepare(
+      `SELECT id FROM sessions
+        WHERE id = ? AND tenant_id = ? AND archived_at IS NULL
+        LIMIT 1`,
+    )
+    .bind(ctx.sessionId, ctx.tenantId)
+    .first<{ id: string }>()
+    .catch(() => null);
+  if (!session) return null;
+
+  const rows = await sql
+    .prepare(
+      `SELECT id, config
+         FROM session_resources
+        WHERE session_id = ?
+          AND type IN ('github_repository', 'github_repo')
+        ORDER BY created_at`,
+    )
+    .bind(ctx.sessionId)
+    .all<{ id: string; config: string }>()
+    .catch(() => ({ results: [] as Array<{ id: string; config: string }> }));
+
+  const requestSlug = parseGithubRepoSlug(url);
+  let fallback: MatchedCred | null = null;
+
+  for (const row of rows.results ?? []) {
+    let resource: { url?: string; repo_url?: string };
+    try {
+      resource = JSON.parse(row.config) as { url?: string; repo_url?: string };
+    } catch {
+      continue;
+    }
+    const repoUrl = resource.url || resource.repo_url;
+    if (!repoUrl) continue;
+    const resourceSlug = parseGithubRepoSlug(repoUrl);
+    if (!resourceSlug) continue;
+
+    const token = await readSessionSecret(ctx.tenantId, ctx.sessionId, row.id);
+    if (!token) continue;
+
+    const matched: MatchedCred = {
+      vaultId: "session",
+      credentialId: `session_resource:${row.id}`,
+      injectHeader: githubAuthHeaderFor(hostname, token),
+    };
+    if (requestSlug && requestSlug === resourceSlug) return matched;
+    if (!fallback) fallback = matched;
+  }
+
+  return fallback;
+}
+
+async function readSessionSecret(
+  tenantId: string,
+  sessionId: string,
+  resourceId: string,
+): Promise<string | null> {
+  const key = `t:${tenantId}:secret:${sessionId}:${resourceId}`;
+  const now = Date.now();
+  const row = await sql
+    .prepare(
+      `SELECT value
+         FROM kv_entries
+        WHERE key = ?
+          AND (tenant_id = ? OR tenant_id = 'default')
+          AND (expires_at IS NULL OR expires_at > ?)
+        ORDER BY CASE WHEN tenant_id = ? THEN 0 ELSE 1 END
+        LIMIT 1`,
+    )
+    .bind(key, tenantId, now, tenantId)
+    .first<{ value: string }>()
+    .catch(() => null);
+  return row?.value ?? null;
+}
+
+function githubAuthHeaderFor(
+  hostname: string,
+  token: string,
+): { name: string; value: string } {
+  if (hostname.toLowerCase() === "github.com") {
+    return {
+      name: "authorization",
+      value: `Basic ${Buffer.from(`x-access-token:${token}`, "utf8").toString("base64")}`,
+    };
+  }
+  return { name: "authorization", value: `Bearer ${token}` };
+}
+
+function parseGithubRepoSlug(input: string): string | null {
+  if (!input) return null;
+  let owner: string | undefined;
+  let repo: string | undefined;
+
+  if (input.startsWith("http://") || input.startsWith("https://")) {
+    let url: URL;
+    try {
+      url = new URL(input);
+    } catch {
+      return null;
+    }
+    const host = url.hostname.toLowerCase();
+    const parts: string[] = [];
+    for (const segment of url.pathname.split("/")) {
+      if (!segment || segment === ".") continue;
+      if (segment === "..") {
+        parts.pop();
+        continue;
+      }
+      parts.push(segment);
+    }
+    if (host === "github.com" || host === "www.github.com") {
+      owner = parts[0];
+      repo = parts[1];
+    } else if (host === "api.github.com" && parts[0] === "repos") {
+      owner = parts[1];
+      repo = parts[2];
+    }
+  }
+
+  if (!owner) {
+    const ssh = input.match(/^git@github\.com:([^/]+)\/([^/]+?)(?:\.git)?$/);
+    if (ssh) {
+      owner = ssh[1];
+      repo = ssh[2];
+    }
+  }
+
+  if (!owner) {
+    const bare = input.match(/^([^/]+)\/([^/]+?)(?:\.git)?$/);
+    if (bare) {
+      owner = bare[1];
+      repo = bare[2];
+    }
+  }
+
+  if (!owner || !repo) return null;
+  repo = repo.replace(/\.git$/i, "");
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(owner)) return null;
+  if (!/^[A-Za-z0-9._-]+$/.test(repo)) return null;
+  return `${owner.toLowerCase()}/${repo.toLowerCase()}`;
 }
 
 function authToHeader(auth: CredentialAuth): { name: string; value: string } | null {
@@ -281,7 +451,8 @@ const proxy = getLocal({
 // same handler thanks to mockttp's TLS termination.
 proxy.forAnyRequest().thenCallback(async (req: CompletedRequest) => {
   const url = req.url;
-  const matched = await findCredentialForUrl(url);
+  const sessionContext = parseProxySessionContext(req.headers);
+  const matched = await findCredentialForUrl(url, sessionContext);
 
   // Strip any incoming Authorization headers — the agent must not be able
   // to override the injected value or smuggle a stolen token. Mirrors the
@@ -361,6 +532,47 @@ proxy.forAnyRequest().thenCallback(async (req: CompletedRequest) => {
     body: Buffer.from(await upstream.arrayBuffer()),
   };
 });
+
+function parseProxySessionContext(
+  headers: Record<string, string | string[] | undefined>,
+): ProxySessionContext | null {
+  const raw = headerValue(headers["proxy-authorization"]);
+  if (!raw) return null;
+  const match = raw.match(/^basic\s+(.+)$/i);
+  if (!match) return null;
+
+  let decoded: string;
+  try {
+    decoded = Buffer.from(match[1], "base64").toString("utf8");
+  } catch {
+    return null;
+  }
+  const sep = decoded.indexOf(":");
+  if (sep <= 0) return null;
+  const username = decoded.slice(0, sep);
+  const password = decoded.slice(sep + 1);
+  if (username !== "oma" || !password) return null;
+
+  let payload: string;
+  try {
+    payload = Buffer.from(password, "base64url").toString("utf8");
+  } catch {
+    return null;
+  }
+  const payloadSep = payload.indexOf("|");
+  if (payloadSep <= 0 || payloadSep === payload.length - 1) return null;
+  const tenantId = payload.slice(0, payloadSep);
+  const sessionId = payload.slice(payloadSep + 1);
+  if (!/^[A-Za-z0-9_.:-]+$/.test(tenantId)) return null;
+  if (!/^[A-Za-z0-9_.:-]+$/.test(sessionId)) return null;
+  return { tenantId, sessionId };
+}
+
+function headerValue(value: string | string[] | undefined): string | null {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value) && typeof value[0] === "string") return value[0];
+  return null;
+}
 
 await proxy.start(port);
 

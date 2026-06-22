@@ -345,8 +345,14 @@ function toRow(r: typeof model_cards.$inferSelect): ModelCardRow {
   };
 }
 
-function msToIso(ms: number): string {
-  return new Date(ms).toISOString();
+function msToIso(value: number | string | bigint | Date): string {
+  const date =
+    value instanceof Date
+      ? value
+      : typeof value === "string"
+        ? new Date(Number.isFinite(Number(value)) ? Number(value) : value)
+        : new Date(Number(value));
+  return date.toISOString();
 }
 
 /**

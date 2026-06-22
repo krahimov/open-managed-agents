@@ -584,6 +584,16 @@ class InProcessSessionCreator implements SessionCreator {
       agentSnapshot: agentBase as never,
       environmentSnapshot: envSnapshot as never,
       metadata: meta as never,
+      resources: (input.resources ?? []).map((resource) => {
+        const repoUrl = resource.repo_url;
+        return {
+          type: "github_repository",
+          url: repoUrl,
+          repo_url: repoUrl,
+          mount_path: resource.mount_path ?? "/workspace",
+          checkout: resource.checkout,
+        };
+      }) as never,
     });
     return { sessionId: session.id as SessionId };
   }

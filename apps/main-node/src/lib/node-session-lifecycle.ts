@@ -29,6 +29,35 @@ export interface NodeSessionLifecycleDeps {
 /** Build the per-process lifecycle hooks bundle for main-node. */
 export function nodeSessionLifecycle(deps: NodeSessionLifecycleDeps): SessionLifecycleHooks {
   return {
+    cloneSessionFile: async ({ tenantId, sessionId, sourceFileId }) => {
+      const source = await deps.files.get({ tenantId, fileId: sourceFileId });
+      if (!source) return null;
+      const object = await deps.filesBlob.get(source.r2_key);
+      if (!object) return null;
+
+      const bytes = await object.bytes();
+      const newFileId = generateFileId();
+      const blobKey = fileR2Key(tenantId, newFileId);
+      await deps.filesBlob.put(blobKey, bytes, {
+        httpMetadata: { contentType: source.media_type },
+      });
+      const row = await deps.files.create({
+        id: newFileId,
+        tenantId,
+        sessionId,
+        filename: source.filename,
+        mediaType: source.media_type,
+        sizeBytes: bytes.byteLength,
+        r2Key: blobKey,
+        downloadable: source.downloadable,
+      });
+      return {
+        fileId: row.id,
+        filename: row.filename,
+        mediaType: row.media_type,
+        sizeBytes: row.size_bytes,
+      };
+    },
     promoteSandboxFile: async ({
       tenantId,
       sessionId,

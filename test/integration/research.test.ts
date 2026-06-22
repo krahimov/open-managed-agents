@@ -114,14 +114,16 @@ describe("Memory stores CRUD", () => {
     expect(body.name).toBe("Archive Me");
   });
 
-  it("excludes archived stores from default list", async () => {
+  it("excludes archived stores with status=active (default list is status=any)", async () => {
+    // Redesign: list defaults to status=any (archived included); callers
+    // that want the old behavior pass ?status=active explicitly.
     const createRes = await post("/v1/memory_stores", {
       name: "Hidden Archived Store",
     });
     const store = (await createRes.json()) as any;
     await post(`/v1/memory_stores/${store.id}/archive`, {});
 
-    const listRes = await get("/v1/memory_stores");
+    const listRes = await get("/v1/memory_stores?status=active");
     const body = (await listRes.json()) as any;
     const found = body.data.find((s: any) => s.id === store.id);
     expect(found).toBeUndefined();
@@ -452,7 +454,7 @@ describe("Outcomes", () => {
     const agentRes = await post("/v1/agents", {
       name: "OutcomeTestAgent",
       model: "claude-sonnet-4-6",
-      harness: "outcome-test",
+      _oma: { harness: "outcome-test" },
     });
     agentId = ((await agentRes.json()) as any).id;
 
@@ -474,7 +476,8 @@ describe("Outcomes", () => {
       events: [
         {
           type: "user.define_outcome",
-          outcome: { description: "Create a working fibonacci script" },
+          description: "Create a working fibonacci script",
+          rubric: "Script prints fibonacci numbers",
         },
       ],
     });
@@ -492,11 +495,12 @@ describe("Outcomes", () => {
       events: [
         {
           type: "user.define_outcome",
-          outcome: {
-            description: "Build a REST API",
-            criteria: ["Has GET /health", "Returns JSON", "Handles errors"],
-            max_iterations: 5,
+          description: "Build a REST API",
+          rubric: {
+            type: "text",
+            content: "Has GET /health; returns JSON; handles errors",
           },
+          max_iterations: 5,
         },
       ],
     });
@@ -515,10 +519,8 @@ describe("Outcomes", () => {
       events: [
         {
           type: "user.define_outcome",
-          outcome: {
-            description: "Write unit tests",
-            criteria: ["Coverage > 80%"],
-          },
+          description: "Write unit tests",
+          rubric: "Coverage > 80%",
         },
       ],
     });
@@ -550,8 +552,9 @@ describe("Outcomes", () => {
       (e) => e.type === "user.define_outcome"
     );
     expect(outcomeEvents.length).toBe(1);
-    expect(outcomeEvents[0].outcome.description).toBe("Write unit tests");
-    expect(outcomeEvents[0].outcome.criteria).toEqual(["Coverage > 80%"]);
+    expect(outcomeEvents[0].description).toBe("Write unit tests");
+    expect(outcomeEvents[0].rubric).toBe("Coverage > 80%");
+    expect(outcomeEvents[0].outcome_id).toMatch(/^outc_/);
   });
 
   it("harness runs normally when outcome is set (no LLM needed for event acceptance)", async () => {
@@ -566,7 +569,8 @@ describe("Outcomes", () => {
       events: [
         {
           type: "user.define_outcome",
-          outcome: { description: "Write fibonacci" },
+          description: "Write fibonacci",
+          rubric: "A fibonacci implementation exists",
         },
       ],
     });
@@ -632,7 +636,8 @@ describe("Outcomes", () => {
       events: [
         {
           type: "user.define_outcome",
-          outcome: { description: "First outcome" },
+          description: "First outcome",
+          rubric: "first",
         },
       ],
     });
@@ -640,10 +645,8 @@ describe("Outcomes", () => {
       events: [
         {
           type: "user.define_outcome",
-          outcome: {
-            description: "Second outcome",
-            criteria: ["Criterion A", "Criterion B"],
-          },
+          description: "Second outcome",
+          rubric: { type: "text", content: "Criterion A; Criterion B" },
         },
       ],
     });
@@ -673,12 +676,12 @@ describe("Outcomes", () => {
       (e) => e.type === "user.define_outcome"
     );
     expect(outcomeEvents.length).toBe(2);
-    expect(outcomeEvents[0].outcome.description).toBe("First outcome");
-    expect(outcomeEvents[1].outcome.description).toBe("Second outcome");
-    expect(outcomeEvents[1].outcome.criteria).toEqual([
-      "Criterion A",
-      "Criterion B",
-    ]);
+    expect(outcomeEvents[0].description).toBe("First outcome");
+    expect(outcomeEvents[1].description).toBe("Second outcome");
+    expect(outcomeEvents[1].rubric).toEqual({
+      type: "text",
+      content: "Criterion A; Criterion B",
+    });
   });
 });
 
@@ -795,7 +798,7 @@ describe("Memory enhancements", () => {
       });
       expect(res.status).toBe(409);
       const body = (await res.json()) as any;
-      expect(body.error).toBe("memory_precondition_failed");
+      expect(body.error.message).toBe("memory_precondition_failed");
     });
 
     it("content_sha256 precondition passes when hash matches", async () => {
@@ -839,7 +842,7 @@ describe("Memory enhancements", () => {
       );
       expect(updateRes.status).toBe(409);
       const body = (await updateRes.json()) as any;
-      expect(body.error).toBe("memory_precondition_failed");
+      expect(body.error.message).toBe("memory_precondition_failed");
     });
 
     it("update without precondition still works", async () => {
@@ -1001,12 +1004,17 @@ describe("Memory enhancements", () => {
         content: "sensitive data",
       });
       const mem = (await createRes.json()) as any;
+      // Redesign safeguard: the current head of a live memory can't be
+      // redacted — write a newer version first, then redact the old one.
+      await post(`/v1/memory_stores/${storeId}/memories/${mem.id}`, {
+        content: "rotated content",
+      });
 
       const versionsRes = await get(
         `/v1/memory_stores/${storeId}/memory_versions?memory_id=${mem.id}`
       );
       const list = (await versionsRes.json()) as any;
-      const verId = list.data[0].id;
+      const verId = list.data.find((v: any) => v.operation === "created").id;
 
       const redactRes = await post(
         `/v1/memory_stores/${storeId}/memory_versions/${verId}/redact`,
@@ -1032,12 +1040,15 @@ describe("Memory enhancements", () => {
         content: "more sensitive data",
       });
       const mem = (await createRes.json()) as any;
+      await post(`/v1/memory_stores/${storeId}/memories/${mem.id}`, {
+        content: "rotated content",
+      });
 
       const versionsRes = await get(
         `/v1/memory_stores/${storeId}/memory_versions?memory_id=${mem.id}`
       );
       const list = (await versionsRes.json()) as any;
-      const verId = list.data[0].id;
+      const verId = list.data.find((v: any) => v.operation === "created").id;
 
       await post(
         `/v1/memory_stores/${storeId}/memory_versions/${verId}/redact`,

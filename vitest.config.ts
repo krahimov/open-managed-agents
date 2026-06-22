@@ -173,7 +173,13 @@ export default defineConfig({
   },
   test: {
     testTimeout: 30000,
-    exclude: ["**/node_modules/**", "**/.git/**", "**/.claude/worktrees/**", "**/.pnpm-store/**", "test/e2e/**", "packages/cap/test/**", "packages/session-runtime/test/**", "apps/console/**"],
+    // First request in each isolate applies the consolidated D1 migrations,
+    // which can push beforeAll hooks past vitest's 10s default under load.
+    hookTimeout: 30000,
+    // apps/main-node + packages/integrations-adapters-node carry their own
+    // vitest.config.ts (Node thread pool — they need better-sqlite3 and real
+    // child processes, which workerd can't load). Run via `pnpm run test:packages`.
+    exclude: ["**/node_modules/**", "**/.git/**", "**/.claude/worktrees/**", "**/.pnpm-store/**", "test/e2e/**", "packages/cap/test/**", "packages/session-runtime/test/**", "apps/console/**", "apps/main-node/**", "packages/integrations-adapters-node/**"],
     pool: cloudflarePool(cfWorkerOptions),
   },
 });

@@ -37,7 +37,7 @@ function post(path: string, body: unknown) {
 }
 
 async function newSession(): Promise<string> {
-  const a = await post("/v1/agents", { name: "RecoveryTest", model: "claude-sonnet-4-6", harness: "noop" });
+  const a = await post("/v1/agents", { name: "RecoveryTest", model: "claude-sonnet-4-6", _oma: { harness: "noop" } });
   const agent = await a.json();
   const e = await post("/v1/environments", { name: "rec-env", config: { type: "cloud" } });
   const environment = await e.json();
@@ -90,6 +90,11 @@ async function newSessionDirect(idHint: string): Promise<string> {
 // Belt-and-braces — top-level helper too, in case the test pool resets
 // storage between cases. (No-op when the column already exists.)
 async function ensureTurnIdColumnsForTest() {
+  // Apply the real consolidated migrations FIRST (test-worker.ts runs them
+  // on the first fetch). If the minimal CREATE TABLE below wins the race,
+  // the full-schema `sessions` table never gets created and POST
+  // /v1/sessions fails on missing columns (e.g. vault_ids).
+  await api("/v1/agents", { headers: H });
   // Some test DBs land here without migration 0001 / 0014 having
   // applied (the test fixture's migration runner stops at earlier
   // failures, e.g. duplicate 0010_* / 0011_* migration filenames).

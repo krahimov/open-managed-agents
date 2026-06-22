@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
 import { execSync } from "node:child_process";
 import { homedir, hostname } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, isAbsolute } from "node:path";
 import { mkdirSync, readFileSync, writeFileSync, unlinkSync, existsSync, chmodSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import type { AgentConfig, ModelCard, SessionMeta } from "@open-managed-agents/api-types";
@@ -18,6 +18,8 @@ interface Config {
    *  `oma whoami` so it can show the source — env vars override stored creds. */
   source: "env" | "stored" | "missing";
 }
+
+const DEFAULT_BASE_URL = "https://app.openma.dev";
 
 // ─── Stored credentials (~/.config/oma/credentials.json) ───
 //
@@ -135,20 +137,46 @@ function resolveActiveTenant(stored: StoredCredentials, cliFlag?: string): strin
   return cliFlag || process.env.OMA_TENANT_ID || stored.active_tenant_id || null;
 }
 
+function normalizeBaseUrl(url: string): string {
+  const trimmed = url.replace(/\/+$/, "");
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.hostname === "openma.dev") {
+      parsed.hostname = "app.openma.dev";
+      return parsed.toString().replace(/\/+$/, "");
+    }
+  } catch {
+    // Keep the original validation behavior for malformed URLs: fetch will
+    // surface the actual parse/connect error at the call site.
+  }
+  return trimmed;
+}
+
+function targetBaseUrl(args: string[], fallback: string): string {
+  return normalizeBaseUrl(flag(args, "--base-url") ?? process.env.OMA_BASE_URL ?? fallback);
+}
+
 function loadConfig(): Config {
-  const envBase = process.env.OMA_BASE_URL;
+  const envBase = process.env.OMA_BASE_URL ? normalizeBaseUrl(process.env.OMA_BASE_URL) : undefined;
   const envKey = process.env.OMA_API_KEY;
   const envTenant = process.env.OMA_TENANT_ID;
   const stored = readCredentials();
   if (envKey) {
     return {
-      baseUrl: envBase || stored?.base_url || "https://openma.dev",
+      baseUrl: envBase || stored?.base_url || DEFAULT_BASE_URL,
       apiKey: envKey,
       json: false,
       source: "env",
     };
   }
   if (stored) {
+    const storedBase = normalizeBaseUrl(stored.base_url);
+    if (envBase && envBase !== storedBase) {
+      console.error(`Error: not authenticated for ${envBase}.`);
+      console.error(`  Run: oma auth login --base-url ${envBase}`);
+      console.error("  Or:  export OMA_API_KEY=<your-key>  (mint at /api-keys page)");
+      process.exit(1);
+    }
     const activeId = envTenant || stored.active_tenant_id;
     const profile = stored.tenants[activeId];
     if (!profile) {
@@ -156,7 +184,7 @@ function loadConfig(): Config {
       process.exit(1);
     }
     return {
-      baseUrl: envBase || stored.base_url,
+      baseUrl: storedBase,
       apiKey: profile.token,
       json: false,
       source: "stored",
@@ -172,21 +200,103 @@ function loadConfig(): Config {
  *  (oma auth login itself). Returns a minimal Config with a possibly-empty
  *  apiKey; callers check Config.source before making authenticated calls. */
 function loadConfigOptional(): Config {
-  const envBase = process.env.OMA_BASE_URL;
+  const envBase = process.env.OMA_BASE_URL ? normalizeBaseUrl(process.env.OMA_BASE_URL) : undefined;
   const envKey = process.env.OMA_API_KEY;
   const envTenant = process.env.OMA_TENANT_ID;
   const stored = readCredentials();
   if (envKey) {
-    return { baseUrl: envBase || stored?.base_url || "https://openma.dev", apiKey: envKey, json: false, source: "env" };
+    return { baseUrl: envBase || stored?.base_url || DEFAULT_BASE_URL, apiKey: envKey, json: false, source: "env" };
   }
   if (stored) {
+    const storedBase = normalizeBaseUrl(stored.base_url);
+    if (envBase && envBase !== storedBase) {
+      return { baseUrl: envBase, apiKey: "", json: false, source: "missing" };
+    }
     const activeId = envTenant || stored.active_tenant_id;
     const profile = stored.tenants[activeId];
     if (profile) {
-      return { baseUrl: envBase || stored.base_url, apiKey: profile.token, json: false, source: "stored" };
+      return { baseUrl: storedBase, apiKey: profile.token, json: false, source: "stored" };
     }
   }
-  return { baseUrl: envBase || "https://openma.dev", apiKey: "", json: false, source: "missing" };
+  return { baseUrl: envBase || DEFAULT_BASE_URL, apiKey: "", json: false, source: "missing" };
+}
+
+function authAutoLoginDisabled(): boolean {
+  const raw = process.env.OMA_AUTH_AUTO_LOGIN?.toLowerCase();
+  return raw === "0" || raw === "false" || raw === "no";
+}
+
+function printMissingAuthHelp(baseUrl?: string): void {
+  console.error("Error: not authenticated.");
+  console.error(`  Run: oma auth login${baseUrl ? ` --base-url ${baseUrl}` : ""}`);
+  console.error("  Or:  export OMA_API_KEY=<your-key>  (mint at /api-keys page)");
+}
+
+async function loadConfigOrLogin(args: string[]): Promise<Config> {
+  const config = loadConfigOptional();
+  const baseUrl = targetBaseUrl(args, config.baseUrl);
+  if (config.source === "env") return { ...config, baseUrl };
+  if (config.source === "stored" && normalizeBaseUrl(config.baseUrl) === baseUrl) return config;
+  const tenant = flag(args, "--tenant") ?? process.env.OMA_TENANT_ID;
+  if (authAutoLoginDisabled()) {
+    printMissingAuthHelp(baseUrl);
+    process.exit(1);
+  }
+  console.log("Harness Studio authentication is required. Opening browser sign-in...");
+  await authLogin(baseUrl, tenant || undefined);
+  const refreshed = loadConfigOptional();
+  if (refreshed.source === "missing") {
+    printMissingAuthHelp(baseUrl);
+    process.exit(1);
+  }
+  return refreshed;
+}
+
+async function ensureAuthenticated(
+  initialConfig: Config,
+  args: string[],
+): Promise<Config> {
+  const baseUrl = targetBaseUrl(args, initialConfig.baseUrl);
+  const tenant = flag(args, "--tenant") ?? process.env.OMA_TENANT_ID;
+  let config = initialConfig.source === "env"
+    ? { ...initialConfig, baseUrl }
+    : initialConfig;
+  if (config.source === "stored" && normalizeBaseUrl(config.baseUrl) !== baseUrl) {
+    config = { baseUrl, apiKey: "", json: config.json, source: "missing" };
+  }
+  if (config.source === "missing") {
+    if (authAutoLoginDisabled()) {
+      printMissingAuthHelp(baseUrl);
+      process.exit(1);
+    }
+    console.log("Harness Studio authentication is required. Opening browser sign-in...");
+    await authLogin(baseUrl, tenant || undefined);
+    config = loadConfigOptional();
+  }
+  if (config.source === "missing") {
+    printMissingAuthHelp(baseUrl);
+    process.exit(1);
+  }
+  try {
+    const me = await apiFetch<{
+      user: { id: string; email: string; name: string | null } | null;
+      tenant: { id: string; name: string };
+      tenants: Array<{ id: string; name: string; role: string }>;
+    }>(config, "/v1/me");
+    if (!config.json) {
+      console.log(`✓ Signed in as ${me.user?.email ?? me.user?.id ?? "(unknown)"}`);
+      console.log(`  Base URL : ${config.baseUrl}`);
+      console.log(`  Tenant   : ${displayTenantName(me.tenant)} (${me.tenant.id})`);
+    } else {
+      console.log(JSON.stringify({ ...me, base_url: config.baseUrl, source: config.source }, null, 2));
+    }
+    return config;
+  } catch (err) {
+    if (config.source !== "stored" || authAutoLoginDisabled()) throw err;
+    console.log("Stored Harness Studio credentials were rejected. Opening browser sign-in...");
+    await authLogin(baseUrl, tenant || undefined);
+    return loadConfigOptional();
+  }
 }
 
 // ─── API Client ───
@@ -381,6 +491,459 @@ function flag(args: string[], name: string): string | undefined {
     if (args[i].startsWith(eqPrefix)) return args[i].slice(eqPrefix.length);
   }
   return undefined;
+}
+
+function sessionCheckoutFromFlags(
+  args: string[],
+): { type: "branch"; name: string } | { type: "commit"; sha: string } | { type: "pull_request"; name: string } | undefined {
+  const branch = flag(args, "--checkout-branch") || flag(args, "--branch");
+  const commit = flag(args, "--checkout-commit") || flag(args, "--commit");
+  const pr = flag(args, "--checkout-pr") || flag(args, "--pr");
+  const selected = [branch, commit, pr].filter(Boolean).length;
+  if (selected > 1) {
+    console.error("Use only one checkout flag: --checkout-branch, --checkout-commit, or --checkout-pr.");
+    process.exit(1);
+  }
+  if (branch) return { type: "branch", name: branch };
+  if (commit) return { type: "commit", sha: commit };
+  if (pr) return { type: "pull_request", name: pr };
+  return undefined;
+}
+
+function requiredFileFlag(args: string[], usageText: string): string {
+  const file = flag(args, "-f") || flag(args, "--file");
+  if (!file) {
+    console.error(usageText);
+    process.exit(1);
+  }
+  return file;
+}
+
+function readJsonObjectFile(path: string): Record<string, unknown> {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    console.error(`Could not read JSON file ${path}: ${(err as Error).message}`);
+    process.exit(1);
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    console.error(`${path} must contain a JSON object.`);
+    process.exit(1);
+  }
+  return parsed as Record<string, unknown>;
+}
+
+function manifestRelativePath(manifestPath: string, childPath: string): string {
+  if (isAbsolute(childPath)) return childPath;
+  return join(dirname(manifestPath), childPath);
+}
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function stringArrayValue(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((v): v is string => typeof v === "string" && v.length > 0)
+    : [];
+}
+
+const COMPOSIO_MCP_SERVER = {
+  name: "composio",
+  type: "url",
+  url: "https://app.composio.dev/tool_router/v3/session/mcp",
+};
+
+interface ComposioAppRef {
+  name: string;
+  toolkit: string;
+}
+
+function composioAppsFromProject(project: Record<string, unknown>): ComposioAppRef[] {
+  const apps = objectValue(project.apps);
+  if (!apps) return [];
+  const refs: ComposioAppRef[] = [];
+  for (const [name, raw] of Object.entries(apps)) {
+    const app = objectValue(raw);
+    if (!app) continue;
+    if (app.provider !== "composio") continue;
+    const toolkit = typeof app.toolkit === "string" && app.toolkit.trim()
+      ? app.toolkit.trim().toLowerCase()
+      : name.trim().toLowerCase();
+    if (toolkit) refs.push({ name, toolkit });
+  }
+  return refs;
+}
+
+function ensureComposioTooling(body: Record<string, unknown>): void {
+  const mcpServers = Array.isArray(body.mcp_servers)
+    ? [...body.mcp_servers]
+    : [];
+  const hasComposioMcp = mcpServers.some((entry) => {
+    const obj = objectValue(entry);
+    return obj?.name === "composio" ||
+      (typeof obj?.url === "string" && obj.url.includes("composio"));
+  });
+  if (!hasComposioMcp) {
+    body.mcp_servers = [COMPOSIO_MCP_SERVER, ...mcpServers];
+  }
+
+  const tools = Array.isArray(body.tools)
+    ? [...body.tools]
+    : [{ type: "agent_toolset_20260401" }];
+  const hasComposioToolset = tools.some((entry) => {
+    const obj = objectValue(entry);
+    return obj?.type === "mcp_toolset" && obj?.mcp_server_name === "composio";
+  });
+  if (!hasComposioToolset) {
+    body.tools = [
+      ...tools,
+      {
+        type: "mcp_toolset",
+        mcp_server_name: "composio",
+        default_config: { permission_policy: { type: "always_allow" } },
+      },
+    ];
+  }
+}
+
+function normalizeAgentFile(path: string): {
+  body: Record<string, unknown>;
+  warnings: string[];
+  project: Record<string, unknown>;
+  composioApps: ComposioAppRef[];
+} {
+  const project = readJsonObjectFile(path);
+  const warnings: string[] = [];
+  const composioApps = composioAppsFromProject(project);
+  const agentSpec = objectValue(project.agent) ?? project;
+  const body: Record<string, unknown> = { ...agentSpec };
+
+  const systemFile = body.system_file ?? body.systemFile;
+  if (typeof systemFile === "string" && systemFile.length > 0) {
+    const resolved = manifestRelativePath(path, systemFile);
+    try {
+      body.system = readFileSync(resolved, "utf8");
+    } catch (err) {
+      console.error(`Could not read system_file ${resolved}: ${(err as Error).message}`);
+      process.exit(1);
+    }
+  }
+  delete body.system_file;
+  delete body.systemFile;
+
+  if (body.mcp_servers === undefined && body.mcpServers !== undefined) {
+    body.mcp_servers = body.mcpServers;
+  }
+  delete body.mcpServers;
+
+  if (body.multiagent === undefined && body.callableAgents !== undefined) {
+    body.multiagent = { type: "coordinator", agents: body.callableAgents };
+  }
+  delete body.callableAgents;
+
+  const oma = objectValue(body._oma) ? { ...(body._oma as Record<string, unknown>) } : {};
+  for (const key of ["aux_model", "auxModel", "harness", "runtime_binding", "runtimeBinding", "appendable_prompts", "appendablePrompts"]) {
+    if (body[key] === undefined) continue;
+    const apiKey =
+      key === "auxModel" ? "aux_model"
+      : key === "runtimeBinding" ? "runtime_binding"
+      : key === "appendablePrompts" ? "appendable_prompts"
+      : key;
+    oma[apiKey] = body[key];
+    delete body[key];
+  }
+  if (Object.keys(oma).length > 0) body._oma = oma;
+
+  const metadata = objectValue(body.metadata)
+    ? { ...(body.metadata as Record<string, unknown>) }
+    : {};
+  const defaultEnv =
+    body.default_environment_id ??
+    body.defaultEnvironmentId ??
+    project.environment_id ??
+    project.default_environment_id ??
+    objectValue(project.environment)?.id;
+  if (typeof defaultEnv === "string" && defaultEnv.length > 0) {
+    metadata.default_environment_id = defaultEnv;
+  } else if (project.environment && objectValue(project.environment)?.name) {
+    warnings.push("environment.name is planning metadata only; create the environment first and set agent.default_environment_id.");
+  }
+  delete body.default_environment_id;
+  delete body.defaultEnvironmentId;
+
+  const defaultVaultIds = [
+    ...stringArrayValue(body.default_vault_ids),
+    ...stringArrayValue(body.defaultVaultIds),
+    ...stringArrayValue(project.vault_ids),
+    ...stringArrayValue(project.default_vault_ids),
+  ];
+  const vaultRefs = Array.isArray(project.vaults)
+    ? project.vaults
+        .map((v) => typeof v === "string" ? v : objectValue(v)?.id)
+        .filter((v): v is string => typeof v === "string" && v.length > 0)
+    : [];
+  if (defaultVaultIds.length || vaultRefs.length) {
+    metadata.default_vault_ids = Array.from(new Set([...defaultVaultIds, ...vaultRefs]));
+  }
+  delete body.default_vault_ids;
+  delete body.defaultVaultIds;
+  if (Object.keys(metadata).length > 0) body.metadata = metadata;
+
+  if (body.tools === undefined) {
+    body.tools = [{ type: "agent_toolset_20260401" }];
+  }
+
+  if (composioApps.length > 0) {
+    ensureComposioTooling(body);
+    const meta = objectValue(body.metadata)
+      ? { ...(body.metadata as Record<string, unknown>) }
+      : {};
+    meta.composio_toolkits = Array.from(new Set(composioApps.map((app) => app.toolkit)));
+    body.metadata = meta;
+  }
+
+  if (project.apps) {
+    const nonComposioApps = Object.entries(objectValue(project.apps) ?? {}).filter(([, raw]) => {
+      const app = objectValue(raw);
+      return app?.provider && app.provider !== "composio";
+    });
+    if (nonComposioApps.length > 0) {
+      warnings.push("non-Composio apps are planning metadata only; connect those credentials with their provider-specific flow.");
+    }
+    if (composioApps.length > 0) {
+      warnings.push("Composio apps require browser OAuth during apply; pass --no-auth to skip credential setup.");
+    }
+  }
+  if (project.publications) {
+    warnings.push("publications is planning metadata only; publish with oma slack/github/linear commands after the agent exists.");
+  }
+  if (project.tests) {
+    warnings.push("tests is planning metadata only; run smoke sessions manually for now.");
+  }
+
+  if (typeof body.name !== "string" || body.name.length === 0) {
+    console.error(`${path} must provide agent.name or name.`);
+    process.exit(1);
+  }
+  if (!body.model && !objectValue(body._oma)?.runtime_binding) {
+    console.error(`${path} must provide agent.model or _oma.runtime_binding.`);
+    process.exit(1);
+  }
+
+  return { body, warnings, project, composioApps };
+}
+
+async function selectOrCreateConnectedAppsVault(
+  config: Config,
+  preferredVaultIds: string[],
+): Promise<{ id: string; name: string }> {
+  const { data } = await apiFetch<{ data: Array<{ id: string; name: string }> }>(
+    config,
+    "/v1/vaults?limit=100",
+  );
+  const preferred = preferredVaultIds
+    .map((id) => data.find((vault) => vault.id === id))
+    .find((vault): vault is { id: string; name: string } => !!vault);
+  if (preferred) return preferred;
+  const connectedApps = data.find((vault) => vault.name === "Connected Apps");
+  if (connectedApps) return connectedApps;
+  return apiFetch<{ id: string; name: string }>(config, "/v1/vaults", {
+    method: "POST",
+    body: JSON.stringify({ name: "Connected Apps" }),
+  });
+}
+
+function callbackQuery(reqUrl: string | undefined, port: number): URLSearchParams {
+  const url = new URL(reqUrl || "/", `http://127.0.0.1:${port}`);
+  return url.searchParams;
+}
+
+function waitForComposioCallback(opts: {
+  toolkit: string;
+  port: number;
+  timeoutMs?: number;
+}): { callbackUrl: string; wait: Promise<Record<string, string>>; close: () => void } {
+  const timeoutMs = opts.timeoutMs ?? 5 * 60 * 1000;
+  const callbackUrl = `http://127.0.0.1:${opts.port}/callback?toolkit=${encodeURIComponent(opts.toolkit)}`;
+  let server: ReturnType<typeof createServer>;
+  let timer: ReturnType<typeof setTimeout>;
+  const close = () => {
+    clearTimeout(timer);
+    try { server.close(() => undefined); } catch {}
+  };
+  const wait = new Promise<Record<string, string>>((resolve, reject) => {
+    const finish = (status: number, title: string, body: string, done: () => void) => {
+      close();
+      return { status, title, body, done };
+    };
+    timer = setTimeout(() => {
+      close();
+      reject(new Error(`Timed out waiting for ${opts.toolkit} OAuth callback`));
+    }, timeoutMs);
+    server = createServer((req: any, res: any) => {
+      try {
+        const query = callbackQuery(req.url, opts.port);
+        const error = query.get("error");
+        if (error) {
+          const response = finish(400, "Connection failed", `Provider returned: ${error}`, () =>
+            reject(new Error(`${opts.toolkit} OAuth failed: ${error}`)),
+          );
+          res.writeHead(response.status, { "content-type": "text/html" });
+          res.end(approvalPage(response.title, response.body));
+          response.done();
+          return;
+        }
+        const values: Record<string, string> = {};
+        for (const [key, value] of query.entries()) values[key] = value;
+        const response = finish(200, "Connection complete", "You can close this tab and return to your terminal.", () =>
+          resolve(values),
+        );
+        res.writeHead(response.status, { "content-type": "text/html" });
+        res.end(approvalPage(response.title, response.body));
+        response.done();
+      } catch (err) {
+        close();
+        res.writeHead(500).end();
+        reject(err);
+      }
+    });
+    server.listen(opts.port, "127.0.0.1");
+  });
+  return { callbackUrl, wait, close };
+}
+
+async function connectComposioAppsForAgent(
+  config: Config,
+  body: Record<string, unknown>,
+  apps: ComposioAppRef[],
+): Promise<{ vaultId: string; credentialId?: string }> {
+  const uniqueToolkits = Array.from(new Set(apps.map((app) => app.toolkit)));
+  const metadata = objectValue(body.metadata)
+    ? { ...(body.metadata as Record<string, unknown>) }
+    : {};
+  const currentVaultIds = stringArrayValue(metadata.default_vault_ids);
+  const vault = await selectOrCreateConnectedAppsVault(config, currentVaultIds);
+  const connectedAccounts: Record<string, string> = {};
+  const authConfigs: Record<string, string> = {};
+
+  for (const toolkit of uniqueToolkits) {
+    const port = 19380 + Math.floor(Math.random() * 1000);
+    const callback = waitForComposioCallback({ toolkit, port });
+    let link: {
+      redirect_url: string;
+      connected_account_id: string;
+      auth_config_id: string;
+    };
+    try {
+      link = await apiFetch<typeof link>(config, `/v1/vaults/${vault.id}/credentials/composio_accounts/link`, {
+        method: "POST",
+        body: JSON.stringify({ toolkit, callback_url: callback.callbackUrl }),
+      });
+    } catch (err) {
+      callback.close();
+      throw err;
+    }
+
+    console.log(`Opening browser to connect ${toolkit} with Composio...`);
+    console.log(`  ${link.redirect_url}`);
+    console.log(`If the browser does not open, copy the URL above into one manually.`);
+    openBrowser(link.redirect_url);
+
+    const callbackValues = await callback.wait;
+    connectedAccounts[toolkit] =
+      callbackValues.connected_account_id ||
+      callbackValues.connectedAccountId ||
+      callbackValues.id ||
+      link.connected_account_id;
+    authConfigs[toolkit] = link.auth_config_id;
+  }
+
+  const cred = await apiFetch<{ id: string }>(
+    config,
+    `/v1/vaults/${vault.id}/credentials/composio_tool_router_session`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        display_name: `Composio Tool Router (${String(body.name || "Agent")})`,
+        toolkits: { enable: uniqueToolkits },
+        connected_accounts: connectedAccounts,
+        auth_configs: authConfigs,
+      }),
+    },
+  );
+
+  metadata.default_vault_ids = Array.from(new Set([...currentVaultIds, vault.id]));
+  metadata.composio_toolkits = uniqueToolkits;
+  body.metadata = metadata;
+  return { vaultId: vault.id, credentialId: cred.id };
+}
+
+async function applyAgentFile(
+  config: Config,
+  path: string,
+  opts: { dryRun?: boolean; id?: string; createOnly?: boolean; skipAuth?: boolean } = {},
+): Promise<void> {
+  const { body, warnings, composioApps } = normalizeAgentFile(path);
+  const name = String(body.name);
+  let existing: { id: string; name: string } | null = null;
+  if (opts.dryRun && config.source === "missing") {
+    const plan = {
+      action: opts.id ? "update" : "create_or_update",
+      target_agent_id: opts.id ?? null,
+      body,
+      warnings: [
+        ...warnings,
+        "Offline plan only; authenticate with oma auth login to compare against existing agents or apply.",
+      ],
+    };
+    console.log(JSON.stringify(plan, null, 2));
+    return;
+  }
+  if (opts.id) {
+    existing = await apiFetch<{ id: string; name: string }>(config, `/v1/agents/${opts.id}`);
+  } else if (!opts.createOnly) {
+    const { data } = await apiFetch<{ data: Array<{ id: string; name: string }> }>(
+      config,
+      `/v1/agents?limit=100&q=${encodeURIComponent(name)}`,
+    );
+    existing = data.find((a) => a.name === name) ?? null;
+  }
+
+  const action = opts.createOnly || !existing ? "create" : "update";
+  const target = existing?.id;
+  if (opts.dryRun) {
+    const plan = { action, target_agent_id: target ?? null, body, warnings };
+    console.log(JSON.stringify(plan, null, 2));
+    return;
+  }
+
+  if (composioApps.length > 0 && !opts.skipAuth) {
+    const connected = await connectComposioAppsForAgent(config, body, composioApps);
+    warnings.push(`Connected Composio apps in vault ${connected.vaultId}.`);
+  } else if (composioApps.length > 0 && opts.skipAuth) {
+    warnings.push("Skipped Composio browser OAuth because --no-auth was passed; connect credentials before running this agent.");
+  }
+
+  const agent = action === "create"
+    ? await apiFetch<Record<string, unknown>>(config, "/v1/agents", {
+        method: "POST",
+        body: JSON.stringify(body),
+      })
+    : await apiFetch<Record<string, unknown>>(config, `/v1/agents/${target}`, {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+
+  if (config.json) {
+    console.log(JSON.stringify({ action, agent, warnings }, null, 2));
+    return;
+  }
+  console.log(`${action === "create" ? "Agent created" : "Agent updated"}: ${agent.name} (${agent.id})`);
+  for (const warning of warnings) console.log(`Note: ${warning}`);
 }
 
 /**
@@ -620,6 +1183,7 @@ function displayTenantName(t: { id: string; name: string }): string {
 }
 
 function openBrowser(url: string): void {
+  if (process.env.OMA_NO_BROWSER_OPEN === "1") return;
   try {
     const p = process.platform;
     if (p === "darwin") execSync(`open "${url}"`);
@@ -628,6 +1192,78 @@ function openBrowser(url: string): void {
   } catch {
     // The URL is already printed above; user can copy-paste manually.
   }
+}
+
+async function githubDeviceAuthToken(): Promise<string> {
+  const clientId = process.env.OMA_GITHUB_DEVICE_CLIENT_ID || "178c6fc778ccc68e1d6a";
+  const scope = process.env.OMA_GITHUB_DEVICE_SCOPES || "repo read:org gist workflow";
+  const initRes = await fetch("https://github.com/login/device/code", {
+    method: "POST",
+    headers: {
+      accept: "application/json",
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({ client_id: clientId, scope }),
+  });
+  if (!initRes.ok) throw new Error(`GitHub device auth initiate failed: ${initRes.status}`);
+  const init = await initRes.json() as {
+    device_code?: string;
+    user_code?: string;
+    verification_uri?: string;
+    verification_uri_complete?: string;
+    expires_in?: number;
+    interval?: number;
+    error?: string;
+    error_description?: string;
+  };
+  if (!init.device_code || !init.user_code || !init.verification_uri) {
+    throw new Error(init.error_description || init.error || "GitHub device auth initiate returned an invalid response");
+  }
+
+  const verifyUrl = init.verification_uri_complete || init.verification_uri;
+  console.log(`GitHub authorization required. Opening: ${verifyUrl}`);
+  console.log(`If prompted, enter code: ${init.user_code}`);
+  openBrowser(verifyUrl);
+
+  const expiresAt = Date.now() + Math.max(1, init.expires_in ?? 900) * 1000;
+  let intervalMs = Math.max(1, init.interval ?? 5) * 1000;
+  while (Date.now() < expiresAt) {
+    await sleep(intervalMs);
+    const pollRes = await fetch("https://github.com/login/oauth/access_token", {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        client_id: clientId,
+        device_code: init.device_code,
+        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+      }),
+    });
+    if (!pollRes.ok) throw new Error(`GitHub device auth poll failed: ${pollRes.status}`);
+    const poll = await pollRes.json() as {
+      access_token?: string;
+      error?: string;
+      error_description?: string;
+    };
+    if (poll.access_token) return poll.access_token;
+    if (poll.error === "authorization_pending") continue;
+    if (poll.error === "slow_down") {
+      intervalMs += 5000;
+      continue;
+    }
+    if (poll.error === "expired_token") {
+      throw new Error("GitHub device auth expired before authorization completed.");
+    }
+    if (poll.error === "access_denied") throw new Error("GitHub device auth was denied.");
+    throw new Error(poll.error_description || poll.error || "GitHub device auth failed.");
+  }
+  throw new Error("GitHub device auth timed out.");
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function approvalPage(title: string, body: string): string {
@@ -657,9 +1293,17 @@ const commands: Cmd[] = [
     usage: "oma auth login [--base-url <url>] [--tenant <id>]", desc: "Open browser to authenticate; --tenant pre-picks a workspace",
     http: "POST   /v1/me/cli-tokens (browser handoff via /cli/login)",
     async run(_config, args) {
-      const baseUrl = (flag(args, "--base-url") ?? process.env.OMA_BASE_URL ?? "https://openma.dev").replace(/\/+$/, "");
+      const baseUrl = targetBaseUrl(args, DEFAULT_BASE_URL);
       const tenant = flag(args, "--tenant");
       await authLogin(baseUrl, tenant);
+    },
+  },
+  {
+    group: "Auth", match: ["auth", "ensure"],
+    usage: "oma auth ensure [--base-url <url>] [--tenant <id>]", desc: "Verify auth or open browser sign-in when missing/expired",
+    http: "GET    /v1/me; POST /v1/me/cli-tokens if sign-in is needed",
+    async run(config, args) {
+      await ensureAuthenticated(config, args);
     },
   },
   {
@@ -764,10 +1408,33 @@ const commands: Cmd[] = [
     },
   },
   {
+    group: "Agents", match: ["agents", "plan"],
+    usage: "oma agents plan -f <agent.json>", desc: "Show create/update plan for an agent file",
+    http: "GET    /v1/agents + local manifest normalization (no writes)",
+    async run(config, args) {
+      const file = requiredFileFlag(args, "Usage: oma agents plan -f <agent.json>");
+      await applyAgentFile(config, file, { dryRun: true, id: flag(args, "--id") });
+    },
+  },
+  {
+    group: "Agents", match: ["agents", "apply"],
+    usage: "oma agents apply -f <agent.json> [--id <agent-id>] [--no-auth]", desc: "Create or update agent from file",
+    http: "POST/PUT /v1/agents from normalized agent file",
+    async run(config, args) {
+      const file = requiredFileFlag(args, "Usage: oma agents apply -f <agent.json> [--id <agent-id>] [--no-auth]");
+      await applyAgentFile(config, file, { id: flag(args, "--id"), skipAuth: args.includes("--no-auth") });
+    },
+  },
+  {
     group: "Agents", match: ["agents", "create"],
-    usage: "oma agents create <name> [--model <id>]", desc: "Create agent",
+    usage: "oma agents create <name> [--model <id>] | -f <agent.json>", desc: "Create agent",
     http: "POST   /v1/agents {name, model, system, tools, skills?, mcp_servers?, multiagent?, _oma?:{runtime_binding,harness,...}}",
     async run(config, args) {
+      const file = flag(args, "-f") || flag(args, "--file");
+      if (file) {
+        await applyAgentFile(config, file, { createOnly: true, skipAuth: args.includes("--no-auth") });
+        return;
+      }
       const name = flag(args, "--name") || args.find(a => !a.startsWith("--"));
       const model = flag(args, "--model") || "claude-sonnet-4-6";
       const system = flag(args, "--system") || "";
@@ -863,13 +1530,50 @@ const commands: Cmd[] = [
   },
   {
     group: "Sessions", match: ["sessions", "create"],
-    usage: "oma sessions create --agent <id> --env <id> [--title <t>]", desc: "Create session",
+    usage: "oma sessions create --agent <id> --env <id> [--title <t>] [--github-repo <url> (--github-auth | --github-token-env GITHUB_TOKEN)]", desc: "Create session",
     http: "POST   /v1/sessions {agent, environment_id, title?, vault_ids?, resources?}",
     async run(config, args) {
-      const agentId = flag(args, "--agent"); const envId = flag(args, "--env"); const title = flag(args, "--title") || "";
-      if (!agentId || !envId) { console.error("Usage: oma sessions create --agent <id> --env <id> [--title <text>]"); process.exit(1); }
-      const session = await apiFetch<{ id: string }>(config, "/v1/sessions", { method: "POST", body: JSON.stringify({ agent: agentId, environment_id: envId, title }) });
+      const agentId = flag(args, "--agent");
+      const envId = flag(args, "--env");
+      const title = flag(args, "--title") || "";
+      const repoUrl = flag(args, "--github-repo") || flag(args, "--repo");
+      const githubTokenEnv = flag(args, "--github-token-env");
+      let githubToken = flag(args, "--github-token") || (githubTokenEnv ? process.env[githubTokenEnv] : undefined);
+      const mountPath = flag(args, "--mount-path") || "/workspace";
+      if (!agentId || !envId) {
+        console.error("Usage: oma sessions create --agent <id> --env <id> [--title <text>] [--github-repo <url> (--github-auth | --github-token-env GITHUB_TOKEN)]");
+        process.exit(1);
+      }
+      if (githubTokenEnv && !githubToken) {
+        console.error(`Environment variable ${githubTokenEnv} is not set.`);
+        process.exit(1);
+      }
+      if (repoUrl && !githubToken && args.includes("--github-auth")) {
+        githubToken = await githubDeviceAuthToken();
+      }
+
+      const body: Record<string, unknown> = { agent: agentId, environment_id: envId, title };
+      if (repoUrl) {
+        const checkout = sessionCheckoutFromFlags(args);
+        body.resources = [{
+          type: "github_repository",
+          url: repoUrl,
+          repo_url: repoUrl,
+          mount_path: mountPath,
+          ...(checkout ? { checkout } : {}),
+          ...(githubToken ? { authorization_token: githubToken } : {}),
+        }];
+      }
+
+      const session = await apiFetch<{ id: string }>(config, "/v1/sessions", { method: "POST", body: JSON.stringify(body) });
+      if (config.json) {
+        console.log(JSON.stringify(session, null, 2));
+        return;
+      }
       console.log(`Session created: ${session.id}`);
+      if (repoUrl && !githubToken) {
+        console.log("GitHub repo resource attached without an inline token. Private repos require a bound GitHub App installation, --github-auth, or --github-token-env/--github-token.");
+      }
     },
   },
   {
@@ -2218,8 +2922,9 @@ function usage() {
     oma api <resource>                         Show endpoints for a resource
 
 Environment:
-  OMA_BASE_URL   API base (default: https://openma.dev)
+  OMA_BASE_URL   API base (default: ${DEFAULT_BASE_URL})
   OMA_API_KEY    API key — overrides stored credentials when set
+  OMA_AUTH_AUTO_LOGIN=0  Disable browser sign-in fallback for missing creds
   XDG_CONFIG_HOME  Base dir for credentials (default: ~/.config)
 
 Stored credentials live at ~/.config/oma/credentials.json (created by
@@ -2350,17 +3055,10 @@ async function main() {
   const wantJson = args.includes("--json");
   args = args.filter((a) => a !== "--json");
 
-  // Pre-auth commands: `auth login` runs before any credentials exist;
-  // `auth logout` is a local file delete and shouldn't error if logged out.
-  // Both bypass the strict loadConfig that exits on missing key.
-  const isPreAuth =
-    (args[0] === "auth" && (args[1] === "login" || args[1] === "logout"));
-  const config = isPreAuth ? loadConfigOptional() : loadConfig();
-  config.json = wantJson;
-
   // Matcher: track the best partial match so we can give a useful hint when
   // the user typed a real subcommand but forgot the required positional.
   let needsArgMatch: Cmd | null = null;
+  let matched: { command: Cmd; rest: string[] } | null = null;
   for (const c of commands) {
     const verbMatch = c.match.every((tok, i) => args[i] === tok);
     if (!verbMatch) continue;
@@ -2368,13 +3066,26 @@ async function main() {
       needsArgMatch = c;
       continue;
     }
-    const rest = args.slice(c.match.length);
-    return c.run(config, rest);
+    matched = { command: c, rest: args.slice(c.match.length) };
+    break;
   }
 
   if (needsArgMatch) {
     console.error(`${needsArgMatch.usage}\n  ${needsArgMatch.desc}`);
     process.exit(1);
+  }
+  if (matched) {
+    // Pre-auth commands: `auth login` and `auth ensure` must run before
+    // credentials exist; `auth logout` is local; `agents plan` is local
+    // manifest normalization and must work before login. Every other
+    // platform command may trigger the browser sign-in handoff if no
+    // stored/API-key auth is available.
+    const isPreAuth =
+      (args[0] === "auth" && (args[1] === "login" || args[1] === "logout" || args[1] === "ensure")) ||
+      (args[0] === "agents" && args[1] === "plan");
+    const config = isPreAuth ? loadConfigOptional() : await loadConfigOrLogin(args);
+    config.json = wantJson;
+    return matched.command.run(config, matched.rest);
   }
   console.error(`Unknown command: ${args.join(" ")}`);
   usage();

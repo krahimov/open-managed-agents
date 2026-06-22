@@ -23,6 +23,7 @@ import {
   AppsIcon,
   RuntimesIcon,
   DashboardIcon,
+  DeploymentsIcon,
   EnvIcon,
   FilesIcon,
   GitHubIcon,
@@ -58,6 +59,7 @@ const navGroups: NavGroup[] = [
     label: "Operate",
     items: [
       { to: "/agents", label: "Agents", icon: AgentIcon },
+      { to: "/deployments", label: "Deployments", icon: DeploymentsIcon },
       { to: "/sessions", label: "Sessions", icon: SessionsIcon },
       { to: "/files", label: "Files", icon: FilesIcon },
       { to: "/evals", label: "Eval Runs", icon: SessionsIcon },

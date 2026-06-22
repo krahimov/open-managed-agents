@@ -47,6 +47,20 @@ export type {
 export { buildEvalRoutes } from "./evals";
 export type { EvalRoutesDeps, EvalTaskSpec } from "./evals";
 
+export {
+  buildDeploymentRoutes,
+  buildPublicGatewayRoutes,
+  kvDeploymentStorage,
+} from "./deployments";
+export type {
+  DeploymentRecord,
+  DeploymentStorage,
+  DeploymentRoutesDeps,
+  PublicGatewayDeps,
+  PublicDeployment,
+  HonoFetchable,
+} from "./deployments";
+
 export { buildIntegrationsRoutes } from "./integrations";
 export type {
   IntegrationsRoutesDeps,

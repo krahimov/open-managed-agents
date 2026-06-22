@@ -186,6 +186,9 @@ export interface NormalizedWebhookEvent {
   action: string | null;
   /** URL of the issue / PR / comment for human navigation. */
   htmlUrl: string | null;
+  /** PR head checkout target, present on pull_request-derived events. */
+  pullRequestHeadSha: string | null;
+  pullRequestHeadRef: string | null;
 }
 
 export interface ParseInput {
@@ -229,6 +232,8 @@ export function parseWebhook({
     action,
     actorLogin: raw.sender?.login ?? null,
     actorUserId: raw.sender?.id ?? null,
+    pullRequestHeadSha: null,
+    pullRequestHeadRef: null,
   };
 
   // Self-wakeup guard: if the sender IS the bot, never dispatch.
@@ -385,6 +390,8 @@ export function parseWebhook({
       commentId: null,
       labels,
       htmlUrl: pr.html_url ?? null,
+      pullRequestHeadSha: pr.head.sha,
+      pullRequestHeadRef: pr.head.ref,
     };
   }
 
@@ -450,6 +457,8 @@ export function parseWebhook({
       commentId: raw.review.id,
       labels,
       htmlUrl: raw.review.html_url ?? pr.html_url ?? null,
+      pullRequestHeadSha: pr.head.sha,
+      pullRequestHeadRef: pr.head.ref,
     };
   }
 
@@ -485,6 +494,8 @@ export function parseWebhook({
       commentId: raw.comment.id,
       labels,
       htmlUrl: raw.comment.html_url ?? pr.html_url ?? null,
+      pullRequestHeadSha: pr.head.sha,
+      pullRequestHeadRef: pr.head.ref,
     };
   }
 

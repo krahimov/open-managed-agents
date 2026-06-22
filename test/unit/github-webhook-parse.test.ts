@@ -33,7 +33,7 @@ describe("GitHub webhook parser", () => {
     ).toBeNull();
   });
 
-  it("issues.assigned to bot → kind=issue_assigned", () => {
+  it("issues.assigned to bot → kind=null (engagement model: assignment is not a trigger)", () => {
     const event = parseWebhook({
       eventType: "issues",
       deliveryId: "del_1",
@@ -52,8 +52,11 @@ describe("GitHub webhook parser", () => {
         },
       }),
     });
+    // The engagement-model redesign routes assigned/reviewer changes to
+    // kind=null — engagement happens via trigger label or @-mention. The
+    // envelope is still parsed for observability.
     expect(event).toMatchObject({
-      kind: "issue_assigned",
+      kind: null,
       installationId: "12345",
       repository: "acme/api",
       itemNumber: 142,
@@ -96,7 +99,7 @@ describe("GitHub webhook parser", () => {
     expect(event?.kind).toBeNull();
   });
 
-  it("issue_comment with @<bot> mention → kind=issue_mentioned", () => {
+  it("issue_comment with @<bot> mention → kind=issue_engaged", () => {
     const event = parseWebhook({
       eventType: "issue_comment",
       deliveryId: "del_3",
@@ -107,7 +110,7 @@ describe("GitHub webhook parser", () => {
         comment: { id: 100, body: `Hey @${BOT}, please look at this.` },
       }),
     });
-    expect(event?.kind).toBe("issue_mentioned");
+    expect(event?.kind).toBe("issue_engaged");
     expect(event?.commentBody).toContain("please look");
   });
 
@@ -142,11 +145,13 @@ describe("GitHub webhook parser", () => {
         comment: { id: 200, body: `@${BOT} take a look` },
       }),
     });
-    expect(event?.kind).toBe("pr_mentioned");
+    expect(event?.kind).toBe("pr_engaged");
     expect(event?.itemKind).toBe("pull_request");
+    expect(event?.pullRequestHeadSha).toBeNull();
+    expect(event?.pullRequestHeadRef).toBeNull();
   });
 
-  it("pull_request.review_requested → kind=pr_review_requested when bot is the reviewer", () => {
+  it("pull_request.review_requested → kind=null (engagement model: reviewer changes don't trigger)", () => {
     const event = parseWebhook({
       eventType: "pull_request",
       deliveryId: "del_6",
@@ -165,7 +170,9 @@ describe("GitHub webhook parser", () => {
         },
       }),
     });
-    expect(event?.kind).toBe("pr_review_requested");
+    expect(event?.kind).toBeNull();
+    expect(event?.pullRequestHeadSha).toBe("abc");
+    expect(event?.pullRequestHeadRef).toBe("feat/x");
   });
 
   it("pull_request.review_requested where reviewer is a human → kind=null", () => {
@@ -185,22 +192,24 @@ describe("GitHub webhook parser", () => {
     expect(event?.kind).toBeNull();
   });
 
-  it("pull_request_review.submitted → kind=pr_review_submitted when bot was the requested reviewer", () => {
+  it("pull_request_review.submitted on a trigger-labeled PR → kind=pr_engaged", () => {
     const event = parseWebhook({
       eventType: "pull_request_review",
       deliveryId: "del_7",
       botLogin: BOT,
+      triggerLabel: "agent:coder",
       raw: env({
         action: "submitted",
         pull_request: {
           id: 1, number: 42, title: "x", state: "open",
           head: { ref: "f", sha: "a" }, base: { ref: "main", sha: "b" },
+          labels: [{ name: "Agent:Coder" }],
           requested_reviewers: [{ id: 1, login: BOT }],
         },
         review: { id: 9, state: "approved", body: "LGTM", user: { id: 99, login: "alice" } },
       }),
     });
-    expect(event?.kind).toBe("pr_review_submitted");
+    expect(event?.kind).toBe("pr_engaged");
     expect(event?.commentBody).toBe("LGTM");
   });
 
@@ -295,7 +304,7 @@ describe("GitHub webhook parser", () => {
   });
 
   it("ignores partial @-prefix (e.g. @myapp must NOT match inside @myappy)", () => {
-    // True positive case (@<bot> at word boundary) → issue_mentioned
+    // True positive case (@<bot> at word boundary) → issue_engaged
     const positive = parseWebhook({
       eventType: "issue_comment",
       deliveryId: "del_p",
@@ -306,7 +315,7 @@ describe("GitHub webhook parser", () => {
         comment: { id: 102, body: "see @myapp for details" },
       }),
     });
-    expect(positive?.kind).toBe("issue_mentioned");
+    expect(positive?.kind).toBe("issue_engaged");
     // Negative case (`@myapp` is a prefix of `@myappy`) → null
     const negative = parseWebhook({
       eventType: "issue_comment",

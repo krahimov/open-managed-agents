@@ -21,7 +21,10 @@ import {
   fetchN,
   trimPage,
 } from "@open-managed-agents/shared";
-import { AgentNotFoundError } from "../errors";
+import {
+  AgentNotFoundError,
+  AgentVersionSnapshotConflictError,
+} from "../errors";
 import type {
   AgentRepo,
   AgentUpdateFields,
@@ -192,7 +195,11 @@ export class SqlAgentRepo implements AgentRepo {
       })
       .where(and(eq(agents.id, agentId), eq(agents.tenant_id, tenantId)));
 
-    await atomicWrite(this.db, [insertSnapshotQ, updateAgentQ]);
+    try {
+      await atomicWrite(this.db, [insertSnapshotQ, updateAgentQ]);
+    } catch (err) {
+      throw mapVersionSnapshotError(err, priorSnapshot);
+    }
 
     // Verify the UPDATE actually hit a row. We re-read instead of inspecting
     // the batch result (D1 surfaces meta.changes per-statement, but PG's
@@ -315,4 +322,24 @@ function stripTenantId(row: AgentRow): AgentConfig {
 
 function msToIso(ms: number): string {
   return new Date(ms).toISOString();
+}
+
+function mapVersionSnapshotError(
+  err: unknown,
+  priorSnapshot: AgentVersionSnapshotInput,
+): unknown {
+  if (!(err instanceof Error)) return err;
+  const msg = err.message;
+  const isUnique =
+    /unique constraint failed/i.test(msg) ||
+    /duplicate key value violates unique constraint/i.test(msg);
+  if (!isUnique) return err;
+  const isAgentVersionKey =
+    /agent_versions/i.test(msg) ||
+    (/agent_id/i.test(msg) && /version/i.test(msg));
+  if (!isAgentVersionKey) return err;
+  return new AgentVersionSnapshotConflictError(
+    priorSnapshot.agentId,
+    priorSnapshot.version,
+  );
 }

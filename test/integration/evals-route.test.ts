@@ -32,7 +32,7 @@ async function setupAgentAndEnv() {
       model: "claude-sonnet-4-6",
       system: "you are helpful",
       tools: [{ type: "agent_toolset_20260401" }],
-      harness: "eval-test",
+      _oma: { harness: "eval-test" },
     }),
   });
   const agent = (await agentRes.json()) as any;

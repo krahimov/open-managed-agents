@@ -8,6 +8,7 @@ import { Page } from "../components/Page";
 import { Modal } from "../components/Modal";
 import { Field } from "../components/Field";
 import { PageHeader } from "../components/PageHeader";
+import { CreateDeploymentDialog } from "../components/CreateDeploymentDialog";
 import { Button } from "@/components/ui/button";
 import type { AgentRecord as Agent } from "../types/agent";
 import {
@@ -30,6 +31,7 @@ export function AgentDetail() {
   const { api } = useApi();
   const nav = useNavigate();
   const [editing, setEditing] = useState(false);
+  const [showDeploy, setShowDeploy] = useState(false);
 
   // Single-resource fetches via TQ. `enabled: !!id` defers until the route
   // param is available; the publication queries inherit the same gate.
@@ -129,6 +131,9 @@ export function AgentDetail() {
                 onClick={() => nav(`/sessions?new=1&agent_id=${encodeURIComponent(agent.id)}`)}
               >
                 Start session
+              </Button>
+              <Button variant="outline" size="sm" onClick={() => setShowDeploy(true)}>
+                Deploy
               </Button>
               <Button variant="outline" size="sm" onClick={archive}>
                 Archive
@@ -273,6 +278,12 @@ export function AgentDetail() {
         </div>
       )}
       </div>
+
+      <CreateDeploymentDialog
+        open={showDeploy}
+        onClose={() => setShowDeploy(false)}
+        initialAgentId={agent.id}
+      />
     </Page>
   );
 }

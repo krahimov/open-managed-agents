@@ -35,12 +35,16 @@ import type {
 } from "@open-managed-agents/sandbox/orchestrator";
 import type { AgentService } from "@open-managed-agents/agents-store";
 import type { MemoryStoreService } from "@open-managed-agents/memory-store";
+import type { FileService } from "@open-managed-agents/files-store";
+import type { SessionService } from "@open-managed-agents/sessions-store";
+import type { BlobStore } from "@open-managed-agents/blob-store";
 import type {
   AgentConfig,
   EnvironmentConfig,
   SessionEvent,
   UserMessageEvent,
 } from "@open-managed-agents/shared";
+import { mountResources } from "@open-managed-agents/agent/runtime/resource-mounter";
 import type { LanguageModel } from "ai";
 import { getLogger } from "@open-managed-agents/observability";
 import type { EventStreamHub } from "./lib/event-stream-hub.js";
@@ -48,6 +52,7 @@ import {
   environmentMemoryStoreRefs,
   environmentMountsSessionOutputs,
 } from "./lib/environment-runtime-config.js";
+import type { NodeSessionSecretService } from "./lib/node-session-secrets.js";
 
 const log = getLogger("session-registry");
 
@@ -59,7 +64,11 @@ export interface SessionRegistryDeps {
    *  throw; failures are swallowed so event delivery never blocks a turn. */
   onSessionEvent?: (tenantId: string, sessionId: string, event: SessionEvent) => void;
   agentsService: AgentService;
+  sessionsService: SessionService;
   memoryService: MemoryStoreService;
+  filesService?: FileService;
+  filesBlob?: BlobStore;
+  sessionSecrets?: Pick<NodeSessionSecretService, "get">;
   /** Sandbox provisioning — vault outbound, mounts, backup-restore.
    *  Replaces the per-runtime buildMemoryMounter / buildSessionOutputsMounter
    *  hooks from before P5. */
@@ -120,6 +129,17 @@ interface SessionEntry {
   machine: SessionStateMachine;
   sandbox: SandboxExecutor;
   eventLog: SqlEventLog;
+}
+
+interface FileResourceMount {
+  fileId: string;
+  mountPath?: string;
+}
+
+interface SharedSessionResourceRow {
+  id: string;
+  type: string;
+  config: string;
 }
 
 export class SessionRegistry {
@@ -212,6 +232,27 @@ export class SessionRegistry {
   }
 
   /**
+   * Remount the current resource set into an already-realized sandbox.
+   * If the session has not warmed yet, initial provisioning will mount
+   * resources when getOrCreate() eventually builds it.
+   */
+  async refreshResources(sessionId: string, tenantId: string): Promise<boolean> {
+    const p = this.map.get(sessionId);
+    if (!p) return false;
+    const entry = await p;
+    const sessionRuntime = await this.loadSessionRuntimeContext(sessionId, tenantId);
+    await this.provisionSandboxResources({
+      sessionId,
+      tenantId,
+      sandbox: entry.sandbox,
+      environment: sessionRuntime.environmentSnapshot,
+      environmentId: sessionRuntime.environmentId,
+      restoreWorkspace: false,
+    });
+    return true;
+  }
+
+  /**
    * Abort the in-flight harness for a session. Routed from
    * POST /v1/sessions/:id/events when the body contains a `user.interrupt`
    * event. No-op if the session has no machine yet (nothing to interrupt).
@@ -238,6 +279,244 @@ export class SessionRegistry {
 
   // ── helpers ─────────────────────────────────────────────────────────
 
+  private async provisionSandboxResources(input: {
+    sessionId: string;
+    tenantId: string;
+    sandbox: SandboxExecutor;
+    environment?: EnvironmentConfig | null;
+    environmentId?: string | null;
+    restoreWorkspace: boolean;
+  }): Promise<void> {
+    const memoryMounts = await this.buildMemoryMounts(
+      input.sessionId,
+      input.tenantId,
+      input.environment,
+    );
+    await this.deps.sandboxOrchestrator.provision(input.sandbox, {
+      sessionId: input.sessionId,
+      tenantId: input.tenantId,
+      environmentId: input.environmentId ?? undefined,
+      memoryMounts,
+      mountOutputs: environmentMountsSessionOutputs(input.environment),
+      backup: input.restoreWorkspace ? { restoreOnWarm: true } : undefined,
+    });
+    await this.mountSharedSessionResources(input.sessionId, input.tenantId, input.sandbox);
+    await this.mountFileResources(input.sessionId, input.tenantId, input.sandbox);
+  }
+
+  private async mountSharedSessionResources(
+    sessionId: string,
+    tenantId: string,
+    sandbox: SandboxExecutor,
+  ): Promise<void> {
+    const rows = await this.loadSharedSessionResourceRows(sessionId);
+    if (rows.length === 0) return;
+
+    const resources: Array<Record<string, unknown>> = [];
+    const secretStore = new Map<string, string>();
+
+    for (const row of rows) {
+      try {
+        const resource = JSON.parse(row.config) as Record<string, unknown>;
+        if (typeof resource.id !== "string" || resource.id.length === 0) {
+          resource.id = row.id;
+        }
+        if (typeof resource.type !== "string" || resource.type.length === 0) {
+          resource.type = row.type;
+        }
+        resources.push(resource);
+
+        const secret = await this.deps.sessionSecrets
+          ?.get({ tenantId, sessionId, resourceId: row.id })
+          .catch((err) => {
+            log.warn(
+              {
+                err,
+                op: "session_registry.resource_secret_lookup_failed",
+                session_id: sessionId,
+                resource_id: row.id,
+              },
+              "failed to load session resource secret",
+            );
+            return null;
+          });
+        if (secret) secretStore.set(row.id, secret);
+      } catch (err) {
+        log.warn(
+          {
+            err,
+            op: "session_registry.resource_parse_failed",
+            session_id: sessionId,
+            resource_id: row.id,
+          },
+          "failed to parse session resource",
+        );
+      }
+    }
+
+    if (resources.length === 0) return;
+    await mountResources(
+      sandbox,
+      resources,
+      {} as KVNamespace,
+      secretStore,
+      undefined,
+      tenantId,
+    );
+  }
+
+  private async loadSharedSessionResourceRows(
+    sessionId: string,
+  ): Promise<SharedSessionResourceRow[]> {
+    const rows = await this.deps.sql
+      .prepare(
+        `SELECT id, type, config
+           FROM session_resources
+          WHERE session_id = ?
+            AND type IN ('github_repository', 'github_repo', 'env', 'env_secret')
+          ORDER BY created_at`,
+      )
+      .bind(sessionId)
+      .all<SharedSessionResourceRow>()
+      .catch((err) => {
+        log.warn(
+          {
+            err,
+            op: "session_registry.resource_query_failed",
+            session_id: sessionId,
+          },
+          "failed to query session resources",
+        );
+        return { results: [] as SharedSessionResourceRow[] };
+      });
+    return rows.results ?? [];
+  }
+
+  private async buildMemoryMounts(
+    sessionId: string,
+    tenantId: string,
+    environment?: EnvironmentConfig | null,
+  ): Promise<OrchestratorMemoryMount[]> {
+    const memoryBindings = await this.loadMemoryBindings(sessionId, tenantId, environment);
+    const memoryMounts: OrchestratorMemoryMount[] = [];
+    for (const binding of memoryBindings) {
+      const store = await this.deps.memoryService.getStore({
+        tenantId,
+        storeId: binding.store_id,
+      });
+      if (!store) continue;
+      memoryMounts.push({
+        storeName: store.name,
+        storeId: binding.store_id,
+        readOnly: binding.access === "read_only",
+      });
+    }
+    return memoryMounts;
+  }
+
+  private async mountFileResources(
+    sessionId: string,
+    tenantId: string,
+    sandbox: SandboxExecutor,
+  ): Promise<void> {
+    if (!this.deps.filesService || !this.deps.filesBlob) return;
+    const resources = await this.loadFileResourceMounts(sessionId);
+    for (const resource of resources) {
+      try {
+        const file = await this.deps.filesService.get({
+          tenantId,
+          fileId: resource.fileId,
+        });
+        if (!file) {
+          log.warn(
+            {
+              op: "session_registry.file_resource_missing",
+              session_id: sessionId,
+              file_id: resource.fileId,
+            },
+            "session file resource metadata not found",
+          );
+          continue;
+        }
+        const object = await this.deps.filesBlob.get(file.r2_key);
+        if (!object) {
+          log.warn(
+            {
+              op: "session_registry.file_resource_blob_missing",
+              session_id: sessionId,
+              file_id: resource.fileId,
+              blob_key: file.r2_key,
+            },
+            "session file resource blob not found",
+          );
+          continue;
+        }
+        const bytes = await object.bytes();
+        const mountPath =
+          resource.mountPath ??
+          `/mnt/session/uploads/${file.filename || resource.fileId}`;
+        if (sandbox.writeFileBytes) {
+          await sandbox.writeFileBytes(mountPath, bytes);
+        } else {
+          await sandbox.writeFile(mountPath, new TextDecoder().decode(bytes));
+        }
+      } catch (err) {
+        log.warn(
+          {
+            err,
+            op: "session_registry.file_resource_mount_failed",
+            session_id: sessionId,
+            file_id: resource.fileId,
+          },
+          "failed to mount session file resource",
+        );
+      }
+    }
+  }
+
+  private async loadFileResourceMounts(sessionId: string): Promise<FileResourceMount[]> {
+    const rows = await this.deps.sessionsService
+      .listResourcesBySession({ sessionId })
+      .catch((err) => {
+        log.warn(
+          {
+            err,
+            op: "session_registry.file_resource_query_failed",
+            session_id: sessionId,
+          },
+          "failed to query session file resources",
+        );
+        return [];
+      });
+    const mounts: FileResourceMount[] = [];
+    for (const row of rows) {
+      if (row.type !== "file") continue;
+      try {
+        const resource = row.resource as {
+          file_id?: string;
+          id?: string;
+          mount_path?: string;
+        };
+        const fileId = resource.file_id ?? resource.id;
+        if (!fileId) continue;
+        mounts.push({
+          fileId,
+          ...(resource.mount_path ? { mountPath: resource.mount_path } : {}),
+        });
+      } catch (err) {
+        log.warn(
+          {
+            err,
+            op: "session_registry.file_resource_parse_failed",
+            session_id: sessionId,
+          },
+          "failed to parse session file resource",
+        );
+      }
+    }
+    return mounts;
+  }
+
   private async build(
     sessionId: string,
     tenantId: string,
@@ -248,28 +527,13 @@ export class SessionRegistry {
     const sandbox = await this.deps.buildSandbox(sessionId, sandboxWorkdir, environment);
 
     try {
-      // Resolve the per-session memory bindings + outputs flag, then hand
-      // the whole bundle to the orchestrator. The orchestrator owns
-      // ordering (vault outbound first, restore second, mounts last) so
-      // the registry no longer reasons about it.
-      const memoryBindings = await this.loadMemoryBindings(sessionId, tenantId, environment);
-      const memoryMounts: OrchestratorMemoryMount[] = [];
-      for (const binding of memoryBindings) {
-        const store = await this.deps.memoryService.getStore({ tenantId, storeId: binding.store_id });
-        if (!store) continue;
-        memoryMounts.push({
-          storeName: store.name,
-          storeId: binding.store_id,
-          readOnly: binding.access === "read_only",
-        });
-      }
-      await this.deps.sandboxOrchestrator.provision(sandbox, {
+      await this.provisionSandboxResources({
         sessionId,
         tenantId,
-        environmentId: sessionRuntime.environmentId ?? undefined,
-        memoryMounts,
-        mountOutputs: environmentMountsSessionOutputs(environment),
-        backup: { restoreOnWarm: true },
+        sandbox,
+        environment,
+        environmentId: sessionRuntime.environmentId,
+        restoreWorkspace: true,
       });
 
       const eventLog = this.deps.newEventLog(sessionId);
@@ -317,6 +581,12 @@ export class SessionRegistry {
         adapter,
         sandbox,
         loadAgent: async (agentId) => {
+          if (
+            sessionRuntime.agentSnapshot &&
+            (!sessionRuntime.agentSnapshot.id || sessionRuntime.agentSnapshot.id === agentId)
+          ) {
+            return sessionRuntime.agentSnapshot;
+          }
           const row = await this.deps.agentsService.get({ tenantId, agentId });
           return row ?? null;
         },
@@ -365,16 +635,22 @@ export class SessionRegistry {
   ): Promise<{
     environmentId: string | null;
     environmentSnapshot: EnvironmentConfig | null;
+    agentSnapshot: AgentConfig | null;
   }> {
     const row = await this.deps.sql
       .prepare(
-        `SELECT environment_id, environment_snapshot FROM sessions WHERE tenant_id = ? AND id = ?`,
+        `SELECT environment_id, environment_snapshot, agent_snapshot FROM sessions WHERE tenant_id = ? AND id = ?`,
       )
       .bind(tenantId, sessionId)
-      .first<{ environment_id: string | null; environment_snapshot: string | null }>();
+      .first<{
+        environment_id: string | null;
+        environment_snapshot: string | null;
+        agent_snapshot: string | null;
+      }>();
     return {
       environmentId: row?.environment_id ?? null,
       environmentSnapshot: parseEnvironmentSnapshot(row?.environment_snapshot),
+      agentSnapshot: parseAgentSnapshot(row?.agent_snapshot),
     };
   }
 
@@ -484,6 +760,19 @@ function parseEnvironmentSnapshot(value: string | null | undefined): Environment
     log.warn(
       { err, op: "session_registry.environment_snapshot_parse_failed" },
       "failed to parse environment snapshot",
+    );
+    return null;
+  }
+}
+
+function parseAgentSnapshot(value: string | null | undefined): AgentConfig | null {
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as AgentConfig;
+  } catch (err) {
+    log.warn(
+      { err, op: "session_registry.agent_snapshot_parse_failed" },
+      "failed to parse agent snapshot",
     );
     return null;
   }

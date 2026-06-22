@@ -1,0 +1,39 @@
+{
+  "name": "@openma/agent-sdk",
+  "version": "0.1.0-beta.1",
+  "description": "Browser-first SDK for talking to a deployed openma agent through the public gateway — publishable keys (oma_pk_...), sessions, SSE streaming.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "README.md"],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": ["ai", "agents", "managed-agents", "openma", "sdk", "frontend", "streaming", "sse"],
+  "license": "Apache-2.0",
+  "homepage": "https://openma.dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/open-ma/open-managed-agents",
+    "directory": "packages/agent-sdk"
+  },
+  "bugs": {
+    "url": "https://github.com/open-ma/open-managed-agents/issues"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.0"
+  }
+}

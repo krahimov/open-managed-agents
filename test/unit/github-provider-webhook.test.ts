@@ -100,6 +100,22 @@ function fakeSig(secret: string, body: string): string {
   return `sha256=expected:${secret}:${body}`;
 }
 
+function queueInstallationTokenRefresh(
+  c: FakeGitHubContainer,
+  token = "ghs_refreshed_install_token",
+): void {
+  c.http.respondWith({
+    status: 201,
+    headers: {},
+    body: JSON.stringify({
+      token,
+      expires_at: "2026-04-21T14:00:00Z",
+      permissions: { contents: "read", issues: "write", pull_requests: "write" },
+      repository_selection: "all",
+    }),
+  });
+}
+
 describe("GitHubProvider — webhook dispatch", () => {
   let c: FakeGitHubContainer;
   let provider: GitHubProvider;
@@ -168,6 +184,7 @@ describe("GitHubProvider — webhook dispatch", () => {
     const { appOmaId, publicationId } = await bootstrapPublication(
       c, provider, "wh_secret",
     );
+    queueInstallationTokenRefresh(c);
     const body = JSON.stringify({
       action: "labeled",
       label: { name: "coder" },
@@ -207,6 +224,7 @@ describe("GitHubProvider — webhook dispatch", () => {
     expect(session.metadata).toMatchObject({
       github: { issueKey: "acme/api#142" },
     });
+    expect(session.resources).toEqual([]);
     const text = (session.initialEvent.content as Array<{ text?: string }>)[0]?.text;
     expect(text).toContain("acme/api#142");
     expect(text).toContain("Auth bug");
@@ -218,8 +236,75 @@ describe("GitHubProvider — webhook dispatch", () => {
     expect(wh?.sessionId).toBe(out.sessionId);
   });
 
+  it("attaches a private repository checkout resource for PR engagements", async () => {
+    const { appOmaId } = await bootstrapPublication(c, provider, "wh_secret");
+    queueInstallationTokenRefresh(c, "ghs_pr_install_token");
+    const body = JSON.stringify({
+      action: "labeled",
+      label: { name: "coder" },
+      installation: { id: 9988776 },
+      repository: { id: 1, name: "api", full_name: "acme/api" },
+      sender: { id: 99, login: "alice" },
+      pull_request: {
+        id: 101,
+        number: 77,
+        title: "feat: review target",
+        state: "open",
+        body: "",
+        user: { id: 99, login: "alice" },
+        head: { ref: "feat/review-target", sha: "abc123headsha" },
+        base: { ref: "main", sha: "def456basesha" },
+        labels: [{ name: "coder" }],
+        html_url: "https://github.com/acme/api/pull/77",
+      },
+    });
+
+    const out = await provider.handleWebhook({
+      providerId: "github",
+      installationId: appOmaId,
+      deliveryId: "del_pr_labeled_1",
+      headers: {
+        "x-github-event": "pull_request",
+        "x-hub-signature-256": fakeSig("wh_secret", body),
+      },
+      rawBody: body,
+    });
+
+    expect(out.handled).toBe(true);
+    expect(c.vaults.rotations).toEqual([
+      {
+        kind: "bearer",
+        vaultId: "vlt_1",
+        credentialId: "(by-type)",
+        newToken: "ghs_pr_install_token",
+      },
+      {
+        kind: "cap_cli",
+        vaultId: "vlt_1",
+        credentialId: "(by-cli:gh)",
+        newToken: "ghs_pr_install_token",
+      },
+    ]);
+    expect(c.sessions.created).toHaveLength(1);
+    expect(c.sessions.created[0].resources).toEqual([
+      {
+        type: "github_repository",
+        repo_url: "https://github.com/acme/api",
+        mount_path: "/workspace/repo",
+        checkout: { type: "pull_request", name: "77", sha: "abc123headsha" },
+        authorization_token: "ghs_pr_install_token",
+      },
+    ]);
+    expect(c.sessions.created[0].initialEvent.metadata?.github).toMatchObject({
+      pullRequestHeadSha: "abc123headsha",
+      pullRequestHeadRef: "feat/review-target",
+    });
+  });
+
   it("a second comment on the same labeled issue resumes the existing session (per_issue)", async () => {
     const { appOmaId } = await bootstrapPublication(c, provider, "wh_secret");
+    queueInstallationTokenRefresh(c, "ghs_refresh_one");
+    queueInstallationTokenRefresh(c, "ghs_refresh_two");
 
     // First webhook → label added → opens session.
     const body1 = JSON.stringify({
@@ -270,6 +355,7 @@ describe("GitHubProvider — webhook dispatch", () => {
 
   it("duplicate delivery id is dropped (idempotency)", async () => {
     const { appOmaId } = await bootstrapPublication(c, provider, "wh_secret");
+    queueInstallationTokenRefresh(c);
     const body = JSON.stringify({
       action: "labeled",
       label: { name: "coder" },

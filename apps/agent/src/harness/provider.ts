@@ -13,6 +13,13 @@ export type ApiCompat = "ant" | "ant-compatible" | "oai" | "oai-compatible";
 
 const KNOWN_CLAUDE_PREFIX = "claude-";
 
+function normalizeClaudeModelId(modelId: string): string {
+  return modelId.replace(
+    /^claude-(opus|sonnet|haiku)-(\d+)\.(\d+)$/,
+    "claude-$1-$2-$3",
+  );
+}
+
 // Cap for non-Claude models on the Anthropic-compat path. The SDK hard-codes
 // max_tokens=4096 for unknown models, which truncates extended thinking
 // (MiniMax-M2 thinking alone exceeds that). Earlier code deleted the field
@@ -121,11 +128,14 @@ export function resolveModel(
   const modelString = typeof model === "string" ? model : model.id;
 
   // Strip provider prefix if present: "anthropic/claude-sonnet-4-6" → "claude-sonnet-4-6"
-  const modelId = modelString.includes("/")
+  const rawModelId = modelString.includes("/")
     ? modelString.split("/").slice(1).join("/")
     : modelString;
 
   const effectiveCompat = compat || "ant";
+  const modelId = useOpenAI(effectiveCompat)
+    ? rawModelId
+    : normalizeClaudeModelId(rawModelId);
 
   if (useOpenAI(effectiveCompat)) {
     const openai = createOpenAI({

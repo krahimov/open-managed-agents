@@ -84,6 +84,12 @@ describe("Provider", () => {
     expect(model.modelId).not.toContain("anthropic/");
   });
 
+  it("normalizes dotted Claude model aliases", () => {
+    const model = resolveModel("anthropic/claude-opus-4.8", "fake-key");
+    expect(model.modelId).toContain("claude-opus-4-8");
+    expect(model.modelId).not.toContain("claude-opus-4.8");
+  });
+
   it("accepts custom base URL", () => {
     const model = resolveModel(
       "claude-sonnet-4-6",

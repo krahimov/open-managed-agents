@@ -1,11 +1,20 @@
 import { Hono } from "hono";
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { Env } from "@open-managed-agents/shared";
-import { servicesMiddleware, tenantDbMiddleware, getCfServicesForTenant } from "@open-managed-agents/services";
+import {
+  servicesMiddleware,
+  tenantDbMiddleware,
+  getCfServicesForTenant,
+  buildCfServices,
+  buildCfTenantDbProvider,
+} from "@open-managed-agents/services";
+import { CfKvStore } from "@open-managed-agents/kv-store";
 import {
   buildAgentRoutes,
   buildVaultRoutes,
   buildSessionRoutes,
+  buildDeploymentRoutes,
+  buildPublicGatewayRoutes,
   buildApiKeyRoutes,
   buildMeRoutes,
   buildTenantRoutes,
@@ -172,6 +181,30 @@ type AppCtx = import("hono").Context<{
 const cfRouteServicesFromCtx = (c: AppCtx) =>
   cfRouteServices(c as never);
 
+type SessionRouteContext = Pick<AppCtx, "env" | "executionCtx" | "var">;
+
+function buildCfSessionRoutesForContext(ctx: SessionRouteContext) {
+  const env = ctx.env;
+  const services = ctx.var.services;
+  const tenantId = ctx.var.tenant_id;
+  const router = new CfSessionRouter({ env, services, tenantId });
+  return buildSessionRoutes({
+    services: () => cfRouteServicesFromCtx(ctx as AppCtx),
+    router,
+    localRuntimeEnvId: LOCAL_RUNTIME_ENV_ID,
+    loadEnvironment: async ({ tenantId, environmentId }) => {
+      if (environmentId === LOCAL_RUNTIME_ENV_ID) return null;
+      const row = await services.environments.get({ tenantId, environmentId });
+      return row ? toEnvironmentConfig(row) : null;
+    },
+    fetchVaultCredentials: ({ tenantId, vaultIds }) =>
+      fetchVaultCredentials(services, tenantId, vaultIds),
+    outputs: cfOutputsAdapter(env),
+    debugRecoveryToken: (env as { DEBUG_TOKEN?: string }).DEBUG_TOKEN,
+    lifecycle: cfSessionLifecycle(ctx as never),
+  });
+}
+
 const agentsRoutes = new Hono<{
   Bindings: Env;
   Variables: { tenant_id: string; user_id?: string };
@@ -328,26 +361,39 @@ const sessionsRoutes = new Hono<{
   Variables: { tenant_id: string; user_id?: string };
 }>().all("*", (c) => {
   const ctx = c as unknown as AppCtx;
-  const env = ctx.env;
-  const services = ctx.var.services;
-  const tenantId = ctx.var.tenant_id;
-  const router = new CfSessionRouter({ env, services, tenantId });
-  const app = buildSessionRoutes({
+  const app = buildCfSessionRoutesForContext(ctx);
+  return invokePackage(c, app);
+});
+
+const deploymentsRoutes = new Hono<{
+  Bindings: Env;
+  Variables: { tenant_id: string; user_id?: string };
+}>().all("*", (c) => {
+  const ctx = c as unknown as AppCtx;
+  const app = buildDeploymentRoutes({
     services: () => cfRouteServicesFromCtx(ctx),
-    router,
-    localRuntimeEnvId: LOCAL_RUNTIME_ENV_ID,
-    loadEnvironment: async ({ tenantId, environmentId }) => {
-      if (environmentId === LOCAL_RUNTIME_ENV_ID) return null;
-      const row = await services.environments.get({ tenantId, environmentId });
-      return row ? toEnvironmentConfig(row) : null;
-    },
-    fetchVaultCredentials: ({ tenantId, vaultIds }) =>
-      fetchVaultCredentials(services, tenantId, vaultIds),
-    outputs: cfOutputsAdapter(env),
-    debugRecoveryToken: (env as { DEBUG_TOKEN?: string }).DEBUG_TOKEN,
-    lifecycle: cfSessionLifecycle(c as never),
   });
   return invokePackage(c, app);
+});
+
+const publicGatewayRoutes = buildPublicGatewayRoutes({
+  kv: (c) => new CfKvStore((c as unknown as { env: Env }).env.CONFIG_KV),
+  sessionsApp: async (c) => {
+    const gatewayCtx = c as unknown as {
+      env: Env;
+      executionCtx: ExecutionContext;
+      var: { tenant_id?: string };
+    };
+    const tenantId = gatewayCtx.var.tenant_id;
+    if (!tenantId) throw new Error("Deployment gateway missing tenant context");
+    const tenantDb = await buildCfTenantDbProvider(gatewayCtx.env).resolve(tenantId);
+    const services = buildCfServices(gatewayCtx.env, tenantDb);
+    return buildCfSessionRoutesForContext({
+      env: gatewayCtx.env,
+      executionCtx: gatewayCtx.executionCtx,
+      var: { tenant_id: tenantId, services, tenantDb },
+    });
+  },
 });
 
 /**
@@ -411,6 +457,7 @@ function invokePackage(
 app.route("/v1/agents", agentsRoutes);
 app.route("/v1/environments", environmentsRoutes);
 app.route("/v1/sessions", sessionsRoutes);
+app.route("/v1/deployments", deploymentsRoutes);
 app.route("/v1/vaults", vaultsRoutes);
 app.route("/v1/composio", composioRoutes);
 app.route("/v1/oauth", oauthRoutes);
@@ -492,11 +539,13 @@ app.route("/v1/oma/api_keys", apiKeysRoutes);
 app.route("/v1/oma/me", meRoutes);
 app.route("/v1/oma/tenants", tenantsRoutes);
 app.route("/v1/oma/evals", evalsRoutes);
+app.route("/v1/oma/deployments", deploymentsRoutes);
 app.route("/v1/oma/cost_report", costReportRoutes);
 app.route("/v1/oma/integrations", integrationsRoutes);
 app.route("/v1/oma/runtimes", runtimesRoutes);
 app.route("/v1/oma/oauth", oauthRoutes);
 app.route("/v1/oma/model_cards", modelCardsRoutes);
+app.route("/public/v1", publicGatewayRoutes);
 // /v1/mcp-proxy is intentionally NOT aliased: auth.ts path-prefix skip is
 // scoped to that exact prefix, and the proxy does its own session-ownership
 // check downstream. Re-mounting under /v1/oma/mcp-proxy would route through

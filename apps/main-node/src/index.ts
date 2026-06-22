@@ -77,6 +77,8 @@ import {
   buildVaultRoutes,
   listComposioToolkits,
   buildSessionRoutes,
+  buildDeploymentRoutes,
+  buildPublicGatewayRoutes,
   buildMemoryRoutes,
   buildTenantRoutes,
   buildMeRoutes,
@@ -577,7 +579,10 @@ const sessionRegistry = new SessionRegistry({
       }
     : undefined,
   agentsService,
+  sessionsService,
   memoryService,
+  filesService,
+  filesBlob,
   sandboxOrchestrator,
   newEventLog,
   buildSandbox,
@@ -974,7 +979,7 @@ const sessionRouter = new NodeSessionRouter({
   newEventLog,
   workQueue: sessionWorkQueue,
 });
-v1.route("/sessions", buildSessionRoutes({
+const sessionRoutesApp = buildSessionRoutes({
   services,
   router: sessionRouter,
   outputs: sessionOutputsBackend.adapter,
@@ -991,7 +996,9 @@ v1.route("/sessions", buildSessionRoutes({
       sandbox_template: null,
     } as unknown as import("@open-managed-agents/shared").EnvironmentConfig;
   },
-}));
+});
+v1.route("/sessions", sessionRoutesApp);
+v1.route("/deployments", buildDeploymentRoutes({ services }));
 v1.route("/vaults", buildVaultRoutes({
   services,
   composio: {
@@ -1384,6 +1391,7 @@ v1.delete("/files/:id", async (c) => {
 });
 
 app.route("/v1", v1);
+app.route("/public/v1", buildPublicGatewayRoutes({ kv, sessionsApp: sessionRoutesApp }));
 
 // /v1/oma/* mirror — same Hono sub-app mounted twice. New OMA-only
 // endpoints should be added here only; the bare /v1/<resource> mounts
@@ -1422,6 +1430,7 @@ app.route("/v1/oma/me", buildMeRoutes({
 }));
 app.route("/v1/oma/tenants", buildTenantRoutes({ services }));
 app.route("/v1/oma/api_keys", buildApiKeyRoutes({ storage: apiKeyStorage }));
+app.route("/v1/oma/deployments", buildDeploymentRoutes({ services }));
 app.route("/v1/oma/evals", buildEvalRoutes({
   evals: evalsService,
   agents: agentsService,

@@ -40,6 +40,7 @@
 
 import type { SandboxExecutor, SandboxFactory } from "../ports";
 import { getLogger } from "@open-managed-agents/observability";
+import { withSessionProxyContext } from "./outbound-proxy";
 
 const moduleLogger = getLogger("boxrun-sandbox");
 
@@ -197,19 +198,20 @@ export class BoxRunSandbox implements SandboxExecutor {
     this.envVars = { ...this.envVars, ...envVars };
   }
 
-  async setOutboundContext(_opts?: { tenantId: string; sessionId: string }): Promise<void> {
+  async setOutboundContext(opts?: { tenantId: string; sessionId: string }): Promise<void> {
     // BoxRun: VM-level network — same env-var pattern as LocalSubprocess /
     // LiteBox. CA cert is uploaded into the box on the first writeFile —
     // we stash the host path here and apply on box creation.
     const proxyUrl = process.env.OMA_VAULT_PROXY_URL;
     const caCertPath = process.env.OMA_VAULT_CA_CERT;
     if (!proxyUrl || !caCertPath) return;
+    const scopedProxyUrl = withSessionProxyContext(proxyUrl, opts);
     const inBoxCaPath = "/etc/ssl/oma-vault-ca.crt";
     await this.setEnvVars({
-      HTTP_PROXY: proxyUrl,
-      HTTPS_PROXY: proxyUrl,
-      http_proxy: proxyUrl,
-      https_proxy: proxyUrl,
+      HTTP_PROXY: scopedProxyUrl,
+      HTTPS_PROXY: scopedProxyUrl,
+      http_proxy: scopedProxyUrl,
+      https_proxy: scopedProxyUrl,
       NODE_EXTRA_CA_CERTS: inBoxCaPath,
       SSL_CERT_FILE: inBoxCaPath,
       CURL_CA_BUNDLE: inBoxCaPath,

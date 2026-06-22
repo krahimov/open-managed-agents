@@ -20,7 +20,6 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 import { MCP_REGISTRY, type McpRegistryEntry } from "../lib/mcp-registry";
 import {
-  COMPOSIO_NOT_CONFIGURED_MESSAGE,
   composioEntriesFromCatalog,
   composioIntegrationIcon,
   type ComposioToolkitCatalogResponse,
@@ -407,6 +406,9 @@ export function VaultDetail() {
           vault={vault}
           initialType={connectMode === "composio" ? "composio" : undefined}
           initialToolkits={connectToolkit ? [connectToolkit] : undefined}
+          hasComposioCredential={credentials.some(
+            (cred) => !cred.archived_at && cred.auth.type === "composio_mcp",
+          )}
           onClose={closeAddCred}
           onCreated={() => {
             closeAddCred();
@@ -426,12 +428,14 @@ function AddCredentialModal({
   vault,
   initialType,
   initialToolkits,
+  hasComposioCredential,
   onClose,
   onCreated,
 }: {
   vault: Vault;
   initialType?: "oauth" | "bearer" | "composio";
   initialToolkits?: string[];
+  hasComposioCredential: boolean;
   onClose: () => void;
   onCreated: () => void;
 }) {
@@ -439,14 +443,6 @@ function AddCredentialModal({
   const { data: composioStatus, isLoading: composioStatusLoading } =
     useApiQuery<ComposioStatusResponse>("/v1/composio/status");
   const composioConfigured = composioStatus?.configured === true;
-  const { data: composioCatalogRes, isLoading: composioCatalogLoading } =
-    useApiQuery<ComposioToolkitCatalogResponse>("/v1/composio/toolkits?limit=500", undefined, {
-      enabled: composioConfigured,
-    });
-  const composioCatalogEntries = useMemo(
-    () => composioEntriesFromCatalog(composioCatalogRes),
-    [composioCatalogRes],
-  );
 
   // Top-level tab inside the modal: MCP server vs CLI. Folds the two
   // previously separate entry points into one modal; matches Anthropic.
@@ -472,10 +468,29 @@ function AddCredentialModal({
     clientId: "",
     clientSecret: "",
     composioToolkits: formatComposioToolkits(initialToolkits ?? []),
+    composioApiKey: "",
   });
   const composioToolkits = useMemo(
     () => parseComposioToolkits(customForm.composioToolkits),
     [customForm.composioToolkits],
+  );
+  const composioApiKey = composioConfigured ? "" : customForm.composioApiKey.trim();
+  const composioAvailable =
+    composioConfigured || !!composioApiKey || hasComposioCredential;
+  const composioCatalogEnabled = composioConfigured || hasComposioCredential;
+  const shouldShowComposioApiKeyInput =
+    !composioStatusLoading && !composioConfigured;
+  const composioUnavailableMessage =
+    "Configure COMPOSIO_API_KEY on the API server or add a key for this vault.";
+  const { data: composioCatalogRes, isLoading: composioCatalogLoading } =
+    useApiQuery<ComposioToolkitCatalogResponse>(
+      `/v1/vaults/${vault.id}/credentials/composio_toolkits`,
+      { limit: "500" },
+      { enabled: composioCatalogEnabled },
+    );
+  const composioCatalogEntries = useMemo(
+    () => composioEntriesFromCatalog(composioCatalogRes),
+    [composioCatalogRes],
   );
   const [composioConnections, setComposioConnections] =
     useState<ComposioConnectionState>({});
@@ -664,8 +679,8 @@ function AddCredentialModal({
   };
 
   const createComposioCred = async () => {
-    if (!composioConfigured) {
-      toast.error(COMPOSIO_NOT_CONFIGURED_MESSAGE);
+    if (!composioAvailable) {
+      toast.error(composioUnavailableMessage);
       return;
     }
     setConnecting("composio");
@@ -678,6 +693,7 @@ function AddCredentialModal({
         body: JSON.stringify({
           display_name:
             customForm.name || customForm.pickedName || "Composio Tool Router",
+          api_key: composioApiKey || undefined,
           toolkits: composioToolkits.length > 0 ? { enable: composioToolkits } : undefined,
           connected_accounts:
             linkedEntries.length > 0
@@ -702,8 +718,8 @@ function AddCredentialModal({
   const connectComposioToolkit = async (
     entry: Pick<ComposioIntegrationEntry, "slug" | "name">,
   ) => {
-    if (!composioConfigured) {
-      toast.error(COMPOSIO_NOT_CONFIGURED_MESSAGE);
+    if (!composioAvailable) {
+      toast.error(composioUnavailableMessage);
       return;
     }
     const slug = normalizeComposioToolkitSlug(entry.slug);
@@ -721,6 +737,7 @@ function AddCredentialModal({
         body: JSON.stringify({
           toolkit: slug,
           callback_url: callbackUrl,
+          api_key: composioApiKey || undefined,
         }),
       });
       setComposioConnections((prev) => ({
@@ -923,7 +940,7 @@ function AddCredentialModal({
                 (customForm.type !== "composio" && !customForm.url) ||
                 !!connecting ||
                 (customForm.type === "bearer" && !customForm.token) ||
-                (customForm.type === "composio" && !composioConfigured)
+                (customForm.type === "composio" && !composioAvailable)
               }
             >
               {customForm.type === "composio"
@@ -997,16 +1014,36 @@ function AddCredentialModal({
 
           {customForm.type === "composio" ? (
             <div className="space-y-3">
-              {!composioStatusLoading && !composioConfigured && (
+              {!composioStatusLoading && !composioAvailable && (
                 <div className="rounded-md border border-warning/30 bg-warning-subtle px-3 py-2 text-sm text-warning">
-                  {COMPOSIO_NOT_CONFIGURED_MESSAGE}
+                  {composioUnavailableMessage}
                 </div>
+              )}
+              {shouldShowComposioApiKeyInput && (
+                <SecretInput
+                  id="vault-composio-api-key"
+                  label={
+                    <>
+                      Composio API key{" "}
+                      <span className="text-xs text-fg-muted ml-1 px-1.5 py-0.5 rounded bg-bg-surface">
+                        {hasComposioCredential ? "Optional" : "Required"}
+                      </span>
+                    </>
+                  }
+                  hint="Used for this vault when the API server does not provide COMPOSIO_API_KEY."
+                  value={customForm.composioApiKey}
+                  onChange={(e) =>
+                    setCustomForm({ ...customForm, composioApiKey: e.target.value })
+                  }
+                  placeholder="ak_..."
+                  className={inputCls}
+                />
               )}
               <div>
                 <label className="text-sm font-medium text-fg block mb-1">
                   Managed Agent apps
                   <span className="text-xs text-fg-muted ml-1">
-                    {composioStatusLoading || (composioConfigured && composioCatalogLoading)
+                    {composioStatusLoading || (composioCatalogEnabled && composioCatalogLoading)
                       ? "loading..."
                       : `${composioCatalogEntries.length} available`}
                   </span>
@@ -1065,7 +1102,7 @@ function AddCredentialModal({
                               void connectComposioToolkit(entry);
                             }
                           }}
-                          disabled={!composioConfigured || !!connecting}
+                          disabled={!composioAvailable || !!connecting}
                         >
                           {connection?.status === "pending" ? "Open auth" : "Connect"}
                         </Button>
@@ -1111,7 +1148,7 @@ function AddCredentialModal({
                           <button
                             type="button"
                             className="text-brand hover:underline"
-                            disabled={!composioConfigured || !!connecting}
+                            disabled={!composioAvailable || !!connecting}
                             onClick={() => {
                               if (connection?.status === "pending" && connection.redirectUrl) {
                                 window.open(

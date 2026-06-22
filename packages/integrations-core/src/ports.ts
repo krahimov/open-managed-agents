@@ -113,6 +113,15 @@ export interface CreateSessionInput {
   mcpServers: ReadonlyArray<{ name: string; url: string }>;
   /** Arbitrary metadata stored on the session for later observability. */
   metadata: Record<string, unknown>;
+  /** Session resources to mount before the first turn. Provider-created
+   *  sessions currently use this only for repo-scoped GitHub checkouts. */
+  resources?: ReadonlyArray<{
+    type: "github_repository";
+    repo_url: string;
+    mount_path?: string;
+    checkout?: { type?: string; name?: string; sha?: string };
+    authorization_token?: string;
+  }>;
   /** First user.message-shaped event. */
   initialEvent: SessionEventInput;
   /**

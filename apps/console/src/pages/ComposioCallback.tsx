@@ -8,12 +8,20 @@ export function ComposioCallback() {
     params.get("connectedAccountId") ||
     params.get("id") ||
     undefined;
+  const authConfigId =
+    params.get("auth_config_id") ||
+    params.get("authConfigId") ||
+    undefined;
+  const error = params.get("error") || undefined;
+  const keepOpen = params.get("keep_open") === "1";
 
   useEffect(() => {
     const payload = {
       type: "composio_auth_complete",
       toolkit,
       connected_account_id: connectedAccountId,
+      auth_config_id: authConfigId,
+      error,
     };
     try {
       window.opener?.postMessage(payload, window.location.origin);
@@ -27,13 +35,19 @@ export function ComposioCallback() {
     } catch {
       // BroadcastChannel is best-effort.
     }
-    const timer = window.setTimeout(() => window.close(), 900);
+    const timer = keepOpen ? 0 : window.setTimeout(() => window.close(), 900);
     return () => window.clearTimeout(timer);
-  }, [connectedAccountId, toolkit]);
+  }, [authConfigId, connectedAccountId, error, keepOpen, toolkit]);
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-bg text-fg">
-      <div className="text-sm text-fg-muted">Connection complete. You can close this window.</div>
+      <div className="text-sm text-fg-muted">
+        {error
+          ? "Connection failed. You can close this window."
+          : keepOpen
+            ? "Connection complete. Continue in this window."
+            : "Connection complete. You can close this window."}
+      </div>
     </div>
   );
 }

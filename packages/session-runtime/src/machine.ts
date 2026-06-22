@@ -28,6 +28,7 @@
 // hintTurnInFlight callback).
 
 import { nanoid } from "nanoid";
+import { generateEventId } from "@open-managed-agents/shared";
 import type {
   AgentConfig,
   SessionEvent,
@@ -112,6 +113,33 @@ export interface SessionMachineDeps {
   logger?: { warn: (msg: string, ctx?: unknown) => void; log: (msg: string) => void };
 }
 
+export const SESSION_ERROR_EMITTED_MARKER = "__omaSessionErrorEmitted";
+
+export function sessionErrorAlreadyEmitted(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as Record<string, unknown>)[SESSION_ERROR_EMITTED_MARKER] === true
+  );
+}
+
+function markSessionErrorEmitted(err: unknown): void {
+  if (typeof err !== "object" || err === null) return;
+  try {
+    Object.defineProperty(err, SESSION_ERROR_EMITTED_MARKER, {
+      value: true,
+      enumerable: false,
+      configurable: true,
+    });
+  } catch {
+    /* best effort */
+  }
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 export class SessionStateMachine {
   private activeTurnId: TurnId | null = null;
   private logger: NonNullable<SessionMachineDeps["logger"]>;
@@ -149,7 +177,14 @@ export class SessionStateMachine {
     await this.deps.adapter.beginTurn(this.deps.sessionId, turnId);
     this.deps.adapter.hintTurnInFlight?.(this.deps.sessionId, turnId);
 
+    const threadId = (userMessage as { session_thread_id?: string }).session_thread_id;
+    let failed = false;
     try {
+      await this.appendAndPublish({
+        type: "session.status_running",
+        ...(threadId ? { session_thread_id: threadId } : {}),
+      } as SessionEvent);
+
       // Memory store mounts: optional adapter step, runs once per turn
       // so a session newly bound to a store picks it up on the next
       // user.message without restarting.
@@ -177,9 +212,27 @@ export class SessionStateMachine {
 
       const harness = this.deps.buildHarness();
       await harness.run(ctx);
+    } catch (err) {
+      failed = true;
+      await this.appendAndPublish({
+        type: "session.error",
+        error: "harness_turn_failed",
+        message: errorMessage(err),
+        ...(threadId ? { session_thread_id: threadId } : {}),
+      } as unknown as SessionEvent);
+      markSessionErrorEmitted(err);
+      if (typeof err === "object" && err !== null) throw err;
+      const wrapped = new Error(errorMessage(err));
+      markSessionErrorEmitted(wrapped);
+      throw wrapped;
     } finally {
       this.activeTurnId = null;
       await this.deps.adapter.endTurn(this.deps.sessionId, turnId, "idle");
+      await this.appendAndPublish({
+        type: "session.status_idle",
+        ...(failed ? {} : { stop_reason: { type: "end_turn" } }),
+        ...(threadId ? { session_thread_id: threadId } : {}),
+      } as SessionEvent);
     }
   }
 
@@ -269,5 +322,32 @@ export class SessionStateMachine {
     // Mark the orphaned turn done so subsequent listOrphanTurns calls
     // don't re-trigger recovery.
     await this.deps.adapter.endTurn(this.deps.sessionId, o.turn_id, "idle");
+  }
+
+  private async appendAndPublish(event: SessionEvent): Promise<void> {
+    const stamped = {
+      ...event,
+      id: (event as { id?: string }).id ?? generateEventId(),
+      processed_at:
+        (event as { processed_at?: string }).processed_at ??
+        new Date().toISOString(),
+    } as SessionEvent;
+    const eventLog = this.deps.adapter.eventLog as unknown as {
+      appendAsync?: (event: SessionEvent) => Promise<void>;
+      getEventsAsync?: () => Promise<SessionEvent[]>;
+      append: (event: SessionEvent) => void;
+    };
+
+    if (typeof eventLog.appendAsync === "function") {
+      await eventLog.appendAsync(stamped);
+      if (typeof eventLog.getEventsAsync === "function") {
+        const stored = await eventLog.getEventsAsync();
+        this.deps.publish(stored[stored.length - 1] ?? stamped);
+        return;
+      }
+    } else {
+      eventLog.append(stamped);
+    }
+    this.deps.publish(stamped);
   }
 }

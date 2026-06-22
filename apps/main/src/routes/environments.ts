@@ -209,12 +209,28 @@ app.post("/:id/archive", async (c) => {
 app.delete("/:id", async (c) => {
   const t = c.get("tenant_id");
   const id = c.req.param("id");
+  // Active-sessions guard — mirrors the agents DELETE route. Sessions pin
+  // the environment via environment_id; deleting it under them would break
+  // replay/resume, so refuse until they're archived or deleted.
+  const hasActive = await c.var.services.sessions.hasActiveByEnvironment({
+    tenantId: t,
+    environmentId: id,
+  });
+  if (hasActive) {
+    return c.json(
+      {
+        error:
+          "Cannot delete environment with active sessions. Archive or delete sessions first.",
+      },
+      409,
+    );
+  }
   try {
     await c.var.services.environments.delete({
       tenantId: t,
       environmentId: id,
     });
-    return c.json({ deleted: true });
+    return c.json({ type: "environment_deleted", id });
   } catch (err) {
     if (err instanceof EnvironmentNotFoundError) {
       return c.json({ error: "Environment not found" }, 404);

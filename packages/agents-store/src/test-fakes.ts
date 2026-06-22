@@ -3,7 +3,10 @@
 // so tests catch the same integrity violations.
 
 import type { AgentConfig } from "@open-managed-agents/shared";
-import { AgentNotFoundError } from "./errors";
+import {
+  AgentNotFoundError,
+  AgentVersionSnapshotConflictError,
+} from "./errors";
 import type {
   AgentRepo,
   AgentUpdateFields,
@@ -138,6 +141,12 @@ export class InMemoryAgentRepo implements AgentRepo {
     if (!row || row.tenant_id !== tenantId) throw new AgentNotFoundError();
     // Atomic: write the prior snapshot to history, then bump the current row.
     const versionKey = `${priorSnapshot.agentId}:v${priorSnapshot.version}`;
+    if (this.versionsByKey.has(versionKey)) {
+      throw new AgentVersionSnapshotConflictError(
+        priorSnapshot.agentId,
+        priorSnapshot.version,
+      );
+    }
     this.versionsByKey.set(versionKey, {
       agent_id: priorSnapshot.agentId,
       tenant_id: priorSnapshot.tenantId,

@@ -62,7 +62,7 @@ async function collectReplayedEvents(sessionId: string, waitMs = 50): Promise<an
 // ============================================================
 describe("Agent + Session snapshot", () => {
   it("session with vault_ids includes them in GET response", async () => {
-    const a = await post("/v1/agents", { name: "VaultAgent", model: "claude-sonnet-4-6", harness: "cross-noop" });
+    const a = await post("/v1/agents", { name: "VaultAgent", model: "claude-sonnet-4-6", _oma: { harness: "cross-noop" } });
     const agent = (await a.json()) as any;
     const e = await post("/v1/environments", { name: "vlt-env", config: { type: "cloud" } });
     const envObj = (await e.json()) as any;
@@ -86,9 +86,107 @@ describe("Agent + Session snapshot", () => {
     expect(fetched.vault_ids).toEqual([vault1.id, vault2.id]);
   });
 
+  it("session vault selection infers MCP servers from active vault credentials", async () => {
+    const a = await post("/v1/agents", { name: "VaultMcpAgent", model: "claude-sonnet-4-6", _oma: { harness: "cross-noop" } });
+    const agent = (await a.json()) as any;
+    const e = await post("/v1/environments", { name: "vlt-mcp-env", config: { type: "cloud" } });
+    const envObj = (await e.json()) as any;
+    const v = await post("/v1/vaults", { name: "mcp-vault" });
+    const vault = (await v.json()) as any;
+    const mcpUrl = "https://backend.composio.dev/tool_router/trs_vault_session/mcp";
+
+    const cred = await post(`/v1/vaults/${vault.id}/credentials`, {
+      display_name: "Notion Composio",
+      auth: {
+        type: "composio_mcp",
+        mcp_server_url: mcpUrl,
+        api_key_env: "COMPOSIO_API_KEY",
+        composio_toolkits: ["notion"],
+      },
+    });
+    expect(cred.status).toBe(201);
+
+    const s = await post("/v1/sessions", {
+      agent: agent.id,
+      environment_id: envObj.id,
+      vault_ids: [vault.id],
+    });
+    expect(s.status).toBe(201);
+    const session = (await s.json()) as any;
+    expect(session.agent.mcp_servers).toEqual([
+      { name: "composio_notion", type: "url", url: mcpUrl },
+    ]);
+
+    const agentRes = await get(`/v1/agents/${agent.id}`);
+    const unchangedAgent = (await agentRes.json()) as any;
+    expect(unchangedAgent.mcp_servers).toEqual([]);
+
+    const getRes = await get(`/v1/sessions/${session.id}`);
+    const fetched = (await getRes.json()) as any;
+    expect(fetched.agent.mcp_servers).toEqual([
+      { name: "composio_notion", type: "url", url: mcpUrl },
+    ]);
+  });
+
+  it("deployment-created sessions inherit default vault MCP credentials", async () => {
+    const e = await post("/v1/environments", { name: "deploy-vlt-mcp-env", config: { type: "cloud" } });
+    const envObj = (await e.json()) as any;
+    const v = await post("/v1/vaults", { name: "deploy-mcp-vault" });
+    const vault = (await v.json()) as any;
+    const mcpUrl = "https://backend.composio.dev/tool_router/trs_deploy_gmail/mcp";
+
+    const cred = await post(`/v1/vaults/${vault.id}/credentials`, {
+      display_name: "Gmail Composio",
+      auth: {
+        type: "composio_mcp",
+        mcp_server_url: mcpUrl,
+        api_key: "cmp_project_key",
+        composio_toolkits: ["gmail"],
+      },
+    });
+    expect(cred.status).toBe(201);
+
+    const a = await post("/v1/agents", {
+      name: "DeployVaultMcpAgent",
+      model: "claude-sonnet-4-6",
+      metadata: {
+        default_vault_ids: [vault.id],
+        default_environment_id: envObj.id,
+      },
+      _oma: { harness: "cross-noop" },
+    });
+    const agent = (await a.json()) as any;
+
+    const depRes = await post("/v1/deployments", {
+      agent_id: agent.id,
+      environment_id: envObj.id,
+    });
+    expect(depRes.status).toBe(201);
+    const deployment = (await depRes.json()) as any;
+
+    const publicSessionRes = await api("/public/v1/sessions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${deployment.key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ title: "gmail deploy smoke" }),
+    });
+    expect(publicSessionRes.status).toBe(201);
+    const publicSession = (await publicSessionRes.json()) as any;
+
+    const privateSessionRes = await get(`/v1/sessions/${publicSession.id}`);
+    expect(privateSessionRes.status).toBe(200);
+    const privateSession = (await privateSessionRes.json()) as any;
+    expect(privateSession.vault_ids).toEqual([vault.id]);
+    expect(privateSession.agent.mcp_servers).toEqual([
+      { name: "composio_gmail", type: "url", url: mcpUrl },
+    ]);
+  });
+
   it("agent update after session creation does not change session snapshot", async () => {
     const a = await post("/v1/agents", {
-      name: "SnapAgent", model: "claude-sonnet-4-6", system: "snap-v1", harness: "cross-noop",
+      name: "SnapAgent", model: "claude-sonnet-4-6", system: "snap-v1", _oma: { harness: "cross-noop" },
     });
     const agent = (await a.json()) as any;
     const e = await post("/v1/environments", { name: "snap-env", config: { type: "cloud" } });
@@ -107,7 +205,7 @@ describe("Agent + Session snapshot", () => {
   });
 
   it("archived agent does not prevent session access", async () => {
-    const a = await post("/v1/agents", { name: "ArchiveSnapAgent", model: "claude-sonnet-4-6", harness: "cross-noop" });
+    const a = await post("/v1/agents", { name: "ArchiveSnapAgent", model: "claude-sonnet-4-6", _oma: { harness: "cross-noop" } });
     const agent = (await a.json()) as any;
     const e = await post("/v1/environments", { name: "archsnap-env", config: { type: "cloud" } });
     const envObj = (await e.json()) as any;
@@ -124,7 +222,7 @@ describe("Agent + Session snapshot", () => {
   });
 
   it("cannot delete agent with active session, archive first", async () => {
-    const a = await post("/v1/agents", { name: "DelSnapAgent", model: "claude-sonnet-4-6", harness: "cross-noop" });
+    const a = await post("/v1/agents", { name: "DelSnapAgent", model: "claude-sonnet-4-6", _oma: { harness: "cross-noop" } });
     const agent = (await a.json()) as any;
     const e = await post("/v1/environments", { name: "delsnap-env", config: { type: "cloud" } });
     const envObj = (await e.json()) as any;
@@ -150,7 +248,7 @@ describe("Agent + Session snapshot", () => {
 
   it("two sessions from same agent with update between have independent snapshots", async () => {
     const a = await post("/v1/agents", {
-      name: "DualSnap", model: "claude-sonnet-4-6", system: "dual-v1", harness: "cross-noop",
+      name: "DualSnap", model: "claude-sonnet-4-6", system: "dual-v1", _oma: { harness: "cross-noop" },
     });
     const agent = (await a.json()) as any;
     const e = await post("/v1/environments", { name: "dualsnap-env", config: { type: "cloud" } });
@@ -181,7 +279,7 @@ describe("Agent + Session snapshot", () => {
       model: "claude-sonnet-4-6",
       system: "full system",
       tools: [{ type: "agent_toolset_20260401" }],
-      harness: "cross-noop",
+      _oma: { harness: "cross-noop" },
       description: "A fully configured agent",
       metadata: { team: "platform", tier: "premium" },
       skills: [{ skill_id: "web_research" }],
@@ -206,7 +304,7 @@ describe("File + Session resource", () => {
   let envId: string;
 
   beforeAll(async () => {
-    const a = await post("/v1/agents", { name: "FileResAgent", model: "claude-sonnet-4-6", harness: "cross-noop" });
+    const a = await post("/v1/agents", { name: "FileResAgent", model: "claude-sonnet-4-6", _oma: { harness: "cross-noop" } });
     agentId = ((await a.json()) as any).id;
     const e = await post("/v1/environments", { name: "fileres-env", config: { type: "cloud" } });
     envId = ((await e.json()) as any).id;
@@ -330,7 +428,7 @@ describe("Memory + Session", () => {
   let envId: string;
 
   beforeAll(async () => {
-    const a = await post("/v1/agents", { name: "MemSessAgent", model: "claude-sonnet-4-6", harness: "cross-noop" });
+    const a = await post("/v1/agents", { name: "MemSessAgent", model: "claude-sonnet-4-6", _oma: { harness: "cross-noop" } });
     agentId = ((await a.json()) as any).id;
     const e = await post("/v1/environments", { name: "memsess-env", config: { type: "cloud" } });
     envId = ((await e.json()) as any).id;
@@ -541,7 +639,7 @@ describe("Cross-entity lifecycle", () => {
       name: "FullFlowAgent",
       model: "claude-sonnet-4-6",
       system: "full flow test",
-      harness: "cross-echo",
+      _oma: { harness: "cross-echo" },
     });
     expect(aRes.status).toBe(201);
     const agent = (await aRes.json()) as any;
@@ -582,7 +680,7 @@ describe("Cross-entity lifecycle", () => {
   });
 
   it("delete env blocked by active session -> archive session -> delete succeeds", async () => {
-    const aRes = await post("/v1/agents", { name: "EnvBlockAgent", model: "claude-sonnet-4-6", harness: "cross-noop" });
+    const aRes = await post("/v1/agents", { name: "EnvBlockAgent", model: "claude-sonnet-4-6", _oma: { harness: "cross-noop" } });
     const agent = (await aRes.json()) as any;
     const eRes = await post("/v1/environments", { name: "envblock-env", config: { type: "cloud" } });
     const envObj = (await eRes.json()) as any;
@@ -604,7 +702,7 @@ describe("Cross-entity lifecycle", () => {
 
   it("agent version history across 3 updates saves 2 versions", async () => {
     const aRes = await post("/v1/agents", {
-      name: "VersionChain", model: "claude-sonnet-4-6", system: "ver-1", harness: "cross-noop",
+      name: "VersionChain", model: "claude-sonnet-4-6", system: "ver-1", _oma: { harness: "cross-noop" },
     });
     const agent = (await aRes.json()) as any;
     expect(agent.version).toBe(1);
@@ -627,7 +725,7 @@ describe("Cross-entity lifecycle", () => {
   });
 
   it("create all entities then archive all and verify archived_at", async () => {
-    const aRes = await post("/v1/agents", { name: "ArchAll", model: "claude-sonnet-4-6", harness: "cross-noop" });
+    const aRes = await post("/v1/agents", { name: "ArchAll", model: "claude-sonnet-4-6", _oma: { harness: "cross-noop" } });
     const agent = (await aRes.json()) as any;
     const eRes = await post("/v1/environments", { name: "archall-env", config: { type: "cloud" } });
     const envObj = (await eRes.json()) as any;
@@ -664,7 +762,7 @@ describe("Event type combinations", () => {
   let envId: string;
 
   beforeAll(async () => {
-    const a = await post("/v1/agents", { name: "EvtCombo", model: "claude-sonnet-4-6", harness: "cross-noop" });
+    const a = await post("/v1/agents", { name: "EvtCombo", model: "claude-sonnet-4-6", _oma: { harness: "cross-noop" } });
     agentId = ((await a.json()) as any).id;
     const e = await post("/v1/environments", { name: "evtcombo-env", config: { type: "cloud" } });
     envId = ((await e.json()) as any).id;
@@ -693,7 +791,7 @@ describe("Event type combinations", () => {
     const sessionId = ((await s.json()) as any).id;
 
     await post(`/v1/sessions/${sessionId}/events`, {
-      events: [{ type: "user.define_outcome", outcome: { description: "Do something" } }],
+      events: [{ type: "user.define_outcome", description: "Do something", rubric: "did the thing" }],
     });
     await post(`/v1/sessions/${sessionId}/events`, {
       events: [{ type: "user.message", content: [{ type: "text", text: "after outcome" }] }],
@@ -741,7 +839,7 @@ describe("Event type combinations", () => {
       events: [{ type: "user.custom_tool_result", custom_tool_use_id: "ct_all", content: [{ type: "text", text: "r" }] }],
     });
     await post(`/v1/sessions/${sessionId}/events`, {
-      events: [{ type: "user.define_outcome", outcome: { description: "all-types" } }],
+      events: [{ type: "user.define_outcome", description: "all-types", rubric: "all types stored" }],
     });
 
     await new Promise((r) => setTimeout(r, 200));
@@ -805,7 +903,7 @@ describe("Session metadata operations", () => {
   let sessionId: string;
 
   beforeAll(async () => {
-    const a = await post("/v1/agents", { name: "MetaAgent", model: "claude-sonnet-4-6", harness: "cross-noop" });
+    const a = await post("/v1/agents", { name: "MetaAgent", model: "claude-sonnet-4-6", _oma: { harness: "cross-noop" } });
     const e = await post("/v1/environments", { name: "meta-env", config: { type: "cloud" } });
     const s = await post("/v1/sessions", {
       agent: ((await a.json()) as any).id,
@@ -877,7 +975,7 @@ describe("GitHub Repository + Env Secret resources", () => {
   let envId: string;
 
   beforeAll(async () => {
-    const a = await post("/v1/agents", { name: "GitResAgent", model: "claude-sonnet-4-6", harness: "cross-noop" });
+    const a = await post("/v1/agents", { name: "GitResAgent", model: "claude-sonnet-4-6", _oma: { harness: "cross-noop" } });
     agentId = ((await a.json()) as any).id;
     const e = await post("/v1/environments", { name: "gitres-env", config: { type: "cloud" } });
     envId = ((await e.json()) as any).id;
@@ -917,20 +1015,22 @@ describe("GitHub Repository + Env Secret resources", () => {
   });
 
   it("authorization_token is NOT returned in session response", async () => {
+    const token = "ghp_supersecrettoken123";
     const s = await post("/v1/sessions", {
       agent: agentId,
       environment_id: envId,
       resources: [{
         type: "github_repository",
         url: "https://github.com/secret-org/secret-repo",
-        authorization_token: "ghp_supersecrettoken123",
+        authorization_token: token,
       }],
     });
     expect(s.status).toBe(201);
     const session = (await s.json()) as any;
     const resource = session.resources[0];
     expect(resource.authorization_token).toBeUndefined();
-    expect(JSON.stringify(resource)).not.toContain("ghp_supersecrettoken123");
+    expect(JSON.stringify(resource)).not.toContain(token);
+    expect(await env.CONFIG_KV.get(`t:default:secret:${session.id}:${resource.id}`)).toBe(token);
   });
 
   it("authorization_token is NOT returned in resource list", async () => {

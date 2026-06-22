@@ -187,9 +187,30 @@ Require explicit confirmation before:
 ## Smoke Test Examples
 
 \`\`\`bash
-oma sessions create --agent <agent-id> --title "agent-smoke"
+oma sessions create --agent <agent-id> --env <env-id> --title "agent-smoke"
 oma sessions chat <session-id> "List the tools you can access and what each is for. Do not send, delete, post, or modify anything."
 \`\`\`
+
+For code review or private repo work, attach the repository as a session
+resource. GitHub MCP/API access alone does not mount a local checkout for bash.
+
+\`\`\`bash
+oma sessions create \\
+  --agent <agent-id> \\
+  --env <env-id> \\
+  --title "pr-review-smoke" \\
+  --github-repo https://github.com/<owner>/<repo> \\
+  --checkout-pr <number> \\
+  --github-auth
+oma sessions chat <session-id> "Review the checked-out PR locally. Run relevant read-only commands and summarize findings without posting to GitHub."
+\`\`\`
+
+If the repo is public, or the platform has a native GitHub App installation
+bound for that repo, omit \`--github-auth\`. If browser/device auth is not
+available, set \`GITHUB_TOKEN\` locally and use \`--github-token-env GITHUB_TOKEN\`.
+If the clone fails for a private repo, the session is missing either a GitHub
+App binding or an inline session resource token; do not assume a
+Composio/GitHub MCP credential creates a git checkout.
 
 For Gmail:
 

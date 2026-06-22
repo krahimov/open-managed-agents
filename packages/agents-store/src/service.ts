@@ -5,6 +5,7 @@ import {
   AgentNotFoundError,
   AgentVersionMismatchError,
   AgentVersionNotFoundError,
+  AgentVersionSnapshotConflictError,
 } from "./errors";
 import type {
   AgentRepo,
@@ -176,41 +177,58 @@ export class AgentService {
     /** When set, refuse if the current version doesn't match. Mirrors POST /v1/agents/:id ?version=. */
     expectedVersion?: number;
   }): Promise<AgentRow> {
-    const existing = await this.requireAgent(opts);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const existing = await this.requireAgent(opts);
 
-    if (
-      opts.expectedVersion !== undefined &&
-      opts.expectedVersion !== existing.version
-    ) {
-      throw new AgentVersionMismatchError(opts.expectedVersion, existing.version);
+      if (
+        opts.expectedVersion !== undefined &&
+        opts.expectedVersion !== existing.version
+      ) {
+        throw new AgentVersionMismatchError(opts.expectedVersion, existing.version);
+      }
+
+      // Detect field-level changes BEFORE building the new config — if nothing
+      // moved, return the existing row unmodified to skip a version bump (mirrors
+      // agents.ts:237-248 — "no-op update").
+      const changed = this.detectChanges(existing, opts.input);
+      if (!changed) return existing;
+
+      const nextConfig = this.applyUpdate(existing, opts.input);
+      nextConfig.version = existing.version + 1;
+      nextConfig.updated_at = msToIso(this.clock.nowMs());
+
+      try {
+        return await this.repo.updateWithVersionSnapshot(
+          opts.tenantId,
+          opts.agentId,
+          {
+            config: nextConfig,
+            version: nextConfig.version,
+            updatedAt: this.clock.nowMs(),
+          } satisfies AgentUpdateFields,
+          {
+            agentId: opts.agentId,
+            tenantId: opts.tenantId,
+            version: existing.version,
+            snapshot: stripTenantId(existing),
+            createdAt: this.clock.nowMs(),
+          },
+        );
+      } catch (err) {
+        if (!(err instanceof AgentVersionSnapshotConflictError)) throw err;
+        const latest = await this.repo.get(opts.tenantId, opts.agentId);
+        if (!latest) throw new AgentNotFoundError();
+        if (opts.expectedVersion !== undefined) {
+          throw new AgentVersionMismatchError(
+            opts.expectedVersion,
+            latest.version,
+          );
+        }
+        if (attempt === 2) throw err;
+      }
     }
 
-    // Detect field-level changes BEFORE building the new config — if nothing
-    // moved, return the existing row unmodified to skip a version bump (mirrors
-    // agents.ts:237-248 — "no-op update").
-    const changed = this.detectChanges(existing, opts.input);
-    if (!changed) return existing;
-
-    const nextConfig = this.applyUpdate(existing, opts.input);
-    nextConfig.version = existing.version + 1;
-    nextConfig.updated_at = msToIso(this.clock.nowMs());
-
-    return await this.repo.updateWithVersionSnapshot(
-      opts.tenantId,
-      opts.agentId,
-      {
-        config: nextConfig,
-        version: nextConfig.version,
-        updatedAt: this.clock.nowMs(),
-      } satisfies AgentUpdateFields,
-      {
-        agentId: opts.agentId,
-        tenantId: opts.tenantId,
-        version: existing.version,
-        snapshot: stripTenantId(existing),
-        createdAt: this.clock.nowMs(),
-      },
-    );
+    throw new Error("unreachable agent update retry exhaustion");
   }
 
   async archive(opts: {

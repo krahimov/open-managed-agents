@@ -65,6 +65,7 @@ async function startMainNode(opts: { dataDir: string }): Promise<ProcessHandle> 
       cwd: REPO_ROOT,
       env: {
         ...process.env,
+        DATABASE_URL: "",
         PORT: String(port),
         DATABASE_PATH: join(opts.dataDir, "oma.db"),
         AUTH_DATABASE_PATH: join(opts.dataDir, "auth.db"),
