@@ -341,6 +341,14 @@ export interface ClerkStoreDeps {
    *  signups use (ensureTenantSqlite), so Clerk users get tenant +
    *  membership rows and every downstream feature works unchanged. */
   ensureTenant(userId: string, name: string | null, email: string | null): Promise<string>;
+  /** Org tenancy — injected so the tenant/membership SQL (camelCase
+   *  better-auth columns) stays beside ensureTenantSqlite in the shell.
+   *  Optional: when absent, organization.* webhooks are audit-only. */
+  orgTenancy?: {
+    createTenant(name: string): Promise<string>;
+    addMembership(userId: string, tenantId: string, role: "owner" | "member"): Promise<void>;
+    removeMembership(userId: string, tenantId: string): Promise<void>;
+  };
   now?(): number;
 }
 
@@ -391,6 +399,18 @@ export class ClerkStore {
         payload_json TEXT NOT NULL,
         received_at ${int} NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS clerk_orgs (
+        clerk_org_id TEXT PRIMARY KEY,
+        tenant_id TEXT,
+        name TEXT,
+        slug TEXT,
+        plan TEXT,
+        billing_status TEXT,
+        deleted_at ${int},
+        created_at ${int} NOT NULL,
+        updated_at ${int} NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_clerk_orgs_tenant ON clerk_orgs(tenant_id);
     `);
   }
 
@@ -458,13 +478,22 @@ export class ClerkStore {
     return r ?? null;
   }
 
-  /** Latest plan info for a tenant (any member's user-scoped plan or the
-   *  org plan mirrored onto members). Null when Clerk knows nothing about
-   *  this tenant — callers fail open in that case. */
+  /** Latest plan info for a tenant. Org mapping wins (an org tenant's
+   *  plan is the org subscription); else any member's user-scoped plan.
+   *  Null when Clerk knows nothing about this tenant — callers fail open
+   *  in that case. */
   async planForTenant(tenantId: string): Promise<{
     plan: string | null;
     billing_status: string | null;
   } | null> {
+    const org = await this.deps.sql
+      .prepare(
+        `SELECT plan, billing_status FROM clerk_orgs
+         WHERE tenant_id = ? AND deleted_at IS NULL LIMIT 1`,
+      )
+      .bind(tenantId)
+      .first<{ plan: string | null; billing_status: string | null }>();
+    if (org) return org;
     const r = await this.deps.sql
       .prepare(
         `SELECT plan, billing_status FROM clerk_users
@@ -474,6 +503,90 @@ export class ClerkStore {
       .bind(tenantId)
       .first<{ plan: string | null; billing_status: string | null }>();
     return r ?? null;
+  }
+
+  // ── Organizations ──────────────────────────────────────────────────────
+
+  async getOrg(clerkOrgId: string): Promise<{
+    clerk_org_id: string;
+    tenant_id: string | null;
+    name: string | null;
+    plan: string | null;
+    deleted_at: number | null;
+  } | null> {
+    const r = await this.deps.sql
+      .prepare(`SELECT clerk_org_id, tenant_id, name, plan, deleted_at FROM clerk_orgs WHERE clerk_org_id = ?`)
+      .bind(clerkOrgId)
+      .first<{
+        clerk_org_id: string;
+        tenant_id: string | null;
+        name: string | null;
+        plan: string | null;
+        deleted_at: number | null;
+      }>();
+    return r ?? null;
+  }
+
+  /** organization.created / organization.updated — upsert and provision a
+   *  tenant for the org (once). No-op tenant-wise without orgTenancy. */
+  async upsertOrg(o: { id?: string; name?: string | null; slug?: string | null }): Promise<void> {
+    if (!o.id) return;
+    const existing = await this.getOrg(o.id);
+    let tenantId = existing?.tenant_id ?? null;
+    if (!tenantId && this.deps.orgTenancy) {
+      tenantId = await this.deps.orgTenancy.createTenant(o.name?.trim() || o.slug || "Organization");
+    }
+    const now = this.now();
+    await this.deps.sql
+      .prepare(
+        `INSERT INTO clerk_orgs (clerk_org_id, tenant_id, name, slug, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT (clerk_org_id) DO UPDATE SET
+           tenant_id = COALESCE(clerk_orgs.tenant_id, excluded.tenant_id),
+           name = excluded.name,
+           slug = excluded.slug,
+           deleted_at = NULL,
+           updated_at = excluded.updated_at`,
+      )
+      .bind(o.id, tenantId, o.name ?? null, o.slug ?? null, now, now)
+      .run();
+  }
+
+  async markOrgDeleted(clerkOrgId: string): Promise<void> {
+    await this.deps.sql
+      .prepare(`UPDATE clerk_orgs SET deleted_at = ?, updated_at = ? WHERE clerk_org_id = ?`)
+      .bind(this.now(), this.now(), clerkOrgId)
+      .run();
+  }
+
+  /** organizationMembership.created — add the member to the org's tenant.
+   *  Clerk roles: org:admin → owner, anything else → member. */
+  async addOrgMember(input: {
+    organization?: { id?: string; name?: string | null; slug?: string | null };
+    public_user_data?: { user_id?: string };
+    role?: string;
+  }): Promise<void> {
+    const orgId = input.organization?.id;
+    const userId = input.public_user_data?.user_id;
+    if (!orgId || !userId || !this.deps.orgTenancy) return;
+    // Membership webhooks can outrun organization.created — self-heal.
+    await this.upsertOrg(input.organization ?? { id: orgId });
+    const org = await this.getOrg(orgId);
+    if (!org?.tenant_id) return;
+    const role = input.role === "org:admin" ? "owner" : "member";
+    await this.deps.orgTenancy.addMembership(userId, org.tenant_id, role);
+  }
+
+  async removeOrgMember(input: {
+    organization?: { id?: string };
+    public_user_data?: { user_id?: string };
+  }): Promise<void> {
+    const orgId = input.organization?.id;
+    const userId = input.public_user_data?.user_id;
+    if (!orgId || !userId || !this.deps.orgTenancy) return;
+    const org = await this.getOrg(orgId);
+    if (!org?.tenant_id) return;
+    await this.deps.orgTenancy.removeMembership(userId, org.tenant_id);
   }
 
   /** Update plan columns from verified JWT claims (cheap freshness path —
@@ -493,11 +606,21 @@ export class ClerkStore {
   }
 
   /**
-   * Fold a billing webhook event into plan state. Clerk billing payloads
-   * carry a payer (user or organization) and a plan; exact shapes vary by
-   * event family, so extraction is defensive — unknown shapes are still
-   * recorded in clerk_webhook_events for audit, they just don't move
-   * plan columns.
+   * Fold a billing webhook event into plan state, for user payers
+   * (clerk_users) and organization payers (clerk_orgs).
+   *
+   * Event catalog (clerk.com/docs/…/webhooks/billing): subscription.
+   * created|updated|active|pastDue; subscriptionItem.updated|active|
+   * canceled|upcoming|ended|abandoned|incomplete|pastDue|freeTrialEnding;
+   * paymentAttempt.created|updated.
+   *
+   * Plan-clearing: canceled/ended/pastDue/incomplete (note Clerk uses
+   * camelCase `pastDue`). NOT clearing: `abandoned` (fires for the OLD
+   * item when the payer switches plans — the paired `…active` for the
+   * new plan may arrive first, and clearing here would wipe it),
+   * `upcoming`, `freeTrialEnding`, and paymentAttempt.* (status-only).
+   * Payload parsing stays defensive; unknown shapes are still recorded
+   * in clerk_webhook_events for audit.
    */
   async applyBillingEvent(eventType: string, data: Record<string, unknown>): Promise<void> {
     const payer = (data.payer ?? {}) as { user_id?: string; organization_id?: string };
@@ -505,34 +628,44 @@ export class ClerkStore {
     const status = typeof data.status === "string" ? data.status : null;
     const planSlug = planObj.slug ?? (typeof data.plan_slug === "string" ? data.plan_slug : null);
     const userId = payer.user_id ?? (typeof data.user_id === "string" ? data.user_id : null);
-    if (!userId) return; // org-payer without user mapping — audit row only
+    const orgId =
+      payer.organization_id ??
+      (typeof data.organization_id === "string" ? data.organization_id : null);
 
-    const cancelled =
-      /(cancel|past_due|expired|ended|abandon|incomplete)/i.test(eventType) ||
-      (status ? /(cancel|past_due|expired|ended)/i.test(status) : false);
+    // Status-only events never move the plan column: paymentAttempt.* is
+    // payment telemetry; `abandoned` describes the OLD item on a plan
+    // switch (the paired `…active` for the new plan carries the truth);
+    // `upcoming`/`freeTrialEnding` describe future state.
+    const statusOnly =
+      /^paymentAttempt\./.test(eventType) ||
+      /(abandoned|upcoming|freetrialending)/i.test(eventType.replace(/_/g, ""));
+    const clearing =
+      !statusOnly &&
+      (/(cancel|pastdue|ended|incomplete|expired)/i.test(eventType.replace(/_/g, "")) ||
+        (status ? /(cancel|pastdue|ended|expired)/i.test(status.replace(/_/g, "")) : false));
 
-    if (cancelled) {
-      // Subscription ended: clear the plan so the gate treats the payer
-      // as free-tier again.
+    const apply = async (table: "clerk_users" | "clerk_orgs", idCol: string, id: string) => {
+      if (clearing && !statusOnly) {
+        await this.deps.sql
+          .prepare(
+            `UPDATE ${table} SET plan = NULL, billing_status = ?, updated_at = ? WHERE ${idCol} = ?`,
+          )
+          .bind(status ?? eventType, this.now(), id)
+          .run();
+        return;
+      }
       await this.deps.sql
         .prepare(
-          `UPDATE clerk_users SET plan = NULL, billing_status = ?, updated_at = ?
-           WHERE clerk_user_id = ?`,
+          `UPDATE ${table}
+           SET plan = COALESCE(?, plan), billing_status = ?, updated_at = ?
+           WHERE ${idCol} = ?`,
         )
-        .bind(status ?? eventType, this.now(), userId)
+        .bind(statusOnly ? null : planSlug, status ?? eventType, this.now(), id)
         .run();
-      return;
-    }
-    // Active/renewed: set the plan when the payload names one, otherwise
-    // keep the current plan and only record the status.
-    await this.deps.sql
-      .prepare(
-        `UPDATE clerk_users
-         SET plan = COALESCE(?, plan), billing_status = ?, updated_at = ?
-         WHERE clerk_user_id = ?`,
-      )
-      .bind(planSlug, status ?? eventType, this.now(), userId)
-      .run();
+    };
+
+    if (userId) await apply("clerk_users", "clerk_user_id", userId);
+    if (orgId) await apply("clerk_orgs", "clerk_org_id", orgId);
   }
 }
 
@@ -627,6 +760,15 @@ export async function handleClerkWebhook(input: {
     } else if (type === "user.deleted") {
       const id = (data as { id?: string }).id;
       if (id) await store.markDeleted(id);
+    } else if (type === "organization.created" || type === "organization.updated") {
+      await store.upsertOrg(data as { id?: string; name?: string | null; slug?: string | null });
+    } else if (type === "organization.deleted") {
+      const id = (data as { id?: string }).id;
+      if (id) await store.markOrgDeleted(id);
+    } else if (type === "organizationMembership.created" || type === "organizationMembership.updated") {
+      await store.addOrgMember(data as Parameters<ClerkStore["addOrgMember"]>[0]);
+    } else if (type === "organizationMembership.deleted") {
+      await store.removeOrgMember(data as Parameters<ClerkStore["removeOrgMember"]>[0]);
     } else if (/^(subscription|subscriptionItem|paymentAttempt)\./.test(type)) {
       await store.applyBillingEvent(type, data);
     }

@@ -7,6 +7,7 @@
  * (agents-store, vaults-store, memory-store, etc.).
  */
 
+import { randomBytes } from "node:crypto";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
@@ -344,6 +345,35 @@ const clerkStore = clerkConfig
       sql,
       dialect,
       ensureTenant: (userId, name, email) => ensureTenantSqlite(sql, userId, name, email),
+      // Org tenancy — same tenant/membership SQL shapes ensureTenantSqlite
+      // uses (better-auth camelCase tenant columns, snake_case membership).
+      orgTenancy: {
+        createTenant: async (name) => {
+          const tenantId = `tn_${randomBytes(16).toString("hex")}`;
+          const now = Date.now();
+          await sql
+            .prepare(`INSERT INTO "tenant" (id, name, "createdAt", "updatedAt") VALUES (?, ?, ?, ?)`)
+            .bind(tenantId, name, now, now)
+            .run();
+          return tenantId;
+        },
+        addMembership: async (userId, tenantId, role) => {
+          await sql
+            .prepare(
+              `INSERT INTO "membership" (user_id, tenant_id, role, created_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT (user_id, tenant_id) DO NOTHING`,
+            )
+            .bind(userId, tenantId, role, Date.now())
+            .run();
+        },
+        removeMembership: async (userId, tenantId) => {
+          await sql
+            .prepare(`DELETE FROM "membership" WHERE user_id = ? AND tenant_id = ?`)
+            .bind(userId, tenantId)
+            .run();
+        },
+      },
     })
   : null;
 if (clerkStore) {
@@ -1051,10 +1081,18 @@ const authMw = buildAuthMw({
           ) {
             await clerkStore.syncEntitlementsFromClaims(verified.userId, verified.entitlements);
           }
+          // Active organization → route to the org's tenant (validated
+          // against membership by the middleware before it takes effect).
+          let tenantHint: string | null = null;
+          if (verified.orgId) {
+            const org = await clerkStore.getOrg(verified.orgId);
+            if (org?.tenant_id && !org.deleted_at) tenantHint = org.tenant_id;
+          }
           return {
             userId: verified.userId,
             email: row?.email ?? null,
             name: row?.name ?? null,
+            tenantHint,
           };
         } catch (err) {
           logger.debug?.({ err, op: "main-node.clerk.verify_failed" }, "clerk token rejected");

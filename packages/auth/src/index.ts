@@ -20,6 +20,11 @@ export interface AuthSession {
   userId: string;
   email?: string | null;
   name?: string | null;
+  /** Optional tenant preference from the auth provider (e.g. Clerk's
+   *  active-organization claim mapped to the org's tenant). Honored after
+   *  x-active-tenant and before defaultTenantForUser, and only when the
+   *  user actually has a membership — a forged hint can't escalate. */
+  tenantHint?: string | null;
 }
 
 export interface ApiKeyResolution {
@@ -95,6 +100,10 @@ export function createAuthMiddleware(deps: AuthMiddlewareDeps) {
         );
       }
       tenantId = requested;
+    }
+    if (!tenantId && session.tenantHint) {
+      const ok = await deps.hasMembership(session.userId, session.tenantHint);
+      if (ok) tenantId = session.tenantHint;
     }
     if (!tenantId) tenantId = await deps.defaultTenantForUser(session.userId);
     if (!tenantId) tenantId = await deps.ensureTenantForUser(session);

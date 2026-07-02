@@ -80,8 +80,11 @@ function verifier(config = baseConfig()): ClerkTokenVerifier {
 function buildStore() {
   const db = new Database(":memory:");
   const sql = new BetterSqlite3SqlClient(db);
-  // Minimal tenant/membership tables so ensureTenant can be a real fake.
+  // Minimal tenant/membership fakes so ensureTenant + orgTenancy behave
+  // like the shell's real closures.
   const tenants: Array<{ userId: string; tenantId: string }> = [];
+  const orgTenants: string[] = [];
+  const memberships: Array<{ userId: string; tenantId: string; role: string }> = [];
   const store = new ClerkStore({
     sql,
     dialect: "sqlite",
@@ -92,8 +95,24 @@ function buildStore() {
       tenants.push({ userId, tenantId });
       return tenantId;
     },
+    orgTenancy: {
+      createTenant: async (name) => {
+        const tenantId = `tn_org_${orgTenants.length + 1}_${name.replace(/\W+/g, "").slice(0, 8)}`;
+        orgTenants.push(tenantId);
+        return tenantId;
+      },
+      addMembership: async (userId, tenantId, role) => {
+        if (!memberships.some((m) => m.userId === userId && m.tenantId === tenantId)) {
+          memberships.push({ userId, tenantId, role });
+        }
+      },
+      removeMembership: async (userId, tenantId) => {
+        const i = memberships.findIndex((m) => m.userId === userId && m.tenantId === tenantId);
+        if (i >= 0) memberships.splice(i, 1);
+      },
+    },
   });
-  return { store, tenants, sql };
+  return { store, tenants, memberships, sql };
 }
 
 // ─── config ──────────────────────────────────────────────────────────────
@@ -286,6 +305,90 @@ describe("ClerkStore", () => {
     const after = await t.store.planForTenant("tn_1");
     expect(after?.plan).toBeNull();
     expect(after?.billing_status).toBe("canceled");
+  });
+
+  it("pastDue clears the plan; abandoned/freeTrialEnding/paymentAttempt do not", async () => {
+    await t.store.upsertUser({ id: "user_1" });
+    const activate = () =>
+      t.store.applyBillingEvent("subscriptionItem.active", {
+        payer: { user_id: "user_1" },
+        plan: { slug: "pro" },
+        status: "active",
+      });
+
+    await activate();
+    await t.store.applyBillingEvent("subscriptionItem.pastDue", {
+      payer: { user_id: "user_1" },
+      plan: { slug: "pro" },
+      status: "past_due",
+    });
+    expect((await t.store.planForTenant("tn_1"))?.plan).toBeNull();
+
+    await activate();
+    await t.store.applyBillingEvent("subscriptionItem.abandoned", {
+      payer: { user_id: "user_1" },
+      plan: { slug: "old_plan" },
+      status: "abandoned",
+    });
+    expect((await t.store.planForTenant("tn_1"))?.plan).toBe("pro");
+
+    await t.store.applyBillingEvent("subscriptionItem.freeTrialEnding", {
+      payer: { user_id: "user_1" },
+      plan: { slug: "pro" },
+    });
+    expect((await t.store.planForTenant("tn_1"))?.plan).toBe("pro");
+
+    // paymentAttempt is status-only: never sets or clears the plan.
+    await t.store.applyBillingEvent("paymentAttempt.updated", {
+      payer: { user_id: "user_1" },
+      plan: { slug: "enterprise" },
+      status: "paid",
+    });
+    const after = await t.store.planForTenant("tn_1");
+    expect(after?.plan).toBe("pro");
+    expect(after?.billing_status).toBe("paid");
+  });
+
+  it("organizations: provision tenant, membership add/remove, org billing wins for the tenant", async () => {
+    await t.store.upsertOrg({ id: "org_1", name: "Acme Inc", slug: "acme" });
+    const org = await t.store.getOrg("org_1");
+    expect(org?.tenant_id).toMatch(/^tn_org_1_/);
+
+    // Membership arriving before organization.created self-heals via upsertOrg.
+    await t.store.addOrgMember({
+      organization: { id: "org_1" },
+      public_user_data: { user_id: "user_a" },
+      role: "org:admin",
+    });
+    await t.store.addOrgMember({
+      organization: { id: "org_2", name: "Beta LLC" },
+      public_user_data: { user_id: "user_b" },
+      role: "org:member",
+    });
+    expect(t.memberships).toEqual([
+      { userId: "user_a", tenantId: org!.tenant_id, role: "owner" },
+      { userId: "user_b", tenantId: (await t.store.getOrg("org_2"))!.tenant_id!, role: "member" },
+    ]);
+
+    // Org-payer billing event lands on clerk_orgs and wins planForTenant.
+    await t.store.applyBillingEvent("subscriptionItem.active", {
+      payer: { organization_id: "org_1" },
+      plan: { slug: "team" },
+      status: "active",
+    });
+    expect(await t.store.planForTenant(org!.tenant_id!)).toEqual({
+      plan: "team",
+      billing_status: "active",
+    });
+
+    await t.store.removeOrgMember({
+      organization: { id: "org_1" },
+      public_user_data: { user_id: "user_a" },
+    });
+    expect(t.memberships.some((m) => m.userId === "user_a")).toBe(false);
+
+    await t.store.markOrgDeleted("org_1");
+    expect(await t.store.planForTenant(org!.tenant_id!)).toBeNull();
   });
 
   it("primaryEmailOf falls back to the first address", () => {
