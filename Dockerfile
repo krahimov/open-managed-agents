@@ -20,6 +20,13 @@ RUN corepack enable
 WORKDIR /app
 COPY . .
 RUN pnpm install --frozen-lockfile
+
+# Console is a Vite build — VITE_* vars are baked in at BUILD time, not
+# read at runtime. Railway exposes service variables to Dockerfile builds
+# as build args; declaring the ARG here is what lets it reach the build.
+# Leave unset for the classic better-auth login screens.
+ARG VITE_CLERK_PUBLISHABLE_KEY
+ENV VITE_CLERK_PUBLISHABLE_KEY=${VITE_CLERK_PUBLISHABLE_KEY}
 RUN pnpm build:console
 
 ENV NODE_ENV=production \
