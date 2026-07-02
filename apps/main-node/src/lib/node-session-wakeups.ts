@@ -69,9 +69,19 @@ export interface NodeSessionWakeupsDeps {
     agentId: string;
     event: UserMessageEvent;
   }): Promise<void>;
-  /** Persist + publish a trajectory event (span.wakeup_scheduled). Optional
-   *  so tests can skip event-log wiring. */
+  /** Persist + publish an event into the session event log. Used for the
+   *  span.wakeup_scheduled trajectory event AND for the synthetic wakeup
+   *  user.message itself — DefaultHarness derives model context purely
+   *  from the event log (the HTTP route pre-appends real user messages
+   *  the same way), so a fire that only enqueues a work item would run a
+   *  turn whose history ends on the assistant's last message. Optional so
+   *  store-level tests can skip event-log wiring. */
   persistEvent?(sessionId: string, event: SessionEvent): Promise<void>;
+  /** Return true when an event with this id is already in the session's
+   *  log — crash-recovery guard so a retried fire doesn't append the
+   *  wakeup user.message twice. Optional; when absent the pump appends
+   *  unconditionally. */
+  hasEvent?(sessionId: string, eventId: string): Promise<boolean>;
   /** Injectable clock for tests. */
   now?(): number;
   maxPending?: number;
@@ -279,6 +289,15 @@ export class NodeSessionWakeups {
             fired_at: new Date(nowMs).toISOString(),
           },
         } as UserMessageEvent;
+
+        // Append the wakeup user.message to the event log FIRST (mirrors
+        // the POST /events route: append → enqueue), guarded by an id
+        // check so a crash-retry doesn't write it twice. The work-queue
+        // enqueue below stays idempotent on the same event id.
+        const alreadyLogged = await this.deps.hasEvent?.(row.session_id, event.id!);
+        if (!alreadyLogged) {
+          await this.deps.persistEvent?.(row.session_id, event);
+        }
 
         await this.deps.enqueue({
           tenantId: row.tenant_id,

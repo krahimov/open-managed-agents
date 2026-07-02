@@ -25,10 +25,20 @@ function build(opts?: { failEnqueue?: () => boolean }) {
   let nowMs = 1_000_000_000_000;
   const enqueued: EnqueuedItem[] = [];
   const seenEventIds = new Set<string>();
+  // Fake event log — pump must append the wakeup user.message here BEFORE
+  // enqueuing (DefaultHarness reads context from the log, not the item).
+  const logged = new Map<string, Array<{ id?: string; type: string }>>();
   const wakeups = new NodeSessionWakeups({
     sql,
     dialect: "sqlite",
     now: () => nowMs,
+    persistEvent: async (sessionId, event) => {
+      const list = logged.get(sessionId) ?? [];
+      list.push(event as { id?: string; type: string });
+      logged.set(sessionId, list);
+    },
+    hasEvent: async (sessionId, eventId) =>
+      (logged.get(sessionId) ?? []).some((e) => e.id === eventId),
     enqueue: async (item) => {
       if (opts?.failEnqueue?.()) throw new Error("enqueue exploded");
       // Mirror the work queue's (session_id, event_id) dedupe.
@@ -41,6 +51,7 @@ function build(opts?: { failEnqueue?: () => boolean }) {
   return {
     wakeups,
     enqueued,
+    logged,
     advance: (ms: number) => {
       nowMs += ms;
     },
@@ -164,6 +175,47 @@ describe("NodeSessionWakeups", () => {
     expect(await t.wakeups.pump()).toBe(1);
     expect(t.enqueued).toHaveLength(1);
     expect(t.enqueued[0].event.id).toMatch(/^sevt_wk_swk_/);
+  });
+
+  it("fires append the user.message to the event log before enqueuing", async () => {
+    const res = await t.wakeups.schedule({ ...CTX, delay_seconds: 10, prompt: "wake up" });
+    // schedule itself logs the span.wakeup_scheduled trajectory event.
+    const spanEvents = (t.logged.get(CTX.sessionId) ?? []).filter(
+      (e) => e.type === "span.wakeup_scheduled",
+    );
+    expect(spanEvents).toHaveLength(1);
+
+    t.advance(11_000);
+    await t.wakeups.pump();
+    const userMsgs = (t.logged.get(CTX.sessionId) ?? []).filter((e) => e.type === "user.message");
+    expect(userMsgs).toHaveLength(1);
+    expect(t.enqueued).toHaveLength(1);
+    // Same event object lands in the log and the queue — DefaultHarness
+    // reads the log; the queue item just triggers the turn.
+    expect(userMsgs[0].id).toBe(t.enqueued[0].event.id);
+    expect(res.kind).toBe("one_shot");
+  });
+
+  it("a crash-retry does not append the wakeup user.message twice", async () => {
+    let fail = true;
+    t = build({ failEnqueue: () => fail });
+    await t.wakeups.ensureSchema();
+    await t.wakeups.schedule({ ...CTX, delay_seconds: 10, prompt: "retry-me" });
+    t.advance(11_000);
+
+    // First tick: append succeeds, enqueue throws → row stays due.
+    await t.wakeups.pump();
+    expect(
+      (t.logged.get(CTX.sessionId) ?? []).filter((e) => e.type === "user.message"),
+    ).toHaveLength(1);
+
+    // Retry tick: hasEvent guard skips the second append; enqueue succeeds.
+    fail = false;
+    expect(await t.wakeups.pump()).toBe(1);
+    expect(
+      (t.logged.get(CTX.sessionId) ?? []).filter((e) => e.type === "user.message"),
+    ).toHaveLength(1);
+    expect(t.enqueued).toHaveLength(1);
   });
 
   it("list returns pending wakeups in fire order with ISO timestamps", async () => {

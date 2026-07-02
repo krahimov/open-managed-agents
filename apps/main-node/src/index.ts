@@ -731,6 +731,10 @@ const sessionWakeups = new NodeSessionWakeups({
     const last = stored[stored.length - 1];
     if (last) hub.publish(sessionId, last);
   },
+  hasEvent: async (sessionId, eventId) => {
+    const stored = await newEventLog(sessionId).getEventsAsync();
+    return stored.some((e) => (e as { id?: string }).id === eventId);
+  },
 });
 await sessionWakeups.ensureSchema();
 
