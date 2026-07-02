@@ -16,8 +16,6 @@
 
 **The open-source platform for running AI agents** — an alternative to Claude Managed Agents that you can self-host on your own hardware or deploy to Cloudflare.
 
-🌐 **[openma.dev](https://openma.dev)** · 📖 **[docs.openma.dev](https://docs.openma.dev)** · 💬 **[github.com/open-ma/open-managed-agents](https://github.com/open-ma/open-managed-agents)**
-
 ---
 
 ## What is this?
@@ -68,7 +66,7 @@ Harnesses are registered by name and selected per agent via the `harness` field:
 ## Quick start: self-host (Docker)
 
 ```bash
-git clone https://github.com/open-ma/open-managed-agents.git
+git clone https://github.com/krahimov/open-managed-agents.git
 cd open-managed-agents
 cp .env.example .env
 
@@ -90,14 +88,12 @@ open http://localhost:8787        # Console UI on the same port
 
 Setting `ANTHROPIC_API_KEY` in `.env` lets your first agent run immediately; for anything beyond a smoke test, add a **Model Card** from the Console instead — it's encrypted, per-tenant, and rotatable without a restart.
 
-Full guide (sandbox providers, Postgres, vault sidecar, operator notes): **[docs.openma.dev/self-host/overview](https://docs.openma.dev/self-host/overview/)**
-
 ## Quick start: Cloudflare
 
 Requires a [Workers Paid plan](https://developers.cloudflare.com/workers/platform/pricing/) for Durable Objects and Containers.
 
 ```bash
-git clone https://github.com/open-ma/open-managed-agents.git
+git clone https://github.com/krahimov/open-managed-agents.git
 cd open-managed-agents
 pnpm install
 
@@ -178,39 +174,6 @@ Attaching `{"type": "agent_toolset_20260401"}` gives an agent:
 
 Attached MCP servers surface their tools as `mcp__<server>__<tool>` (HTTP/SSE for hosted servers, stdio spawned inside the sandbox for npm/PyPI packages). Callable agents surface as `call_agent_*` for multi-agent delegation.
 
-## Deployments — connect your frontend
-
-Publish an agent and get a **publishable key** (`oma_pk_...`) that's safe to
-ship in a browser bundle — it can only start and drive sessions of that one
-agent through the public gateway (`/public/v1`), never read or mutate
-anything else. Think Stripe publishable keys, for agents.
-
-```bash
-# Publish (Console: Agents → Deploy, or API):
-curl -X POST $OMA/v1/deployments -H "x-api-key: $KEY" \
-  -d '{"agent_id":"agent_abc","environment_id":"env_abc","allowed_origins":["https://app.example.com"]}'
-# → { ..., "key": "oma_pk_..." }   # shown once; rotate any time
-```
-
-```ts
-// In your app — npm install @openma/agent-sdk
-import { AgentClient } from "@openma/agent-sdk";
-
-const client = new AgentClient({ baseUrl: "https://your-oma-host", deploymentKey: "oma_pk_..." });
-const session = await client.createSession({ title: "Support chat" });
-for await (const ev of session.chat("Hello!")) {
-  if (ev.type === "agent.message_chunk") render(ev.delta);
-}
-```
-
-The gateway pins the agent/environment server-side, allowlists event types
-(`user.message`, `interrupt`, `tool_confirmation`, `custom_tool_result`),
-scopes each key to the sessions it created, sanitizes responses (no system
-prompt / tool config leaks), and enforces per-deployment CORS. Details:
-[`docs/agent-deployments.md`](docs/agent-deployments.md).
-
----
-
 ## Integrations
 
 Publish an agent into a tool your team already uses. Each publication gets its own bot identity, inbound webhooks become session messages, and replies go out through the provider's API under the agent's name — gated by a per-publication capability allowlist.
@@ -232,8 +195,8 @@ open-managed-agents/
 │   ├── integrations/      # Integrations gateway — Linear / GitHub / Slack
 │   ├── oma-vault/         # Vault sidecar — outbound credential injection (self-host)
 │   ├── console/           # Web dashboard — React + Vite + Tailwind
-│   ├── docs/              # Docs site (Astro Starlight) → docs.openma.dev
-│   └── web/               # Marketing site → openma.dev
+│   ├── docs/              # Docs site (Astro Starlight)
+│   └── web/               # Marketing site (Astro)
 ├── packages/
 │   ├── cli/               # `oma` CLI
 │   ├── http-routes/       # REST route definitions shared by main + main-node
@@ -259,7 +222,7 @@ The variables that gate boot and at-rest safety:
 | `SANDBOX_PROVIDER` | No | `subprocess` (default), `litebox`, `daytona`, `e2b`, or `boxrun`. Use an isolated backend for untrusted agents. |
 | `TAVILY_API_KEY` | No | Backend for the `web_search` tool. |
 
-Full reference: **[docs.openma.dev/reference/configuration](https://docs.openma.dev/reference/configuration/)** and the annotated `.env.example` / `.dev.vars.example`.
+Full reference: the annotated `.env.example` / `.dev.vars.example`.
 
 ## Development
 
