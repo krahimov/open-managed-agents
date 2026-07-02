@@ -13,6 +13,7 @@ import "@fontsource-variable/geist";
 import "@fontsource-variable/jetbrains-mono";
 import "./index.css";
 import { AuthProvider } from "./lib/auth";
+import { MaybeClerkProvider } from "./lib/clerk-auth";
 import { Toaster } from "./components/ui/sonner";
 import { AppShell } from "./components/AppShell";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -267,11 +268,13 @@ createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <ErrorBoundary>
       <QueryClientProvider client={queryClient}>
-        <AuthProvider>
-          <Suspense fallback={null}>
-            <RouterProvider router={router} />
-          </Suspense>
-        </AuthProvider>
+        <MaybeClerkProvider>
+          <AuthProvider>
+            <Suspense fallback={null}>
+              <RouterProvider router={router} />
+            </Suspense>
+          </AuthProvider>
+        </MaybeClerkProvider>
         <Toaster />
       </QueryClientProvider>
     </ErrorBoundary>

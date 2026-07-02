@@ -64,13 +64,37 @@ CLERK_SECRET_KEY=sk_...                            # reserved for Backend API ca
 4. Frontend: use Clerk's components; call the OMA API with
    `Authorization: Bearer ${await session.getToken()}`.
 
+## Console sign-in (Clerk mode)
+
+Build the console with `VITE_CLERK_PUBLISHABLE_KEY=pk_…` and it flips to
+Clerk end-to-end: `/login` renders Clerk's `<SignIn/>`, the auth context
+maps Clerk's user, and every `api()` call + SSE stream carries
+`Authorization: Bearer <session token>` (SSE resolves a fresh token on
+every reconnect — Clerk tokens live ~60s). Without the env var the
+classic better-auth screens render unchanged.
+
+## Organizations
+
+`organization.*` and `organizationMembership.*` webhooks map each Clerk
+org to its own tenant (`clerk_orgs`), with members added to the tenant's
+membership (org:admin → owner). A session token with an active org (`o`
+claim) routes API requests to the org's tenant (membership-validated),
+and org-payer billing events gate that tenant by the org's plan.
+
+Billing events follow Clerk's published catalog: `subscription.created|
+updated|active|pastDue`, `subscriptionItem.updated|active|canceled|
+upcoming|ended|abandoned|incomplete|pastDue|freeTrialEnding`,
+`paymentAttempt.created|updated`. Plan-clearing: canceled/ended/pastDue/
+incomplete. Status-only (never move the plan): abandoned (describes the
+OLD item on a plan switch), upcoming, freeTrialEnding, paymentAttempt.*.
+
 ## Known limits / next steps
 
-- Console sign-in still renders better-auth screens; a ClerkProvider
-  path in `apps/console` is the natural follow-up.
-- Org-scoped billing (`o:` plans) currently maps through the requesting
-  user's row; a `clerk_orgs → tenant` mapping would make org plans
-  first-class.
-- `applyBillingEvent` parses payloads defensively (payer/plan/status).
-  Tighten against Clerk's exact billing webhook schemas when convenient
-  (e.g. from Clerk's billing SKILL.md).
+- Exact billing payload field shapes are still parsed defensively
+  (payer/plan.slug/status); Clerk's billing SKILL.md would let us pin
+  them precisely.
+- Sign-out UI in Clerk mode uses Clerk's components; the sidebar's
+  better-auth sign-out button is a no-op for Clerk sessions (follow-up).
+- Real-dashboard E2E needs CLERK_ISSUER + CLERK_WEBHOOK_SIGNING_SECRET
+  (+ VITE_CLERK_PUBLISHABLE_KEY for the console build) from your Clerk
+  app.

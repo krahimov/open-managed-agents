@@ -28,8 +28,13 @@ export class FatalSseError extends Error {
 }
 
 export interface StreamSseOpts {
-  /** Request headers to merge into the GET. */
-  headers?: Record<string, string>;
+  /** Request headers to merge into the GET. A function is re-invoked on
+   *  every connection attempt (initial + each reconnect) — required for
+   *  short-lived credentials like Clerk session tokens (~60s TTL), which
+   *  would go stale across a long stream's reconnects if captured once. */
+  headers?:
+    | Record<string, string>
+    | (() => Record<string, string> | Promise<Record<string, string>>);
   /** Caller's abort signal. Aborts terminate the loop without onError. */
   signal?: AbortSignal;
   /** Inspect the open response (status, headers). Throw FatalSseError to
@@ -51,13 +56,15 @@ export async function streamSse(url: string, opts: StreamSseOpts): Promise<void>
   while (true) {
     let response: Response;
     try {
+      const resolvedHeaders =
+        typeof headers === "function" ? await headers() : (headers ?? {});
       response = await fetch(url, {
         method: "GET",
         credentials: "include",
         cache: "no-store",
         headers: {
           Accept: "text/event-stream",
-          ...(headers ?? {}),
+          ...resolvedHeaders,
         },
         signal,
       });

@@ -1,6 +1,7 @@
 import { createContext, useContext, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { authClient } from "./auth-client";
+import { clerkEnabled, useClerkMappedUser } from "./clerk-auth";
 
 interface User {
   id: string;
@@ -69,7 +70,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     );
   }
 
+  // Clerk mode: the build carries VITE_CLERK_PUBLISHABLE_KEY and
+  // MaybeClerkProvider is mounted app-wide — session state comes from
+  // Clerk's SDK instead of the better-auth cookie.
+  if (clerkEnabled) return <ClerkAuthBridge>{children}</ClerkAuthBridge>;
+
   return <SessionAuthProvider>{children}</SessionAuthProvider>;
+}
+
+function ClerkAuthBridge({ children }: { children: ReactNode }) {
+  const value = useClerkMappedUser();
+  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
 function SessionAuthProvider({ children }: { children: ReactNode }) {
