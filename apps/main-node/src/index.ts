@@ -146,6 +146,7 @@ import {
 } from "./lib/event-stream-hub";
 import { PgEventStreamHub } from "./lib/pg-event-stream-hub";
 import { NodeHarnessRuntime } from "./lib/node-harness-runtime";
+import { NodeSessionWakeups } from "./lib/node-session-wakeups";
 import { SessionRegistry } from "./registry.js";
 
 loadDotenvDefaults();
@@ -603,6 +604,19 @@ const sessionRegistry = new SessionRegistry({
       mcpBinding: nodeMcpBinding,
       tenantId: context.tenantId,
       sessionId: context.sessionId,
+      // Durable wakeups (session_wakeups table + scheduler pump) — wiring
+      // these unlocks the schedule/cancel_schedule/list_schedules tools,
+      // which tools.ts only registers when the runtime provides the hooks.
+      // Parity with SessionDO's DO-alarm implementation on CF.
+      scheduleWakeup: (a) =>
+        sessionWakeups.schedule({
+          tenantId: context.tenantId,
+          sessionId: context.sessionId,
+          agentId: agent.id,
+          ...a,
+        }),
+      cancelWakeup: (id) => sessionWakeups.cancel(context.sessionId, id),
+      listWakeups: () => sessionWakeups.list(context.sessionId),
     });
   },
   buildHarness: () => {
@@ -699,6 +713,27 @@ const sessionWorkQueue = new NodeSessionWorkQueue({
   },
 });
 await sessionWorkQueue.ensureSchema();
+
+// Durable session wakeups — fired by the scheduler's session-wakeups job;
+// synthetic user.message events flow through the same work queue as real
+// ones so turn ordering and crash recovery hold.
+const sessionWakeups = new NodeSessionWakeups({
+  sql,
+  dialect,
+  enqueue: async (item) => {
+    await sessionWorkQueue.enqueue(item);
+    void sessionWorkQueue.wake(item.sessionId);
+  },
+  persistEvent: async (sessionId, event) => {
+    const log = newEventLog(sessionId);
+    await log.appendAsync(event);
+    const stored = await log.getEventsAsync();
+    const last = stored[stored.length - 1];
+    if (last) hub.publish(sessionId, last);
+  },
+});
+await sessionWakeups.ensureSchema();
+
 await sessionRegistry.bootstrap();
 void sessionWorkQueue.wakeAll().catch((err) => {
   logger.error({ err, op: "session_work_queue.bootstrap_failed" }, "session work queue bootstrap failed");
@@ -1602,6 +1637,7 @@ const scheduler = buildNodeScheduler({
   },
   memory: memoryService,
   integrationsSql: platformRootSecret ? sql : null,
+  wakeups: { pump: () => sessionWakeups.pump() },
 });
 await scheduler.start();
 logger.info({ op: "main-node.scheduler.started" }, "scheduler started");

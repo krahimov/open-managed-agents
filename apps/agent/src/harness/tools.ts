@@ -401,14 +401,25 @@ export async function buildTools(
     /** Cancel a previously scheduled wakeup by id. */
     cancelWakeup?: (id: string) => Promise<{ cancelled: boolean }>;
     /** List pending wakeup schedules for THIS session. Filters out the
-     *  framework's internal recoverEventQueue / pollBackgroundTasks rows. */
-    listWakeups?: () => Array<{
-      id: string;
-      fire_at?: string;
-      cron?: string;
-      prompt: string;
-      kind: "one_shot" | "cron";
-    }>;
+     *  framework's internal recoverEventQueue / pollBackgroundTasks rows.
+     *  May be async (Node reads a SQL table; CF reads DO state inline). */
+    listWakeups?: () =>
+      | Array<{
+          id: string;
+          fire_at?: string;
+          cron?: string;
+          prompt: string;
+          kind: "one_shot" | "cron";
+        }>
+      | Promise<
+          Array<{
+            id: string;
+            fire_at?: string;
+            cron?: string;
+            prompt: string;
+            kind: "one_shot" | "cron";
+          }>
+        >;
   }
 ): Promise<Record<string, any>> {
   const enabled = getEnabledTools(agentConfig.tools);
@@ -981,7 +992,7 @@ export async function buildTools(
       description:
         "List all pending wakeup schedules for THIS session: id, fire_at, cron (if recurring), prompt, kind.",
       inputSchema: z.object({}),
-      execute: safe(async () => ({ schedules: env.listWakeups!() })),
+      execute: safe(async () => ({ schedules: await env.listWakeups!() })),
     });
   }
 

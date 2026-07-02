@@ -40,6 +40,9 @@ export interface NodeSchedulerDeps {
    *  in-process LinearProvider is available. Skip when null — most
    *  self-host deployments don't run the Linear gateway side yet. */
   linearSweeper?: (() => Promise<LinearDispatchSweeper | null>) | null;
+  /** Session wakeup pump (NodeSessionWakeups). Fires due schedule-tool
+   *  wakeups by enqueuing synthetic user.message events. Skip when null. */
+  wakeups?: { pump: () => Promise<number> } | null;
   /** Override defaults via env so an operator can quiet noisy crons
    *  during a maintenance window without a code change. */
   env?: NodeJS.ProcessEnv;
@@ -74,6 +77,28 @@ export function buildNodeScheduler(deps: NodeSchedulerDeps) {
       }
     },
   });
+
+  // Session wakeups — the schedule tool's durable timers. Croner accepts
+  // 6-field (seconds) expressions, so the default ticks every 20s; DO-alarm
+  // parity on CF fires to the second, ≤20s drift here is acceptable and
+  // matches the jitter Anthropic documents for scheduled deployments.
+  if (deps.wakeups) {
+    const wakeups = deps.wakeups;
+    scheduler.register({
+      name: "session-wakeups",
+      cron: cron("SESSION_WAKEUPS_CRON", "*/20 * * * * *"),
+      handler: async () => {
+        try {
+          const fired = await wakeups.pump();
+          if (fired > 0) {
+            log.info({ fired, op: "scheduler.session_wakeups.fired" }, "session wakeups fired");
+          }
+        } catch (err) {
+          log.warn({ err, op: "scheduler.session_wakeups.failed" }, "session-wakeups tick failed");
+        }
+      },
+    });
+  }
 
   // Memory retention.
   scheduler.register({
