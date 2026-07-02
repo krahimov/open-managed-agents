@@ -147,6 +147,13 @@ import {
 import { PgEventStreamHub } from "./lib/pg-event-stream-hub";
 import { NodeHarnessRuntime } from "./lib/node-harness-runtime";
 import { NodeSessionWakeups } from "./lib/node-session-wakeups";
+import {
+  resolveClerkConfig,
+  ClerkTokenVerifier,
+  ClerkStore,
+  buildClerkPreCreateGate,
+  handleClerkWebhook,
+} from "./lib/clerk";
 import { SessionRegistry } from "./registry.js";
 
 loadDotenvDefaults();
@@ -322,6 +329,29 @@ if (!authDisabled) {
       authDb.close();
     };
   }
+}
+
+// ─── Clerk (optional managed-auth overlay) ──────────────────────────────
+// Active when CLERK_ISSUER or CLERK_PUBLISHABLE_KEY is set. Coexists with
+// better-auth: cookie sessions resolve first, then `Authorization:
+// Bearer <clerk session JWT>`. Users sync into clerk_users (+ tenant +
+// membership via the same ensureTenant path) through /clerk/webhook.
+
+const clerkConfig = resolveClerkConfig();
+const clerkVerifier = clerkConfig ? new ClerkTokenVerifier(clerkConfig) : null;
+const clerkStore = clerkConfig
+  ? new ClerkStore({
+      sql,
+      dialect,
+      ensureTenant: (userId, name, email) => ensureTenantSqlite(sql, userId, name, email),
+    })
+  : null;
+if (clerkStore) {
+  await clerkStore.ensureSchema();
+  logger.info(
+    { op: "main-node.clerk.enabled", issuer: clerkConfig!.issuer, billing_enforce: clerkConfig!.billingEnforce },
+    "clerk auth enabled",
+  );
 }
 
 // ─── Stores ─────────────────────────────────────────────────────────────
@@ -946,6 +976,7 @@ app.get("/auth-info", (c) =>
           ...(process.env.GITHUB_AUTH_CLIENT_ID && process.env.GITHUB_AUTH_CLIENT_SECRET
             ? ["github"]
             : []),
+          ...(clerkConfig ? ["clerk"] : []),
         ],
     turnstile_site_key: null,
   }),
@@ -959,22 +990,79 @@ if (auth) {
   app.on(["GET", "POST"], "/auth/*", (c) => auth!.handler(c.req.raw));
 }
 
+// Clerk webhooks (user sync + billing) — public route on the root app
+// (svix signature IS the auth; the v1 auth middleware never sees this).
+if (clerkConfig && clerkStore) {
+  app.post("/clerk/webhook", async (c) => {
+    const rawBody = await c.req.text();
+    const result = await handleClerkWebhook({
+      config: clerkConfig,
+      store: clerkStore,
+      rawBody,
+      headers: {
+        svixId: c.req.header("svix-id"),
+        svixTimestamp: c.req.header("svix-timestamp"),
+        svixSignature: c.req.header("svix-signature"),
+      },
+    });
+    return c.json(result.body, result.status as 200);
+  });
+}
+
 // Auth middleware via packages/auth — same five-priority resolution as
 // apps/main on CF.
 const authMw = buildAuthMw({
   disabled: authDisabled,
   bypassPath: (path) => path === "/health" || path.startsWith("/auth/"),
   resolveSession: async (headers) => {
-    if (!auth) return null;
-    const session = (await auth.api.getSession({ headers })) as
-      | { user?: { id: string; email?: string | null; name?: string | null } }
-      | null;
-    if (!session?.user) return null;
-    return {
-      userId: session.user.id,
-      email: session.user.email ?? null,
-      name: session.user.name ?? null,
-    };
+    if (auth) {
+      const session = (await auth.api.getSession({ headers })) as
+        | { user?: { id: string; email?: string | null; name?: string | null } }
+        | null;
+      if (session?.user) {
+        return {
+          userId: session.user.id,
+          email: session.user.email ?? null,
+          name: session.user.name ?? null,
+        };
+      }
+    }
+    // Clerk session JWT — `Authorization: Bearer <token>` (API keys use
+    // the x-api-key header, so there's no collision on Bearer).
+    if (clerkVerifier && clerkStore) {
+      const authz = headers.get("authorization") ?? "";
+      const token = authz.startsWith("Bearer ") ? authz.slice("Bearer ".length).trim() : "";
+      if (token) {
+        try {
+          const verified = await clerkVerifier.verify(token);
+          let row = await clerkStore.getByClerkId(verified.userId);
+          if (!row) {
+            // JIT provision when the user.created webhook hasn't landed
+            // yet (or isn't configured): tenant + membership + clerk_users
+            // row keyed by the Clerk user id. The webhook enriches later.
+            row = await clerkStore.upsertUser({ id: verified.userId });
+          }
+          // Claims are authoritative only when the token actually carries
+          // billing claims — absent pla/fea must not clobber webhook state.
+          if (
+            row &&
+            verified.hasBillingClaims &&
+            row.plan !== verified.entitlements.plan
+          ) {
+            await clerkStore.syncEntitlementsFromClaims(verified.userId, verified.entitlements);
+          }
+          return {
+            userId: verified.userId,
+            email: row?.email ?? null,
+            name: row?.name ?? null,
+          };
+        } catch (err) {
+          logger.debug?.({ err, op: "main-node.clerk.verify_failed" }, "clerk token rejected");
+          return null;
+        }
+      }
+    }
+    return null;
   },
   resolveApiKey: async (apiKey) => {
     const hash = await sha256Hex(apiKey);
@@ -1028,7 +1116,29 @@ v1.route("/sessions", buildSessionRoutes({
   services,
   router: sessionRouter,
   outputs: sessionOutputsBackend.adapter,
-  lifecycle: nodeSessionLifecycle({ files: filesService, filesBlob }),
+  lifecycle: {
+    ...nodeSessionLifecycle({ files: filesService, filesBlob }),
+    // Clerk Billing entitlement gate: free-plan tenants get a concurrent-
+    // session cap (402), paid plans pass, non-Clerk tenants fail open.
+    ...(clerkConfig && clerkStore && clerkConfig.billingEnforce
+      ? {
+          preCreateGate: buildClerkPreCreateGate({
+            store: clerkStore,
+            config: clerkConfig,
+            countActiveSessions: async (tenantId) => {
+              const row = await sql
+                .prepare(
+                  `SELECT COUNT(*) AS n FROM sessions
+                   WHERE tenant_id = ? AND archived_at IS NULL AND terminated_at IS NULL`,
+                )
+                .bind(tenantId)
+                .first<{ n: number }>();
+              return Number(row?.n ?? 0);
+            },
+          }),
+        }
+      : {}),
+  },
   // Node sandboxes are selected by SANDBOX_PROVIDER. Environment rows still
   // carry the package/networking config and are snapshotted onto sessions.
   localRuntimeEnvId: "env-local-runtime",

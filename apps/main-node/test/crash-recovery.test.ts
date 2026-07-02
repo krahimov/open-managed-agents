@@ -66,6 +66,9 @@ async function startMainNode(opts: { dataDir: string }): Promise<ProcessHandle> 
       env: {
         ...process.env,
         PORT: String(port),
+        // Hermetic: block main-node's .env self-load from routing this
+        // child at the operator's real DATABASE_URL (shared Neon).
+        DATABASE_URL: "",
         DATABASE_PATH: join(opts.dataDir, "oma.db"),
         AUTH_DATABASE_PATH: join(opts.dataDir, "auth.db"),
         SANDBOX_WORKDIR: join(opts.dataDir, "sandboxes"),
