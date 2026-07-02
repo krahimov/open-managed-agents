@@ -1,0 +1,18 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" role="img" aria-label="orrery" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .ink { stroke: #17171a; }
+    .hub { fill: #17171a; }
+    .dot { fill: #d9564a; }
+    @media (prefers-color-scheme: dark) {
+      .ink { stroke: #f1f1f3; }
+      .hub { fill: #f1f1f3; }
+      .dot { fill: #ff8d7e; }
+    }
+  </style>
+  <g class="ink" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M32 32l12-12"/>
+    <circle cx="32" cy="32" r="17"/>
+  </g>
+  <circle class="hub" cx="32" cy="32" r="4.5"/>
+  <circle class="dot" cx="44" cy="20" r="7"/>
+</svg>
