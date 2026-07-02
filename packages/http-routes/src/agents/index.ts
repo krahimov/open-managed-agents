@@ -159,6 +159,12 @@ export interface AgentRoutesDeps {
     tenantId: string,
     agentId: string,
   ) => Promise<boolean>;
+  /** Pre-create gate, mirroring sessions' lifecycle.preCreateGate: return
+   *  null to proceed, { status, body } to short-circuit. Node wires the
+   *  MAX_AGENTS_PER_TENANT cap (and later billing entitlements) here. */
+  preCreateGate?: (input: {
+    tenantId: string;
+  }) => Promise<{ status: number; body: unknown } | null>;
 }
 
 export function buildAgentRoutes(deps: AgentRoutesDeps) {
@@ -208,6 +214,12 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
     }
 
     const tenantId = c.var.tenant_id;
+
+    if (deps.preCreateGate) {
+      const gate = await deps.preCreateGate({ tenantId });
+      if (gate) return c.json(gate.body as object, gate.status as 403);
+    }
+
     const isLocalRuntime = !!body.runtime_binding;
     if (!isLocalRuntime && deps.validateModel) {
       const r = await deps.validateModel(tenantId, body.model);

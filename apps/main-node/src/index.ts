@@ -155,6 +155,7 @@ import {
   buildClerkPreCreateGate,
   handleClerkWebhook,
 } from "./lib/clerk";
+import { resolveMaxAgentsPerTenant, buildAgentPreCreateGate } from "./lib/agent-limits";
 import { SessionRegistry } from "./registry.js";
 
 loadDotenvDefaults();
@@ -1139,9 +1140,15 @@ v1.use("*", async (c, next) => {
 });
 
 // Mount route bundles. Same paths CF uses; behavior preserved.
+// Flat per-tenant agent cap (MAX_AGENTS_PER_TENANT) — interim production
+// guard for every tenant until billing entitlements own limits.
+const maxAgentsPerTenant = resolveMaxAgentsPerTenant();
 v1.route("/agents", buildAgentRoutes({
   services,
   validateModel: validateNodeModel,
+  ...(maxAgentsPerTenant
+    ? { preCreateGate: buildAgentPreCreateGate({ sql, maxAgents: maxAgentsPerTenant }) }
+    : {}),
 }));
 const sessionRouter = new NodeSessionRouter({
   sql,
