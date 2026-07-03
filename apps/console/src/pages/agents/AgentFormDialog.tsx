@@ -140,6 +140,9 @@ const BUILTIN_TOOLS: Array<{ name: string; label: string; description: string }>
   { name: "schedule", label: "schedule", description: "Wake this session later or on a recurring schedule" },
   { name: "list_schedules", label: "list_schedules", description: "List pending self-wake schedules for this session" },
   { name: "cancel_schedule", label: "cancel_schedule", description: "Cancel a pending self-wake schedule" },
+  { name: "create_ambient_rule", label: "create_ambient_rule", description: "Let the agent create standing ambient rules (recurring fresh-session jobs) from chat" },
+  { name: "list_ambient_rules", label: "list_ambient_rules", description: "List this agent's ambient rules" },
+  { name: "delete_ambient_rule", label: "delete_ambient_rule", description: "Delete one of this agent's ambient rules" },
   { name: "browser", label: "browser (opt-in)", description: "Heavy multi-step browser session (navigate / click / screenshot). Off by default — LLMs over-reach for it on simple lookups. Enable only when you need interactive navigation, JS-rendered SPAs, or auth flows." },
 ];
 

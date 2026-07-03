@@ -160,6 +160,7 @@ import {
 } from "./lib/clerk";
 import { resolveMaxAgentsPerTenant, buildAgentPreCreateGate } from "./lib/agent-limits";
 import { NodeAmbientDispatcher } from "./lib/node-ambient-dispatch";
+import { Cron } from "croner";
 import { SessionRegistry } from "./registry.js";
 
 loadDotenvDefaults();
@@ -694,6 +695,53 @@ const sessionRegistry = new SessionRegistry({
         }),
       cancelWakeup: (id) => sessionWakeups.cancel(context.sessionId, id),
       listWakeups: () => sessionWakeups.list(context.sessionId),
+      // Ambient rules from inside the session — "set up a daily deep-research
+      // run" said in chat becomes a standing agent-level rule the ambient
+      // dispatcher fires as fresh sessions. next_wake_at is armed here from
+      // the cron so the rule is live the moment the tool returns.
+      createAmbientRule: async (a) => {
+        const timezone = a.timezone?.trim() || "UTC";
+        const next = new Cron(a.cron, { timezone }).nextRun();
+        if (!next) throw new Error(`cron "${a.cron}" has no future occurrence`);
+        const row = await ambientRulesService.create({
+          tenantId: context.tenantId,
+          agentId: agent.id,
+          input: {
+            name: a.name,
+            ...(a.description ? { description: a.description } : {}),
+            trigger: {
+              source: "schedule",
+              config: { cron: a.cron, timezone, prompt: a.prompt },
+            },
+            wake_mode: a.wake_mode ?? "decide",
+            next_wake_at: next.toISOString(),
+            created_by: `session:${context.sessionId}`,
+          },
+        });
+        return { id: row.id, next_wake_at: row.next_wake_at };
+      },
+      listAmbientRules: async () => {
+        const rows = await ambientRulesService.listByAgent({
+          tenantId: context.tenantId,
+          agentId: agent.id,
+        });
+        return rows.map((r) => ({
+          id: r.id,
+          name: r.name,
+          enabled: r.enabled,
+          cron: typeof r.trigger.config?.cron === "string" ? r.trigger.config.cron : undefined,
+          next_wake_at: r.next_wake_at,
+          wake_mode: r.wake_mode,
+        }));
+      },
+      deleteAmbientRule: async (id) => {
+        await ambientRulesService.delete({
+          tenantId: context.tenantId,
+          agentId: agent.id,
+          ruleId: id,
+        });
+        return { deleted: true };
+      },
     });
   },
   buildHarness: () => {
