@@ -274,10 +274,21 @@ const authDisabled = process.env.AUTH_DISABLED === "1";
 const authDbPath = process.env.AUTH_DATABASE_PATH ?? "./data/auth.db";
 const sender = senderFromEnv(process.env);
 
+// AUTH_MODE=clerk → Clerk is the ONLY auth: better-auth is not mounted at
+// all (no /auth/* endpoints, no cookie sessions); every request must carry
+// a Clerk session JWT (or an x-api-key). Pair with a console built with
+// VITE_CLERK_PUBLISHABLE_KEY. AUTH_DISABLED=1 still wins for bare dev.
+const clerkOnly = (process.env.AUTH_MODE ?? "").trim().toLowerCase() === "clerk";
+if (clerkOnly && !resolveClerkConfig()) {
+  throw new Error(
+    "AUTH_MODE=clerk requires CLERK_ISSUER or CLERK_PUBLISHABLE_KEY to be set",
+  );
+}
+
 let auth: ReturnType<typeof buildBetterAuth> | null = null;
 let authShutdown: (() => Promise<void>) | null = null;
 
-if (!authDisabled) {
+if (!authDisabled && !clerkOnly) {
   if (usePostgres) {
     const { Pool } = (await import("pg")) as typeof import("pg");
     const pgPool = new Pool({ connectionString: dbUrl });
@@ -998,17 +1009,19 @@ app.get("/auth-info", (c) =>
     auth_disabled: authDisabled,
     providers: authDisabled
       ? []
-      : [
-          "email",
-          ...(process.env.AUTH_REQUIRE_EMAIL_VERIFY === "1" ? ["email-otp"] : []),
-          ...(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET
-            ? ["google"]
-            : []),
-          ...(process.env.GITHUB_AUTH_CLIENT_ID && process.env.GITHUB_AUTH_CLIENT_SECRET
-            ? ["github"]
-            : []),
-          ...(clerkConfig ? ["clerk"] : []),
-        ],
+      : clerkOnly
+        ? ["clerk"]
+        : [
+            "email",
+            ...(process.env.AUTH_REQUIRE_EMAIL_VERIFY === "1" ? ["email-otp"] : []),
+            ...(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET
+              ? ["google"]
+              : []),
+            ...(process.env.GITHUB_AUTH_CLIENT_ID && process.env.GITHUB_AUTH_CLIENT_SECRET
+              ? ["github"]
+              : []),
+            ...(clerkConfig ? ["clerk"] : []),
+          ],
     turnstile_site_key: null,
   }),
 );

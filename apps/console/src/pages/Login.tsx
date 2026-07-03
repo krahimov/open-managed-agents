@@ -389,6 +389,29 @@ function ClassicLogin() {
     );
   }
 
+  // Server runs AUTH_MODE=clerk but this console build has no
+  // VITE_CLERK_PUBLISHABLE_KEY — the classic form would only produce 404s
+  // (better-auth endpoints aren't mounted). Say so instead of dead-ending.
+  if (
+    authInfo?.providers?.length === 1 &&
+    authInfo.providers[0] === "clerk"
+  ) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-bg">
+        <div className="max-w-md w-full border border-border rounded-xl bg-bg-surface p-8 text-center space-y-3 shadow-[var(--shadow-sm)]">
+          <Logo className="mx-auto h-8 w-8" />
+          <h1 className="text-lg font-semibold text-fg">Sign-in runs through Clerk</h1>
+          <p className="text-sm text-fg-muted">
+            This server accepts only Clerk sessions, but this console build was
+            made without <code className="text-xs">VITE_CLERK_PUBLISHABLE_KEY</code>.
+            Rebuild the console with that variable set to enable the Clerk
+            sign-in screen.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
   const inputCls =
     "w-full border border-border rounded-md px-3 py-2.5 text-sm bg-bg-surface text-fg shadow-[var(--shadow-sm)] outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
 
