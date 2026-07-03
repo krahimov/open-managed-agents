@@ -20,6 +20,7 @@ import type {
 import {
   AgentNotFoundError,
   AgentVersionMismatchError,
+  AmbientRuleNotFoundError,
 } from "@open-managed-agents/agents-store";
 import type { RouteServicesArg } from "../types";
 import { resolveServices } from "../types";
@@ -99,6 +100,32 @@ function formatAgent(agent: AgentConfig) {
 function toApiAgent(row: AgentConfig & { tenant_id?: string }) {
   const { tenant_id: _t, ...rest } = row;
   return formatAgent(rest);
+}
+
+function toApiAmbientRule(row: {
+  tenant_id?: string;
+  id: string;
+  agent_id: string;
+  name: string;
+  description?: string;
+  enabled: boolean;
+  trigger: unknown;
+  wake_mode: string;
+  decision_policy?: unknown;
+  execution_profile?: string;
+  budget?: unknown;
+  created_by?: string;
+  created_at: string;
+  updated_at?: string;
+  next_wake_at?: string;
+  last_wake_at?: string;
+  last_decision?: unknown;
+}) {
+  const { tenant_id: _tenantId, ...rest } = row;
+  return {
+    type: "ambient_rule" as const,
+    ...rest,
+  };
 }
 
 function multiagentToCallableAgents(
@@ -341,6 +368,112 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
       ...(page.nextCursor ? { next_cursor: page.nextCursor } : {}),
       has_more: !!page.nextCursor,
     });
+  });
+
+  // GET /v1/agents/:id/ambient-rules — list ambient wake rules
+  app.get("/:id/ambient-rules", async (c) => {
+    const services = resolveServices(deps.services, c);
+    const tenantId = c.var.tenant_id;
+    const agentId = c.req.param("id");
+    const agent = await services.agents.get({ tenantId, agentId });
+    if (!agent) return c.json({ error: "Agent not found" }, 404);
+    const rules = await services.ambientRules.listByAgent({ tenantId, agentId });
+    return c.json({ data: rules.map(toApiAmbientRule) });
+  });
+
+  // POST /v1/agents/:id/ambient-rules — create ambient wake rule
+  app.post("/:id/ambient-rules", async (c) => {
+    const services = resolveServices(deps.services, c);
+    const tenantId = c.var.tenant_id;
+    const agentId = c.req.param("id");
+    const agent = await services.agents.get({ tenantId, agentId });
+    if (!agent) return c.json({ error: "Agent not found" }, 404);
+    const raw = await c.req.json().catch(() => null);
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return c.json({ error: "Request body must be an object" }, 400);
+    }
+    try {
+      const row = await services.ambientRules.create({
+        tenantId,
+        agentId,
+        input: {
+          ...(raw as Record<string, unknown>),
+          created_by:
+            typeof c.var.user_id === "string"
+              ? c.var.user_id
+              : (raw as { created_by?: string }).created_by,
+        } as Parameters<typeof services.ambientRules.create>[0]["input"],
+      });
+      return c.json(toApiAmbientRule(row), 201);
+    } catch (err) {
+      if (err instanceof TypeError) return c.json({ error: err.message }, 400);
+      throw err;
+    }
+  });
+
+  // GET /v1/agents/:id/ambient-rules/:ruleId — fetch ambient wake rule
+  app.get("/:id/ambient-rules/:ruleId", async (c) => {
+    const services = resolveServices(deps.services, c);
+    const tenantId = c.var.tenant_id;
+    const agentId = c.req.param("id");
+    const ruleId = c.req.param("ruleId");
+    const agent = await services.agents.get({ tenantId, agentId });
+    if (!agent) return c.json({ error: "Agent not found" }, 404);
+    const row = await services.ambientRules.get({ tenantId, agentId, ruleId });
+    if (!row) return c.json({ error: "Ambient rule not found" }, 404);
+    return c.json(toApiAmbientRule(row));
+  });
+
+  // PATCH/PUT /v1/agents/:id/ambient-rules/:ruleId — update ambient wake rule
+  const updateAmbientRule = async (
+    c: import("hono").Context<Vars, "/:id/ambient-rules/:ruleId">,
+  ): Promise<Response> => {
+    const services = resolveServices(deps.services, c);
+    const tenantId = c.var.tenant_id;
+    const agentId = c.req.param("id");
+    const ruleId = c.req.param("ruleId");
+    const agent = await services.agents.get({ tenantId, agentId });
+    if (!agent) return c.json({ error: "Agent not found" }, 404);
+    const raw = await c.req.json().catch(() => null);
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return c.json({ error: "Request body must be an object" }, 400);
+    }
+    try {
+      const row = await services.ambientRules.update({
+        tenantId,
+        agentId,
+        ruleId,
+        input: raw as Parameters<typeof services.ambientRules.update>[0]["input"],
+      });
+      return c.json(toApiAmbientRule(row));
+    } catch (err) {
+      if (err instanceof AmbientRuleNotFoundError) {
+        return c.json({ error: "Ambient rule not found" }, 404);
+      }
+      if (err instanceof TypeError) return c.json({ error: err.message }, 400);
+      throw err;
+    }
+  };
+  app.patch("/:id/ambient-rules/:ruleId", updateAmbientRule);
+  app.put("/:id/ambient-rules/:ruleId", updateAmbientRule);
+
+  // DELETE /v1/agents/:id/ambient-rules/:ruleId — disable/remove ambient wake rule
+  app.delete("/:id/ambient-rules/:ruleId", async (c) => {
+    const services = resolveServices(deps.services, c);
+    const tenantId = c.var.tenant_id;
+    const agentId = c.req.param("id");
+    const ruleId = c.req.param("ruleId");
+    const agent = await services.agents.get({ tenantId, agentId });
+    if (!agent) return c.json({ error: "Agent not found" }, 404);
+    try {
+      await services.ambientRules.delete({ tenantId, agentId, ruleId });
+      return c.json({ type: "ambient_rule_deleted", id: ruleId });
+    } catch (err) {
+      if (err instanceof AmbientRuleNotFoundError) {
+        return c.json({ error: "Ambient rule not found" }, 404);
+      }
+      throw err;
+    }
   });
 
   // GET /v1/agents/:id — get

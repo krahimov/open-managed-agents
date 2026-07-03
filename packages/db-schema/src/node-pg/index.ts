@@ -10,6 +10,7 @@
 
 export * from "./cf-auth-auth";
 export * from "./cf-auth-agents";
+export * from "./cf-auth-ambient-rules";
 export * from "./cf-auth-sessions";
 export * from "./cf-auth-memory";
 export * from "./cf-auth-vaults";

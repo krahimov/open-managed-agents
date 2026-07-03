@@ -28,3 +28,10 @@ export class AgentVersionMismatchError extends Error {
     super(`Version mismatch. Expected ${expected}, got ${actual}.`);
   }
 }
+
+export class AmbientRuleNotFoundError extends Error {
+  readonly code = "ambient_rule_not_found";
+  constructor(message = "Ambient rule not found") {
+    super(message);
+  }
+}

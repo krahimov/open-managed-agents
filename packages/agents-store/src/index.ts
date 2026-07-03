@@ -12,13 +12,20 @@
 //   import { createInMemoryAgentService } from "@open-managed-agents/agents-store/test-fakes";
 
 export * from "./types";
+export * from "./ambient-types";
 export * from "./errors";
 export * from "./ports";
+export * from "./ambient-ports";
 export { AgentService } from "./service";
 export type { AgentServiceDeps, NewAgentInput, UpdateAgentInput } from "./service";
+export { AmbientRuleService } from "./ambient-service";
+export type { AmbientRuleServiceDeps } from "./ambient-service";
 
 export {
+  createCfAmbientRuleService,
   createCfAgentService,
+  createSqliteAmbientRuleService,
   createSqliteAgentService,
+  SqlAmbientRuleRepo,
   SqlAgentRepo,
 } from "./adapters";

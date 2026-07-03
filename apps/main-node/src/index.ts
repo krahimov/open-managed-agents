@@ -33,7 +33,10 @@ import {
   createPostgresSqlClient,
   type SqlClient,
 } from "@open-managed-agents/sql-client";
-import { createSqliteAgentService } from "@open-managed-agents/agents-store";
+import {
+  createSqliteAgentService,
+  createSqliteAmbientRuleService,
+} from "@open-managed-agents/agents-store";
 import {
   createSqliteMemoryStoreService,
   SqlMemoryRepo,
@@ -156,6 +159,7 @@ import {
   handleClerkWebhook,
 } from "./lib/clerk";
 import { resolveMaxAgentsPerTenant, buildAgentPreCreateGate } from "./lib/agent-limits";
+import { NodeAmbientDispatcher } from "./lib/node-ambient-dispatch";
 import { SessionRegistry } from "./registry.js";
 
 loadDotenvDefaults();
@@ -399,6 +403,7 @@ if (clerkStore) {
 // ─── Stores ─────────────────────────────────────────────────────────────
 
 const agentsService = createSqliteAgentService({ db: drizzleDb });
+const ambientRulesService = createSqliteAmbientRuleService({ db: drizzleDb });
 const vaultService = createSqliteVaultService({ db: drizzleDb });
 const credentialService = createSqliteCredentialService({ db: drizzleDb });
 const sessionsService = createSqliteSessionService({ db: drizzleDb });
@@ -822,6 +827,7 @@ const kv = new SqlKvStore({ db: drizzleDb, tenantId: "default" });
 const services: RouteServices = {
   sql,
   agents: agentsService,
+  ambientRules: ambientRulesService,
   vaults: vaultService,
   credentials: credentialService,
   memory: memoryService,
@@ -1799,6 +1805,17 @@ serve({ fetch: app.fetch, port, hostname: host }, (info) => {
 // applied) webhook-events retention. Linear dispatch is left un-wired here
 // because main-node doesn't construct a LinearProvider; pass `linearSweeper`
 // when an in-process gateway lands.
+const ambientDispatcher = new NodeAmbientDispatcher({
+  ambientRules: ambientRulesService,
+  agents: agentsService,
+  sessions: sessionsService,
+  // Same lever the integrations bridge uses: append a user.message via
+  // NodeSessionRouter so the harness runs a real turn.
+  appendUserEvent: async (sessionId, _tenantId, _agentId, event) => {
+    await sessionRouter.appendEvent(sessionId, event);
+  },
+});
+
 const scheduler = buildNodeScheduler({
   evalServices: {
     agents: agentsService,
@@ -1808,6 +1825,7 @@ const scheduler = buildNodeScheduler({
     kv,
   },
   memory: memoryService,
+  ambientDispatcher,
   integrationsSql: platformRootSecret ? sql : null,
   wakeups: { pump: () => sessionWakeups.pump() },
 });

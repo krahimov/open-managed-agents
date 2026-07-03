@@ -29,10 +29,14 @@ import {
   type EvalRunnerServices,
   type SandboxFetcher,
 } from "@open-managed-agents/evals-runner";
+import type { NodeAmbientDispatcher } from "./node-ambient-dispatch.js";
 
 export interface NodeSchedulerDeps {
   evalServices: EvalRunnerServices;
   memory: MemoryStoreService;
+  /** Ambient rule dispatcher — sweeps due ambient_rules and starts agent
+   *  sessions. Skip when null (feature dormant until rules exist anyway). */
+  ambientDispatcher?: NodeAmbientDispatcher | null;
   /** Optional integrations DB SqlClient. Pass null to skip the
    *  webhook-events retention sweep on Node. */
   integrationsSql?: SqlClient | null;
@@ -127,6 +131,27 @@ export function buildNodeScheduler(deps: NodeSchedulerDeps) {
   // is provided — most self-host deployments don't run the gateway side
   // (no Linear OAuth callback URL configured), so the registration is
   // gated rather than no-op'd.
+  // Ambient rule sweep — every 15s by default (croner 6-field, with
+  // seconds). Rules are indexed on (tenant, enabled, next_wake_at) so an
+  // empty table costs one indexed miss per tick.
+  if (deps.ambientDispatcher) {
+    const dispatcher = deps.ambientDispatcher;
+    scheduler.register({
+      name: "ambient-dispatch",
+      cron: cron("AMBIENT_DISPATCH_CRON", "*/15 * * * * *"),
+      handler: async () => {
+        try {
+          const fired = await dispatcher.dispatchDue();
+          if (fired > 0) {
+            log.info({ op: "scheduler.ambient.fired", fired }, "ambient rules fired");
+          }
+        } catch (err) {
+          log.warn({ err, op: "scheduler.ambient.failed" }, "ambient dispatch failed");
+        }
+      },
+    });
+  }
+
   if (deps.linearSweeper) {
     const resolveSweeper = deps.linearSweeper;
     scheduler.register({

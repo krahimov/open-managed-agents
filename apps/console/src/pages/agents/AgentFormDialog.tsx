@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { Select, SelectGroup, SelectGroupLabel, SelectOption } from "../../components/Select";
 import { Combobox } from "../../components/Combobox";
 import { McpServerPickerModal } from "../../components/McpServerPickerModal";
+import { AmbientTriggerControls } from "../../components/AmbientTriggerControls";
 import { AGENT_TEMPLATES, type AgentTemplate } from "../../lib/agent-templates";
 import {
   COMPOSIO_NOT_CONFIGURED_MESSAGE,
@@ -27,6 +28,16 @@ import {
 } from "@open-managed-agents/acp-runtime/known-agents";
 import type { AgentRecord as Agent } from "../../types/agent";
 import { BRAND_NAME } from "../../lib/brand";
+import {
+  AMBIENT_WAKE_MODES,
+  buildAmbientTrigger,
+  buildBudget,
+  buildDecisionPolicy,
+  createDefaultAmbientTriggerDraft,
+  type AmbientBudgetPreset,
+  type AmbientDecisionPreset,
+  type AmbientWakeMode,
+} from "../../lib/ambient-controls";
 
 interface McpEntry {
   name: string;
@@ -126,6 +137,9 @@ const BUILTIN_TOOLS: Array<{ name: string; label: string; description: string }>
   { name: "grep", label: "grep", description: "Search file contents" },
   { name: "web_fetch", label: "web_fetch", description: "Fetch a URL → markdown. Default for any web read." },
   { name: "web_search", label: "web_search", description: "Web search via DuckDuckGo. Default for lookups." },
+  { name: "schedule", label: "schedule", description: "Wake this session later or on a recurring schedule" },
+  { name: "list_schedules", label: "list_schedules", description: "List pending self-wake schedules for this session" },
+  { name: "cancel_schedule", label: "cancel_schedule", description: "Cancel a pending self-wake schedule" },
   { name: "browser", label: "browser (opt-in)", description: "Heavy multi-step browser session (navigate / click / screenshot). Off by default — LLMs over-reach for it on simple lookups. Enable only when you need interactive navigation, JS-rendered SPAs, or auth flows." },
 ];
 
@@ -162,6 +176,15 @@ const INITIAL_FORM = {
   toolOverrides: {} as Record<string, ToolOverride>,
   // Opt-in to the built-in `general_subagent` tool.
   enableGeneralSubagent: false,
+  ambientEnabled: false,
+  ambientRuleName: "",
+  ambientRuleDescription: "",
+  ambientRuleActive: true,
+  ambientTrigger: createDefaultAmbientTriggerDraft("schedule"),
+  ambientWakeMode: "decide" as AmbientWakeMode,
+  ambientNextWakeAt: "",
+  ambientDecisionPreset: "new_signal" as AmbientDecisionPreset,
+  ambientBudgetPreset: "standard" as AmbientBudgetPreset,
 };
 
 interface AgentFormDialogProps {
@@ -219,7 +242,7 @@ export function AgentFormDialog({
   const [templateSearch, setTemplateSearch] = useState("");
   const [form, setForm] = useState({ ...INITIAL_FORM });
   const [tab, setTab] = useState<
-    "basic" | "integrations" | "tools" | "skills" | "sandbox" | "mcp" | "agents"
+    "basic" | "integrations" | "ambient" | "tools" | "skills" | "sandbox" | "mcp" | "agents"
   >("basic");
   const [createMode, setCreateMode] = useState<"form" | "yaml" | "json">("form");
   const [codeValue, setCodeValue] = useState("");
@@ -586,6 +609,7 @@ export function AgentFormDialog({
   const create = async () => {
     setCreateError("");
     try {
+      const ambientRuleBody = form.ambientEnabled ? buildAmbientRuleBody(form) : null;
       const defaultVaultIds = await ensureComposioCredentialForAgent();
       const mcpServers = mergedMcpServersForCreate();
       const payload: Record<string, unknown> = {
@@ -630,6 +654,22 @@ export function AgentFormDialog({
         method: "POST",
         body: JSON.stringify(payload),
       });
+      if (ambientRuleBody) {
+        try {
+          await api(`/v1/agents/${agent.id}/ambient-rules`, {
+            method: "POST",
+            body: JSON.stringify(ambientRuleBody),
+          });
+        } catch (ambientErr) {
+          const message =
+            ambientErr instanceof Error
+              ? ambientErr.message
+              : "Failed to create ambient rule";
+          toast.error("Agent created, but ambient setup failed.", {
+            description: message,
+          });
+        }
+      }
       closeCreate();
       onCreated?.();
       await goToSetup(agent);
@@ -1024,6 +1064,18 @@ export function AgentFormDialog({
                     </button>
                     <button
                       role="tab"
+                      aria-selected={tab === "ambient"}
+                      tabIndex={tab === "ambient" ? 0 : -1}
+                      onClick={() => setTab("ambient")}
+                      className={tabCls("ambient")}
+                    >
+                      Ambient{" "}
+                      {form.ambientEnabled && (
+                        <span className="ml-1 text-xs opacity-60">(1)</span>
+                      )}
+                    </button>
+                    <button
+                      role="tab"
                       aria-selected={tab === "tools"}
                       tabIndex={tab === "tools" ? 0 : -1}
                       onClick={() => setTab("tools")}
@@ -1134,6 +1186,15 @@ export function AgentFormDialog({
                   />
                 )}
 
+                {createMode === "form" && tab === "ambient" && (
+                  <AmbientTab
+                    form={form}
+                    setForm={setForm}
+                    inputCls={inputCls}
+                    createError={createError}
+                  />
+                )}
+
                 {createMode === "form" && tab === "tools" && (
                   <ToolsTab form={form} setForm={setForm} createError={createError} />
                 )}
@@ -1189,6 +1250,9 @@ export function AgentFormDialog({
                       {form.environmentId && (
                         <span className="mr-3">sandbox selected</span>
                       )}
+                      {form.ambientEnabled && (
+                        <span className="mr-3">ambient rule</span>
+                      )}
                       {form.skills.length > 0 && (
                         <span className="mr-3">{form.skills.length} skills</span>
                       )}
@@ -1235,6 +1299,182 @@ export function AgentFormDialog({
 
 type FormState = typeof INITIAL_FORM;
 type FormSetter = React.Dispatch<React.SetStateAction<FormState>>;
+
+function buildAmbientRuleBody(form: FormState): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    name: form.ambientRuleName.trim() || `${form.name.trim()} heartbeat`,
+    enabled: form.ambientRuleActive,
+    trigger: buildAmbientTrigger(form.ambientTrigger),
+    wake_mode: form.ambientWakeMode,
+  };
+  const description = form.ambientRuleDescription.trim();
+  if (description) body.description = description;
+  const policy = buildDecisionPolicy(form.ambientDecisionPreset);
+  if (policy) body.decision_policy = policy;
+  const budget = buildBudget(form.ambientBudgetPreset);
+  if (budget) body.budget = budget;
+  if (form.ambientNextWakeAt) {
+    const nextWakeAt = new Date(form.ambientNextWakeAt);
+    if (Number.isNaN(nextWakeAt.getTime())) {
+      throw new Error("Next wake must be a valid date and time");
+    }
+    body.next_wake_at = nextWakeAt.toISOString();
+  }
+  return body;
+}
+
+function AmbientTab({
+  form,
+  setForm,
+  inputCls,
+  createError,
+}: {
+  form: FormState;
+  setForm: FormSetter;
+  inputCls: string;
+  createError: string;
+}) {
+  return (
+    <div className="space-y-4">
+      {createError && (
+        <div className="text-sm text-danger bg-danger-subtle border border-danger/30 rounded-lg px-3 py-2">
+          {createError}
+        </div>
+      )}
+
+      <div className="rounded-md border border-border bg-bg-surface px-3 py-3">
+        <label className="flex items-start gap-2 text-sm cursor-pointer">
+          <input
+            type="checkbox"
+            checked={form.ambientEnabled}
+            onChange={(e) => setForm({ ...form, ambientEnabled: e.target.checked })}
+            className="accent-brand mt-0.5"
+          />
+          <div>
+            <div className="font-medium text-fg">Create an ambient rule</div>
+            <p className="text-xs text-fg-subtle mt-0.5">
+              Attach the agent's first wake rule during creation.
+            </p>
+          </div>
+        </label>
+      </div>
+
+      {form.ambientEnabled && (
+        <div className="space-y-3">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <AmbientField label="Rule name">
+              <input
+                value={form.ambientRuleName}
+                onChange={(e) => setForm({ ...form, ambientRuleName: e.target.value })}
+                className={inputCls}
+                placeholder={`${form.name || "Agent"} heartbeat`}
+              />
+            </AmbientField>
+            <AmbientField label="Next wake">
+              <input
+                type="datetime-local"
+                value={form.ambientNextWakeAt}
+                onChange={(e) => setForm({ ...form, ambientNextWakeAt: e.target.value })}
+                className={inputCls}
+              />
+            </AmbientField>
+          </div>
+
+          <AmbientField label="Description">
+            <input
+              value={form.ambientRuleDescription}
+              onChange={(e) => setForm({ ...form, ambientRuleDescription: e.target.value })}
+              className={inputCls}
+              placeholder="Check for new pull requests every hour"
+            />
+          </AmbientField>
+
+          <AmbientTriggerControls
+            value={form.ambientTrigger}
+            onChange={(ambientTrigger) => setForm({ ...form, ambientTrigger })}
+            inputClassName={inputCls}
+          />
+
+          <div className="grid gap-3 sm:grid-cols-3">
+            <AmbientField label="Wake mode">
+              <select
+                value={form.ambientWakeMode}
+                onChange={(e) =>
+                  setForm({ ...form, ambientWakeMode: e.target.value as AmbientWakeMode })
+                }
+                className={inputCls}
+              >
+                {AMBIENT_WAKE_MODES.map((mode) => (
+                  <option key={mode} value={mode}>
+                    {mode}
+                  </option>
+                ))}
+              </select>
+            </AmbientField>
+            <AmbientField label="Status">
+              <label className="inline-flex w-full items-center gap-2 rounded-md border border-border bg-bg px-3 py-2 min-h-11 sm:min-h-0 text-sm text-fg-muted">
+                <input
+                  type="checkbox"
+                  checked={form.ambientRuleActive}
+                  onChange={(e) => setForm({ ...form, ambientRuleActive: e.target.checked })}
+                  className="accent-brand"
+                />
+                Active
+              </label>
+            </AmbientField>
+            <AmbientField label="Decision">
+              <select
+                value={form.ambientDecisionPreset}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    ambientDecisionPreset: e.target.value as AmbientDecisionPreset,
+                  })
+                }
+                className={inputCls}
+              >
+                <option value="always">Always wake</option>
+                <option value="new_signal">Only for new signal</option>
+                <option value="approval_required">Ask before acting</option>
+              </select>
+            </AmbientField>
+            <AmbientField label="Budget">
+              <select
+                value={form.ambientBudgetPreset}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    ambientBudgetPreset: e.target.value as AmbientBudgetPreset,
+                  })
+                }
+                className={inputCls}
+              >
+                <option value="conservative">Conservative</option>
+                <option value="standard">Standard</option>
+                <option value="intensive">High frequency</option>
+              </select>
+            </AmbientField>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AmbientField({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <label className="block text-sm text-fg-muted">
+      <span className="block mb-1">{label}</span>
+      {children}
+    </label>
+  );
+}
 
 interface BasicTabProps {
   form: FormState;
