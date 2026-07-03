@@ -254,6 +254,20 @@ const router = createBrowserRouter([
   },
 ]);
 
+// A deploy replaces every hashed chunk; tabs opened before it still hold
+// the old index.html and fail to lazy-load route chunks (Model Cards /
+// Integrations pages silently break). Vite fires this event exactly for
+// that case — reload once to pick up the fresh manifest.
+window.addEventListener("vite:preloadError", (event) => {
+  event.preventDefault();
+  const KEY = "oma-chunk-reload-at";
+  const last = Number(sessionStorage.getItem(KEY) ?? 0);
+  if (Date.now() - last > 10_000) {
+    sessionStorage.setItem(KEY, String(Date.now()));
+    window.location.reload();
+  }
+});
+
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <ErrorBoundary>
