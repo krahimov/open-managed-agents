@@ -78,8 +78,11 @@ export interface SessionRegistryDeps {
   ): Promise<SandboxExecutor>;
 
   /** Build the LanguageModel for the agent. Reads env, applies custom
-   *  headers, picks the right provider. */
-  buildModel(agent: AgentConfig): LanguageModel | Promise<LanguageModel>;
+   *  headers, picks the right provider. tenantId is the SESSION's tenant —
+   *  agent snapshots don't carry tenant_id, so the model-card lookup must
+   *  receive it explicitly (deriving it from the agent object searched
+   *  tenant "default" and broke multi-tenant turn-time resolution). */
+  buildModel(agent: AgentConfig, tenantId: string): LanguageModel | Promise<LanguageModel>;
 
   /** Build harness tools. Returns the tools dict the harness expects. */
   buildTools(
@@ -325,7 +328,7 @@ export class SessionRegistry {
         // Node passes no-ops since the work has already been done.
         mountMemoryStores: async () => {},
         mountSessionOutputs: async () => {},
-        buildModel: (agent) => this.deps.buildModel(agent),
+        buildModel: (agent) => this.deps.buildModel(agent, tenantId),
         buildTools: (agent, sb) => this.deps.buildTools(agent, sb, { tenantId, sessionId, environment }),
         buildHarness: () => this.deps.buildHarness(),
         buildHarnessContext: (input) =>

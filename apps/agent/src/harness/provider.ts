@@ -153,14 +153,18 @@ export function resolveModel(
   if (customHeaders) Object.assign(headers, customHeaders);
 
   // @ai-sdk/anthropic appends `/messages` directly to baseURL — no `/v1`
-  // segment is added. Real api.anthropic.com endpoints include `/v1` in the
-  // SDK default, so deployments pointing at proxies must too. Auto-append
-  // `/v1` if the user supplied a bare host so common env values work.
+  // segment is added. Real api.anthropic.com endpoints include `/v1`, so
+  // auto-append it when the caller supplied a bare host — and NEVER fall
+  // back to the SDK default: depending on which peer-variant copy of
+  // @ai-sdk/anthropic pnpm loads, the default resolves to
+  // https://api.anthropic.com (no /v1) and every request 404s with an
+  // empty body. Pin the correct URL explicitly. Empty-string baseURL
+  // (model cards store '' for "unset") counts as absent.
   const normalizedBaseURL = baseURL
     ? /\/v\d+(\/)?$/.test(baseURL)
       ? baseURL.replace(/\/$/, "")
       : `${baseURL.replace(/\/$/, "")}/v1`
-    : undefined;
+    : "https://api.anthropic.com/v1";
 
   const anthropic = createAnthropic({
     apiKey,

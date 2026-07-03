@@ -662,8 +662,8 @@ const sessionRegistry = new SessionRegistry({
   buildSandbox,
   sandboxWorkdirRoot: process.env.SANDBOX_WORKDIR ?? "./data/sandboxes",
   sqlDialect: dialect,
-  buildModel: async (agent) => {
-    const creds = await resolveNodeModelCredentials(agent);
+  buildModel: async (agent, tenantId) => {
+    const creds = await resolveNodeModelCredentials(agent, tenantId);
     return resolveModel(
       creds.model,
       creds.apiKey,
@@ -673,7 +673,7 @@ const sessionRegistry = new SessionRegistry({
     );
   },
   buildTools: async (agent, sandbox, context) => {
-    const creds = await resolveNodeModelCredentials(agent);
+    const creds = await resolveNodeModelCredentials(agent, context.tenantId);
     return buildTools(agent, sandbox, {
       ANTHROPIC_API_KEY: creds.apiCompat.startsWith("ant") ? creds.apiKey : undefined,
       ANTHROPIC_BASE_URL: creds.apiCompat.startsWith("ant") ? creds.baseURL : undefined,
@@ -787,7 +787,7 @@ const sessionRegistry = new SessionRegistry({
     };
   },
   buildHarnessContext: async (input) => {
-    const creds = await resolveNodeModelCredentials(input.agent);
+    const creds = await resolveNodeModelCredentials(input.agent, input.tenantId);
     const runtime = new NodeHarnessRuntime({
       sessionId: input.sessionId,
       log: input.eventLog,
@@ -2880,9 +2880,14 @@ function providerToCompat(provider: string): ApiCompat {
 
 async function resolveNodeModelCredentials(
   agent: import("@open-managed-agents/shared").AgentConfig,
+  tenantId: string,
 ): Promise<NodeModelCredentials> {
   const handle = modelHandle(agent.model);
-  const tenantId = (agent as { tenant_id?: string }).tenant_id ?? "default";
+  // tenantId MUST come from the session context, never from the agent
+  // object: session agent_snapshots are persisted with tenant_id stripped
+  // (sessions route), so `agent.tenant_id ?? "default"` silently searched
+  // the wrong tenant at turn time and no real tenant's model card was
+  // ever found — the production "No model card with model_id …" bug.
   const card = await modelCardService.findByModelId({ tenantId, modelId: handle });
   if (card) {
     const apiKey = await modelCardService.getApiKey({ tenantId, cardId: card.id });
@@ -2892,7 +2897,9 @@ async function resolveNodeModelCredentials(
     return {
       model: card.model,
       apiKey,
-      baseURL: card.base_url ?? undefined,
+      // Cards persist '' for "no base url" — coerce to undefined so the
+      // provider default (with /v1) applies instead of an empty string.
+      baseURL: card.base_url || undefined,
       apiCompat: providerToCompat(card.provider),
       customHeaders: card.custom_headers ?? undefined,
     };
