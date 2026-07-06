@@ -178,3 +178,97 @@ export function resolveModel(
 
   return anthropic(modelId);
 }
+
+// ─── OpenAI tool-name length cap ─────────────────────────────────────────
+//
+// OpenAI's chat/completions API rejects function names longer than 64
+// characters — both in the `tools` array AND inside replayed history
+// (`messages[n].tool_calls[n].function.name`), with a hard 400. MCP tool
+// names routinely blow past that (Composio:
+// mcp__composio_gmail_googlecalendar_notion__COMPOSIO_MULTI_EXECUTE_TOOL
+// is 70 chars), which killed every gpt-* turn that touched such a tool.
+// Anthropic has no such limit, so this only applies on the OpenAI path.
+//
+// The mangle is a pure function of the name (prefix + fnv1a suffix), so
+// it is stable across turns: a mangled name logged into the event log
+// re-mangles to itself on history replay (already ≤64 → identity).
+
+export const OPENAI_MAX_TOOL_NAME = 64;
+
+function fnv1a(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h >>> 0;
+}
+
+/** Deterministically shorten a tool name to ≤64 chars (identity when it
+ *  already fits). Collisions between distinct long names are avoided by
+ *  the 7-char base36 fnv1a suffix. */
+export function openAiSafeToolName(name: string): string {
+  if (name.length <= OPENAI_MAX_TOOL_NAME) return name;
+  const suffix = fnv1a(name).toString(36).padStart(7, "0").slice(0, 7);
+  return `${name.slice(0, OPENAI_MAX_TOOL_NAME - 8)}_${suffix}`;
+}
+
+/** True when the resolved LanguageModel talks to an OpenAI-compat API
+ *  (createOpenAI providers report provider ids like "openai.chat"). */
+export function isOpenAiCompatModel(model: LanguageModel): boolean {
+  if (typeof model === "string") return false;
+  const provider = (model as { provider?: unknown }).provider;
+  return typeof provider === "string" && provider.startsWith("openai");
+}
+
+/**
+ * Sanitize tool names for the OpenAI path: re-keys the tools dict and
+ * rewrites tool-call / tool-result parts in history messages with the
+ * same deterministic mangle. Fast no-op (returns the originals) when
+ * every name already fits. The AI SDK keys returned tool calls by the
+ * dict key, so execution routes to the right tool without a reverse map;
+ * events log the mangled name, which re-mangles to itself next turn.
+ */
+export function sanitizeOpenAiToolNames<M extends { role?: string; content?: unknown }>(input: {
+  tools?: Record<string, unknown>;
+  messages?: M[];
+}): { tools?: Record<string, unknown>; messages?: M[] } {
+  const toolKeys = Object.keys(input.tools ?? {});
+  const messagesHaveLongNames = (input.messages ?? []).some(
+    (m) =>
+      Array.isArray(m.content) &&
+      m.content.some(
+        (p: { type?: string; toolName?: string }) =>
+          (p?.type === "tool-call" || p?.type === "tool-result") &&
+          typeof p.toolName === "string" &&
+          p.toolName.length > OPENAI_MAX_TOOL_NAME,
+      ),
+  );
+  const toolsHaveLongNames = toolKeys.some((k) => k.length > OPENAI_MAX_TOOL_NAME);
+  if (!toolsHaveLongNames && !messagesHaveLongNames) return input;
+
+  const tools = input.tools
+    ? Object.fromEntries(
+        Object.entries(input.tools).map(([k, v]) => [openAiSafeToolName(k), v]),
+      )
+    : undefined;
+
+  const messages = input.messages?.map((m) => {
+    if (!Array.isArray(m.content)) return m;
+    let changed = false;
+    const content = m.content.map((p: { type?: string; toolName?: string }) => {
+      if (
+        (p?.type === "tool-call" || p?.type === "tool-result") &&
+        typeof p.toolName === "string" &&
+        p.toolName.length > OPENAI_MAX_TOOL_NAME
+      ) {
+        changed = true;
+        return { ...p, toolName: openAiSafeToolName(p.toolName) };
+      }
+      return p;
+    });
+    return changed ? { ...m, content } : m;
+  });
+
+  return { tools, messages };
+}
