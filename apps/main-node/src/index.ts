@@ -1871,6 +1871,42 @@ const ambientDispatcher = new NodeAmbientDispatcher({
   appendUserEvent: async (sessionId, _tenantId, _agentId, event) => {
     await sessionRouter.appendEvent(sessionId, event);
   },
+  // Vault credentials → MCP servers for the spawned snapshot. Console
+  // sessions get the Composio tool-router entry injected client-side at
+  // create time; ambient sessions derive the same entry from the vault's
+  // composio_mcp credential (its mcp_server_url IS the persistent
+  // tool-router session URL). Name mirrors the console's convention:
+  // composio_<toolkits-joined>, so resolveNodeMcpProxyTarget's URL match
+  // finds the credential and injects the api key at call time.
+  resolveVaultMcpServers: async (tenantId, vaultIds) => {
+    const grouped = await credentialService
+      .listByVaults({ tenantId, vaultIds })
+      .catch(() => []);
+    const servers: Array<{ name: string; type: "url"; url: string }> = [];
+    const seenUrls = new Set<string>();
+    for (const group of grouped) {
+      for (const cred of group.credentials) {
+        const c = cred as {
+          archived_at?: string | null;
+          auth?: { type?: string; mcp_server_url?: string; composio_toolkits?: string[] };
+        };
+        if (c.archived_at) continue;
+        const auth = c.auth;
+        if (auth?.type !== "composio_mcp") continue;
+        const url = auth.mcp_server_url?.trim();
+        if (!url || seenUrls.has(url)) continue;
+        seenUrls.add(url);
+        const toolkits = Array.isArray(auth.composio_toolkits)
+          ? auth.composio_toolkits.filter((t): t is string => typeof t === "string" && !!t)
+          : [];
+        const base = toolkits.length > 0 ? `composio_${toolkits.join("_")}` : "composio";
+        let name = base;
+        for (let i = 2; servers.some((s) => s.name === name); i++) name = `${base}_${i}`;
+        servers.push({ name, type: "url", url });
+      }
+    }
+    return servers;
+  },
 });
 
 const scheduler = buildNodeScheduler({

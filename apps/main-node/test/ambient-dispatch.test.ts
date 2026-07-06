@@ -155,6 +155,9 @@ describe("NodeAmbientDispatcher", () => {
     expect(tm.created).toHaveLength(0);
     const [rule] = await tm.ambientRules.listByAgent({ tenantId: TENANT, agentId: AGENT });
     expect(rule.last_decision?.outcome).toBe("error");
+    // Orphan rules are DISABLED (not just disarmed) — the service's
+    // arming invariant would otherwise re-arm an enabled schedule rule.
+    expect(rule.enabled).toBe(false);
     expect(rule.next_wake_at).toBeUndefined();
     expect(await tm.dispatcher.dispatchDue()).toBe(0);
   });
@@ -225,5 +228,91 @@ describe("helpers", () => {
       wake_mode: "act",
     } as never);
     expect(custom).toBe("Check my email inbox");
+  });
+});
+
+describe("service-level arming (dormant-rule fix)", () => {
+  it("arms schedule rules created without next_wake_at from the cron", async () => {
+    const t = build();
+    const rule = await t.ambientRules.create({
+      tenantId: TENANT,
+      agentId: AGENT,
+      input: {
+        name: "UI-created rule",
+        trigger: { source: "schedule", config: { cron: "0 9 * * *", timezone: "UTC" } },
+        wake_mode: "act",
+        // note: NO next_wake_at — the console leaves it blank
+      },
+    });
+    expect(rule.next_wake_at).toBe("2026-07-03T09:00:00.000Z");
+  });
+
+  it("does not arm disabled or non-schedule or cronless rules", async () => {
+    const t = build();
+    const disabled = await t.ambientRules.create({
+      tenantId: TENANT, agentId: AGENT,
+      input: { name: "off", enabled: false, trigger: { source: "schedule", config: { cron: "0 9 * * *" } } },
+    });
+    expect(disabled.next_wake_at).toBeUndefined();
+    const webhook = await t.ambientRules.create({
+      tenantId: TENANT, agentId: AGENT,
+      input: { name: "wh", trigger: { source: "webhook", config: {} } },
+    });
+    expect(webhook.next_wake_at).toBeUndefined();
+    const noCron = await t.ambientRules.create({
+      tenantId: TENANT, agentId: AGENT,
+      input: { name: "nc", trigger: { source: "schedule", config: {} } },
+    });
+    expect(noCron.next_wake_at).toBeUndefined();
+  });
+
+  it("re-arms on update when a schedule rule is enabled with no wake", async () => {
+    const t = build();
+    const rule = await t.ambientRules.create({
+      tenantId: TENANT, agentId: AGENT,
+      input: { name: "flip", enabled: false, trigger: { source: "schedule", config: { cron: "0 9 * * *", timezone: "UTC" } } },
+    });
+    expect(rule.next_wake_at).toBeUndefined();
+    const enabled = await t.ambientRules.update({
+      tenantId: TENANT, agentId: AGENT, ruleId: rule.id,
+      input: { enabled: true },
+    });
+    expect(enabled.next_wake_at).toBe("2026-07-03T09:00:00.000Z");
+  });
+});
+
+describe("vault MCP injection", () => {
+  it("merges vault-derived servers into the spawned snapshot", async () => {
+    const { service: ambientRules } = createInMemoryAmbientRuleService({ clock: { nowMs: () => T0 } });
+    const created: Array<{ agentSnapshot?: { mcp_servers?: unknown } }> = [];
+    const dispatcher = new NodeAmbientDispatcher({
+      ambientRules,
+      agents: {
+        get: async () => ({
+          id: AGENT, name: "a", archived_at: null,
+          metadata: { default_vault_ids: ["vlt-cnb"] },
+          mcp_servers: [{ name: "custom", type: "url", url: "https://example.com/mcp" }],
+        }),
+      } as never,
+      sessions: {
+        create: async (input: never) => { created.push(input); return { session: { id: "s1" }, resources: [] }; },
+      } as never,
+      appendUserEvent: async () => {},
+      resolveVaultMcpServers: async (_t, vaultIds) => {
+        expect(vaultIds).toEqual(["vlt-cnb"]);
+        return [
+          { name: "composio_gmail_notion", type: "url", url: "https://backend.composio.dev/tool_router/trs_x/mcp" },
+          { name: "dupe", type: "url", url: "https://example.com/mcp" }, // deduped by url
+        ];
+      },
+      now: () => T0,
+    });
+    await ambientRules.create({
+      tenantId: TENANT, agentId: AGENT,
+      input: { name: "with creds", trigger: { source: "schedule", config: { cron: "0 9 * * *", timezone: "UTC" } }, wake_mode: "act", next_wake_at: new Date(T0).toISOString() },
+    });
+    expect(await dispatcher.dispatchDue()).toBe(1);
+    const snap = created[0].agentSnapshot as { mcp_servers: Array<{ name: string; url: string }> };
+    expect(snap.mcp_servers.map((s) => s.name)).toEqual(["custom", "composio_gmail_notion"]);
   });
 });

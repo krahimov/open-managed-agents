@@ -11,6 +11,7 @@
     "@open-managed-agents/db-schema": "workspace:*",
     "@open-managed-agents/shared": "workspace:*",
     "@open-managed-agents/sql-client": "workspace:*",
+    "croner": "^9.0.0",
     "drizzle-orm": "^0.45.2"
   }
 }

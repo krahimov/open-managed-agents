@@ -42,6 +42,15 @@ export interface AmbientDispatcherDeps {
     agentId: string,
     event: UserMessageEvent,
   ): Promise<void>;
+  /** Derive MCP server entries from the vaults' credentials (Composio
+   *  tool-router URLs). Console sessions get these injected into the
+   *  snapshot at create time by the client; ambient sessions must do the
+   *  equivalent server-side or the spawned agent has no integration
+   *  tools (GitHub/Linear/Notion) even though the vault creds attach. */
+  resolveVaultMcpServers?(
+    tenantId: string,
+    vaultIds: string[],
+  ): Promise<Array<{ name: string; type: "url"; url: string }>>;
   now?(): number;
 }
 
@@ -115,6 +124,26 @@ export class NodeAmbientDispatcher {
     const vaultIds = Array.isArray(metaVaults)
       ? metaVaults.filter((id): id is string => typeof id === "string" && id.length > 0)
       : [];
+    // Materialize vault-derived MCP servers into the snapshot — parity
+    // with console-created sessions, where the client injects the
+    // Composio tool-router entry. Config-declared servers keep priority;
+    // vault-derived ones are appended (deduped by url).
+    if (vaultIds.length > 0 && this.deps.resolveVaultMcpServers) {
+      try {
+        const derived = await this.deps.resolveVaultMcpServers(rule.tenant_id, vaultIds);
+        const existing = Array.isArray(agentBase.mcp_servers)
+          ? (agentBase.mcp_servers as Array<{ url?: string }>)
+          : [];
+        const known = new Set(existing.map((s) => s.url));
+        const merged = [...existing, ...derived.filter((s) => !known.has(s.url))];
+        if (merged.length > 0) agentBase.mcp_servers = merged;
+      } catch (err) {
+        log.warn(
+          { err, op: "ambient.vault_mcp_resolve_failed", rule_id: rule.id },
+          "vault MCP resolution failed — session starts without integration tools",
+        );
+      }
+    }
     const { session } = await this.deps.sessions.create({
       tenantId: rule.tenant_id,
       agentId: rule.agent_id,
@@ -163,7 +192,10 @@ export class NodeAmbientDispatcher {
   }
 
   /** Stamp last_wake/last_decision and advance next_wake_at (cron) or
-   *  clear it (one-shot). */
+   *  clear it (one-shot). forceClearNextWake DISABLES the rule as well —
+   *  the service re-arms any enabled schedule rule with an empty wake
+   *  (the dormant-rule fix), so "stop firing permanently" must flip
+   *  enabled off, which is also the honest UI state for an orphan rule. */
   private async finishRule(
     rule: AmbientRuleRow,
     nowMs: number,
@@ -179,6 +211,7 @@ export class NodeAmbientDispatcher {
         last_wake_at: new Date(nowMs).toISOString(),
         next_wake_at: next ? new Date(next).toISOString() : null,
         last_decision: decision,
+        ...(opts?.forceClearNextWake ? { enabled: false } : {}),
       },
     });
   }
