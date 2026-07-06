@@ -8,6 +8,7 @@ import { SummarizeCompactionStrategy, resolveCompactionStrategy } from "./compac
 import type { CompactionStrategy } from "./compaction";
 import { ALL_TOOLS } from "./tools";
 import { llmLoggingMiddleware, llmLogKey } from "./llm-logging-middleware";
+import { isOpenAiCompatModel, sanitizeOpenAiToolNames } from "./provider";
 
 // Single source of truth lives in ./tools.ts (ALL_TOOLS). Importing here so
 // adding a new toolset entry can't drift the event-classification list — the
@@ -316,6 +317,14 @@ export class DefaultHarness implements HarnessInterface {
     // model.provider here. To add OpenAI/Gemini cache support later, extend
     // the strategy table below; the harness loop above doesn't change.
     const cached = applyProviderCacheStrategy(model, systemPrompt, tools, messages);
+    // OpenAI hard-caps function names at 64 chars — in the tools array AND
+    // in replayed history tool_calls. Long MCP names (Composio) 400 the
+    // whole turn otherwise. Deterministic mangle; no-op for other providers.
+    if (isOpenAiCompatModel(model)) {
+      const safe = sanitizeOpenAiToolNames({ tools: cached.tools, messages: cached.messages });
+      if (safe.tools) cached.tools = safe.tools as typeof cached.tools;
+      if (safe.messages) cached.messages = safe.messages as typeof cached.messages;
+    }
     const finalMessages = cached.messages;
 
     // 4. Resolve model id (used by per-step span events emitted via the

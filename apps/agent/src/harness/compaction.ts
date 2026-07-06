@@ -2,6 +2,7 @@ import { generateText } from "ai";
 import type { ModelMessage, LanguageModel } from "ai";
 import type { ContentBlock, SessionEvent } from "@open-managed-agents/shared";
 import { eventsToMessages } from "../runtime/history";
+import { isOpenAiCompatModel, sanitizeOpenAiToolNames } from "./provider";
 import type { HarnessRuntime } from "./interface";
 
 /**
@@ -166,6 +167,13 @@ export class SummarizeCompactionStrategy implements CompactionStrategy {
     // (skipCacheWrite-equivalent — the appended user message is so small
     // there's no point caching it).
     const cached = applyCacheStrategy(systemPrompt, tools, messages);
+    // OpenAI rejects >64-char function names in tools AND history — same
+    // guard as the main loop (see provider.ts sanitizeOpenAiToolNames).
+    if (isOpenAiCompatModel(model)) {
+      const safe = sanitizeOpenAiToolNames({ tools: cached.tools, messages: cached.messages });
+      if (safe.tools) cached.tools = safe.tools as typeof cached.tools;
+      if (safe.messages) cached.messages = safe.messages as typeof cached.messages;
+    }
 
     const summarizeRequest: ModelMessage = {
       role: "user",
@@ -359,10 +367,15 @@ export class CCStyleCompactionStrategy implements CompactionStrategy {
     //   - The main agent's tools (we pass nothing)
     //   - toolChoice (we don't try to constrain — relies on the prompt)
     //   - applyCacheStrategy (we're not optimizing for cache reuse here)
+    // History still carries tool-call parts, so the OpenAI 64-char
+    // function-name cap applies here too.
+    const safeMessages = isOpenAiCompatModel(model)
+      ? (sanitizeOpenAiToolNames({ messages: cleanedMessages }).messages ?? cleanedMessages)
+      : cleanedMessages;
     const result = await generateText({
       model,
       system: CC_STYLE_SYSTEM_PROMPT,
-      messages: [...cleanedMessages, summarizeRequest],
+      messages: [...safeMessages, summarizeRequest],
       maxOutputTokens: this.opts.maxSummaryTokens ?? 2000,
     });
 
