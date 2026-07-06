@@ -15,17 +15,19 @@ import {
 
 const T0 = Date.parse("2026-07-02T09:00:00.000Z");
 
-function build(opts?: { agentMissing?: boolean }) {
+function build(opts?: { agentMissing?: boolean; agentMetadata?: Record<string, unknown> }) {
   const { service: ambientRules } = createInMemoryAmbientRuleService({
     clock: { nowMs: () => T0 },
   });
-  const created: Array<{ agentId: string; title?: string; metadata?: unknown }> = [];
+  const created: Array<{ agentId: string; title?: string; metadata?: unknown; vaultIds?: string[] }> = [];
   const appended: Array<{ sessionId: string; text: string }> = [];
   let now = T0;
 
   const agents = {
     get: async ({ agentId }: { tenantId: string; agentId: string }) =>
-      opts?.agentMissing ? null : { id: agentId, name: "a", archived_at: null },
+      opts?.agentMissing
+        ? null
+        : { id: agentId, name: "a", archived_at: null, metadata: opts?.agentMetadata },
   } as unknown as AgentService;
   const sessions = {
     create: async (input: { agentId: string; title?: string; metadata?: unknown }) => {
@@ -155,6 +157,39 @@ describe("NodeAmbientDispatcher", () => {
     expect(rule.last_decision?.outcome).toBe("error");
     expect(rule.next_wake_at).toBeUndefined();
     expect(await tm.dispatcher.dispatchDue()).toBe(0);
+  });
+
+  it("spawned sessions inherit the agent's default_vault_ids (integration creds)", async () => {
+    const tv = build({ agentMetadata: { default_vault_ids: ["vlt-cnb", "", 42] } });
+    await tv.ambientRules.create({
+      tenantId: TENANT,
+      agentId: AGENT,
+      input: {
+        name: "Review with creds",
+        trigger: { source: "schedule", config: { cron: "0 9 * * *", timezone: "UTC" } },
+        wake_mode: "act",
+        next_wake_at: new Date(T0).toISOString(),
+      },
+    });
+    expect(await tv.dispatcher.dispatchDue()).toBe(1);
+    expect(tv.created).toHaveLength(1);
+    // Non-string/empty entries filtered; valid vault ids passed through.
+    expect(tv.created[0].vaultIds).toEqual(["vlt-cnb"]);
+  });
+
+  it("omits vaultIds entirely when the agent has no defaults", async () => {
+    await t.ambientRules.create({
+      tenantId: TENANT,
+      agentId: AGENT,
+      input: {
+        name: "No creds",
+        trigger: { source: "schedule", config: { cron: "0 9 * * *", timezone: "UTC" } },
+        wake_mode: "act",
+        next_wake_at: new Date(T0).toISOString(),
+      },
+    });
+    expect(await t.dispatcher.dispatchDue()).toBe(1);
+    expect("vaultIds" in t.created[0]).toBe(false);
   });
 
   it("disabled rules never fire", async () => {

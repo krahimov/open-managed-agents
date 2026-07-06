@@ -106,11 +106,21 @@ export class NodeAmbientDispatcher {
     const agentBase = { ...agent } as Record<string, unknown>;
     delete agentBase.tenant_id;
     const environmentId = "env_local_runtime";
+    // Inherit the agent's default vaults — same fallback the sessions
+    // route applies when vault_ids is omitted. Without this, ambient
+    // sessions had no credentials and integration workflows (GitHub /
+    // Linear / Notion via vault MCP creds) silently couldn't act.
+    const metaVaults = (agent.metadata as { default_vault_ids?: unknown } | undefined)
+      ?.default_vault_ids;
+    const vaultIds = Array.isArray(metaVaults)
+      ? metaVaults.filter((id): id is string => typeof id === "string" && id.length > 0)
+      : [];
     const { session } = await this.deps.sessions.create({
       tenantId: rule.tenant_id,
       agentId: rule.agent_id,
       environmentId,
       title: `Ambient: ${rule.name}`,
+      ...(vaultIds.length > 0 ? { vaultIds } : {}),
       agentSnapshot: agentBase as never,
       environmentSnapshot: {
         id: environmentId,
