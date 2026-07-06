@@ -1,0 +1,208 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { OMA_SETUP_HARNESS } from "@open-managed-agents/api-types";
+import { useApi } from "../../lib/api";
+import type { Event } from "../../lib/events";
+import { Markdown } from "../../components/Markdown";
+import {
+  Conversation,
+  ConversationContent,
+  ConversationEmptyState,
+  ConversationScrollButton,
+} from "../../components/ai-elements/conversation";
+import { Message, MessageContent } from "../../components/ai-elements/message";
+import {
+  PromptInput,
+  PromptInputFooter,
+  PromptInputSubmit,
+  PromptInputTextarea,
+  PromptInputTools,
+} from "../../components/ai-elements/prompt-input";
+
+/**
+ * Lightweight, session-id-driven chat surface. Reuses the same ai-elements
+ * primitives + SSE client as SessionDetail, but without the full-page chrome
+ * (trajectory chips, panels, timeline) — so it can be embedded twice in the
+ * Agent Builder: once for the builder interview, once for the test-run preview.
+ *
+ * It deliberately renders only the canonical events (user/assistant text +
+ * non-setup tool calls). Setup harness markers ride on `agent.message`
+ * tagged `metadata.harness === OMA_SETUP_HARNESS` (per the EventBase metadata
+ * convention) — those are surfaced to the parent via `onEvent` and never shown
+ * as chat bubbles.
+ */
+interface SessionChatProps {
+  sessionId: string;
+  /** Fires for every event (replayed history + live). The builder page uses it
+   *  to capture draft_updated / finalized markers for the Config pane. */
+  onEvent?: (ev: Event) => void;
+  placeholder?: string;
+  emptyTitle?: string;
+  emptyDescription?: string;
+}
+
+function eventText(ev: Event): string {
+  if (Array.isArray(ev.content)) return ev.content.map((b) => b.text ?? "").join("");
+  if (typeof ev.content === "string") return ev.content;
+  return "";
+}
+
+function isSetupMarker(ev: Event): boolean {
+  return (ev.metadata as { harness?: string } | undefined)?.harness === OMA_SETUP_HARNESS;
+}
+
+/** Events worth showing as chat bubbles/chips (everything else — stream deltas,
+ *  status, span, results, builder markers — is filtered out). */
+function isRenderable(ev: Event): boolean {
+  if (isSetupMarker(ev)) return false;
+  if (ev.type === "user.message") return eventText(ev).length > 0;
+  if (ev.type === "agent.message") return eventText(ev).trim().length > 0;
+  if (ev.type === "agent.tool_use") {
+    return typeof ev.name === "string" && !ev.name.startsWith("mcp__oma_setup__");
+  }
+  return false;
+}
+
+export function SessionChat({
+  sessionId,
+  onEvent,
+  placeholder,
+  emptyTitle,
+  emptyDescription,
+}: SessionChatProps) {
+  const { api, streamEvents } = useApi();
+  const [events, setEvents] = useState<Event[]>([]);
+  const [pending, setPending] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
+  const [status, setStatus] = useState<"idle" | "running">("idle");
+
+  // Keep the latest onEvent without re-subscribing the stream on each render.
+  const onEventRef = useRef(onEvent);
+  onEventRef.current = onEvent;
+
+  useEffect(() => {
+    const abort = new AbortController();
+    const seen = new Set<string>();
+    setEvents([]);
+    setPending(null);
+    setStatus("idle");
+
+    // streamEvents replays history (replay=1) then live-streams; reconnects
+    // replay again, so dedup by seq/id.
+    streamEvents(
+      sessionId,
+      (raw) => {
+        const ev = raw as Event;
+        onEventRef.current?.(ev);
+
+        if (ev.type === "session.status_running") setStatus("running");
+        else if (ev.type === "session.status_idle" || ev.type === "session.error") {
+          setStatus("idle");
+        }
+        if (ev.type === "user.message") setPending(null);
+
+        if (!isRenderable(ev)) return;
+        const key = ev.seq != null ? `seq:${ev.seq}` : ev.id ? `id:${ev.id}` : null;
+        if (key) {
+          if (seen.has(key)) return;
+          seen.add(key);
+        }
+        setEvents((prev) => [...prev, ev]);
+      },
+      abort.signal,
+    );
+    return () => abort.abort();
+  }, [sessionId, streamEvents]);
+
+  const send = useCallback(
+    async (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+      setSending(true);
+      setPending(trimmed);
+      try {
+        await api(`/v1/sessions/${sessionId}/events`, {
+          method: "POST",
+          body: JSON.stringify({
+            events: [{ type: "user.message", content: [{ type: "text", text: trimmed }] }],
+          }),
+        });
+      } catch {
+        // api() surfaces the error toast; drop the optimistic bubble.
+        setPending(null);
+      }
+      setSending(false);
+    },
+    [api, sessionId],
+  );
+
+  const isEmpty = events.length === 0 && !pending;
+
+  return (
+    <div className="flex flex-col h-full min-h-0">
+      <Conversation className="flex-1 min-h-0">
+        <ConversationContent className="gap-4">
+          {isEmpty && (
+            <ConversationEmptyState
+              title={emptyTitle ?? "No messages yet"}
+              description={emptyDescription ?? "Send a message to get started."}
+            />
+          )}
+          {events.map((ev, i) => {
+            const key = ev.seq != null ? `seq:${ev.seq}` : ev.id ?? `i${i}`;
+            if (ev.type === "user.message") {
+              return (
+                <Message from="user" key={key}>
+                  <MessageContent>{eventText(ev)}</MessageContent>
+                </Message>
+              );
+            }
+            if (ev.type === "agent.message") {
+              return (
+                <Message from="assistant" key={key}>
+                  <MessageContent>
+                    <Markdown>{eventText(ev)}</Markdown>
+                  </MessageContent>
+                </Message>
+              );
+            }
+            // agent.tool_use → compact chip
+            return (
+              <div
+                key={key}
+                className="text-xs text-fg-subtle inline-flex items-center gap-1.5"
+              >
+                <span aria-hidden>🔧</span>
+                <span className="font-mono">{ev.name}</span>
+              </div>
+            );
+          })}
+          {pending && (
+            <Message from="user">
+              <MessageContent className="opacity-70">{pending}</MessageContent>
+            </Message>
+          )}
+          {status === "running" && (
+            <div className="text-xs text-fg-subtle">Working…</div>
+          )}
+        </ConversationContent>
+        <ConversationScrollButton />
+      </Conversation>
+      <div className="border-t border-border p-3 bg-bg shrink-0">
+        <PromptInput
+          onSubmit={async ({ text }) => {
+            await send(text);
+          }}
+        >
+          <PromptInputTextarea
+            placeholder={placeholder ?? "Send a message…"}
+            disabled={sending}
+          />
+          <PromptInputFooter>
+            <PromptInputTools />
+            <PromptInputSubmit status={sending ? "submitted" : undefined} disabled={sending} />
+          </PromptInputFooter>
+        </PromptInput>
+      </div>
+    </div>
+  );
+}

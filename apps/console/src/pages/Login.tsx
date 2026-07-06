@@ -9,6 +9,7 @@ import { setActiveTenantId } from "../lib/api";
 import { useApiQuery } from "../lib/useApiQuery";
 import { BrandLoader } from "../components/BrandLoader";
 import { BRAND_NAME, BRAND_TAGLINE } from "../lib/brand";
+import { clerkEnabled, ClerkLoginScreen } from "../lib/clerk-auth";
 
 // Clear browser-cached tenant pin on every successful auth transition.
 // The pin is per-user — different login → different membership set →
@@ -61,6 +62,28 @@ type Mode =
   | "reset-otp";
 
 export function Login() {
+  // Build-time constant: with VITE_CLERK_PUBLISHABLE_KEY set the console
+  // authenticates through Clerk (<SignIn/> + Bearer tokens on api());
+  // otherwise the classic better-auth screens render. Constant per build,
+  // so the branch never flips between renders.
+  if (clerkEnabled) return <ClerkLogin />;
+  return <ClassicLogin />;
+}
+
+function ClerkLogin() {
+  const { isAuthenticated, isLoading } = useAuth();
+  const nav = useNavigate();
+  useEffect(() => {
+    if (!isLoading && isAuthenticated) {
+      const raw = new URLSearchParams(window.location.search).get("next");
+      const next = raw && raw.startsWith("/") && !raw.startsWith("//") ? raw : "/";
+      nav(next, { replace: true });
+    }
+  }, [isAuthenticated, isLoading, nav]);
+  return <ClerkLoginScreen />;
+}
+
+function ClassicLogin() {
   const { isAuthenticated, isLoading } = useAuth();
   const nav = useNavigate();
   const [mode, setMode] = useState<Mode>("login");
@@ -362,6 +385,29 @@ export function Login() {
     return (
       <div className="min-h-screen flex items-center justify-center bg-bg">
         <BrandLoader size="lg" label="Loading session" />
+      </div>
+    );
+  }
+
+  // Server runs AUTH_MODE=clerk but this console build has no
+  // VITE_CLERK_PUBLISHABLE_KEY — the classic form would only produce 404s
+  // (better-auth endpoints aren't mounted). Say so instead of dead-ending.
+  if (
+    authInfo?.providers?.length === 1 &&
+    authInfo.providers[0] === "clerk"
+  ) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-bg">
+        <div className="max-w-md w-full border border-border rounded-xl bg-bg-surface p-8 text-center space-y-3 shadow-[var(--shadow-sm)]">
+          <Logo className="mx-auto h-8 w-8" />
+          <h1 className="text-lg font-semibold text-fg">Sign-in runs through Clerk</h1>
+          <p className="text-sm text-fg-muted">
+            This server accepts only Clerk sessions, but this console build was
+            made without <code className="text-xs">VITE_CLERK_PUBLISHABLE_KEY</code>.
+            Rebuild the console with that variable set to enable the Clerk
+            sign-in screen.
+          </p>
+        </div>
       </div>
     );
   }

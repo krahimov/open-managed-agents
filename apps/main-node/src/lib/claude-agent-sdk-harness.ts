@@ -26,10 +26,26 @@
 
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { createSdkMcpServer, query, tool } from "@anthropic-ai/claude-agent-sdk";
+import { z } from "zod";
 import type { HarnessContext } from "@open-managed-agents/agent/harness/interface";
-import type { SessionEvent } from "@open-managed-agents/api-types";
+import {
+  OMA_SETUP_HARNESS,
+  OMA_SETUP_KIND_HARNESS_UPDATED,
+  type SessionEvent,
+} from "@open-managed-agents/api-types";
+import type { AgentConfig } from "@open-managed-agents/shared";
 import { generateId } from "@open-managed-agents/shared";
+
+/** Fields a setup session may change on its own harness. */
+export interface HarnessPatch {
+  name?: string;
+  description?: string;
+  model?: string;
+  system?: string;
+  mcp_servers?: AgentConfig["mcp_servers"];
+  skills?: AgentConfig["skills"];
+}
 
 /** OMA session id → SDK session id, for `resume` continuity across turns. */
 const sdkSessions = new Map<string, string>();
@@ -74,6 +90,31 @@ export interface ClaudeAgentSdkHarnessDeps {
     tenantId: string,
     refs: Array<{ skill_id: string; type: string }> | undefined,
   ) => Promise<Array<{ name: string; content: string }>>;
+  /**
+   * Read a session's metadata blob. Used by the builder toolset to load the
+   * persisted draft (`metadata.harness_draft`) and the finalize guard
+   * (`metadata.harness_finalized_agent_id`). Wired in main-node's buildHarness().
+   */
+  readSessionMetadata?: (
+    tenantId: string,
+    sessionId: string,
+  ) => Promise<Record<string, unknown> | null>;
+  /** Per-key merge into a session's metadata (drop a key by passing null). */
+  patchSessionMetadata?: (
+    tenantId: string,
+    sessionId: string,
+    patch: Record<string, unknown>,
+  ) => Promise<void>;
+  /**
+   * Apply a setup session's refined harness to the agent it belongs to and
+   * return the updated config (so the new harness can be broadcast). Provided
+   * by main-node (wraps AgentService.update).
+   */
+  updateAgent?: (
+    tenantId: string,
+    agentId: string,
+    patch: HarnessPatch,
+  ) => Promise<AgentConfig>;
 }
 
 function workdirFor(sessionId: string): string {
@@ -110,6 +151,65 @@ function textOfToolResult(content: unknown): string {
       .join("\n");
   }
   return JSON.stringify(content ?? "");
+}
+
+/**
+ * tool()'s inputSchema type comes from the zod the SDK bundles (4.4.x). The
+ * workspace pins zod 4.3.x, so a schema built with the workspace zod is
+ * structurally identical but nominally distinct and won't satisfy the param
+ * without a cast. Runtime is unaffected — both are zod v4. Localized here
+ * instead of bumping the workspace-wide zod.
+ */
+type SdkToolSchema = Parameters<typeof tool>[2];
+
+/** The user-meaningful slice of an AgentConfig (drops internal bookkeeping like
+ *  id/version/created_at). Shared by the setup preamble and the broadcast. */
+function harnessView(agent: AgentConfig): Record<string, unknown> {
+  const view: Record<string, unknown> = {};
+  const model = typeof agent.model === "string" ? agent.model : agent.model?.id;
+  if (agent.name) view.name = agent.name;
+  if (agent.description) view.description = agent.description;
+  if (model) view.model = model;
+  if (agent.system) view.system = agent.system;
+  if (agent.mcp_servers?.length) view.mcp_servers = agent.mcp_servers;
+  if (agent.tools?.length) view.tools = agent.tools;
+  if (agent.skills?.length) view.skills = agent.skills;
+  return view;
+}
+
+/** Setup-mode preamble. Replaces the claude_code preset entirely (string
+ *  systemPrompt) so the agent acts as a config designer refining ITS OWN
+ *  harness, not a coding agent. The current harness is embedded so the agent
+ *  can "scan its own harness" and clarify what the user wants. */
+function buildSetupPrompt(agent: AgentConfig): string {
+  return [
+    "You are an OMA agent that was just created and is now in SETUP MODE — a planning conversation to dial in your own configuration (your \"harness\") before you start doing real work.",
+    "",
+    "Below is your CURRENT harness. Read it, then interview the user to clarify what they actually want you to do, and refine your own harness to match.",
+    "",
+    "```json",
+    JSON.stringify(harnessView(agent), null, 2),
+    "```",
+    "",
+    "You have exactly one tool and no file, shell, or web access:",
+    "- update_harness: change fields on your own harness. Call it after EACH meaningful answer so the live config on the user's screen stays in sync. Pass only the fields that changed.",
+    "",
+    "Harness fields you can refine:",
+    "- name / description: a short label + one-line summary of what you do.",
+    "- model: your Claude model id (keep the current one unless the task clearly needs a stronger model).",
+    "- system: your system prompt — the heart of the harness. Write it in the second person, concrete and task-specific.",
+    "- mcp_servers: external tool servers, e.g. [{ \"name\": \"notion\", \"type\": \"url\", \"url\": \"https://mcp.notion.com/mcp\" }].",
+    "- skills: optional named skills.",
+    "",
+    "How to run setup:",
+    "1. Open by briefly reflecting your current purpose, then ask what the user wants you to do (or do differently).",
+    "2. Ask ONE focused question at a time. After each answer, immediately call update_harness with what you can refine now — usually a sharper system prompt first, then name/description, then any MCP servers or skills.",
+    "3. Keep tightening your system prompt as you learn more.",
+    "4. Be concise. In a sentence, say what you just changed (e.g. \"I rewrote my system prompt around daily triage and added the Notion server\").",
+    "5. When the user is satisfied, confirm your harness is set and that you're ready to run.",
+    "",
+    "Never invent credentials or secrets. For an MCP server that needs auth, add the server and tell the user they'll connect credentials afterward.",
+  ].join("\n");
 }
 
 export class ClaudeAgentSdkHarness {
@@ -152,6 +252,78 @@ export class ClaudeAgentSdkHarness {
     return Object.keys(out).length > 0 ? out : undefined;
   }
 
+  /** In-process MCP server exposing the single harness-editing tool. The
+   *  handler runs in THIS process (the SDK child calls back over the in-process
+   *  MCP transport), so it can apply the change to the real agent and broadcast
+   *  the new harness to the session's SSE stream. */
+  #setupServer(ctx: HarnessContext, runtime: HarnessContext["runtime"]) {
+    const tenantId = ctx.tenant_id ?? "default";
+    const agentId = ctx.agent.id;
+
+    const updateHarness = tool(
+      "update_harness",
+      "Change fields on your own harness (your agent configuration). Call after each meaningful answer so the live config on the user's screen stays in sync. Pass only the fields you want to change.",
+      {
+        name: z.string().optional(),
+        description: z.string().optional(),
+        model: z.string().optional(),
+        system: z.string().optional(),
+        mcp_servers: z.array(z.any()).optional(),
+        skills: z.array(z.any()).optional(),
+      } as unknown as SdkToolSchema,
+      async (args) => {
+        const patch: HarnessPatch = {};
+        const changed: string[] = [];
+        for (const key of [
+          "name",
+          "description",
+          "model",
+          "system",
+          "mcp_servers",
+          "skills",
+        ] as const) {
+          const value = (args as Record<string, unknown>)[key];
+          if (value !== undefined) {
+            (patch as Record<string, unknown>)[key] = value;
+            changed.push(key);
+          }
+        }
+        if (!this.#deps.updateAgent || changed.length === 0) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: this.#deps.updateAgent
+                  ? "No changes applied."
+                  : "Harness editing is unavailable here.",
+              },
+            ],
+            isError: !this.#deps.updateAgent,
+          };
+        }
+        const updated = await this.#deps.updateAgent(tenantId, agentId, patch);
+        runtime.broadcast({
+          type: "agent.message",
+          id: generateId(),
+          content: [],
+          metadata: {
+            harness: OMA_SETUP_HARNESS,
+            kind: OMA_SETUP_KIND_HARNESS_UPDATED,
+            harness_config: harnessView(updated),
+            changed,
+          },
+        } as SessionEvent);
+        return { content: [{ type: "text", text: `Updated: ${changed.join(", ")}.` }] };
+      },
+    );
+
+    return createSdkMcpServer({
+      name: "oma_setup",
+      version: "1",
+      tools: [updateHarness],
+    });
+  }
+
   async run(ctx: HarnessContext): Promise<void> {
     const runtime = ctx.runtime;
     // Typed optional on HarnessContext but always set by buildHarnessContext.
@@ -191,6 +363,18 @@ export class ClaudeAgentSdkHarness {
       }
     }
 
+    // Setup sessions (the agent's first session, refining its own harness) run
+    // a focused planning conversation with an in-process toolset and NO
+    // built-in/coding tools. Flagged via session metadata at creation.
+    const sessionMeta = await this.#deps.readSessionMetadata?.(
+      ctx.tenant_id ?? "default",
+      sessionId,
+    );
+    const isSetup = sessionMeta?.["oma_setup"] === true && !!this.#deps.updateAgent;
+    const mcpServersForTurn = isSetup
+      ? { ...(mcpServers ?? {}), oma_setup: this.#setupServer(ctx, runtime) }
+      : mcpServers;
+
     try {
       const stream = query({
         prompt: textOfUserMessage(ctx),
@@ -200,14 +384,16 @@ export class ClaudeAgentSdkHarness {
           abortController: abort,
           resume: sdkSessions.get(sessionId),
           model,
-          mcpServers,
-          systemPrompt: {
-            type: "preset",
-            preset: "claude_code",
-            // CLI_NOTES: observed footguns in headless sessions (e.g. `gh api`
-            // with -f/-F silently switches GET→POST → bogus 404s).
-            append: [ctx.systemPrompt, CLI_NOTES].filter(Boolean).join("\n\n"),
-          },
+          mcpServers: mcpServersForTurn,
+          systemPrompt: isSetup
+            ? buildSetupPrompt(ctx.agent)
+            : {
+                type: "preset",
+                preset: "claude_code",
+                // CLI_NOTES: observed footguns in headless sessions (e.g. `gh
+                // api` with -f/-F silently switches GET→POST → bogus 404s).
+                append: [ctx.systemPrompt, CLI_NOTES].filter(Boolean).join("\n\n"),
+              },
           // Headless: OMA has no tool-confirmation round-trip on this path
           // yet, and the child is already scoped to a per-session workdir.
           permissionMode: "bypassPermissions",
@@ -217,7 +403,10 @@ export class ClaudeAgentSdkHarness {
           // this machine's personal CLAUDE.md/settings stay invisible.
           settingSources: skillNames.length > 0 ? ["project"] : [],
           skills: skillNames.length > 0 ? skillNames : undefined,
-          maxTurns: 50,
+          // Setup: disable every built-in tool so the only callable tool is the
+          // oma_setup MCP closure, and lock out any on-disk MCP config.
+          ...(isSetup ? { tools: [], strictMcpConfig: true } : {}),
+          maxTurns: isSetup ? 30 : 50,
         },
       });
 

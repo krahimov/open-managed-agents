@@ -16,6 +16,15 @@ import type {
   Logger,
   NewAgentInput,
 } from "./ports";
+import type {
+  AmbientRuleClock,
+  AmbientRuleIdGenerator,
+  AmbientRuleRepo,
+  AmbientRuleUpdateFields,
+  NewAmbientRuleInput,
+} from "./ambient-ports";
+import type { AmbientRuleRow } from "./ambient-types";
+import { AmbientRuleService } from "./ambient-service";
 import { AgentService } from "./service";
 import type { AgentRow, AgentVersionRow } from "./types";
 
@@ -205,10 +214,130 @@ export class InMemoryAgentRepo implements AgentRepo {
   }
 }
 
+interface InMemAmbientRule {
+  id: string;
+  tenant_id: string;
+  agent_id: string;
+  config: Omit<AmbientRuleRow, "tenant_id">;
+  enabled: number;
+  trigger_source: string;
+  wake_mode: string;
+  created_at: number;
+  updated_at: number | null;
+  next_wake_at: number | null;
+  last_wake_at: number | null;
+  deleted_at: number | null;
+}
+
+export class InMemoryAmbientRuleRepo implements AmbientRuleRepo {
+  private readonly byId = new Map<string, InMemAmbientRule>();
+
+  async insert(input: NewAmbientRuleInput): Promise<AmbientRuleRow> {
+    const row: InMemAmbientRule = {
+      id: input.id,
+      tenant_id: input.tenantId,
+      agent_id: input.agentId,
+      config: input.config,
+      enabled: input.config.enabled ? 1 : 0,
+      trigger_source: input.config.trigger.source,
+      wake_mode: input.config.wake_mode,
+      created_at: input.createdAt,
+      updated_at: input.createdAt,
+      next_wake_at: input.config.next_wake_at
+        ? Date.parse(input.config.next_wake_at)
+        : null,
+      last_wake_at: input.config.last_wake_at
+        ? Date.parse(input.config.last_wake_at)
+        : null,
+      deleted_at: null,
+    };
+    this.byId.set(input.id, row);
+    return toAmbientRow(row);
+  }
+
+  async get(
+    tenantId: string,
+    agentId: string,
+    ruleId: string,
+  ): Promise<AmbientRuleRow | null> {
+    const row = this.byId.get(ruleId);
+    if (!row || row.tenant_id !== tenantId || row.agent_id !== agentId) return null;
+    if (row.deleted_at !== null) return null;
+    return toAmbientRow(row);
+  }
+
+  async listByAgent(
+    tenantId: string,
+    agentId: string,
+  ): Promise<AmbientRuleRow[]> {
+    return Array.from(this.byId.values())
+      .filter((r) => r.tenant_id === tenantId)
+      .filter((r) => r.agent_id === agentId)
+      .filter((r) => r.deleted_at === null)
+      .sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id))
+      .map(toAmbientRow);
+  }
+
+  async listDue(opts: {
+    tenantId?: string;
+    now: number;
+    limit: number;
+  }): Promise<AmbientRuleRow[]> {
+    return Array.from(this.byId.values())
+      .filter((r) => (opts.tenantId ? r.tenant_id === opts.tenantId : true))
+      .filter((r) => r.enabled === 1)
+      .filter((r) => r.deleted_at === null)
+      .filter((r) => r.next_wake_at !== null && r.next_wake_at <= opts.now)
+      .sort((a, b) => (a.next_wake_at ?? 0) - (b.next_wake_at ?? 0) || a.id.localeCompare(b.id))
+      .slice(0, opts.limit)
+      .map(toAmbientRow);
+  }
+
+  async update(
+    tenantId: string,
+    agentId: string,
+    ruleId: string,
+    fields: AmbientRuleUpdateFields,
+  ): Promise<AmbientRuleRow> {
+    const row = this.byId.get(ruleId);
+    if (!row || row.tenant_id !== tenantId || row.agent_id !== agentId || row.deleted_at !== null) {
+      throw new Error("Ambient rule not found");
+    }
+    row.config = fields.config;
+    row.enabled = fields.enabled ? 1 : 0;
+    row.trigger_source = fields.triggerSource;
+    row.wake_mode = fields.wakeMode;
+    row.updated_at = fields.updatedAt;
+    row.next_wake_at = fields.nextWakeAt ?? null;
+    row.last_wake_at = fields.lastWakeAt ?? null;
+    return toAmbientRow(row);
+  }
+
+  async softDelete(
+    tenantId: string,
+    agentId: string,
+    ruleId: string,
+    deletedAt: number,
+  ): Promise<void> {
+    const row = this.byId.get(ruleId);
+    if (!row || row.tenant_id !== tenantId || row.agent_id !== agentId) return;
+    row.enabled = 0;
+    row.deleted_at = deletedAt;
+    row.updated_at = deletedAt;
+  }
+}
+
 export class SequentialIdGenerator implements IdGenerator {
   private n = 0;
   agentId(): string {
     return `agent-${++this.n}`;
+  }
+}
+
+export class SequentialAmbientRuleIdGenerator implements AmbientRuleIdGenerator {
+  private n = 0;
+  ambientRuleId(): string {
+    return `ambrule-${++this.n}`;
   }
 }
 
@@ -251,6 +380,22 @@ export function createInMemoryAgentService(opts?: {
   return { service, repo };
 }
 
+export function createInMemoryAmbientRuleService(opts?: {
+  clock?: AmbientRuleClock;
+  ids?: AmbientRuleIdGenerator;
+}): {
+  service: AmbientRuleService;
+  repo: InMemoryAmbientRuleRepo;
+} {
+  const repo = new InMemoryAmbientRuleRepo();
+  const service = new AmbientRuleService({
+    repo,
+    clock: opts?.clock,
+    ids: opts?.ids ?? new SequentialAmbientRuleIdGenerator(),
+  });
+  return { service, repo };
+}
+
 // ── helpers ──
 
 function toRow(a: InMemAgent): AgentRow {
@@ -277,4 +422,24 @@ function toVersionRow(v: InMemVersion): AgentVersionRow {
 
 function msToIso(ms: number): string {
   return new Date(ms).toISOString();
+}
+
+function toAmbientRow(a: InMemAmbientRule): AmbientRuleRow {
+  return {
+    ...a.config,
+    tenant_id: a.tenant_id,
+    agent_id: a.agent_id,
+    enabled: a.enabled === 1,
+    trigger: {
+      ...a.config.trigger,
+      source: a.trigger_source as AmbientRuleRow["trigger"]["source"],
+    },
+    wake_mode: a.wake_mode as AmbientRuleRow["wake_mode"],
+    created_at: msToIso(a.created_at),
+    updated_at: a.updated_at !== null ? msToIso(a.updated_at) : undefined,
+    next_wake_at:
+      a.next_wake_at !== null ? msToIso(a.next_wake_at) : a.config.next_wake_at,
+    last_wake_at:
+      a.last_wake_at !== null ? msToIso(a.last_wake_at) : a.config.last_wake_at,
+  };
 }

@@ -33,6 +33,15 @@ async function startMainNode(opts: { dataDir: string }): Promise<ProcessHandle> 
       ...process.env,
       DATABASE_URL: "",
       PORT: String(port),
+      // Hermetic: main-node self-loads .env/.env.local (loadDotenvDefaults)
+      // for any key the child env leaves undefined — an empty string blocks
+      // the file value. Without these pins the test runs against the
+      // operator's real DATABASE_URL (shared Neon!) and sandbox provider.
+      DATABASE_URL: "",
+      SANDBOX_PROVIDER: "subprocess",
+      // validateNodeModel accepts a bare model string only when a model
+      // card exists or a provider key is set.
+      ANTHROPIC_API_KEY: "test-key-not-real",
       DATABASE_PATH: join(opts.dataDir, "oma.db"),
       AUTH_DATABASE_PATH: join(opts.dataDir, "auth.db"),
       SANDBOX_WORKDIR: join(opts.dataDir, "sandboxes"),

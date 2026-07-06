@@ -737,8 +737,22 @@ export class DefaultHarness implements HarnessInterface {
       // Throw so the failure is visible in events; the caller decides whether
       // to retry (current default-loop has no internal retry — the throw
       // propagates as a `unexpected` TurnError up to drainEventQueue).
+      //
+      // Scope: r.text / r.toolCalls describe the FINAL step only. A turn
+      // whose earlier steps ran tools and streamed real text can still end
+      // on one empty trailing step (observed on haiku wakeup turns
+      // 2026-07-01, sess-w6jk4fppboterg3n: bash + summary shipped, then a
+      // final empty step failed the whole work item). Only classify as
+      // silent_stop when the ENTIRE turn shipped nothing.
+      const steps = await r.steps;
+      const turnShippedNothing = steps.every(
+        (s) =>
+          (!s.text || s.text.trim().length === 0)
+          && (!s.toolCalls || s.toolCalls.length === 0),
+      );
       if (
         (finishReason === "stop" || finishReason === "length")
+        && turnShippedNothing
         && (!finalText || finalText.trim().length === 0)
         && (!toolCalls || toolCalls.length === 0)
       ) {

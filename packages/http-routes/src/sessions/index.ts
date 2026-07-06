@@ -485,6 +485,7 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
       environment?: string | { id: string };
       title?: string;
       vault_ids?: string[];
+      metadata?: Record<string, unknown>;
       resources?: Array<{
         type: "file" | "memory_store" | "github_repository" | "github_repo" | "env" | "env_secret";
         file_id?: string;
@@ -650,6 +651,7 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
         agentSnapshot: sessionAgentSnapshot,
         environmentSnapshot: envSnap ?? undefined,
         resources: nonFileInputs as never,
+        metadata: body.metadata,
       });
       session = result.session;
       createdResources = result.resources as never;

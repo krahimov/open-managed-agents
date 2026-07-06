@@ -13,6 +13,7 @@ import "@fontsource-variable/geist";
 import "@fontsource-variable/jetbrains-mono";
 import "./index.css";
 import { AuthProvider } from "./lib/auth";
+import { MaybeClerkProvider } from "./lib/clerk-auth";
 import { Toaster } from "./components/ui/sonner";
 import { AppShell } from "./components/AppShell";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -87,6 +88,17 @@ const protectedRoutes: RouteObject[] = [
     handle: { crumb: "Agents" },
     children: [
       { index: true, element: <AgentsList /> },
+      {
+        // Agent setup session — the agent's first session, where it reads its
+        // own harness and interviews the user to refine it. Lazy (pulls in
+        // ai-elements + Shiki like SessionDetail), so keep it out of the list bundle.
+        path: ":id/setup",
+        handle: { crumb: "Setup" },
+        lazy: async () => {
+          const { AgentSetup } = await import("./pages/agents/AgentSetup");
+          return { Component: AgentSetup };
+        },
+      },
       {
         path: ":id",
         element: <AgentDetail />,
@@ -272,11 +284,13 @@ createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <ErrorBoundary>
       <QueryClientProvider client={queryClient}>
-        <AuthProvider>
-          <Suspense fallback={null}>
-            <RouterProvider router={router} />
-          </Suspense>
-        </AuthProvider>
+        <MaybeClerkProvider>
+          <AuthProvider>
+            <Suspense fallback={null}>
+              <RouterProvider router={router} />
+            </Suspense>
+          </AuthProvider>
+        </MaybeClerkProvider>
         <Toaster />
       </QueryClientProvider>
     </ErrorBoundary>

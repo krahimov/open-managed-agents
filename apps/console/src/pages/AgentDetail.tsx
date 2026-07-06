@@ -11,10 +11,23 @@ import { PageHeader } from "../components/PageHeader";
 import { CreateDeploymentDialog } from "../components/CreateDeploymentDialog";
 import { Button } from "@/components/ui/button";
 import type { AgentRecord as Agent } from "../types/agent";
+import { AmbientTriggerControls } from "../components/AmbientTriggerControls";
 import {
   COMPOSIO_MANAGED_AGENT_INTEGRATIONS,
   composioIntegrationIcon,
 } from "../lib/composio-integrations";
+import {
+  AMBIENT_WAKE_MODES,
+  buildAmbientTrigger,
+  buildBudget,
+  buildDecisionPolicy,
+  createDefaultAmbientTriggerDraft,
+  scheduleSummary,
+  type AmbientBudgetPreset,
+  type AmbientDecisionPreset,
+  type AmbientTriggerSource,
+  type AmbientWakeMode,
+} from "../lib/ambient-controls";
 
 /** Shared publication shape across Linear / GitHub / Slack — they all
  *  expose the same id / status / mode / persona / workspace_name fields. */
@@ -24,6 +37,24 @@ interface Pub {
   mode: string;
   persona: { name: string; avatarUrl: string | null };
   workspace_name: string | null;
+}
+
+interface AmbientRule {
+  type: "ambient_rule";
+  id: string;
+  agent_id: string;
+  name: string;
+  description?: string;
+  enabled: boolean;
+  trigger: { source: AmbientTriggerSource; config?: Record<string, unknown> };
+  wake_mode: AmbientWakeMode;
+  decision_policy?: Record<string, unknown>;
+  budget?: Record<string, unknown>;
+  created_at: string;
+  updated_at?: string;
+  next_wake_at?: string;
+  last_wake_at?: string;
+  last_decision?: { outcome: string; reason?: string; decided_at: string; session_id?: string };
 }
 
 export function AgentDetail() {
@@ -64,6 +95,13 @@ export function AgentDetail() {
   );
   const { data: slackRes } = useApiQuery<{ data: Pub[] }>(
     id ? `/v1/integrations/slack/agents/${id}/publications` : null,
+    undefined,
+    { enabled },
+  );
+
+  const ambientRulesPath = id ? `/v1/agents/${id}/ambient-rules` : null;
+  const { data: ambientRulesRes } = useApiQuery<{ data: AmbientRule[] }>(
+    ambientRulesPath,
     undefined,
     { enabled },
   );
@@ -241,6 +279,11 @@ export function AgentDetail() {
         </div>
       </div>
 
+      <AmbientRulesPanel
+        agentId={agent.id}
+        rules={ambientRulesRes?.data ?? []}
+      />
+
       {/* System prompt */}
       {agent.system && (
         <div className="mt-8 max-w-2xl">
@@ -285,6 +328,211 @@ export function AgentDetail() {
         initialAgentId={agent.id}
       />
     </Page>
+  );
+}
+
+function AmbientRulesPanel({
+  agentId,
+  rules,
+}: {
+  agentId: string;
+  rules: AmbientRule[];
+}) {
+  const { api } = useApi();
+  const qc = useQueryClient();
+  const path = `/v1/agents/${agentId}/ambient-rules`;
+  const [name, setName] = useState("");
+  const [triggerDraft, setTriggerDraft] = useState(createDefaultAmbientTriggerDraft("schedule"));
+  const [wakeMode, setWakeMode] = useState<AmbientWakeMode>("decide");
+  const [enabled, setEnabled] = useState(true);
+  const [nextWakeAt, setNextWakeAt] = useState("");
+  const [decisionPreset, setDecisionPreset] = useState<AmbientDecisionPreset>("new_signal");
+  const [budgetPreset, setBudgetPreset] = useState<AmbientBudgetPreset>("standard");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const invalidate = () => qc.invalidateQueries({ queryKey: [path] });
+
+  const createRule = async () => {
+    setSaving(true);
+    setErr(null);
+    try {
+      const body: Record<string, unknown> = {
+        name,
+        enabled,
+        trigger: buildAmbientTrigger(triggerDraft),
+        wake_mode: wakeMode,
+      };
+      const policy = buildDecisionPolicy(decisionPreset);
+      if (policy) body.decision_policy = policy;
+      const budget = buildBudget(budgetPreset);
+      if (budget) body.budget = budget;
+      if (nextWakeAt) body.next_wake_at = new Date(nextWakeAt).toISOString();
+      await api(path, { method: "POST", body: JSON.stringify(body) });
+      setName("");
+      setTriggerDraft(createDefaultAmbientTriggerDraft("schedule"));
+      setDecisionPreset("new_signal");
+      setBudgetPreset("standard");
+      setNextWakeAt("");
+      await invalidate();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : "Failed to create ambient rule");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const setRuleEnabled = async (rule: AmbientRule, next: boolean) => {
+    await api(`${path}/${rule.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ enabled: next }),
+    });
+    await invalidate();
+  };
+
+  const deleteRule = async (rule: AmbientRule) => {
+    if (!confirm(`Delete ambient rule "${rule.name}"?`)) return;
+    await api(`${path}/${rule.id}`, { method: "DELETE" });
+    await invalidate();
+  };
+
+  return (
+    <div className="mt-8 max-w-4xl">
+      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between mb-3">
+        <div>
+          <h2 className="font-display text-base font-semibold">Ambient</h2>
+          <p className="text-xs text-fg-subtle">
+            {rules.filter((r) => r.enabled).length} enabled · {rules.length} total
+          </p>
+        </div>
+      </div>
+
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
+        <div className="border border-border rounded-lg overflow-hidden">
+          {rules.length === 0 ? (
+            <div className="px-4 py-8 text-sm text-fg-subtle">
+              No ambient rules configured.
+            </div>
+          ) : (
+            <div className="divide-y divide-border">
+              {rules.map((rule) => (
+                <div key={rule.id} className="px-4 py-3 flex flex-col gap-3 sm:flex-row sm:items-center">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <span className="font-medium text-sm text-fg truncate">{rule.name}</span>
+                      <span className={rule.enabled ? "text-xs text-success" : "text-xs text-fg-subtle"}>
+                        {rule.enabled ? "Enabled" : "Disabled"}
+                      </span>
+                    </div>
+                    <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-fg-subtle">
+                      <span>{rule.trigger.source}</span>
+                      <span>{rule.wake_mode}</span>
+                      {rule.trigger.source === "schedule" && (
+                        <span>{scheduleSummary(rule.trigger.config) ?? "Schedule"}</span>
+                      )}
+                      <span>{rule.next_wake_at ? `Next ${new Date(rule.next_wake_at).toLocaleString()}` : "No next wake"}</span>
+                      {rule.last_decision && <span>Last {rule.last_decision.outcome}</span>}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <label className="inline-flex items-center gap-2 text-xs text-fg-muted min-h-9">
+                      <input
+                        type="checkbox"
+                        checked={rule.enabled}
+                        onChange={(e) => void setRuleEnabled(rule, e.target.checked)}
+                        className="accent-[var(--brand)]"
+                      />
+                      Active
+                    </label>
+                    <Button variant="outline" size="sm" onClick={() => void deleteRule(rule)}>
+                      Delete
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="border border-border rounded-lg p-4 space-y-3">
+          <h3 className="font-display text-sm font-semibold">New Rule</h3>
+          {err && <div className="text-xs text-danger">{err}</div>}
+          <Field label="Name">
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Hourly PR review"
+              className="w-full px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg"
+            />
+          </Field>
+          <AmbientTriggerControls
+            value={triggerDraft}
+            onChange={setTriggerDraft}
+            inputClassName="w-full px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg"
+          />
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Wake mode">
+              <select
+                value={wakeMode}
+                onChange={(e) => setWakeMode(e.target.value as AmbientWakeMode)}
+                className="w-full px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg"
+              >
+                {AMBIENT_WAKE_MODES.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))}
+              </select>
+            </Field>
+            <Field label="Decision">
+              <select
+                value={decisionPreset}
+                onChange={(e) => setDecisionPreset(e.target.value as AmbientDecisionPreset)}
+                className="w-full px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg"
+              >
+                <option value="always">Always wake</option>
+                <option value="new_signal">Only for new signal</option>
+                <option value="approval_required">Ask before acting</option>
+              </select>
+            </Field>
+          </div>
+          <Field label="Budget">
+            <select
+              value={budgetPreset}
+              onChange={(e) => setBudgetPreset(e.target.value as AmbientBudgetPreset)}
+              className="w-full px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg"
+            >
+              <option value="conservative">Conservative</option>
+              <option value="standard">Standard</option>
+              <option value="intensive">High frequency</option>
+            </select>
+          </Field>
+          <label className="inline-flex items-center gap-2 text-sm text-fg-muted">
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(e) => setEnabled(e.target.checked)}
+              className="accent-[var(--brand)]"
+            />
+            Enabled
+          </label>
+          <Field label="Next wake">
+            <input
+              type="datetime-local"
+              value={nextWakeAt}
+              onChange={(e) => setNextWakeAt(e.target.value)}
+              className="w-full px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg"
+            />
+          </Field>
+          <Button
+            size="sm"
+            onClick={() => void createRule()}
+            disabled={saving || !name.trim()}
+            className="w-full"
+          >
+            {saving ? "Creating…" : "Create rule"}
+          </Button>
+        </div>
+      </div>
+    </div>
   );
 }
 

@@ -23,7 +23,7 @@ import type { BrowserHarness, BrowserBillingHook } from "@open-managed-agents/br
 /** Tools enabled by default when an agent has no explicit tools config.
  *  Excludes opt-in tools that bias the LLM away from cheaper alternatives
  *  — see OPT_IN_TOOLS below. */
-export const DEFAULT_TOOLS = ["bash", "read", "write", "edit", "glob", "grep", "web_fetch", "web_search", "schedule", "cancel_schedule", "list_schedules"];
+export const DEFAULT_TOOLS = ["bash", "read", "write", "edit", "glob", "grep", "web_fetch", "web_search", "schedule", "cancel_schedule", "list_schedules", "create_ambient_rule", "list_ambient_rules", "delete_ambient_rule"];
 
 /** Tools recognised but NOT registered by default — agents must opt in
  *  via tools config (`{ name: "browser", enabled: true }`).
@@ -401,14 +401,51 @@ export async function buildTools(
     /** Cancel a previously scheduled wakeup by id. */
     cancelWakeup?: (id: string) => Promise<{ cancelled: boolean }>;
     /** List pending wakeup schedules for THIS session. Filters out the
-     *  framework's internal recoverEventQueue / pollBackgroundTasks rows. */
-    listWakeups?: () => Array<{
-      id: string;
-      fire_at?: string;
-      cron?: string;
+     *  framework's internal recoverEventQueue / pollBackgroundTasks rows.
+     *  May be async (Node reads a SQL table; CF reads DO state inline). */
+    listWakeups?: () =>
+      | Array<{
+          id: string;
+          fire_at?: string;
+          cron?: string;
+          prompt: string;
+          kind: "one_shot" | "cron";
+        }>
+      | Promise<
+          Array<{
+            id: string;
+            fire_at?: string;
+            cron?: string;
+            prompt: string;
+            kind: "one_shot" | "cron";
+          }>
+        >;
+    /** Create a standing ambient rule on THIS session's agent — unlike
+     *  scheduleWakeup (which re-wakes this session), an ambient rule
+     *  spawns a FRESH session per occurrence via the ambient dispatcher.
+     *  Node wires this to the agents-store AmbientRuleService; CF leaves
+     *  it unset until the ambient dispatcher lands there. */
+    createAmbientRule?: (args: {
+      name: string;
+      description?: string;
+      cron: string;
+      timezone?: string;
       prompt: string;
-      kind: "one_shot" | "cron";
-    }>;
+      wake_mode?: "observe" | "decide" | "act" | "escalate";
+    }) => Promise<{ id: string; next_wake_at?: string }>;
+    /** List this agent's ambient rules. */
+    listAmbientRules?: () => Promise<
+      Array<{
+        id: string;
+        name: string;
+        enabled: boolean;
+        cron?: string;
+        next_wake_at?: string;
+        wake_mode: string;
+      }>
+    >;
+    /** Soft-delete one of this agent's ambient rules by id. */
+    deleteAmbientRule?: (id: string) => Promise<{ deleted: boolean }>;
   }
 ): Promise<Record<string, any>> {
   const enabled = getEnabledTools(agentConfig.tools);
@@ -981,7 +1018,56 @@ export async function buildTools(
       description:
         "List all pending wakeup schedules for THIS session: id, fire_at, cron (if recurring), prompt, kind.",
       inputSchema: z.object({}),
-      execute: safe(async () => ({ schedules: env.listWakeups!() })),
+      execute: safe(async () => ({ schedules: await env.listWakeups!() })),
+    });
+  }
+
+  // --- Ambient rules (agent-level standing crons) ---
+  // schedule/cancel_schedule re-wake THIS session; ambient rules are the
+  // agent-level counterpart: a standing rule the ambient dispatcher turns
+  // into a FRESH session per occurrence. This is how a user can say "run
+  // deep research on X every morning" in chat and have the agent wire its
+  // own recurring job — no console UI required.
+  if (env?.createAmbientRule && enabled.has("create_ambient_rule")) {
+    tools.create_ambient_rule = tool({
+      description:
+        "Create a standing ambient rule on THIS agent: on the given cron, the platform starts a FRESH session " +
+        "of this agent and injects `prompt` as the opening user message. Unlike the `schedule` tool (which " +
+        "re-wakes the current session), ambient rules outlive this conversation — use them when the user asks " +
+        "for a recurring job (\"do deep research on X every day\", \"check my email every morning\"). " +
+        "Confirm the cadence and the task with the user before creating one, echo back the rule you created, " +
+        "and mention it can be managed later with list_ambient_rules / delete_ambient_rule or in the console's " +
+        "Ambient panel on the agent page.",
+      inputSchema: z.object({
+        name: z.string().min(1).max(120).describe("Short human-readable rule name, e.g. \"Daily deep research: quantum error correction\""),
+        description: z.string().max(500).optional().describe("One-line summary shown in the console"),
+        cron: z.string().min(9).max(120).describe("5-field cron cadence (e.g. \"0 9 * * *\" = 9:00 daily)"),
+        timezone: z.string().max(64).optional().describe("IANA timezone for the cron (e.g. \"America/Los_Angeles\"). Defaults to UTC."),
+        prompt: z.string().min(1).max(4000).describe("Opening user message for each spawned session — the standing task, written to future-you"),
+        wake_mode: z.enum(["observe", "decide", "act", "escalate"]).optional()
+          .describe("act = do the task; decide (default) = assess then act if warranted; observe = log only; escalate = flag a human"),
+      }),
+      execute: safe(async (args) => env.createAmbientRule!(args)),
+    });
+  }
+
+  if (env?.listAmbientRules && enabled.has("list_ambient_rules")) {
+    tools.list_ambient_rules = tool({
+      description:
+        "List this agent's standing ambient rules: id, name, enabled, cron, next_wake_at, wake_mode.",
+      inputSchema: z.object({}),
+      execute: safe(async () => ({ rules: await env.listAmbientRules!() })),
+    });
+  }
+
+  if (env?.deleteAmbientRule && enabled.has("delete_ambient_rule")) {
+    tools.delete_ambient_rule = tool({
+      description:
+        "Delete one of this agent's ambient rules by id (soft-delete; the standing job stops firing).",
+      inputSchema: z.object({
+        id: z.string().min(1).describe("Rule id from list_ambient_rules or create_ambient_rule"),
+      }),
+      execute: safe(async ({ id }) => env.deleteAmbientRule!(id)),
     });
   }
 

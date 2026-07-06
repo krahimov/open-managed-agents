@@ -3,12 +3,15 @@
 // live here behind a single SqlAgentRepo class.
 
 export { SqlAgentRepo } from "./sql-agent-repo";
+export { SqlAmbientRuleRepo } from "./sql-ambient-rule-repo";
 
 import { SqlAgentRepo } from "./sql-agent-repo";
+import { SqlAmbientRuleRepo } from "./sql-ambient-rule-repo";
 import { drizzle } from "drizzle-orm/d1";
 import type { OmaDb } from "@open-managed-agents/db-schema";
 import type { Logger } from "../ports";
 import { AgentService } from "../service";
+import { AmbientRuleService } from "../ambient-service";
 
 /**
  * CF deployment factory. Wraps the D1Database binding in a Drizzle client so
@@ -30,6 +33,15 @@ export function createCfAgentService(
   });
 }
 
+export function createCfAmbientRuleService(
+  deps: { db: D1Database },
+): AmbientRuleService {
+  const drz = drizzle(deps.db);
+  return new AmbientRuleService({
+    repo: new SqlAmbientRuleRepo(drz),
+  });
+}
+
 /**
  * Node deployment factory. Caller passes any {@link OmaDb} — typically a
  * postgres-js or better-sqlite3 Drizzle client built at the composition root.
@@ -48,5 +60,13 @@ export function createSqliteAgentService(
   return new AgentService({
     repo: new SqlAgentRepo(deps.db),
     logger: opts?.logger,
+  });
+}
+
+export function createSqliteAmbientRuleService(
+  deps: { db: OmaDb },
+): AmbientRuleService {
+  return new AmbientRuleService({
+    repo: new SqlAmbientRuleRepo(deps.db),
   });
 }

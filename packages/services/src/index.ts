@@ -64,6 +64,8 @@ import {
 } from "@open-managed-agents/model-cards-store";
 import {
   AgentService,
+  AmbientRuleService,
+  createCfAmbientRuleService,
   createCfAgentService,
 } from "@open-managed-agents/agents-store";
 import {
@@ -124,6 +126,7 @@ export interface Services {
   evals: EvalRunService;
   modelCards: ModelCardService;
   agents: AgentService;
+  ambientRules: AmbientRuleService;
   environments: EnvironmentService;
   outboundSnapshots: OutboundSnapshotService;
   sessionSecrets: SessionSecretService;
@@ -297,6 +300,10 @@ export function buildServices(env: Env, db: D1Database): Services {
     agents: pickBackend(overrides, "agents", {
       cf: () => createCfAgentService({ db }),
       // pg: () => createPgAgentService({ pg: getPgPool(env) }),
+    }),
+    ambientRules: pickBackend(overrides, "ambientRules", {
+      cf: () => createCfAmbientRuleService({ db }),
+      // pg: () => createPgAmbientRuleService({ pg: getPgPool(env) }),
     }),
     environments: pickBackend(overrides, "environments", {
       cf: () => createCfEnvironmentService({ db }),

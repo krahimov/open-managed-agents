@@ -3,6 +3,7 @@ const BASE = "";
 import { useCallback, useMemo } from "react";
 import { toast } from "sonner";
 import { FatalSseError, streamSse } from "./sse";
+import { getClerkBearerToken } from "./clerk-auth";
 
 /**
  * Server error envelope after the Anthropic-compatible migration:
@@ -131,6 +132,10 @@ export function useApi() {
       // multipart boundaries itself, and a manually set content-type without
       // the boundary breaks parsing on the server.
       const isFormData = init?.body instanceof FormData;
+      // Clerk mode: short-lived session JWT per request (null when Clerk
+      // is disabled or signed out — better-auth cookies still ride along
+      // via credentials: "include").
+      const clerkToken = await getClerkBearerToken();
       let res: Response;
       try {
         res = await fetch(`${BASE}${path}`, {
@@ -138,6 +143,7 @@ export function useApi() {
           credentials: "include",
           headers: {
             ...(init?.body && !isFormData ? { "content-type": "application/json" } : {}),
+            ...(clerkToken ? { authorization: `Bearer ${clerkToken}` } : {}),
             // Pin the workspace for this request. Backend validates membership;
             // a stale value (deleted tenant, removed membership) yields 403 and
             // the sidebar's catch-and-retry path clears + reloads.
@@ -214,7 +220,12 @@ export function useApi() {
       // Successful response — clear the self-heal sentinel so a future stale
       // tenant can self-heal again later in the same browser session.
       sessionStorage.removeItem("oma_tenant_self_heal");
-      return res.json() as Promise<T>;
+      // Some endpoints return a success with no body (e.g. POST /events → 202,
+      // 204 No Content). res.json() rejects on an empty string, which would
+      // turn a successful write into a thrown error for the caller. Parse
+      // defensively: empty body → undefined.
+      const text = await res.text();
+      return (text ? JSON.parse(text) : undefined) as T;
     },
     [],
   );
@@ -253,7 +264,15 @@ export function useApi() {
 
       void streamSse(path, {
         signal,
-        headers: activeTenant ? { "x-active-tenant": activeTenant } : {},
+        // Factory: re-resolved on every (re)connect so a fresh Clerk token
+        // is attached — the static form would go stale mid-stream.
+        headers: async () => {
+          const clerkToken = await getClerkBearerToken();
+          return {
+            ...(clerkToken ? { authorization: `Bearer ${clerkToken}` } : {}),
+            ...(activeTenant ? { "x-active-tenant": activeTenant } : {}),
+          };
+        },
         async onOpen(response) {
           if (response.ok) {
             // Connection (re)established — clear the failure counter so the

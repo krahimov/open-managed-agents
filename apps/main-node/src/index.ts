@@ -7,6 +7,7 @@
  * (agents-store, vaults-store, memory-store, etc.).
  */
 
+import { randomBytes } from "node:crypto";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
@@ -32,7 +33,10 @@ import {
   createPostgresSqlClient,
   type SqlClient,
 } from "@open-managed-agents/sql-client";
-import { createSqliteAgentService } from "@open-managed-agents/agents-store";
+import {
+  createSqliteAgentService,
+  createSqliteAmbientRuleService,
+} from "@open-managed-agents/agents-store";
 import {
   createSqliteMemoryStoreService,
   SqlMemoryRepo,
@@ -148,6 +152,17 @@ import {
 } from "./lib/event-stream-hub";
 import { PgEventStreamHub } from "./lib/pg-event-stream-hub";
 import { NodeHarnessRuntime } from "./lib/node-harness-runtime";
+import { NodeSessionWakeups } from "./lib/node-session-wakeups";
+import {
+  resolveClerkConfig,
+  ClerkTokenVerifier,
+  ClerkStore,
+  buildClerkPreCreateGate,
+  handleClerkWebhook,
+} from "./lib/clerk";
+import { resolveMaxAgentsPerTenant, buildAgentPreCreateGate } from "./lib/agent-limits";
+import { NodeAmbientDispatcher } from "./lib/node-ambient-dispatch";
+import { Cron } from "croner";
 import { SessionRegistry } from "./registry.js";
 
 loadDotenvDefaults();
@@ -266,10 +281,21 @@ const authDisabled = process.env.AUTH_DISABLED === "1";
 const authDbPath = process.env.AUTH_DATABASE_PATH ?? "./data/auth.db";
 const sender = senderFromEnv(process.env);
 
+// AUTH_MODE=clerk → Clerk is the ONLY auth: better-auth is not mounted at
+// all (no /auth/* endpoints, no cookie sessions); every request must carry
+// a Clerk session JWT (or an x-api-key). Pair with a console built with
+// VITE_CLERK_PUBLISHABLE_KEY. AUTH_DISABLED=1 still wins for bare dev.
+const clerkOnly = (process.env.AUTH_MODE ?? "").trim().toLowerCase() === "clerk";
+if (clerkOnly && !resolveClerkConfig()) {
+  throw new Error(
+    "AUTH_MODE=clerk requires CLERK_ISSUER or CLERK_PUBLISHABLE_KEY to be set",
+  );
+}
+
 let auth: ReturnType<typeof buildBetterAuth> | null = null;
 let authShutdown: (() => Promise<void>) | null = null;
 
-if (!authDisabled) {
+if (!authDisabled && !clerkOnly) {
   if (usePostgres) {
     const { Pool } = (await import("pg")) as typeof import("pg");
     const pgPool = new Pool({ connectionString: dbUrl });
@@ -325,9 +351,62 @@ if (!authDisabled) {
   }
 }
 
+// ─── Clerk (optional managed-auth overlay) ──────────────────────────────
+// Active when CLERK_ISSUER or CLERK_PUBLISHABLE_KEY is set. Coexists with
+// better-auth: cookie sessions resolve first, then `Authorization:
+// Bearer <clerk session JWT>`. Users sync into clerk_users (+ tenant +
+// membership via the same ensureTenant path) through /clerk/webhook.
+
+const clerkConfig = resolveClerkConfig();
+const clerkVerifier = clerkConfig ? new ClerkTokenVerifier(clerkConfig) : null;
+const clerkStore = clerkConfig
+  ? new ClerkStore({
+      sql,
+      dialect,
+      ensureTenant: (userId, name, email) => ensureTenantSqlite(sql, userId, name, email),
+      // Org tenancy — same tenant/membership SQL shapes ensureTenantSqlite
+      // uses (better-auth camelCase tenant columns, snake_case membership).
+      orgTenancy: {
+        createTenant: async (name) => {
+          const tenantId = `tn_${randomBytes(16).toString("hex")}`;
+          const now = Date.now();
+          await sql
+            .prepare(`INSERT INTO "tenant" (id, name, "createdAt", "updatedAt") VALUES (?, ?, ?, ?)`)
+            .bind(tenantId, name, now, now)
+            .run();
+          return tenantId;
+        },
+        addMembership: async (userId, tenantId, role) => {
+          await sql
+            .prepare(
+              `INSERT INTO "membership" (user_id, tenant_id, role, created_at)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT (user_id, tenant_id) DO NOTHING`,
+            )
+            .bind(userId, tenantId, role, Date.now())
+            .run();
+        },
+        removeMembership: async (userId, tenantId) => {
+          await sql
+            .prepare(`DELETE FROM "membership" WHERE user_id = ? AND tenant_id = ?`)
+            .bind(userId, tenantId)
+            .run();
+        },
+      },
+    })
+  : null;
+if (clerkStore) {
+  await clerkStore.ensureSchema();
+  logger.info(
+    { op: "main-node.clerk.enabled", issuer: clerkConfig!.issuer, billing_enforce: clerkConfig!.billingEnforce },
+    "clerk auth enabled",
+  );
+}
+
 // ─── Stores ─────────────────────────────────────────────────────────────
 
 const agentsService = createSqliteAgentService({ db: drizzleDb });
+const ambientRulesService = createSqliteAmbientRuleService({ db: drizzleDb });
 const vaultService = createSqliteVaultService({ db: drizzleDb });
 const credentialService = createSqliteCredentialService({ db: drizzleDb });
 const sessionsService = createSqliteSessionService({ db: drizzleDb });
@@ -608,6 +687,66 @@ const sessionRegistry = new SessionRegistry({
       mcpBinding: nodeMcpBinding,
       tenantId: context.tenantId,
       sessionId: context.sessionId,
+      // Durable wakeups (session_wakeups table + scheduler pump) — wiring
+      // these unlocks the schedule/cancel_schedule/list_schedules tools,
+      // which tools.ts only registers when the runtime provides the hooks.
+      // Parity with SessionDO's DO-alarm implementation on CF.
+      scheduleWakeup: (a) =>
+        sessionWakeups.schedule({
+          tenantId: context.tenantId,
+          sessionId: context.sessionId,
+          agentId: agent.id,
+          ...a,
+        }),
+      cancelWakeup: (id) => sessionWakeups.cancel(context.sessionId, id),
+      listWakeups: () => sessionWakeups.list(context.sessionId),
+      // Ambient rules from inside the session — "set up a daily deep-research
+      // run" said in chat becomes a standing agent-level rule the ambient
+      // dispatcher fires as fresh sessions. next_wake_at is armed here from
+      // the cron so the rule is live the moment the tool returns.
+      createAmbientRule: async (a) => {
+        const timezone = a.timezone?.trim() || "UTC";
+        const next = new Cron(a.cron, { timezone }).nextRun();
+        if (!next) throw new Error(`cron "${a.cron}" has no future occurrence`);
+        const row = await ambientRulesService.create({
+          tenantId: context.tenantId,
+          agentId: agent.id,
+          input: {
+            name: a.name,
+            ...(a.description ? { description: a.description } : {}),
+            trigger: {
+              source: "schedule",
+              config: { cron: a.cron, timezone, prompt: a.prompt },
+            },
+            wake_mode: a.wake_mode ?? "decide",
+            next_wake_at: next.toISOString(),
+            created_by: `session:${context.sessionId}`,
+          },
+        });
+        return { id: row.id, next_wake_at: row.next_wake_at };
+      },
+      listAmbientRules: async () => {
+        const rows = await ambientRulesService.listByAgent({
+          tenantId: context.tenantId,
+          agentId: agent.id,
+        });
+        return rows.map((r) => ({
+          id: r.id,
+          name: r.name,
+          enabled: r.enabled,
+          cron: typeof r.trigger.config?.cron === "string" ? r.trigger.config.cron : undefined,
+          next_wake_at: r.next_wake_at,
+          wake_mode: r.wake_mode,
+        }));
+      },
+      deleteAmbientRule: async (id) => {
+        await ambientRulesService.delete({
+          tenantId: context.tenantId,
+          agentId: agent.id,
+          ruleId: id,
+        });
+        return { deleted: true };
+      },
     });
   },
   buildHarness: () => {
@@ -615,6 +754,17 @@ const sessionRegistry = new SessionRegistry({
     const sdk = new ClaudeAgentSdkHarness({
       resolveMcpTarget: resolveNodeMcpProxyTarget,
       resolveSkills: (tenantId, refs) => skillStore.resolveRefs(tenantId, refs),
+      // Setup-session support: the in-process oma_setup MCP server stages the
+      // agent's refined harness in session metadata and, on finish, applies it
+      // to the agent it belongs to.
+      readSessionMetadata: async (tenantId, sessionId) =>
+        (await sessionsService.get({ tenantId, sessionId }))?.metadata ?? null,
+      patchSessionMetadata: async (tenantId, sessionId, patch) => {
+        await sessionsService.update({ tenantId, sessionId, metadata: patch });
+      },
+      updateAgent: async (tenantId, agentId, patch) => {
+        return await agentsService.update({ tenantId, agentId, input: patch });
+      },
     });
     return {
       run: (ctx: unknown) => {
@@ -693,6 +843,31 @@ const sessionWorkQueue = new NodeSessionWorkQueue({
   },
 });
 await sessionWorkQueue.ensureSchema();
+
+// Durable session wakeups — fired by the scheduler's session-wakeups job;
+// synthetic user.message events flow through the same work queue as real
+// ones so turn ordering and crash recovery hold.
+const sessionWakeups = new NodeSessionWakeups({
+  sql,
+  dialect,
+  enqueue: async (item) => {
+    await sessionWorkQueue.enqueue(item);
+    void sessionWorkQueue.wake(item.sessionId);
+  },
+  persistEvent: async (sessionId, event) => {
+    const log = newEventLog(sessionId);
+    await log.appendAsync(event);
+    const stored = await log.getEventsAsync();
+    const last = stored[stored.length - 1];
+    if (last) hub.publish(sessionId, last);
+  },
+  hasEvent: async (sessionId, eventId) => {
+    const stored = await newEventLog(sessionId).getEventsAsync();
+    return stored.some((e) => (e as { id?: string }).id === eventId);
+  },
+});
+await sessionWakeups.ensureSchema();
+
 await sessionRegistry.bootstrap();
 void sessionWorkQueue.wakeAll().catch((err) => {
   logger.error({ err, op: "session_work_queue.bootstrap_failed" }, "session work queue bootstrap failed");
@@ -705,6 +880,7 @@ const kv = new SqlKvStore({ db: drizzleDb, tenantId: "default" });
 const services: RouteServices = {
   sql,
   agents: agentsService,
+  ambientRules: ambientRulesService,
   vaults: vaultService,
   credentials: credentialService,
   memory: memoryService,
@@ -892,16 +1068,19 @@ app.get("/auth-info", (c) =>
     auth_disabled: authDisabled,
     providers: authDisabled
       ? []
-      : [
-          "email",
-          ...(process.env.AUTH_REQUIRE_EMAIL_VERIFY === "1" ? ["email-otp"] : []),
-          ...(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET
-            ? ["google"]
-            : []),
-          ...(process.env.GITHUB_AUTH_CLIENT_ID && process.env.GITHUB_AUTH_CLIENT_SECRET
-            ? ["github"]
-            : []),
-        ],
+      : clerkOnly
+        ? ["clerk"]
+        : [
+            "email",
+            ...(process.env.AUTH_REQUIRE_EMAIL_VERIFY === "1" ? ["email-otp"] : []),
+            ...(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET
+              ? ["google"]
+              : []),
+            ...(process.env.GITHUB_AUTH_CLIENT_ID && process.env.GITHUB_AUTH_CLIENT_SECRET
+              ? ["github"]
+              : []),
+            ...(clerkConfig ? ["clerk"] : []),
+          ],
     turnstile_site_key: null,
   }),
 );
@@ -914,22 +1093,87 @@ if (auth) {
   app.on(["GET", "POST"], "/auth/*", (c) => auth!.handler(c.req.raw));
 }
 
+// Clerk webhooks (user sync + billing) — public route on the root app
+// (svix signature IS the auth; the v1 auth middleware never sees this).
+if (clerkConfig && clerkStore) {
+  app.post("/clerk/webhook", async (c) => {
+    const rawBody = await c.req.text();
+    const result = await handleClerkWebhook({
+      config: clerkConfig,
+      store: clerkStore,
+      rawBody,
+      headers: {
+        svixId: c.req.header("svix-id"),
+        svixTimestamp: c.req.header("svix-timestamp"),
+        svixSignature: c.req.header("svix-signature"),
+      },
+    });
+    return c.json(result.body, result.status as 200);
+  });
+}
+
 // Auth middleware via packages/auth — same five-priority resolution as
 // apps/main on CF.
 const authMw = buildAuthMw({
   disabled: authDisabled,
   bypassPath: (path) => path === "/health" || path.startsWith("/auth/"),
   resolveSession: async (headers) => {
-    if (!auth) return null;
-    const session = (await auth.api.getSession({ headers })) as
-      | { user?: { id: string; email?: string | null; name?: string | null } }
-      | null;
-    if (!session?.user) return null;
-    return {
-      userId: session.user.id,
-      email: session.user.email ?? null,
-      name: session.user.name ?? null,
-    };
+    if (auth) {
+      const session = (await auth.api.getSession({ headers })) as
+        | { user?: { id: string; email?: string | null; name?: string | null } }
+        | null;
+      if (session?.user) {
+        return {
+          userId: session.user.id,
+          email: session.user.email ?? null,
+          name: session.user.name ?? null,
+        };
+      }
+    }
+    // Clerk session JWT — `Authorization: Bearer <token>` (API keys use
+    // the x-api-key header, so there's no collision on Bearer).
+    if (clerkVerifier && clerkStore) {
+      const authz = headers.get("authorization") ?? "";
+      const token = authz.startsWith("Bearer ") ? authz.slice("Bearer ".length).trim() : "";
+      if (token) {
+        try {
+          const verified = await clerkVerifier.verify(token);
+          let row = await clerkStore.getByClerkId(verified.userId);
+          if (!row) {
+            // JIT provision when the user.created webhook hasn't landed
+            // yet (or isn't configured): tenant + membership + clerk_users
+            // row keyed by the Clerk user id. The webhook enriches later.
+            row = await clerkStore.upsertUser({ id: verified.userId });
+          }
+          // Claims are authoritative only when the token actually carries
+          // billing claims — absent pla/fea must not clobber webhook state.
+          if (
+            row &&
+            verified.hasBillingClaims &&
+            row.plan !== verified.entitlements.plan
+          ) {
+            await clerkStore.syncEntitlementsFromClaims(verified.userId, verified.entitlements);
+          }
+          // Active organization → route to the org's tenant (validated
+          // against membership by the middleware before it takes effect).
+          let tenantHint: string | null = null;
+          if (verified.orgId) {
+            const org = await clerkStore.getOrg(verified.orgId);
+            if (org?.tenant_id && !org.deleted_at) tenantHint = org.tenant_id;
+          }
+          return {
+            userId: verified.userId,
+            email: row?.email ?? null,
+            name: row?.name ?? null,
+            tenantHint,
+          };
+        } catch (err) {
+          logger.debug?.({ err, op: "main-node.clerk.verify_failed" }, "clerk token rejected");
+          return null;
+        }
+      }
+    }
+    return null;
   },
   resolveApiKey: async (apiKey) => {
     const hash = await sha256Hex(apiKey);
@@ -968,9 +1212,15 @@ v1.use("*", async (c, next) => {
 });
 
 // Mount route bundles. Same paths CF uses; behavior preserved.
+// Flat per-tenant agent cap (MAX_AGENTS_PER_TENANT) — interim production
+// guard for every tenant until billing entitlements own limits.
+const maxAgentsPerTenant = resolveMaxAgentsPerTenant();
 v1.route("/agents", buildAgentRoutes({
   services,
   validateModel: validateNodeModel,
+  ...(maxAgentsPerTenant
+    ? { preCreateGate: buildAgentPreCreateGate({ sql, maxAgents: maxAgentsPerTenant }) }
+    : {}),
 }));
 const sessionRouter = new NodeSessionRouter({
   sql,
@@ -983,7 +1233,29 @@ const sessionRoutesApp = buildSessionRoutes({
   services,
   router: sessionRouter,
   outputs: sessionOutputsBackend.adapter,
-  lifecycle: nodeSessionLifecycle({ files: filesService, filesBlob }),
+  lifecycle: {
+    ...nodeSessionLifecycle({ files: filesService, filesBlob }),
+    // Clerk Billing entitlement gate: free-plan tenants get a concurrent-
+    // session cap (402), paid plans pass, non-Clerk tenants fail open.
+    ...(clerkConfig && clerkStore && clerkConfig.billingEnforce
+      ? {
+          preCreateGate: buildClerkPreCreateGate({
+            store: clerkStore,
+            config: clerkConfig,
+            countActiveSessions: async (tenantId) => {
+              const row = await sql
+                .prepare(
+                  `SELECT COUNT(*) AS n FROM sessions
+                   WHERE tenant_id = ? AND archived_at IS NULL AND terminated_at IS NULL`,
+                )
+                .bind(tenantId)
+                .first<{ n: number }>();
+              return Number(row?.n ?? 0);
+            },
+          }),
+        }
+      : {}),
+  },
   // Node sandboxes are selected by SANDBOX_PROVIDER. Environment rows still
   // carry the package/networking config and are snapshotted onto sessions.
   localRuntimeEnvId: "env-local-runtime",
@@ -1590,6 +1862,17 @@ serve({ fetch: app.fetch, port, hostname: host }, (info) => {
 // applied) webhook-events retention. Linear dispatch is left un-wired here
 // because main-node doesn't construct a LinearProvider; pass `linearSweeper`
 // when an in-process gateway lands.
+const ambientDispatcher = new NodeAmbientDispatcher({
+  ambientRules: ambientRulesService,
+  agents: agentsService,
+  sessions: sessionsService,
+  // Same lever the integrations bridge uses: append a user.message via
+  // NodeSessionRouter so the harness runs a real turn.
+  appendUserEvent: async (sessionId, _tenantId, _agentId, event) => {
+    await sessionRouter.appendEvent(sessionId, event);
+  },
+});
+
 const scheduler = buildNodeScheduler({
   evalServices: {
     agents: agentsService,
@@ -1599,7 +1882,9 @@ const scheduler = buildNodeScheduler({
     kv,
   },
   memory: memoryService,
+  ambientDispatcher,
   integrationsSql: platformRootSecret ? sql : null,
+  wakeups: { pump: () => sessionWakeups.pump() },
 });
 await scheduler.start();
 logger.info({ op: "main-node.scheduler.started" }, "scheduler started");

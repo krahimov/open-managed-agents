@@ -1,27 +1,34 @@
 {
-  "version": "7",
-  "dialect": "postgresql",
-  "entries": [
-    {
-      "idx": 0,
-      "version": "7",
-      "when": 1779348643561,
-      "tag": "0000_consolidated",
-      "breakpoints": true
-    },
-    {
-      "idx": 1,
-      "version": "7",
-      "when": 1781290000000,
-      "tag": "0001_model_cards_model_column",
-      "breakpoints": true
-    },
-    {
-      "idx": 2,
-      "version": "7",
-      "when": 1781380000000,
-      "tag": "0002_workspace_backups_0011_shape",
-      "breakpoints": true
-    }
-  ]
+ "version": "7",
+ "dialect": "postgresql",
+ "entries": [
+  {
+   "idx": 0,
+   "version": "7",
+   "when": 1779348643561,
+   "tag": "0000_consolidated",
+   "breakpoints": true
+  },
+  {
+   "idx": 1,
+   "version": "7",
+   "when": 1781290000000,
+   "tag": "0001_model_cards_model_column",
+   "breakpoints": true
+  },
+  {
+   "idx": 2,
+   "version": "7",
+   "when": 1781380000000,
+   "tag": "0002_workspace_backups_0011_shape",
+   "breakpoints": true
+  },
+  {
+   "idx": 3,
+   "version": "7",
+   "when": 1783120000000,
+   "tag": "0003_ambient_rules",
+   "breakpoints": true
+  }
+ ]
 }
