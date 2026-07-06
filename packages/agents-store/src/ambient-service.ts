@@ -1,3 +1,4 @@
+import { Cron } from "croner";
 import { generateAmbientRuleId } from "@open-managed-agents/shared";
 import { AmbientRuleNotFoundError } from "./errors";
 import type {
@@ -45,7 +46,19 @@ export class AmbientRuleService {
     const id = this.ids.ambientRuleId();
     const trigger = normalizeTrigger(opts.input.trigger);
     const wakeMode = normalizeWakeMode(opts.input.wake_mode ?? "decide");
-    const nextWakeAt = parseOptionalIso(opts.input.next_wake_at, "next_wake_at");
+    let nextWakeAt = parseOptionalIso(opts.input.next_wake_at, "next_wake_at");
+    // Arm schedule rules on creation. The dispatcher only fires rules
+    // whose next_wake_at is set (listDue), so a cron rule created without
+    // an explicit first wake would be permanently dormant — exactly what
+    // happened to console-created rules, where the "Next wake" field is
+    // optional and usually left blank. Compute the first occurrence.
+    if (
+      nextWakeAt === undefined &&
+      (opts.input.enabled ?? true) &&
+      trigger.source === "schedule"
+    ) {
+      nextWakeAt = nextCronOccurrence(trigger, nowMs);
+    }
 
     const config: AmbientRuleConfig = {
       id,
@@ -115,7 +128,7 @@ export class AmbientRuleService {
     if (!existing) throw new AmbientRuleNotFoundError();
 
     const nowMs = this.clock.nowMs();
-    const nextWakeAt =
+    let nextWakeAt =
       opts.input.next_wake_at !== undefined
         ? parseOptionalIso(opts.input.next_wake_at, "next_wake_at")
         : parseOptionalIso(existing.next_wake_at, "next_wake_at");
@@ -170,6 +183,15 @@ export class AmbientRuleService {
       ...(nextWakeAt !== undefined ? { next_wake_at: msToIso(nextWakeAt) } : { next_wake_at: undefined }),
       ...(lastWakeAt !== undefined ? { last_wake_at: msToIso(lastWakeAt) } : { last_wake_at: undefined }),
     };
+
+    // Re-arm on update the same way create arms: an enabled schedule rule
+    // must never sit with an empty next_wake_at (it would be invisible to
+    // the dispatcher). Covers enable-flips and trigger rewrites; an
+    // explicit next_wake_at: null on a NON-schedule rule still disarms.
+    if (nextWakeAt === undefined && config.enabled && config.trigger.source === "schedule") {
+      nextWakeAt = nextCronOccurrence(config.trigger, nowMs);
+      if (nextWakeAt !== undefined) config.next_wake_at = msToIso(nextWakeAt);
+    }
 
     return this.repo.update(opts.tenantId, opts.agentId, opts.ruleId, {
       config,
@@ -251,6 +273,25 @@ function normalizeLastDecision(
   }
   parseRequiredIso(input.decided_at, "last_decision.decided_at");
   return input;
+}
+
+/** First occurrence of a schedule trigger's cron (config.cron, optional
+ *  config.timezone). Undefined when the cron is absent or unparseable —
+ *  the rule is then created disarmed, matching the old behavior. */
+function nextCronOccurrence(
+  trigger: AmbientTriggerConfig,
+  nowMs: number,
+): number | undefined {
+  const config = trigger.config ?? {};
+  const cron = typeof config.cron === "string" ? config.cron.trim() : "";
+  if (!cron) return undefined;
+  const timezone = typeof config.timezone === "string" && config.timezone ? config.timezone : undefined;
+  try {
+    const next = new Cron(cron, { timezone }).nextRun(new Date(nowMs));
+    return next ? next.getTime() : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function parseOptionalIso(
