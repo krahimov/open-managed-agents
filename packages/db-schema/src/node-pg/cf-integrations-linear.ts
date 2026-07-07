@@ -75,8 +75,7 @@ export const linear_publications = pgTable(
     user_id: text("user_id").notNull(),
     agent_id: text("agent_id").notNull(),
     installation_id: text("installation_id")
-      .notNull()
-      .references(() => linear_installations.id),
+      .notNull(),
     mode: text("mode").notNull(),
     status: text("status").notNull(),
     persona_name: text("persona_name").notNull(),
@@ -107,7 +106,7 @@ export const linear_events = pgTable(
   {
     delivery_id: text("delivery_id").primaryKey().notNull(),
     tenant_id: text("tenant_id").notNull(),
-    installation_id: text("installation_id").notNull(),
+    installation_id: text("installation_id").notNull(), // no FK: "" sentinel until OAuth binds (app-managed reference)
     publication_id: text("publication_id"),
     event_type: text("event_type").notNull(),
     received_at: bigint("received_at", { mode: "number" }).notNull(),
