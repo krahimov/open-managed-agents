@@ -160,6 +160,7 @@ import {
 } from "./lib/clerk";
 import { resolveMaxAgentsPerTenant, buildAgentPreCreateGate } from "./lib/agent-limits";
 import { NodeAmbientDispatcher } from "./lib/node-ambient-dispatch";
+import { NodeSlackReplyBridge } from "./lib/node-slack-reply-bridge";
 import { Cron } from "croner";
 import { SessionRegistry } from "./registry.js";
 
@@ -817,12 +818,30 @@ const sessionRegistry = new SessionRegistry({
   },
 });
 
+// Guaranteed Slack delivery: if a Slack-originated turn ends without the
+// agent posting through the Slack MCP tools, mirror its final message to
+// the originating channel/thread with the installation's bot token.
+// Same token cipher domain the integrations repos use.
+const slackReplyBridge = platformRootSecret
+  ? new NodeSlackReplyBridge({
+      sql,
+      decryptToken: (cipher) =>
+        new WebCryptoAesGcm(platformRootSecret, "integrations.tokens").decrypt(cipher),
+    })
+  : null;
+
 const sessionWorkQueue = new NodeSessionWorkQueue({
   sql,
   dialect,
   run: async (item) => {
     const entry = await sessionRegistry.getOrCreate(item.sessionId, item.tenantId);
     await entry.machine.runHarnessTurn(item.agentId, item.event);
+    // Best-effort, never throws — a Slack hiccup must not fail the turn.
+    await slackReplyBridge?.mirrorTurnReply({
+      tenantId: item.tenantId,
+      sessionId: item.sessionId,
+      triggerEvent: item.event,
+    });
   },
   onError: async (item, err) => {
     const log = newEventLog(item.sessionId);
