@@ -29,6 +29,13 @@
    "when": 1783120000000,
    "tag": "0003_ambient_rules",
    "breakpoints": true
+  },
+  {
+   "idx": 4,
+   "version": "7",
+   "when": 1783395300000,
+   "tag": "0004_drop_publication_installation_fks",
+   "breakpoints": true
   }
  ]
 }

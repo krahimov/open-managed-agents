@@ -69,8 +69,7 @@ export const slack_publications = pgTable(
     user_id: text("user_id").notNull(),
     agent_id: text("agent_id").notNull(),
     installation_id: text("installation_id")
-      .notNull()
-      .references(() => slack_installations.id),
+      .notNull(),
     environment_id: text("environment_id").notNull(),
     mode: text("mode").notNull(),
     status: text("status").notNull(),
@@ -98,7 +97,7 @@ export const slack_webhook_events = pgTable(
   {
     delivery_id: text("delivery_id").primaryKey().notNull(),
     tenant_id: text("tenant_id").notNull(),
-    installation_id: text("installation_id").notNull(),
+    installation_id: text("installation_id").notNull(), // no FK: "" sentinel until OAuth binds (app-managed reference)
     publication_id: text("publication_id"),
     event_type: text("event_type").notNull(),
     received_at: bigint("received_at", { mode: "number" }).notNull(),
