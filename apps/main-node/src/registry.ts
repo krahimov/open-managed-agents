@@ -314,12 +314,42 @@ export class SessionRegistry {
         };
       }
 
+      // Per-machine cache for the session's frozen agent snapshot —
+      // loadAgent runs every turn; the snapshot never changes.
+      let agentSnapshot: AgentConfig | null | undefined;
+
       const machine = new SessionStateMachine({
         sessionId,
         tenantId,
         adapter,
         sandbox,
         loadAgent: async (agentId) => {
+          // Prefer the session's frozen agent snapshot (CF SessionDO
+          // parity). The snapshot carries per-session enrichments the live
+          // row never sees: the Slack signal-protocol prompt the install
+          // bridge appends to `system` (without it, Slack-bound agents
+          // reply into the event log and never post back to the thread),
+          // and console-injected per-session mcp_servers. Snapshot use is
+          // safe again now that model-card lookups thread tenantId
+          // explicitly instead of reading it off the agent object.
+          if (agentSnapshot === undefined) {
+            const row = await this.deps.sql
+              .prepare(
+                `SELECT agent_snapshot FROM sessions WHERE tenant_id = ? AND id = ?`,
+              )
+              .bind(tenantId, sessionId)
+              .first<{ agent_snapshot: string | Record<string, unknown> | null }>();
+            const raw = row?.agent_snapshot ?? null;
+            try {
+              agentSnapshot =
+                raw == null
+                  ? null
+                  : ((typeof raw === "string" ? JSON.parse(raw) : raw) as AgentConfig);
+            } catch {
+              agentSnapshot = null;
+            }
+          }
+          if (agentSnapshot && agentSnapshot.id === agentId) return agentSnapshot;
           const row = await this.deps.agentsService.get({ tenantId, agentId });
           return row ?? null;
         },
