@@ -63,6 +63,11 @@ export function createAuthMiddleware(deps: AuthMiddlewareDeps) {
 
     if (deps.disabled) {
       c.set("tenant_id", "default");
+      // Same synthetic identity /v1/me reports in disabled mode. Without it
+      // every user-scoped route (integrations/publications) 403s in bare
+      // dev with "regenerate your API key" — nonsense advice when auth is
+      // off entirely.
+      c.set("user_id", "default");
       return next();
     }
 
