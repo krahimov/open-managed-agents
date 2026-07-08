@@ -24,7 +24,7 @@ import type { BrowserHarness, BrowserBillingHook } from "@open-managed-agents/br
 /** Tools enabled by default when an agent has no explicit tools config.
  *  Excludes opt-in tools that bias the LLM away from cheaper alternatives
  *  — see OPT_IN_TOOLS below. */
-export const DEFAULT_TOOLS = ["bash", "read", "write", "edit", "glob", "grep", "web_fetch", "web_search", "schedule", "cancel_schedule", "list_schedules", "create_ambient_rule", "list_ambient_rules", "delete_ambient_rule"];
+export const DEFAULT_TOOLS = ["bash", "read", "write", "edit", "glob", "grep", "web_fetch", "web_search", "schedule", "cancel_schedule", "list_schedules", "create_ambient_rule", "list_ambient_rules", "delete_ambient_rule", "request_access"];
 
 /** Tools recognised but NOT registered by default — agents must opt in
  *  via tools config (`{ name: "browser", enabled: true }`).
@@ -468,6 +468,16 @@ export async function buildTools(
     >;
     /** Soft-delete one of this agent's ambient rules by id. */
     deleteAmbientRule?: (id: string) => Promise<{ deleted: boolean }>;
+    /** Agent-initiated credential request: append a system.access_request
+     *  event to THIS session so the console renders a one-click connect
+     *  card (Composio OAuth popup). Resolves with what the model should
+     *  know: the request id + whether the tenant even has Composio wired.
+     *  Node wires this through NodeSessionRouter; CF leaves it unset until
+     *  the connect-card flow lands there. */
+    requestServiceAccess?: (args: {
+      service: string;
+      reason: string;
+    }) => Promise<{ request_id: string; status: string; note?: string }>;
   }
 ): Promise<Record<string, any>> {
   const enabled = getEnabledTools(agentConfig.tools);
@@ -1070,6 +1080,32 @@ export async function buildTools(
           .describe("act = do the task; decide (default) = assess then act if warranted; observe = log only; escalate = flag a human"),
       }),
       execute: safe(async (args) => env.createAmbientRule!(args)),
+    });
+  }
+
+  if (env?.requestServiceAccess && enabled.has("request_access")) {
+    tools.request_access = tool({
+      description:
+        "Ask the user to connect an external service you need but don't have access to (no connected " +
+        "account / credential) — e.g. Gmail, GitHub, Notion, HubSpot. Posts a connect card to the user's " +
+        "session view; they authenticate with one click and you receive a message when access is granted. " +
+        "Call this the moment a task needs a service you can't reach (a tool is missing, or its calls fail " +
+        "with an auth/not-connected error) instead of giving up or asking the user to paste secrets in chat. " +
+        "Never ask for API keys or passwords in the conversation. After calling, continue whatever work " +
+        "doesn't need the service, or end your turn and wait.",
+      inputSchema: z.object({
+        service: z
+          .string()
+          .min(1)
+          .max(64)
+          .describe("Service/toolkit slug, lowercase (e.g. \"gmail\", \"github\", \"notion\", \"hubspot\")"),
+        reason: z
+          .string()
+          .min(1)
+          .max(300)
+          .describe("One line shown to the user: what you need it for (e.g. \"to read this week's invoices\")"),
+      }),
+      execute: safe(async (args) => env.requestServiceAccess!(args)),
     });
   }
 

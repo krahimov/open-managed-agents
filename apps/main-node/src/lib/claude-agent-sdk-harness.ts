@@ -120,6 +120,17 @@ export interface ClaudeAgentSdkHarnessDeps {
     agentId: string,
     patch: HarnessPatch,
   ) => Promise<AgentConfig>;
+  /**
+   * Agent-initiated credential request (the `request_access` tool). Appends
+   * a system.access_request event to the session so the console renders a
+   * one-click Composio connect card. Wired in main-node to the same
+   * postAccessRequest helper the DefaultHarness buildTools hook uses.
+   */
+  requestServiceAccess?: (
+    tenantId: string,
+    sessionId: string,
+    args: { service: string; reason: string },
+  ) => Promise<{ request_id: string; status: string; note?: string }>;
 }
 
 function workdirFor(sessionId: string): string {
@@ -329,6 +340,47 @@ export class ClaudeAgentSdkHarness {
     });
   }
 
+  /** In-process MCP server exposing `request_access` on working (non-setup)
+   *  sessions. The SDK child calls back over the in-process transport, so
+   *  the handler runs HERE and can append the session event directly. */
+  #accessServer(ctx: HarnessContext, sessionId: string) {
+    const tenantId = ctx.tenant_id ?? "default";
+    const requestAccess = tool(
+      "request_access",
+      "Ask the user to connect an external service you need but don't have access to (no connected " +
+        "account / credential) — e.g. Gmail, GitHub, Notion, HubSpot. Posts a connect card to the user's " +
+        "session view; they authenticate with one click and you receive a message when access is granted. " +
+        "Call this the moment a task needs a service you can't reach (a tool is missing, or its calls fail " +
+        "with an auth/not-connected error) instead of giving up or asking the user to paste secrets in chat. " +
+        "Never ask for API keys or passwords in the conversation. After calling, continue whatever work " +
+        "doesn't need the service, or end your turn and wait.",
+      {
+        service: z
+          .string()
+          .describe('Service/toolkit slug, lowercase (e.g. "gmail", "github", "notion", "hubspot")'),
+        reason: z
+          .string()
+          .describe('One line shown to the user: what you need it for (e.g. "to read this week\'s invoices")'),
+      } as unknown as SdkToolSchema,
+      async (args) => {
+        const a = args as { service?: string; reason?: string };
+        if (!a.service?.trim()) {
+          return { content: [{ type: "text" as const, text: "service is required" }], isError: true };
+        }
+        const result = await this.#deps.requestServiceAccess!(tenantId, sessionId, {
+          service: a.service,
+          reason: a.reason?.trim() || "The agent needs this service for the current task.",
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+      },
+    );
+    return createSdkMcpServer({
+      name: "oma_access",
+      version: "1",
+      tools: [requestAccess],
+    });
+  }
+
   async run(ctx: HarnessContext): Promise<void> {
     const runtime = ctx.runtime;
     // Typed optional on HarnessContext but always set by buildHarnessContext.
@@ -378,7 +430,9 @@ export class ClaudeAgentSdkHarness {
     const isSetup = sessionMeta?.["oma_setup"] === true && !!this.#deps.updateAgent;
     const mcpServersForTurn = isSetup
       ? { ...(mcpServers ?? {}), oma_setup: this.#setupServer(ctx, runtime) }
-      : mcpServers;
+      : this.#deps.requestServiceAccess
+        ? { ...(mcpServers ?? {}), oma_access: this.#accessServer(ctx, sessionId) }
+        : mcpServers;
 
     // The pinned access policy (snapshot enrichment set at session create).
     // This harness never runs buildTools(), so the same policy is compiled

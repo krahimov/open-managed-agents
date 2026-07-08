@@ -875,6 +875,26 @@ export interface SystemPolicyDecisionEvent extends EventBase {
   reason?: string;
 }
 
+// Agent-initiated credential request. Emitted when the agent calls its
+// `request_access` tool because a service it needs (Gmail, GitHub, a CRM…)
+// has no connected account / vault credential. Live consumers (Console)
+// render a connect card: one click opens the provider OAuth popup via the
+// existing Composio link flow, and on completion the console appends a
+// user.message telling the agent access is granted. The event is a request
+// record, not a grant — credentials only ever move through the vault flow.
+export interface SystemAccessRequestEvent extends EventBase {
+  type: "system.access_request";
+  /** Unique request id (also used by the UI to dedupe cards). */
+  request_id: string;
+  /** Toolkit/service slug, e.g. "gmail", "github", "hubspot". */
+  service: string;
+  /** Agent-provided one-liner shown to the user under the card title. */
+  reason: string;
+  /** Whether the tenant has a Composio key configured — when false the
+   *  card routes the user to Apps → Connect Composio first. */
+  composio_configured?: boolean;
+}
+
 export type SessionEvent =
   | UserMessageEvent
   | UserInterruptEvent
@@ -924,7 +944,8 @@ export type SessionEvent =
   | SystemUserMessagePromotedEvent
   | SystemUserMessageCancelledEvent
   | SystemPolicyPinnedEvent
-  | SystemPolicyDecisionEvent;
+  | SystemPolicyDecisionEvent
+  | SystemAccessRequestEvent;
 
 /**
  * Event types defined by Anthropic's Managed Agents spec — what their

@@ -245,3 +245,39 @@ describe("buildTools policy enforcement", () => {
     expect(tools.bash.execute).toBeDefined();
   });
 });
+
+describe("request_access tool", () => {
+  const agent = (): AgentConfig =>
+    ({ id: "a", name: "t", model: "m", system: "", tools: [] }) as AgentConfig;
+
+  it("registers only when the runtime provides the hook", async () => {
+    const without = await buildTools(agent(), new TestSandbox());
+    expect(without.request_access).toBeUndefined();
+
+    const calls: Array<{ service: string; reason: string }> = [];
+    const withHook = await buildTools(agent(), new TestSandbox(), {
+      requestServiceAccess: async (a) => {
+        calls.push(a);
+        return { request_id: "acreq-1", status: "pending" };
+      },
+    });
+    expect(withHook.request_access).toBeDefined();
+    const result = await withHook.request_access.execute(
+      { service: "gmail", reason: "read invoices" },
+      { toolCallId: "t1", messages: [] },
+    );
+    expect(calls).toEqual([{ service: "gmail", reason: "read invoices" }]);
+    expect(result).toMatchObject({ request_id: "acreq-1", status: "pending" });
+  });
+
+  it("is denied like any other tool by the pinned policy", async () => {
+    const cfg = agent();
+    (cfg as AgentConfig).effective_policy = {
+      rules: [{ effect: "deny", selector: "request_access" }],
+    };
+    const tools = await buildTools(cfg, new TestSandbox(), {
+      requestServiceAccess: async () => ({ request_id: "x", status: "pending" }),
+    });
+    expect(tools.request_access).toBeUndefined();
+  });
+});

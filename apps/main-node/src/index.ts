@@ -745,6 +745,12 @@ const sessionRegistry = new SessionRegistry({
         });
         return { deleted: true };
       },
+      // Agent-initiated credential requests — "I need Gmail for this" from
+      // inside the session becomes a connect card in the console; the user
+      // one-clicks through the Composio OAuth popup and the agent gets a
+      // message when the account lands. No secrets ever transit the chat.
+      requestServiceAccess: (a) =>
+        postAccessRequest(context.tenantId, context.sessionId, a),
     });
   },
   buildHarness: () => {
@@ -763,6 +769,10 @@ const sessionRegistry = new SessionRegistry({
       updateAgent: async (tenantId, agentId, patch) => {
         return await agentsService.update({ tenantId, agentId, input: patch });
       },
+      // request_access tool on the SDK harness — same event pipeline as the
+      // DefaultHarness buildTools hook.
+      requestServiceAccess: (tenantId, sessionId, a) =>
+        postAccessRequest(tenantId, sessionId, a),
     });
     return {
       run: (ctx: unknown) => {
@@ -1246,6 +1256,38 @@ const sessionRouter = new NodeSessionRouter({
   newEventLog,
   workQueue: sessionWorkQueue,
 });
+
+/**
+ * Append a system.access_request event to a session — the backend half of
+ * the agent's `request_access` tool (both harnesses call this). The console
+ * renders the event as a one-click connect card wired to the existing
+ * Composio link/callback popup flow. Function declaration (hoisted) so the
+ * buildTools/buildHarness closures above can reference it.
+ */
+async function postAccessRequest(
+  tenantId: string,
+  sessionId: string,
+  args: { service: string; reason: string },
+): Promise<{ request_id: string; status: string; note?: string }> {
+  const service = args.service.trim().toLowerCase();
+  const key = await composioKeyForTenant(tenantId).catch(() => null);
+  const requestId = `acreq-${generateEventId().replace(/^sevt-/, "")}`;
+  await sessionRouter.appendEvent(sessionId, {
+    type: "system.access_request",
+    id: generateEventId(),
+    request_id: requestId,
+    service,
+    reason: args.reason,
+    composio_configured: !!key,
+  } as SessionEvent);
+  return {
+    request_id: requestId,
+    status: "pending",
+    note: key
+      ? `Connect card for "${service}" posted to the user's session view. You'll receive a message when access is granted — continue any work that doesn't need it, or end your turn and wait.`
+      : `Request posted, but this workspace has no Composio account connected yet — the user is being guided to connect one (Console → Apps) before authorizing "${service}".`,
+  };
+}
 v1.route("/sessions", buildSessionRoutes({
   services,
   router: sessionRouter,
