@@ -39,9 +39,25 @@ const MAX_SKILL_BYTES = 256 * 1024;
 export function parseFrontmatter(content: string): { name?: string; description?: string } {
   const m = /^---\n([\s\S]*?)\n---/.exec(content);
   if (!m) return {};
+  const lines = m[1].split("\n");
   const pick = (key: string) => {
-    const r = new RegExp(`^${key}:\\s*(.+)$`, "m").exec(m[1]);
-    return r ? r[1].trim().replace(/^["']|["']$/g, "") : undefined;
+    const idx = lines.findIndex((l) => l.startsWith(`${key}:`));
+    if (idx === -1) return undefined;
+    const inline = lines[idx].slice(key.length + 1).trim();
+    // YAML block scalar (`description: >` or `|`, with optional +/- chomping):
+    // the value is the following deeper-indented lines, joined. Folded (>)
+    // vs literal (|) both collapse to spaces here — descriptions are prose,
+    // and this parser stays deliberately dumb (no YAML dependency).
+    if (/^[>|][+-]?$/.test(inline)) {
+      const block: string[] = [];
+      for (let i = idx + 1; i < lines.length; i++) {
+        if (lines[i].trim() === "") continue;
+        if (!/^\s/.test(lines[i])) break;
+        block.push(lines[i].trim());
+      }
+      return block.length > 0 ? block.join(" ") : undefined;
+    }
+    return inline ? inline.replace(/^["']|["']$/g, "") : undefined;
   };
   return { name: pick("name"), description: pick("description") };
 }
