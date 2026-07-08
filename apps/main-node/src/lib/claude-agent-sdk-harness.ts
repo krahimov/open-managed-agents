@@ -129,7 +129,7 @@ export interface ClaudeAgentSdkHarnessDeps {
   requestServiceAccess?: (
     tenantId: string,
     sessionId: string,
-    args: { service: string; reason: string },
+    args: { service: string; reason: string; mcp_server_url?: string },
   ) => Promise<{ request_id: string; status: string; note?: string }>;
 }
 
@@ -207,8 +207,9 @@ function buildSetupPrompt(agent: AgentConfig): string {
     JSON.stringify(harnessView(agent), null, 2),
     "```",
     "",
-    "You have exactly one tool and no file, shell, or web access:",
+    "You have exactly two tools and no file, shell, or web access:",
     "- update_harness: change fields on your own harness. Call it after EACH meaningful answer so the live config on the user's screen stays in sync. Pass only the fields that changed.",
+    "- request_access: pop a one-click connect card in the user's setup panel for a service that needs credentials. Pass the service slug (for an MCP server you added, use its exact `name`) and a one-line reason. The user authenticates in the popup and you get a message when the account is connected.",
     "",
     "Harness fields you can refine:",
     "- name / description: a short label + one-line summary of what you do.",
@@ -224,7 +225,7 @@ function buildSetupPrompt(agent: AgentConfig): string {
     "4. Be concise. In a sentence, say what you just changed (e.g. \"I rewrote my system prompt around daily triage and added the Notion server\").",
     "5. When the user is satisfied, confirm your harness is set and that you're ready to run.",
     "",
-    "Never invent credentials or secrets. For an MCP server that needs auth, add the server and tell the user they'll connect credentials afterward.",
+    "Never invent credentials or secrets, and never ask the user to paste keys or tokens in chat. For an MCP server that needs auth, add the server with update_harness, then call request_access for it (one call per server) so the user can authenticate right here — don't defer it to \"afterward\".",
   ].join("\n");
 }
 
@@ -367,9 +368,18 @@ export class ClaudeAgentSdkHarness {
         if (!a.service?.trim()) {
           return { content: [{ type: "text" as const, text: "service is required" }], isError: true };
         }
+        // Requested service that names one of the agent's own URL MCP
+        // servers (e.g. the github/notion/linear servers it added during
+        // setup) → the card runs vault MCP OAuth against that URL rather
+        // than the Composio connected-account flow.
+        const slug = a.service.trim().toLowerCase();
+        const matched = (ctx.agent.mcp_servers ?? []).find(
+          (s) => s?.name?.trim().toLowerCase() === slug && s.type !== "stdio" && !!s.url,
+        );
         const result = await this.#deps.requestServiceAccess!(tenantId, sessionId, {
           service: a.service,
           reason: a.reason?.trim() || "The agent needs this service for the current task.",
+          ...(matched?.url ? { mcp_server_url: matched.url } : {}),
         });
         return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
       },
@@ -428,11 +438,21 @@ export class ClaudeAgentSdkHarness {
       sessionId,
     );
     const isSetup = sessionMeta?.["oma_setup"] === true && !!this.#deps.updateAgent;
-    const mcpServersForTurn = isSetup
-      ? { ...(mcpServers ?? {}), oma_setup: this.#setupServer(ctx, runtime) }
-      : this.#deps.requestServiceAccess
-        ? { ...(mcpServers ?? {}), oma_access: this.#accessServer(ctx, sessionId) }
-        : mcpServers;
+    // request_access rides along in BOTH modes: in setup it's how the agent
+    // hands the user the OAuth popups for the servers it just added to its
+    // own harness; in working sessions it covers services hit mid-task.
+    type SdkMcpEntry =
+      | ReturnType<typeof createSdkMcpServer>
+      | { type: "http"; url: string; headers: Record<string, string> };
+    let mcpServersForTurn: Record<string, SdkMcpEntry> | undefined = mcpServers;
+    if (isSetup || this.#deps.requestServiceAccess) {
+      const withInProcess: Record<string, SdkMcpEntry> = { ...(mcpServers ?? {}) };
+      if (isSetup) withInProcess.oma_setup = this.#setupServer(ctx, runtime);
+      if (this.#deps.requestServiceAccess) {
+        withInProcess.oma_access = this.#accessServer(ctx, sessionId);
+      }
+      mcpServersForTurn = withInProcess;
+    }
 
     // The pinned access policy (snapshot enrichment set at session create).
     // This harness never runs buildTools(), so the same policy is compiled

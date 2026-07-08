@@ -10,6 +10,7 @@ import {
   ConversationScrollButton,
 } from "../../components/ai-elements/conversation";
 import { Message, MessageContent } from "../../components/ai-elements/message";
+import { AccessRequestCard } from "../../components/AccessRequestCard";
 import {
   PromptInput,
   PromptInputFooter,
@@ -59,6 +60,10 @@ function isRenderable(ev: Event): boolean {
   if (ev.type === "agent.tool_use") {
     return typeof ev.name === "string" && !ev.name.startsWith("mcp__oma_setup__");
   }
+  // Agent-initiated credential requests render as a connect card — during
+  // setup this is how the agent hands the user the OAuth popups for the
+  // servers it just added to its own harness.
+  if (ev.type === "system.access_request") return true;
   return false;
 }
 
@@ -164,6 +169,9 @@ export function SessionChat({
                   </MessageContent>
                 </Message>
               );
+            }
+            if (ev.type === "system.access_request") {
+              return <AccessRequestCard key={key} event={ev} sessionId={sessionId} />;
             }
             // agent.tool_use → compact chip
             return (

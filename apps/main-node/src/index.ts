@@ -747,10 +747,13 @@ const sessionRegistry = new SessionRegistry({
       },
       // Agent-initiated credential requests — "I need Gmail for this" from
       // inside the session becomes a connect card in the console; the user
-      // one-clicks through the Composio OAuth popup and the agent gets a
+      // one-clicks through the provider OAuth popup and the agent gets a
       // message when the account lands. No secrets ever transit the chat.
       requestServiceAccess: (a) =>
-        postAccessRequest(context.tenantId, context.sessionId, a),
+        postAccessRequest(context.tenantId, context.sessionId, {
+          ...a,
+          mcp_server_url: matchAgentMcpServer(agent, a.service),
+        }),
     });
   },
   buildHarness: () => {
@@ -1267,10 +1270,11 @@ const sessionRouter = new NodeSessionRouter({
 async function postAccessRequest(
   tenantId: string,
   sessionId: string,
-  args: { service: string; reason: string },
+  args: { service: string; reason: string; mcp_server_url?: string },
 ): Promise<{ request_id: string; status: string; note?: string }> {
   const service = args.service.trim().toLowerCase();
-  const key = await composioKeyForTenant(tenantId).catch(() => null);
+  const mcpServerUrl = args.mcp_server_url?.trim() || undefined;
+  const key = mcpServerUrl ? null : await composioKeyForTenant(tenantId).catch(() => null);
   const requestId = `acreq-${generateEventId().replace(/^sevt-/, "")}`;
   await sessionRouter.appendEvent(sessionId, {
     type: "system.access_request",
@@ -1278,15 +1282,32 @@ async function postAccessRequest(
     request_id: requestId,
     service,
     reason: args.reason,
-    composio_configured: !!key,
+    ...(mcpServerUrl
+      ? { mcp_server_url: mcpServerUrl }
+      : { composio_configured: !!key }),
   } as SessionEvent);
   return {
     request_id: requestId,
     status: "pending",
-    note: key
-      ? `Connect card for "${service}" posted to the user's session view. You'll receive a message when access is granted — continue any work that doesn't need it, or end your turn and wait.`
-      : `Request posted, but this workspace has no Composio account connected yet — the user is being guided to connect one (Console → Apps) before authorizing "${service}".`,
+    note:
+      mcpServerUrl || key
+        ? `Connect card for "${service}" posted to the user's session view. You'll receive a message when access is granted — continue any work that doesn't need it, or end your turn and wait.`
+        : `Request posted, but this workspace has no Composio account connected yet — the user is being guided to connect one (Console → Apps) before authorizing "${service}".`,
   };
+}
+
+/** Match a requested service slug against the agent's own URL MCP servers by
+ *  name — when it hits, the connect card runs vault MCP OAuth against that
+ *  server instead of the Composio flow. */
+function matchAgentMcpServer(
+  agent: { mcp_servers?: Array<{ name?: string; type?: string; url?: string }> } | null | undefined,
+  service: string,
+): string | undefined {
+  const slug = service.trim().toLowerCase();
+  const hit = (agent?.mcp_servers ?? []).find(
+    (s) => s?.name?.trim().toLowerCase() === slug && s.type !== "stdio" && !!s.url,
+  );
+  return hit?.url;
 }
 v1.route("/sessions", buildSessionRoutes({
   services,

@@ -893,6 +893,10 @@ export interface SystemAccessRequestEvent extends EventBase {
   /** Whether the tenant has a Composio key configured — when false the
    *  card routes the user to Apps → Connect Composio first. */
   composio_configured?: boolean;
+  /** Set when the requested service matched one of the agent's own URL MCP
+   *  servers by name — the card then runs the vault MCP OAuth flow against
+   *  this URL instead of the Composio connected-account flow. */
+  mcp_server_url?: string;
 }
 
 export type SessionEvent =
