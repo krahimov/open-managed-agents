@@ -43,8 +43,14 @@ export function Dashboard() {
     { limit: "5" },
   );
   const stats = statsQuery.data ?? null;
+  // Until /v1/stats settles we don't know whether this is a fresh workspace
+  // or an active one — render the neutral Overview shell and NO guide.
+  // Deciding "new user" from missing data made the whole onboarding panel
+  // (API-key step included) flash for a beat on every hard refresh, then
+  // vanish when stats landed.
+  const statsPending = statsQuery.isLoading;
   const workspaceActive = (stats?.agents ?? 0) > 0;
-  const guideVisible = !workspaceActive || showGuide;
+  const guideVisible = !statsPending && (!workspaceActive || showGuide);
   const recentSessions = sessionsQuery.data?.data.slice(0, 5) ?? [];
 
   const copy = (text: string, key: string) => {
@@ -92,10 +98,10 @@ export function Dashboard() {
         <header className="flex items-start justify-between gap-4">
           <div>
             <h1 className="text-[20px] leading-tight font-semibold text-fg">
-              {workspaceActive ? "Overview" : `Get started with ${BRAND_NAME}`}
+              {workspaceActive || statsPending ? "Overview" : `Get started with ${BRAND_NAME}`}
             </h1>
             <p className="mt-1.5 text-[15px] text-fg-muted">
-              {workspaceActive
+              {workspaceActive || statsPending
                 ? "Workspace activity at a glance."
                 : "Install the CLI, mint a key, and let agents operate against your control plane."}
             </p>
