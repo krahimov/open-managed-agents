@@ -8,7 +8,11 @@
 // (CF — services are per-request because of multi-tenant DB resolution).
 
 import type { Context } from "hono";
-import type { AgentService, AmbientRuleService } from "@open-managed-agents/agents-store";
+import type {
+  AgentService,
+  AmbientRuleService,
+  PermissionGrantService,
+} from "@open-managed-agents/agents-store";
 import type { VaultService } from "@open-managed-agents/vaults-store";
 import type { CredentialService } from "@open-managed-agents/credentials-store";
 import type { MemoryStoreService } from "@open-managed-agents/memory-store";
@@ -97,6 +101,10 @@ export interface RouteServices {
    *  backend is configured (legacy fixtures); the harness silently
    *  skips browser tool registration. */
   browser?: BrowserHarness | null;
+  // ── Access control — appended (Phase 1). Optional so legacy fixtures
+  // compile; when unset the grants routes 404 and sessions pin no policy
+  // (legacy allow-all). ──
+  permissionGrants?: PermissionGrantService | null;
 }
 
 /** Per-request services accessor. CF passes a callback that resolves

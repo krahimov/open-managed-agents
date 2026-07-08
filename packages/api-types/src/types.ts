@@ -77,6 +77,17 @@ export interface AgentConfig {
   aux_model?: string | { id: string; speed?: "standard" | "fast" };
   harness?: string;
   /**
+   * SESSION-SNAPSHOT-ONLY enrichment — never present on live agent rows.
+   * The access policy resolved from the agent's permission grants at
+   * session-create time and pinned into the session's agent_snapshot (the
+   * same enrichment pattern as the Slack signal-protocol system append and
+   * console-injected mcp_servers). Enforcement reads it wherever the
+   * snapshot flows: buildTools() filters the DefaultHarness tool dict, the
+   * claude-agent-sdk harness compiles it to SDK options. Mid-session grant
+   * edits never affect a running session — by design (snapshot determinism).
+   */
+  effective_policy?: import("./policy").EffectivePolicy;
+  /**
    * When set, agent runs on a user-registered local ACP runtime instead of
    * OMA's cloud SessionDO loop. `harness` MUST be "acp-proxy" for this to
    * take effect; SessionDO routes the AcpProxyHarness which proxies via the
@@ -841,6 +852,29 @@ export interface SystemUserMessageCancelledEvent extends EventBase {
   cancelled_at: number;
 }
 
+// Access-control audit frames. `system.policy_pinned` lands once at session
+// init recording the exact policy the session will enforce (grant lineage +
+// rules). `system.policy_decision` records a concrete enforcement decision —
+// in Phase 1 that's a tool filtered out of the model's tool dict by a deny
+// rule (the model never sees it); ask-gate decisions join in Phase 4. Like
+// other `system.*` frames, old SDK consumers ignore them silently.
+export interface SystemPolicyPinnedEvent extends EventBase {
+  type: "system.policy_pinned";
+  agent_id: string;
+  grant_id?: string;
+  grant_version?: number;
+  rules: import("./policy").PermissionRule[];
+}
+
+export interface SystemPolicyDecisionEvent extends EventBase {
+  type: "system.policy_decision";
+  tool_name: string;
+  effect: import("./policy").PermissionEffect;
+  /** Selector of the rule that decided; absent = default allow. */
+  selector?: string;
+  reason?: string;
+}
+
 export type SessionEvent =
   | UserMessageEvent
   | UserInterruptEvent
@@ -888,7 +922,9 @@ export type SessionEvent =
   | AuxModelCallEvent
   | SystemUserMessagePendingEvent
   | SystemUserMessagePromotedEvent
-  | SystemUserMessageCancelledEvent;
+  | SystemUserMessageCancelledEvent
+  | SystemPolicyPinnedEvent
+  | SystemPolicyDecisionEvent;
 
 /**
  * Event types defined by Anthropic's Managed Agents spec — what their

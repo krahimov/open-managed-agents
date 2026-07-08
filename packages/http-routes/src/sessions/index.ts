@@ -37,7 +37,7 @@ import {
   SessionResourceNotFoundError,
 } from "@open-managed-agents/sessions-store";
 import type { SessionRouter, SessionInitParams } from "@open-managed-agents/session-runtime";
-import type { RouteServicesArg } from "../types";
+import type { RouteServices, RouteServicesArg } from "../types";
 import { resolveServices } from "../types";
 
 interface Vars {
@@ -373,6 +373,27 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
     }
 
     const { tenant_id: _atid, ...agentSnapshot } = agentRow;
+
+    // Pin the access policy into the snapshot (Phase 1: baseline grant).
+    // Resolved ONCE here and frozen for the session's lifetime — both
+    // runtimes read enforcement off the snapshot (buildTools filter on
+    // DefaultHarness, SDK-option compilation on claude-agent-sdk), so a
+    // grant edit after this point only affects future sessions.
+    let pinnedPolicy: Awaited<
+      ReturnType<
+        NonNullable<RouteServices["permissionGrants"]>["resolveEffectivePolicy"]
+      >
+    > = null;
+    if (services.permissionGrants) {
+      pinnedPolicy = await services.permissionGrants.resolveEffectivePolicy({
+        tenantId: t,
+        agentId,
+      });
+      if (pinnedPolicy) {
+        (agentSnapshot as AgentConfig).effective_policy = pinnedPolicy;
+      }
+    }
+
     const envSnap = deps.loadEnvironment
       ? await deps.loadEnvironment({ tenantId: t, environmentId: envId })
       : null;
@@ -483,7 +504,20 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
       agentSnapshot: agentSnapshot as AgentConfig,
       environmentSnapshot: envSnap ?? undefined,
       vaultCredentials: vaultCreds,
-      initEvents: refreshEvents,
+      // system.policy_pinned first: the audit record of exactly which rules
+      // this session will enforce, ahead of any credential warnings.
+      initEvents: pinnedPolicy
+        ? [
+            {
+              type: "system.policy_pinned",
+              agent_id: agentId,
+              grant_id: pinnedPolicy.grant_id,
+              grant_version: pinnedPolicy.grant_version,
+              rules: pinnedPolicy.rules,
+            } as SessionEvent,
+            ...refreshEvents,
+          ]
+        : refreshEvents,
     };
     await router.init(sessionId, initParams).catch((err) => {
       console.warn(`[sessions] router.init failed for ${sessionId}:`, err);

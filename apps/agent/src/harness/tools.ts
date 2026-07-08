@@ -4,6 +4,7 @@ import { z } from "zod";
 import { anthropic } from "@ai-sdk/anthropic";
 import type { LanguageModel } from "ai";
 import type { AgentConfig, ToolsetConfig, CustomToolConfig, SessionEvent } from "@open-managed-agents/shared";
+import { evaluatePolicy } from "@open-managed-agents/shared";
 import type { ToMarkdownProvider } from "@open-managed-agents/markdown";
 import type { SandboxExecutor, ProcessHandle } from "./interface";
 import { nanoid } from "nanoid";
@@ -46,6 +47,27 @@ const MAX_BASH_TIMEOUT = 600000;      // 10 minutes (CC max)
 // with `flushed 0 tool_uses` and no error log — opaque to debug.
 // 15s is generous: a healthy server replies in <1s.
 const MCP_SETUP_TIMEOUT_MS = 15_000;
+
+// Dedupe system.policy_decision deny frames per (session, tool): buildTools
+// rebuilds the dict every turn, and re-emitting the same denial into the
+// append-only event log each turn would drown the audit trail. Module scope
+// is safe — CF runs one session per SessionDO isolate; on Node the map is
+// capped so a long-lived process can't grow it unboundedly (eviction just
+// means a repeated audit frame, never a missed enforcement).
+const MAX_POLICY_AUDIT_SESSIONS = 2000;
+const policyDenyAuditedBySession = new Map<string, Set<string>>();
+function policyDenyAudited(sessionId: string): Set<string> {
+  let set = policyDenyAuditedBySession.get(sessionId);
+  if (!set) {
+    if (policyDenyAuditedBySession.size >= MAX_POLICY_AUDIT_SESSIONS) {
+      const oldest = policyDenyAuditedBySession.keys().next().value;
+      if (oldest !== undefined) policyDenyAuditedBySession.delete(oldest);
+    }
+    set = new Set();
+    policyDenyAuditedBySession.set(sessionId, set);
+  }
+  return set;
+}
 
 // System prompt for the auxiliary model when summarizing web pages fetched
 // by web_fetch. Designed for the OMA agent loop: the summary lands directly
@@ -1338,6 +1360,43 @@ export async function buildTools(
         }
       }),
     });
+  }
+
+  // Access-policy gate (Phase 1). The policy was pinned into the agent
+  // snapshot at session create; this is the deterministic enforcement point
+  // for EVERY tool the DefaultHarness can call — built-ins, MCP (discovered
+  // dynamically above), delegation, custom. deny = the tool is dropped from
+  // the dict entirely, so the model cannot see or call it; ask = execute is
+  // stripped so the AI SDK surfaces a pending call (same mechanics as the
+  // legacy always_ask path below). Runs before the legacy pass so a policy
+  // "ask" and a config "always_ask" converge on the same shape.
+  const policy = agentConfig.effective_policy;
+  if (policy?.rules?.length) {
+    const audited = env?.sessionId ? policyDenyAudited(env.sessionId) : null;
+    for (const [name, t] of Object.entries(tools)) {
+      const decision = evaluatePolicy(policy, name);
+      if (decision.effect === "deny") {
+        delete tools[name];
+        if (audited && !audited.has(name)) {
+          audited.add(name);
+          env?.broadcastEvent?.({
+            type: "system.policy_decision",
+            tool_name: name,
+            effect: "deny",
+            selector: decision.selector,
+            reason: "tool hidden from model by pinned access policy",
+          } as SessionEvent);
+        }
+      } else if (decision.effect === "ask") {
+        tools[name] = tool({
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          description: (t as any).description,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          inputSchema: (t as any).parameters || (t as any).inputSchema,
+          // No execute — AI SDK treats this as a pending tool call
+        });
+      }
+    }
   }
 
   // Strip execute from always_ask tools so AI SDK returns them as pending calls

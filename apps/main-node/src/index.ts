@@ -36,6 +36,7 @@ import {
 import {
   createSqliteAgentService,
   createSqliteAmbientRuleService,
+  createSqlitePermissionGrantService,
 } from "@open-managed-agents/agents-store";
 import {
   createSqliteMemoryStoreService,
@@ -406,6 +407,7 @@ if (clerkStore) {
 
 const agentsService = createSqliteAgentService({ db: drizzleDb });
 const ambientRulesService = createSqliteAmbientRuleService({ db: drizzleDb });
+const permissionGrantService = createSqlitePermissionGrantService({ db: drizzleDb });
 const vaultService = createSqliteVaultService({ db: drizzleDb });
 const credentialService = createSqliteCredentialService({ db: drizzleDb });
 const sessionsService = createSqliteSessionService({ db: drizzleDb });
@@ -895,6 +897,7 @@ const services: RouteServices = {
   sql,
   agents: agentsService,
   ambientRules: ambientRulesService,
+  permissionGrants: permissionGrantService,
   vaults: vaultService,
   credentials: credentialService,
   memory: memoryService,

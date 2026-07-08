@@ -476,6 +476,74 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
     }
   });
 
+  // GET /v1/agents/:id/grants — active baseline grant + version history.
+  // Read surface for the console Access tab. 404s when the runtime hasn't
+  // wired a PermissionGrantService (legacy fixtures).
+  app.get("/:id/grants", async (c) => {
+    const services = resolveServices(deps.services, c);
+    if (!services.permissionGrants) {
+      return c.json({ error: "Permission grants not available" }, 404);
+    }
+    const tenantId = c.var.tenant_id;
+    const agentId = c.req.param("id");
+    const agent = await services.agents.get({ tenantId, agentId });
+    if (!agent) return c.json({ error: "Agent not found" }, 404);
+    const [baseline, versions] = await Promise.all([
+      services.permissionGrants.getBaseline({ tenantId, agentId }),
+      services.permissionGrants.listBaselineVersions({ tenantId, agentId }),
+    ]);
+    return c.json({ baseline, versions });
+  });
+
+  // PUT /v1/agents/:id/grants/baseline — write the next baseline version.
+  // Append-only: every call (rule change or enable flip) creates version+1
+  // stamped with the approver. Takes effect on sessions created afterward —
+  // running sessions keep their pinned snapshot by design.
+  app.put("/:id/grants/baseline", async (c) => {
+    const services = resolveServices(deps.services, c);
+    if (!services.permissionGrants) {
+      return c.json({ error: "Permission grants not available" }, 404);
+    }
+    const tenantId = c.var.tenant_id;
+    const agentId = c.req.param("id");
+    const agent = await services.agents.get({ tenantId, agentId });
+    if (!agent) return c.json({ error: "Agent not found" }, 404);
+    const raw = await c.req.json().catch(() => null);
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return c.json({ error: "Request body must be an object" }, 400);
+    }
+    const body = raw as {
+      rules?: unknown;
+      enabled?: unknown;
+      approved_by?: unknown;
+    };
+    const approvedBy =
+      typeof c.var.user_id === "string" && c.var.user_id
+        ? c.var.user_id
+        : typeof body.approved_by === "string"
+          ? body.approved_by
+          : "";
+    if (!approvedBy) {
+      return c.json(
+        { error: "approved_by is required (no authenticated user on request)" },
+        400,
+      );
+    }
+    try {
+      const row = await services.permissionGrants.setBaseline({
+        tenantId,
+        agentId,
+        rules: body.rules ?? [],
+        ...(typeof body.enabled === "boolean" ? { enabled: body.enabled } : {}),
+        approvedBy,
+      });
+      return c.json(row, 201);
+    } catch (err) {
+      if (err instanceof TypeError) return c.json({ error: err.message }, 400);
+      throw err;
+    }
+  });
+
   // GET /v1/agents/:id — get
   app.get("/:id", async (c) => {
     const services = resolveServices(deps.services, c);

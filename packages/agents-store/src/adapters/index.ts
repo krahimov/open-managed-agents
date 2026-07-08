@@ -4,14 +4,17 @@
 
 export { SqlAgentRepo } from "./sql-agent-repo";
 export { SqlAmbientRuleRepo } from "./sql-ambient-rule-repo";
+export { SqlPermissionGrantRepo } from "./sql-permission-grant-repo";
 
 import { SqlAgentRepo } from "./sql-agent-repo";
 import { SqlAmbientRuleRepo } from "./sql-ambient-rule-repo";
+import { SqlPermissionGrantRepo } from "./sql-permission-grant-repo";
 import { drizzle } from "drizzle-orm/d1";
 import type { OmaDb } from "@open-managed-agents/db-schema";
 import type { Logger } from "../ports";
 import { AgentService } from "../service";
 import { AmbientRuleService } from "../ambient-service";
+import { PermissionGrantService } from "../grants-service";
 
 /**
  * CF deployment factory. Wraps the D1Database binding in a Drizzle client so
@@ -68,5 +71,22 @@ export function createSqliteAmbientRuleService(
 ): AmbientRuleService {
   return new AmbientRuleService({
     repo: new SqlAmbientRuleRepo(deps.db),
+  });
+}
+
+export function createCfPermissionGrantService(
+  deps: { db: D1Database },
+): PermissionGrantService {
+  const drz = drizzle(deps.db);
+  return new PermissionGrantService({
+    repo: new SqlPermissionGrantRepo(drz),
+  });
+}
+
+export function createSqlitePermissionGrantService(
+  deps: { db: OmaDb },
+): PermissionGrantService {
+  return new PermissionGrantService({
+    repo: new SqlPermissionGrantRepo(deps.db),
   });
 }

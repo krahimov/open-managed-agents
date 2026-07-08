@@ -35,7 +35,12 @@ import {
   type SessionEvent,
 } from "@open-managed-agents/api-types";
 import type { AgentConfig } from "@open-managed-agents/shared";
-import { generateId } from "@open-managed-agents/shared";
+import {
+  ccToolNameToOma,
+  compileSdkDisallowedTools,
+  evaluatePolicy,
+  generateId,
+} from "@open-managed-agents/shared";
 
 /** Fields a setup session may change on its own harness. */
 export interface HarnessPatch {
@@ -375,6 +380,17 @@ export class ClaudeAgentSdkHarness {
       ? { ...(mcpServers ?? {}), oma_setup: this.#setupServer(ctx, runtime) }
       : mcpServers;
 
+    // The pinned access policy (snapshot enrichment set at session create).
+    // This harness never runs buildTools(), so the same policy is compiled
+    // into SDK-native controls: a static disallowedTools list for exact-name
+    // deny rules, plus a canUseTool backstop that re-evaluates every call in
+    // the OMA namespace (covers glob selectors and dynamically-discovered
+    // MCP tools). Phase 1 enforces deny only on this path — "ask" passes
+    // through until the SDK confirmation round-trip lands (plan Phase 4).
+    const policy = ctx.agent.effective_policy;
+    const hasPolicy = !!policy?.rules?.length;
+    const disallowedTools = compileSdkDisallowedTools(policy);
+
     try {
       const stream = query({
         prompt: textOfUserMessage(ctx),
@@ -396,7 +412,39 @@ export class ClaudeAgentSdkHarness {
               },
           // Headless: OMA has no tool-confirmation round-trip on this path
           // yet, and the child is already scoped to a per-session workdir.
-          permissionMode: "bypassPermissions",
+          // With a pinned policy, bypassPermissions would skip canUseTool
+          // entirely — so policy sessions run permissionMode "default" and
+          // the callback below answers every check (deny per policy, allow
+          // otherwise), keeping the turn headless while enforcing the gate.
+          permissionMode: hasPolicy ? "default" : "bypassPermissions",
+          ...(disallowedTools.length > 0 ? { disallowedTools } : {}),
+          ...(hasPolicy
+            ? {
+                canUseTool: async (
+                  toolName: string,
+                  input: Record<string, unknown>,
+                ) => {
+                  const decision = evaluatePolicy(
+                    policy,
+                    ccToolNameToOma(toolName),
+                  );
+                  if (decision.effect === "deny") {
+                    runtime.broadcast({
+                      type: "system.policy_decision",
+                      tool_name: ccToolNameToOma(toolName),
+                      effect: "deny",
+                      selector: decision.selector,
+                      reason: "tool call denied by pinned access policy",
+                    } as SessionEvent);
+                    return {
+                      behavior: "deny" as const,
+                      message: `Denied by access policy (rule: ${decision.selector ?? "default"}). This tool is not available in this session.`,
+                    };
+                  }
+                  return { behavior: "allow" as const, updatedInput: input };
+                },
+              }
+            : {}),
           // Project scope only when skills are attached (discovery is
           // governed by settingSources; the cwd is platform-owned so
           // "project" exposes exactly what we materialized). Never "user" —
