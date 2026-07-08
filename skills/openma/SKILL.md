@@ -196,6 +196,13 @@ key (Console → agent form → Connect Composio) and pick toolkits per agent.
 Agents can also spawn stdio MCP servers inside their sandbox via the
 `mcp_servers[].stdio` config — no separate gateway needed.
 
+**Agents ask for access themselves.** When an agent hits a service it can't
+reach mid-task, it calls its `request_access(service, reason)` tool — a
+connect card appears in the session view, the user one-clicks through the
+provider OAuth popup, and the agent gets a message when the account is
+connected. No secrets ever transit the chat; don't paste API keys to an agent
+that asks — it shouldn't, and the card flow is the supported path.
+
 ## HTTP API Reference
 
 Run `oma api` for the full endpoint reference, or `oma api <resource>` for a
