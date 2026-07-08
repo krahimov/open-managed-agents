@@ -9,6 +9,7 @@ import { formatDuration, formatRelative, shortenId } from "../lib/format";
 import { Badge, StatusPill } from "../components/Badge";
 import { Modal } from "../components/Modal";
 import { AccessRequestCard } from "../components/AccessRequestCard";
+import { AmbientRuleCard } from "../components/AmbientRuleCard";
 import { Button } from "@/components/ui/button";
 import { AgentIcon, ClockIcon, DurationIcon, EnvIcon, VaultIcon } from "../components/icons";
 import { FilesPanel, ResourcePanel } from "./session-detail/Panels";
@@ -1782,6 +1783,9 @@ function EventRender({
 
     case "system.access_request":
       return <AccessRequestCard event={event} />;
+
+    case "system.ambient_rule_created":
+      return <AmbientRuleCard event={event} />;
 
     default:
       return null;

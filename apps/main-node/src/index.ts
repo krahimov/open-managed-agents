@@ -702,27 +702,8 @@ const sessionRegistry = new SessionRegistry({
       // run" said in chat becomes a standing agent-level rule the ambient
       // dispatcher fires as fresh sessions. next_wake_at is armed here from
       // the cron so the rule is live the moment the tool returns.
-      createAmbientRule: async (a) => {
-        const timezone = a.timezone?.trim() || "UTC";
-        const next = new Cron(a.cron, { timezone }).nextRun();
-        if (!next) throw new Error(`cron "${a.cron}" has no future occurrence`);
-        const row = await ambientRulesService.create({
-          tenantId: context.tenantId,
-          agentId: agent.id,
-          input: {
-            name: a.name,
-            ...(a.description ? { description: a.description } : {}),
-            trigger: {
-              source: "schedule",
-              config: { cron: a.cron, timezone, prompt: a.prompt },
-            },
-            wake_mode: a.wake_mode ?? "decide",
-            next_wake_at: next.toISOString(),
-            created_by: `session:${context.sessionId}`,
-          },
-        });
-        return { id: row.id, next_wake_at: row.next_wake_at };
-      },
+      createAmbientRule: (a) =>
+        createAmbientRuleFromSession(context.tenantId, agent.id, context.sessionId, a),
       listAmbientRules: async () => {
         const rows = await ambientRulesService.listByAgent({
           tenantId: context.tenantId,
@@ -772,10 +753,12 @@ const sessionRegistry = new SessionRegistry({
       updateAgent: async (tenantId, agentId, patch) => {
         return await agentsService.update({ tenantId, agentId, input: patch });
       },
-      // request_access tool on the SDK harness — same event pipeline as the
-      // DefaultHarness buildTools hook.
+      // request_access + create_ambient_rule on the SDK harness — same event
+      // pipeline as the DefaultHarness buildTools hooks.
       requestServiceAccess: (tenantId, sessionId, a) =>
         postAccessRequest(tenantId, sessionId, a),
+      createAmbientRule: (tenantId, sessionId, agentId, a) =>
+        createAmbientRuleFromSession(tenantId, agentId, sessionId, a),
     });
     return {
       run: (ctx: unknown) => {
@@ -1259,6 +1242,64 @@ const sessionRouter = new NodeSessionRouter({
   newEventLog,
   workQueue: sessionWorkQueue,
 });
+
+/**
+ * Create a standing ambient rule from inside a session — the backend half of
+ * the agent's `create_ambient_rule` tool on BOTH harnesses. Arms the first
+ * wake from the cron and appends a system.ambient_rule_created event so the
+ * console renders the new rule as a card instead of a raw tool result.
+ * Function declaration (hoisted) so the buildTools/buildHarness closures
+ * above can reference it.
+ */
+async function createAmbientRuleFromSession(
+  tenantId: string,
+  agentId: string,
+  sessionId: string,
+  a: {
+    name: string;
+    description?: string;
+    cron: string;
+    timezone?: string;
+    prompt: string;
+    wake_mode?: "observe" | "decide" | "act" | "escalate";
+  },
+): Promise<{ id: string; next_wake_at?: string }> {
+  const timezone = a.timezone?.trim() || "UTC";
+  const next = new Cron(a.cron, { timezone }).nextRun();
+  if (!next) throw new Error(`cron "${a.cron}" has no future occurrence`);
+  const row = await ambientRulesService.create({
+    tenantId,
+    agentId,
+    input: {
+      name: a.name,
+      ...(a.description ? { description: a.description } : {}),
+      trigger: {
+        source: "schedule",
+        config: { cron: a.cron, timezone, prompt: a.prompt },
+      },
+      wake_mode: a.wake_mode ?? "decide",
+      next_wake_at: next.toISOString(),
+      created_by: `session:${sessionId}`,
+    },
+  });
+  await sessionRouter
+    .appendEvent(sessionId, {
+      type: "system.ambient_rule_created",
+      id: generateEventId(),
+      rule_id: row.id,
+      name: row.name,
+      ...(a.description ? { description: a.description } : {}),
+      cron: a.cron,
+      timezone,
+      wake_mode: row.wake_mode,
+      prompt: a.prompt,
+      ...(row.next_wake_at ? { next_wake_at: row.next_wake_at } : {}),
+    } as SessionEvent)
+    .catch(() => {
+      // Card is presentation only — the rule itself is already created.
+    });
+  return { id: row.id, next_wake_at: row.next_wake_at };
+}
 
 /**
  * Append a system.access_request event to a session — the backend half of

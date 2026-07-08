@@ -138,6 +138,25 @@ export interface ClaudeAgentSdkHarnessDeps {
     sessionId: string,
     args: { service: string; reason: string; mcp_server_url?: string },
   ) => Promise<{ request_id: string; status: string; note?: string }>;
+  /**
+   * Create a standing ambient rule on the session's agent (the
+   * `create_ambient_rule` tool). Main-node wires this to the same
+   * createAmbientRuleFromSession helper the DefaultHarness buildTools hook
+   * uses — it arms the first wake and appends the ambient-rule card event.
+   */
+  createAmbientRule?: (
+    tenantId: string,
+    sessionId: string,
+    agentId: string,
+    args: {
+      name: string;
+      description?: string;
+      cron: string;
+      timezone?: string;
+      prompt: string;
+      wake_mode?: "observe" | "decide" | "act" | "escalate";
+    },
+  ) => Promise<{ id: string; next_wake_at?: string }>;
 }
 
 function workdirFor(sessionId: string): string {
@@ -355,10 +374,11 @@ export class ClaudeAgentSdkHarness {
     });
   }
 
-  /** In-process MCP server exposing `request_access` on working (non-setup)
-   *  sessions. The SDK child calls back over the in-process transport, so
-   *  the handler runs HERE and can append the session event directly. */
-  #accessServer(ctx: HarnessContext, sessionId: string) {
+  /** In-process MCP server exposing platform tools (request_access,
+   *  create_ambient_rule) to the SDK child in both setup and working
+   *  sessions. The child calls back over the in-process transport, so the
+   *  handlers run HERE and can append session events directly. */
+  #platformServer(ctx: HarnessContext, sessionId: string) {
     const tenantId = ctx.tenant_id ?? "default";
     const requestAccess = tool(
       "request_access",
@@ -398,10 +418,64 @@ export class ClaudeAgentSdkHarness {
         return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
       },
     );
+    const tools = [requestAccess];
+
+    if (this.#deps.createAmbientRule) {
+      tools.push(
+        tool(
+          "create_ambient_rule",
+          "Create a standing ambient rule on THIS agent: on the given cron, the platform starts a FRESH " +
+            "session of this agent and injects `prompt` as the opening user message. Ambient rules outlive " +
+            "this conversation — use them when the user asks for a recurring job (\"do deep research on X " +
+            "every day\", \"check my email every morning\", \"review PRs as they come in on a schedule\"). " +
+            "Confirm the cadence and the task with the user before creating one; the rule appears as a card " +
+            "in their session view and can be managed later in the console's Ambient panel.",
+          {
+            name: z.string().describe('Short human-readable rule name, e.g. "Daily PR triage"'),
+            description: z.string().optional().describe("One-line summary shown in the console"),
+            cron: z.string().describe('5-field cron cadence (e.g. "0 9 * * *" = 9:00 daily)'),
+            timezone: z.string().optional().describe('IANA timezone for the cron (e.g. "America/Los_Angeles"). Defaults to UTC.'),
+            prompt: z.string().describe("Opening user message for each spawned session — the standing task, written to future-you"),
+            wake_mode: z.enum(["observe", "decide", "act", "escalate"]).optional()
+              .describe("act = do the task; decide (default) = assess then act if warranted; observe = log only; escalate = flag a human"),
+          } as unknown as SdkToolSchema,
+          async (args) => {
+            const a = args as {
+              name?: string; description?: string; cron?: string;
+              timezone?: string; prompt?: string;
+              wake_mode?: "observe" | "decide" | "act" | "escalate";
+            };
+            if (!a.name?.trim() || !a.cron?.trim() || !a.prompt?.trim()) {
+              return {
+                content: [{ type: "text" as const, text: "name, cron, and prompt are required" }],
+                isError: true,
+              };
+            }
+            try {
+              const result = await this.#deps.createAmbientRule!(tenantId, sessionId, ctx.agent.id, {
+                name: a.name,
+                description: a.description,
+                cron: a.cron,
+                timezone: a.timezone,
+                prompt: a.prompt,
+                wake_mode: a.wake_mode,
+              });
+              return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+            } catch (err) {
+              return {
+                content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }],
+                isError: true,
+              };
+            }
+          },
+        ),
+      );
+    }
+
     return createSdkMcpServer({
-      name: "oma_access",
+      name: "oma_platform",
       version: "1",
-      tools: [requestAccess],
+      tools,
     });
   }
 
@@ -463,7 +537,7 @@ export class ClaudeAgentSdkHarness {
       const withInProcess: Record<string, SdkMcpEntry> = { ...(mcpServers ?? {}) };
       if (isSetup) withInProcess.oma_setup = this.#setupServer(ctx, runtime);
       if (this.#deps.requestServiceAccess) {
-        withInProcess.oma_access = this.#accessServer(ctx, sessionId);
+        withInProcess.oma_platform = this.#platformServer(ctx, sessionId);
       }
       mcpServersForTurn = withInProcess;
     }

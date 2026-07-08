@@ -15,6 +15,7 @@ import {
 import { Message, MessageContent } from "../../components/ai-elements/message";
 import { AccessRequestCard } from "../../components/AccessRequestCard";
 import { HarnessDiffCard } from "../../components/HarnessDiffCard";
+import { AmbientRuleCard } from "../../components/AmbientRuleCard";
 import {
   PromptInput,
   PromptInputFooter,
@@ -78,6 +79,7 @@ function isRenderable(ev: Event): boolean {
   // setup this is how the agent hands the user the OAuth popups for the
   // servers it just added to its own harness.
   if (ev.type === "system.access_request") return true;
+  if (ev.type === "system.ambient_rule_created") return true;
   return false;
 }
 
@@ -231,6 +233,9 @@ export function SessionChat({
             }
             if (ev.type === "system.access_request") {
               return <AccessRequestCard key={key} event={ev} sessionId={sessionId} />;
+            }
+            if (ev.type === "system.ambient_rule_created") {
+              return <AmbientRuleCard key={key} event={ev} />;
             }
             // agent.tool_use → compact chip
             return (

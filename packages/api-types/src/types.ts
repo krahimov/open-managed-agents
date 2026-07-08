@@ -899,6 +899,23 @@ export interface SystemAccessRequestEvent extends EventBase {
   mcp_server_url?: string;
 }
 
+// Agent-created ambient rule. Emitted alongside the create_ambient_rule
+// tool result so live consumers (Console) render the new standing rule as a
+// card — cadence, wake mode, opening prompt, first wake — instead of a raw
+// tool-result blob. Like other system.* frames, old consumers ignore it.
+export interface SystemAmbientRuleCreatedEvent extends EventBase {
+  type: "system.ambient_rule_created";
+  rule_id: string;
+  name: string;
+  description?: string;
+  cron?: string;
+  timezone?: string;
+  wake_mode: string;
+  /** Opening user message each spawned session receives. */
+  prompt?: string;
+  next_wake_at?: string;
+}
+
 export type SessionEvent =
   | UserMessageEvent
   | UserInterruptEvent
@@ -949,7 +966,8 @@ export type SessionEvent =
   | SystemUserMessageCancelledEvent
   | SystemPolicyPinnedEvent
   | SystemPolicyDecisionEvent
-  | SystemAccessRequestEvent;
+  | SystemAccessRequestEvent
+  | SystemAmbientRuleCreatedEvent;
 
 /**
  * Event types defined by Anthropic's Managed Agents spec — what their
