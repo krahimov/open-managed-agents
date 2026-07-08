@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { OMA_SETUP_HARNESS } from "@open-managed-agents/api-types";
+import {
+  OMA_SETUP_HARNESS,
+  OMA_SETUP_KIND_HARNESS_UPDATED,
+} from "@open-managed-agents/api-types";
 import { useApi } from "../../lib/api";
 import type { Event } from "../../lib/events";
 import { Markdown } from "../../components/Markdown";
@@ -11,6 +14,7 @@ import {
 } from "../../components/ai-elements/conversation";
 import { Message, MessageContent } from "../../components/ai-elements/message";
 import { AccessRequestCard } from "../../components/AccessRequestCard";
+import { HarnessDiffCard } from "../../components/HarnessDiffCard";
 import {
   PromptInput,
   PromptInputFooter,
@@ -51,9 +55,19 @@ function isSetupMarker(ev: Event): boolean {
   return (ev.metadata as { harness?: string } | undefined)?.harness === OMA_SETUP_HARNESS;
 }
 
+/** update_harness markers carry a before/after harness view — these render
+ *  as an animated diff card instead of being hidden like other markers. */
+function isHarnessUpdate(ev: Event): boolean {
+  return (
+    isSetupMarker(ev) &&
+    (ev.metadata as { kind?: string } | undefined)?.kind === OMA_SETUP_KIND_HARNESS_UPDATED
+  );
+}
+
 /** Events worth showing as chat bubbles/chips (everything else — stream deltas,
  *  status, span, results, builder markers — is filtered out). */
 function isRenderable(ev: Event): boolean {
+  if (isHarnessUpdate(ev)) return true;
   if (isSetupMarker(ev)) return false;
   if (ev.type === "user.message") return eventText(ev).length > 0;
   if (ev.type === "agent.message") return eventText(ev).trim().length > 0;
@@ -79,6 +93,11 @@ export function SessionChat({
   const [pending, setPending] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [status, setStatus] = useState<"idle" | "running">("idle");
+  /** In-flight token streams keyed by message_id. An entry appears on
+   *  stream_start (or a stray chunk after reconnect), grows per chunk, and
+   *  is dropped when the canonical agent.message with the same id lands
+   *  (or the stream ends aborted). */
+  const [streams, setStreams] = useState<Record<string, string>>({});
 
   // Keep the latest onEvent without re-subscribing the stream on each render.
   const onEventRef = useRef(onEvent);
@@ -90,6 +109,7 @@ export function SessionChat({
     setEvents([]);
     setPending(null);
     setStatus("idle");
+    setStreams({});
 
     // streamEvents replays history (replay=1) then live-streams; reconnects
     // replay again, so dedup by seq/id.
@@ -104,6 +124,42 @@ export function SessionChat({
           setStatus("idle");
         }
         if (ev.type === "user.message") setPending(null);
+
+        // Live token streaming — broadcast-only events, never in history.
+        if (ev.type === "agent.message_stream_start") {
+          const mid = (ev as { message_id?: string }).message_id;
+          if (mid) setStreams((s) => ({ ...s, [mid]: s[mid] ?? "" }));
+          return;
+        }
+        if (ev.type === "agent.message_chunk") {
+          const { message_id: mid, delta } = ev as { message_id?: string; delta?: string };
+          if (mid && delta) setStreams((s) => ({ ...s, [mid]: (s[mid] ?? "") + delta }));
+          return;
+        }
+        if (ev.type === "agent.message_stream_end") {
+          const { message_id: mid, status: st } = ev as { message_id?: string; status?: string };
+          // completed streams stay visible until the canonical agent.message
+          // (same id) replaces them a beat later — no flicker.
+          if (mid && st !== "completed") {
+            setStreams((s) => {
+              if (!(mid in s)) return s;
+              const { [mid]: _dropped, ...rest } = s;
+              return rest;
+            });
+          }
+          return;
+        }
+        if (ev.type === "agent.message") {
+          // Canonical message replaces its stream bubble (ids match).
+          const mid = (ev as { message_id?: string }).message_id ?? ev.id;
+          if (mid) {
+            setStreams((s) => {
+              if (!(mid in s)) return s;
+              const { [mid]: _dropped, ...rest } = s;
+              return rest;
+            });
+          }
+        }
 
         if (!isRenderable(ev)) return;
         const key = ev.seq != null ? `seq:${ev.seq}` : ev.id ? `id:${ev.id}` : null;
@@ -162,6 +218,9 @@ export function SessionChat({
               );
             }
             if (ev.type === "agent.message") {
+              if (isHarnessUpdate(ev)) {
+                return <HarnessDiffCard key={key} event={ev} />;
+              }
               return (
                 <Message from="assistant" key={key}>
                   <MessageContent>
@@ -189,7 +248,17 @@ export function SessionChat({
               <MessageContent className="opacity-70">{pending}</MessageContent>
             </Message>
           )}
-          {status === "running" && (
+          {Object.entries(streams).map(([mid, text]) =>
+            text ? (
+              <Message from="assistant" key={`stream:${mid}`}>
+                <MessageContent>
+                  <Markdown>{text}</Markdown>
+                  <span className="inline-block w-2 h-4 align-text-bottom bg-fg-subtle/60 animate-pulse" aria-hidden />
+                </MessageContent>
+              </Message>
+            ) : null,
+          )}
+          {status === "running" && Object.keys(streams).length === 0 && (
             <div className="text-xs text-fg-subtle">Working…</div>
           )}
         </ConversationContent>

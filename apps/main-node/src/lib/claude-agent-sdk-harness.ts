@@ -55,6 +55,13 @@ export interface HarnessPatch {
 /** OMA session id → SDK session id, for `resume` continuity across turns. */
 const sdkSessions = new Map<string, string>();
 
+/** OMA session id → last harness view broadcast from THAT session's
+ *  update_harness calls. ctx.agent is the frozen session snapshot, so after
+ *  the first edit it no longer reflects reality — this map keeps the true
+ *  "before" for diff rendering across a multi-edit setup conversation.
+ *  In-memory like sdkSessions: a restart just resets the diff baseline. */
+const lastHarnessViews = new Map<string, Record<string, unknown>>();
+
 /** Footgun guidance appended to every SDK-harness system prompt — distilled
  *  from real failed sessions (see git history for the gh api 404 incident). */
 const CLI_NOTES = [
@@ -318,7 +325,11 @@ export class ClaudeAgentSdkHarness {
             isError: !this.#deps.updateAgent,
           };
         }
+        const sessionKey = ctx.session_id ?? "";
+        const before = lastHarnessViews.get(sessionKey) ?? harnessView(ctx.agent);
         const updated = await this.#deps.updateAgent(tenantId, agentId, patch);
+        const after = harnessView(updated);
+        lastHarnessViews.set(sessionKey, after);
         runtime.broadcast({
           type: "agent.message",
           id: generateId(),
@@ -326,7 +337,10 @@ export class ClaudeAgentSdkHarness {
           metadata: {
             harness: OMA_SETUP_HARNESS,
             kind: OMA_SETUP_KIND_HARNESS_UPDATED,
-            harness_config: harnessView(updated),
+            harness_config: after,
+            // Previous values for the changed fields — the console renders
+            // the update as a red/green diff card from these two views.
+            harness_previous: before,
             changed,
           },
         } as SessionEvent);
@@ -529,10 +543,54 @@ export class ClaudeAgentSdkHarness {
           // oma_setup MCP closure, and lock out any on-disk MCP config.
           ...(isSetup ? { tools: [], strictMcpConfig: true } : {}),
           maxTurns: isSetup ? 30 : 50,
+          // Token-level partial events so text streams into the console
+          // instead of landing as one block per assistant message.
+          includePartialMessages: true,
         },
       });
 
+      // Live text streaming. Each streamed text block gets a minted message
+      // id; the ids queue up in order and the canonical assistant message
+      // (which arrives after the block completes) consumes them FIFO so the
+      // committed agent.message carries the SAME id as its chunks — clients
+      // fold the stream bubble into the final message by that id.
+      const streamedTextIds: string[] = [];
+      let liveTextId: string | null = null;
+      let liveTextChars = 0;
+      const endLiveText = async (status: "completed" | "aborted") => {
+        if (!liveTextId) return;
+        const id = liveTextId;
+        liveTextId = null;
+        liveTextChars = 0;
+        await runtime.broadcastStreamEnd(id, status).catch(() => {});
+      };
+
       for await (const msg of stream) {
+        if (msg.type === "stream_event") {
+          const ev = (msg as { event?: { type?: string; content_block?: { type?: string }; delta?: { type?: string; text?: string } } }).event;
+          if (!ev) continue;
+          if (ev.type === "content_block_start" && ev.content_block?.type === "text") {
+            liveTextId = generateId();
+            liveTextChars = 0;
+            streamedTextIds.push(liveTextId);
+            await runtime.broadcastStreamStart(liveTextId).catch(() => {});
+          } else if (
+            ev.type === "content_block_delta" &&
+            ev.delta?.type === "text_delta" &&
+            liveTextId &&
+            ev.delta.text
+          ) {
+            liveTextChars += ev.delta.text.length;
+            await runtime.broadcastChunk(liveTextId, ev.delta.text).catch(() => {});
+          } else if (ev.type === "content_block_stop") {
+            // A zero-delta text block never produces a canonical agent.message
+            // (empty text is skipped below) — drop its queued id so later
+            // blocks don't fold onto the wrong message.
+            if (liveTextId && liveTextChars === 0) streamedTextIds.pop();
+            await endLiveText("completed");
+          }
+          continue;
+        }
         if (msg.type === "system" && "subtype" in msg && msg.subtype === "init") {
           sdkSessions.set(sessionId, (msg as { session_id: string }).session_id);
           continue;
@@ -541,9 +599,11 @@ export class ClaudeAgentSdkHarness {
           sdkSessions.set(sessionId, msg.session_id);
           for (const block of msg.message.content) {
             if (block.type === "text" && block.text.trim()) {
+              const streamedId = streamedTextIds.shift();
               runtime.broadcast({
                 type: "agent.message",
-                id: generateId(),
+                id: streamedId ?? generateId(),
+                ...(streamedId ? { message_id: streamedId } : {}),
                 content: [{ type: "text", text: block.text }],
               } as SessionEvent);
             } else if (block.type === "tool_use") {
@@ -590,5 +650,9 @@ export class ClaudeAgentSdkHarness {
       runtime.broadcast({ type: "session.error", error: message } as SessionEvent);
       throw err;
     }
+
+    // The endLiveText closure lives inside the try; any stream that died
+    // mid-block was already ended as "aborted" by the recovery scan or the
+    // catch above — nothing to clean up here.
   }
 }
