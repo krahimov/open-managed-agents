@@ -157,6 +157,20 @@ export interface ClaudeAgentSdkHarnessDeps {
       wake_mode?: "observe" | "decide" | "act" | "escalate";
     },
   ) => Promise<{ id: string; next_wake_at?: string }>;
+  /** Skill discovery (the `find_skill` tool) — tenant store + curated
+   *  catalog keyword search, same helper as the DefaultHarness hook. */
+  findSkills?: (
+    tenantId: string,
+    query: string,
+  ) => Promise<Array<{ name: string; description: string; installed: boolean; source?: string }>>;
+  /** Skill acquisition request (the `request_skill` tool) — appends a
+   *  system.skill_request event the console renders as an attach card. */
+  requestSkill?: (
+    tenantId: string,
+    agentId: string,
+    sessionId: string,
+    args: { skill_name: string; reason: string },
+  ) => Promise<{ request_id: string; status: string; note?: string }>;
 }
 
 function workdirFor(sessionId: string): string {
@@ -467,6 +481,56 @@ export class ClaudeAgentSdkHarness {
                 isError: true,
               };
             }
+          },
+        ),
+      );
+    }
+
+    if (this.#deps.findSkills) {
+      tools.push(
+        tool(
+          "find_skill",
+          "Search available skills (installed + curated catalog) by keyword. A skill is a SKILL.md " +
+            "playbook that teaches you how to do a class of task well (e.g. xlsx spreadsheets, pdf " +
+            "manipulation, frontend design). Use when a task would benefit from domain expertise you " +
+            "don't currently have loaded — then call request_skill to ask the user to attach one.",
+          {
+            query: z.string().describe('Keywords, e.g. "spreadsheet excel" or "pdf"'),
+          } as unknown as SdkToolSchema,
+          async (args) => {
+            const a = args as { query?: string };
+            if (!a.query?.trim()) {
+              return { content: [{ type: "text" as const, text: "query is required" }], isError: true };
+            }
+            const skills = await this.#deps.findSkills!(tenantId, a.query);
+            return { content: [{ type: "text" as const, text: JSON.stringify({ skills }) }] };
+          },
+        ),
+      );
+    }
+
+    if (this.#deps.requestSkill) {
+      tools.push(
+        tool(
+          "request_skill",
+          "Ask the user to attach a skill to you (use find_skill first to discover the right name). " +
+            "Posts an attach card to the user's session view; on approval the skill is security-scanned, " +
+            "attached to your config, and its content is injected into THIS session so you can use it " +
+            "immediately. Continue other work or end your turn while you wait.",
+          {
+            skill_name: z.string().describe('Skill name from find_skill (e.g. "xlsx")'),
+            reason: z.string().describe("One line shown to the user: why you need it"),
+          } as unknown as SdkToolSchema,
+          async (args) => {
+            const a = args as { skill_name?: string; reason?: string };
+            if (!a.skill_name?.trim()) {
+              return { content: [{ type: "text" as const, text: "skill_name is required" }], isError: true };
+            }
+            const result = await this.#deps.requestSkill!(tenantId, ctx.agent.id, sessionId, {
+              skill_name: a.skill_name,
+              reason: a.reason?.trim() || "The agent needs this skill for the current task.",
+            });
+            return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
           },
         ),
       );

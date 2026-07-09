@@ -766,6 +766,9 @@ const sessionRegistry = new SessionRegistry({
         postAccessRequest(tenantId, sessionId, a),
       createAmbientRule: (tenantId, sessionId, agentId, a) =>
         createAmbientRuleFromSession(tenantId, agentId, sessionId, a),
+      findSkills: (tenantId, query) => findSkillsForTenant(tenantId, query),
+      requestSkill: (tenantId, agentId, sessionId, a) =>
+        postSkillRequest(tenantId, agentId, sessionId, a),
     });
     return {
       run: (ctx: unknown) => {
