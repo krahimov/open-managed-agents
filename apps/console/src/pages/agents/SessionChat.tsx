@@ -16,6 +16,7 @@ import { Message, MessageContent } from "../../components/ai-elements/message";
 import { AccessRequestCard } from "../../components/AccessRequestCard";
 import { HarnessDiffCard } from "../../components/HarnessDiffCard";
 import { AmbientRuleCard } from "../../components/AmbientRuleCard";
+import { SkillRequestCard } from "../../components/SkillRequestCard";
 import {
   PromptInput,
   PromptInputFooter,
@@ -80,6 +81,7 @@ function isRenderable(ev: Event): boolean {
   // servers it just added to its own harness.
   if (ev.type === "system.access_request") return true;
   if (ev.type === "system.ambient_rule_created") return true;
+  if (ev.type === "system.skill_request") return true;
   return false;
 }
 
@@ -236,6 +238,9 @@ export function SessionChat({
             }
             if (ev.type === "system.ambient_rule_created") {
               return <AmbientRuleCard key={key} event={ev} />;
+            }
+            if (ev.type === "system.skill_request") {
+              return <SkillRequestCard key={key} event={ev} sessionId={sessionId} />;
             }
             // agent.tool_use → compact chip
             return (

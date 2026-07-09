@@ -916,6 +916,28 @@ export interface SystemAmbientRuleCreatedEvent extends EventBase {
   next_wake_at?: string;
 }
 
+// Agent-initiated skill acquisition. Emitted when the agent calls its
+// request_skill tool ("this task needs the xlsx skill"). The console
+// renders an attach card showing provenance + scan status; approval runs
+// install-if-needed (quarantine-enforced) + attaches to the agent + injects
+// the skill into the running session. Same proposes/ratifies split as
+// access requests: the event is a request record, never an attachment.
+export interface SystemSkillRequestEvent extends EventBase {
+  type: "system.skill_request";
+  request_id: string;
+  agent_id: string;
+  /** Normalized skill name the agent asked for. */
+  skill_name: string;
+  reason: string;
+  /** Set when the name matched an installed tenant skill. */
+  skill_id?: string;
+  /** Set when the name matched a curated catalog entry (import source). */
+  catalog_source?: string;
+  /** installed | catalog | unknown — what the card should offer. */
+  resolution: "installed" | "catalog" | "unknown";
+  description?: string;
+}
+
 export type SessionEvent =
   | UserMessageEvent
   | UserInterruptEvent
@@ -967,7 +989,8 @@ export type SessionEvent =
   | SystemPolicyPinnedEvent
   | SystemPolicyDecisionEvent
   | SystemAccessRequestEvent
-  | SystemAmbientRuleCreatedEvent;
+  | SystemAmbientRuleCreatedEvent
+  | SystemSkillRequestEvent;
 
 /**
  * Event types defined by Anthropic's Managed Agents spec — what their

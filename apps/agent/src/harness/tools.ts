@@ -24,7 +24,7 @@ import type { BrowserHarness, BrowserBillingHook } from "@open-managed-agents/br
 /** Tools enabled by default when an agent has no explicit tools config.
  *  Excludes opt-in tools that bias the LLM away from cheaper alternatives
  *  — see OPT_IN_TOOLS below. */
-export const DEFAULT_TOOLS = ["bash", "read", "write", "edit", "glob", "grep", "web_fetch", "web_search", "schedule", "cancel_schedule", "list_schedules", "create_ambient_rule", "list_ambient_rules", "delete_ambient_rule", "request_access"];
+export const DEFAULT_TOOLS = ["bash", "read", "write", "edit", "glob", "grep", "web_fetch", "web_search", "schedule", "cancel_schedule", "list_schedules", "create_ambient_rule", "list_ambient_rules", "delete_ambient_rule", "request_access", "find_skill", "request_skill"];
 
 /** Tools recognised but NOT registered by default — agents must opt in
  *  via tools config (`{ name: "browser", enabled: true }`).
@@ -476,6 +476,19 @@ export async function buildTools(
      *  the connect-card flow lands there. */
     requestServiceAccess?: (args: {
       service: string;
+      reason: string;
+    }) => Promise<{ request_id: string; status: string; note?: string }>;
+    /** Search the tenant skill store + curated catalog by keyword — the
+     *  discovery half of agent-initiated skill acquisition. */
+    findSkills?: (query: string) => Promise<
+      Array<{ name: string; description: string; installed: boolean; source?: string }>
+    >;
+    /** Ask the user to attach a skill to THIS agent: appends a
+     *  system.skill_request event the console renders as an attach card.
+     *  Approval installs (quarantine-enforced), attaches, and injects the
+     *  skill into the running session. */
+    requestSkill?: (args: {
+      skill_name: string;
       reason: string;
     }) => Promise<{ request_id: string; status: string; note?: string }>;
   }
@@ -1106,6 +1119,35 @@ export async function buildTools(
           .describe("One line shown to the user: what you need it for (e.g. \"to read this week's invoices\")"),
       }),
       execute: safe(async (args) => env.requestServiceAccess!(args)),
+    });
+  }
+
+  if (env?.findSkills && enabled.has("find_skill")) {
+    tools.find_skill = tool({
+      description:
+        "Search available skills (installed + curated catalog) by keyword. A skill is a SKILL.md " +
+        "playbook that teaches you how to do a class of task well (e.g. xlsx spreadsheets, pdf " +
+        "manipulation, frontend design). Use when a task would benefit from domain expertise you " +
+        "don't currently have loaded — then call request_skill to ask the user to attach one.",
+      inputSchema: z.object({
+        query: z.string().min(1).max(120).describe("Keywords, e.g. \"spreadsheet excel\" or \"pdf\""),
+      }),
+      execute: safe(async ({ query }) => ({ skills: await env.findSkills!(query) })),
+    });
+  }
+
+  if (env?.requestSkill && enabled.has("request_skill")) {
+    tools.request_skill = tool({
+      description:
+        "Ask the user to attach a skill to you (use find_skill first to discover the right name). " +
+        "Posts an attach card to the user's session view; on approval the skill is security-scanned, " +
+        "attached to your config, and its content is injected into THIS session so you can use it " +
+        "immediately. Continue other work or end your turn while you wait.",
+      inputSchema: z.object({
+        skill_name: z.string().min(1).max(64).describe("Skill name from find_skill (e.g. \"xlsx\")"),
+        reason: z.string().min(1).max(300).describe("One line shown to the user: why you need it"),
+      }),
+      execute: safe(async (args) => env.requestSkill!(args)),
     });
   }
 

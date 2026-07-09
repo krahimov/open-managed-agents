@@ -10,6 +10,7 @@ import { Badge, StatusPill } from "../components/Badge";
 import { Modal } from "../components/Modal";
 import { AccessRequestCard } from "../components/AccessRequestCard";
 import { AmbientRuleCard } from "../components/AmbientRuleCard";
+import { SkillRequestCard } from "../components/SkillRequestCard";
 import { Button } from "@/components/ui/button";
 import { AgentIcon, ClockIcon, DurationIcon, EnvIcon, VaultIcon } from "../components/icons";
 import { FilesPanel, ResourcePanel } from "./session-detail/Panels";
@@ -1786,6 +1787,9 @@ function EventRender({
 
     case "system.ambient_rule_created":
       return <AmbientRuleCard event={event} />;
+
+    case "system.skill_request":
+      return <SkillRequestCard event={event} />;
 
     default:
       return null;

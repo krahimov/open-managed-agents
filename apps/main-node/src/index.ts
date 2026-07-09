@@ -737,6 +737,11 @@ const sessionRegistry = new SessionRegistry({
           ...a,
           mcp_server_url: matchAgentMcpServer(agent, a.service),
         }),
+      // Agent-initiated skill acquisition — discovery over the tenant store
+      // + curated catalog, and an attach-request card the human ratifies.
+      findSkills: (query) => findSkillsForTenant(context.tenantId, query),
+      requestSkill: (a) =>
+        postSkillRequest(context.tenantId, agent.id, context.sessionId, a),
     });
   },
   buildHarness: () => {
@@ -1352,6 +1357,142 @@ function matchAgentMcpServer(
   );
   return hit?.url;
 }
+/** Keyword search over installed skills + curated catalog (installed wins
+ *  name conflicts). The discovery half of agent skill acquisition. */
+async function findSkillsForTenant(
+  tenantId: string,
+  query: string,
+): Promise<Array<{ name: string; description: string; installed: boolean; source?: string }>> {
+  const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const matches = (name: string, desc: string) => {
+    const hay = `${name} ${desc}`.toLowerCase();
+    return tokens.some((t) => hay.includes(t));
+  };
+  const installed = await skillStore.list(tenantId);
+  const out: Array<{ name: string; description: string; installed: boolean; source?: string }> = [];
+  for (const s of installed) {
+    if (matches(s.name, s.description)) {
+      out.push({ name: s.name, description: s.description.slice(0, 160), installed: true });
+    }
+  }
+  const have = new Set(out.map((s) => s.name));
+  for (const e of CURATED_SKILL_CATALOG) {
+    if (!have.has(e.name) && matches(e.name, e.description)) {
+      out.push({
+        name: e.name,
+        description: e.description.slice(0, 160),
+        installed: false,
+        source: e.source,
+      });
+    }
+  }
+  return out.slice(0, 8);
+}
+
+/** Append a system.skill_request event — backend half of the agent's
+ *  request_skill tool. Resolution tells the console card what one click
+ *  should do: attach an installed skill, or install-from-catalog first. */
+async function postSkillRequest(
+  tenantId: string,
+  agentId: string,
+  sessionId: string,
+  args: { skill_name: string; reason: string },
+): Promise<{ request_id: string; status: string; note?: string }> {
+  const name = args.skill_name.trim().toLowerCase();
+  const installed = (await skillStore.list(tenantId)).find((s) => s.name === name);
+  const catalog = installed ? undefined : CURATED_SKILL_CATALOG.find((e) => e.name === name);
+  const requestId = `skreq-${generateEventId().replace(/^sevt-/, "")}`;
+  await sessionRouter.appendEvent(sessionId, {
+    type: "system.skill_request",
+    id: generateEventId(),
+    request_id: requestId,
+    agent_id: agentId,
+    skill_name: name,
+    reason: args.reason,
+    ...(installed ? { skill_id: installed.id, description: installed.description } : {}),
+    ...(catalog ? { catalog_source: catalog.source, description: catalog.description } : {}),
+    resolution: installed ? "installed" : catalog ? "catalog" : "unknown",
+  } as SessionEvent);
+  return {
+    request_id: requestId,
+    status: "pending",
+    note: installed
+      ? `Attach card for installed skill "${name}" posted — you'll get its playbook in a message once the user approves.`
+      : catalog
+        ? `Attach card posted — "${name}" is in the curated catalog; approval will security-scan, install, and attach it.`
+        : `Request posted, but no skill named "${name}" exists in the store or catalog — the user can import one from a URL. Consider find_skill to check alternatives.`,
+  };
+}
+
+// Ratification endpoint behind the skill-request card: install if needed
+// (quarantine-enforced — blocked content 422s here regardless of UI),
+// attach to the agent's skills refs, and inject the playbook into the
+// running session so the agent can use it THIS turn (the session snapshot
+// is frozen, so a config-only attach wouldn't reach it until a new session).
+v1.post("/skills/acquire", async (c) => {
+  const body = await c.req
+    .json<{ agent_id?: string; session_id?: string; skill_id?: string; source?: string }>()
+    .catch(() => null);
+  if (!body?.agent_id || (!body.skill_id && !body.source)) {
+    return c.json({ error: "agent_id and one of skill_id | source required" }, 400);
+  }
+  const tenantId = c.get("tenant_id");
+  try {
+    let skill = body.skill_id ? await skillStore.get(tenantId, body.skill_id) : null;
+    if (!skill && body.source) {
+      const candidates = await skillStore.fetchFromSource(body.source);
+      const cand = candidates[0];
+      if (!cand) return c.json({ error: "no SKILL.md at source" }, 404);
+      const installedNames = (await skillStore.list(tenantId)).map((s) => s.name);
+      const report = scanSkillContent(cand.content, { installedNames });
+      if (report.verdict === "blocked") {
+        return c.json({ error: "skill blocked by security scan", report }, 422);
+      }
+      const curated = body.source.startsWith("anthropics/skills/");
+      skill = await skillStore.create({
+        tenantId,
+        content: cand.content,
+        source: cand.source,
+        contentHash: report.content_sha256,
+        securityStatus:
+          curated && report.verdict === "pass" ? "curated" : report.verdict === "pass" ? "approved" : "flagged",
+        securityReport: JSON.stringify(report),
+      });
+    }
+    if (!skill) return c.json({ error: "skill not found" }, 404);
+
+    const agentRow = await agentsService.get({ tenantId, agentId: body.agent_id });
+    if (!agentRow) return c.json({ error: "agent not found" }, 404);
+    const existingRefs =
+      (agentRow as { skills?: Array<{ skill_id: string; type: string }> }).skills ?? [];
+    if (!existingRefs.some((r) => r.skill_id === skill.id)) {
+      await agentsService.update({
+        tenantId,
+        agentId: body.agent_id,
+        input: { skills: [...existingRefs, { type: "custom", skill_id: skill.id }] } as never,
+      });
+    }
+
+    // Inject into the running session (its snapshot is frozen) — the
+    // user.message both wakes the turn loop and carries the playbook.
+    if (body.session_id) {
+      await sessionRouter.appendEvent(body.session_id, {
+        type: "user.message",
+        id: generateEventId(),
+        content: [
+          {
+            type: "text",
+            text: `[skill attached] "${skill.name}" is now attached to you. Its playbook follows — apply it and continue where you left off.\n\n---\n\n${skill.content}`,
+          },
+        ],
+      } as SessionEvent);
+    }
+    return c.json({ attached: true, skill_id: skill.id, name: skill.name });
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : "acquire failed" }, 400);
+  }
+});
+
 v1.route("/sessions", buildSessionRoutes({
   services,
   router: sessionRouter,
