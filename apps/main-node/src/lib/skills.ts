@@ -31,6 +31,14 @@ export interface SkillRow {
   source: string;
   content: string;
   created_at: number;
+  /** sha256 of the exact installed bytes — what the human approved is what
+   *  runs; materialization re-verifies against this. */
+  content_hash?: string | null;
+  /** curated | approved | flagged | blocked (quarantine pipeline verdict at
+   *  install time; legacy rows are null). */
+  security_status?: string | null;
+  /** JSON SkillScanReport from skill-scan.ts, for the console report card. */
+  security_report?: string | null;
 }
 
 const MAX_IMPORT_PER_REPO = 10;
@@ -83,6 +91,20 @@ export class SkillStore {
     await this.sql.exec(
       `CREATE INDEX IF NOT EXISTS idx_skills_tenant ON skills (tenant_id, name)`,
     );
+    // Quarantine-pipeline columns, additive for pre-existing tables. ADD
+    // COLUMN throws when the column exists — swallow per-column so partial
+    // upgrades converge (same pattern as other self-contained DDL stores).
+    for (const ddl of [
+      `ALTER TABLE skills ADD COLUMN content_hash text`,
+      `ALTER TABLE skills ADD COLUMN security_status text`,
+      `ALTER TABLE skills ADD COLUMN security_report text`,
+    ]) {
+      try {
+        await this.sql.exec(ddl);
+      } catch {
+        // column already exists
+      }
+    }
   }
 
   async create(opts: {
@@ -90,6 +112,9 @@ export class SkillStore {
     content: string;
     source?: string;
     name?: string;
+    contentHash?: string;
+    securityStatus?: string;
+    securityReport?: string;
   }): Promise<SkillRow> {
     if (opts.content.length > MAX_SKILL_BYTES) throw new Error("skill content too large");
     const fm = parseFrontmatter(opts.content);
@@ -103,13 +128,27 @@ export class SkillStore {
       source: opts.source ?? "",
       content: opts.content,
       created_at: Date.now(),
+      content_hash: opts.contentHash ?? null,
+      security_status: opts.securityStatus ?? null,
+      security_report: opts.securityReport ?? null,
     };
     await this.sql
       .prepare(
-        `INSERT INTO skills (id, tenant_id, name, description, source, content, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO skills (id, tenant_id, name, description, source, content, created_at, content_hash, security_status, security_report)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .bind(row.id, row.tenant_id, row.name, row.description, row.source, row.content, row.created_at)
+      .bind(
+        row.id,
+        row.tenant_id,
+        row.name,
+        row.description,
+        row.source,
+        row.content,
+        row.created_at,
+        row.content_hash,
+        row.security_status,
+        row.security_report,
+      )
       .run();
     return row;
   }
@@ -117,7 +156,7 @@ export class SkillStore {
   async list(tenantId: string): Promise<Array<Omit<SkillRow, "content">>> {
     const res = await this.sql
       .prepare(
-        `SELECT id, tenant_id, name, description, source, created_at
+        `SELECT id, tenant_id, name, description, source, created_at, content_hash, security_status
          FROM skills WHERE tenant_id = ? ORDER BY created_at DESC`,
       )
       .bind(tenantId)
@@ -155,8 +194,14 @@ export class SkillStore {
     return out;
   }
 
-  /** Import from a raw URL or GitHub owner/repo[/path] shorthand. */
-  async importFromSource(tenantId: string, source: string): Promise<SkillRow[]> {
+  /**
+   * Fetch SKILL.md candidates from a raw URL or GitHub owner/repo[/path]
+   * shorthand WITHOUT installing — the quarantine pipeline scans between
+   * fetch and create (routes call fetchFromSource → scan → create).
+   */
+  async fetchFromSource(
+    source: string,
+  ): Promise<Array<{ content: string; source: string }>> {
     const fetchText = async (url: string): Promise<string | null> => {
       const res = await fetch(url, {
         headers: { "user-agent": "openma-skills-import/1.0" },
@@ -171,7 +216,7 @@ export class SkillStore {
     if (/^https?:\/\//.test(source)) {
       const text = await fetchText(source);
       if (!text) throw new Error(`could not fetch ${source}`);
-      return [await this.create({ tenantId, content: text, source })];
+      return [{ content: text, source }];
     }
 
     // GitHub shorthand: owner/repo[/sub/path]
@@ -183,7 +228,7 @@ export class SkillStore {
     // 1. Direct SKILL.md at the given path (or repo root)
     const direct = await fetchText(raw(sub ? `${sub}/SKILL.md` : "SKILL.md"));
     if (direct) {
-      return [await this.create({ tenantId, content: direct, source })];
+      return [{ content: direct, source }];
     }
 
     // 2. Scan the repo tree for */SKILL.md (npx-skills repo layout)
@@ -199,13 +244,24 @@ export class SkillStore {
       .slice(0, MAX_IMPORT_PER_REPO);
     if (paths.length === 0) throw new Error("no SKILL.md found in repo");
 
-    const out: SkillRow[] = [];
+    const out: Array<{ content: string; source: string }> = [];
     for (const e of paths) {
       const text = await fetchText(raw(e.path));
       if (!text) continue;
-      out.push(await this.create({ tenantId, content: text, source: `${source}:${e.path}` }));
+      out.push({ content: text, source: `${source}:${e.path}` });
     }
     if (out.length === 0) throw new Error("found SKILL.md entries but none fetchable");
+    return out;
+  }
+
+  /** Legacy one-shot import (fetch + install, no scan gate) — kept for the
+   *  CLI path; console + agent flows go through fetchFromSource + scan. */
+  async importFromSource(tenantId: string, source: string): Promise<SkillRow[]> {
+    const candidates = await this.fetchFromSource(source);
+    const out: SkillRow[] = [];
+    for (const c of candidates) {
+      out.push(await this.create({ tenantId, content: c.content, source: c.source }));
+    }
     return out;
   }
 }

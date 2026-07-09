@@ -29,6 +29,7 @@ import { EnvironmentDetail } from "./pages/EnvironmentDetail";
 import { VaultsList } from "./pages/VaultsList";
 import { VaultDetail } from "./pages/VaultDetail";
 import { SkillsList } from "./pages/SkillsList";
+import { SkillsCatalog } from "./pages/SkillsCatalog";
 import { MemoryStoresList } from "./pages/MemoryStoresList";
 import { MemoryStoreDetail } from "./pages/MemoryStoreDetail";
 import { ModelCardsList } from "./pages/ModelCardsList";
@@ -150,6 +151,7 @@ const protectedRoutes: RouteObject[] = [
     ],
   },
   { path: "skills", element: <SkillsList />, handle: { crumb: "Skills" } },
+  { path: "skills/catalog", element: <SkillsCatalog />, handle: { crumb: "Catalog" } },
   {
     path: "vaults",
     handle: { crumb: "Credential Vaults" },

@@ -9,6 +9,7 @@ import { DataTable, type ColumnDef } from "../components/DataTable";
 import { FacetedFilter } from "../components/FacetedFilter";
 import { FilterChip } from "../components/FilterChip";
 import { RowActionsMenu } from "../components/RowActionsMenu";
+import { useNavigate } from "react-router";
 
 /* ---------- types ---------- */
 
@@ -78,6 +79,7 @@ export function SkillsList() {
   /* Server-driven filter state. `source` flows into skillsParams below
    * → useApiQuery reruns when params change → list reflects exactly
    * what the server returned (no client-side split on s.source). */
+  const navigate = useNavigate();
   const [source, setSource] = useState<SourceValue>("any");
   const skillsParams = useMemo(
     () => (source !== "any" ? { source } : {}),
@@ -421,6 +423,11 @@ export function SkillsList() {
   return (
     <DataTable<Skill>
       subtitle="Manage pre-built and custom skills for your agents."
+      headerActions={
+        <Button variant="outline" onClick={() => navigate("/skills/catalog")}>
+          Browse catalog
+        </Button>
+      }
       createLabel="+ New skill"
       onCreate={() => setShowCreate(true)}
       filters={filters}

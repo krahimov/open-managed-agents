@@ -435,7 +435,9 @@ if (webhookStore) await webhookStore.ensureSchema();
 if (webhookStore) startWebhookDeliveryPoller({ store: webhookStore });
 
 // ─── Skills (SKILL.md storage + GitHub import) ─────────────────────────────
-const { SkillStore } = await import("./lib/skills.js");
+const { SkillStore, parseFrontmatter: parseSkillFrontmatter } = await import("./lib/skills.js");
+const { CURATED_SKILL_CATALOG } = await import("./lib/skill-catalog.js");
+const { scanSkillContent, extractUrlFromCurl } = await import("./lib/skill-scan.js");
 const skillStore = new SkillStore(sql);
 await skillStore.ensureSchema();
 
@@ -1609,11 +1611,82 @@ v1.get("/runtimes", (c) => {
 });
 // Skills — SKILL.md storage, agent-attachable, importable from GitHub.
 v1.get("/skills", async (c) => c.json({ data: await skillStore.list(c.get("tenant_id")) }));
+
+// Curated catalog — static in-repo manifest (anthropics/skills) annotated
+// with per-tenant installed state. Registered before /skills/:id so the
+// literal segment isn't swallowed by the param route.
+v1.get("/skills/catalog", async (c) => {
+  const installed = await skillStore.list(c.get("tenant_id"));
+  const names = new Set(installed.map((s) => s.name));
+  return c.json({
+    data: CURATED_SKILL_CATALOG.map((e) => ({
+      ...e,
+      curated: true,
+      installed: names.has(e.name),
+    })),
+  });
+});
+
+// Quarantine stage 1+2: fetch + static scan WITHOUT installing. Accepts a
+// URL, owner/repo[/path] shorthand, a pasted `curl …` one-liner (MCP Market
+// hands users those), or inline content. The console shows the returned
+// report card; approval calls POST /skills with the content.
+v1.post("/skills/scan", async (c) => {
+  const body = await c.req
+    .json<{ source?: string; content?: string }>()
+    .catch(() => null);
+  if (!body?.source && !body?.content) {
+    return c.json({ error: "source (URL / owner/repo / curl command) or content required" }, 400);
+  }
+  try {
+    const tenantId = c.get("tenant_id");
+    const installedNames = (await skillStore.list(tenantId)).map((s) => s.name);
+    const candidates = body.content
+      ? [{ content: body.content, source: body.source ?? "" }]
+      : await skillStore.fetchFromSource(
+          extractUrlFromCurl(body.source!) ?? body.source!,
+        );
+    const data = candidates.map((cand) => {
+      const fm = parseSkillFrontmatter(cand.content);
+      return {
+        source: cand.source,
+        name: fm.name ?? "",
+        description: fm.description ?? "",
+        content: cand.content,
+        report: scanSkillContent(cand.content, { installedNames }),
+      };
+    });
+    return c.json({ data });
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : "scan failed" }, 400);
+  }
+});
+
 v1.post("/skills", async (c) => {
-  const body = await c.req.json<{ content?: string; name?: string }>().catch(() => null);
+  const body = await c.req.json<{ content?: string; name?: string; source?: string }>().catch(() => null);
   if (!body?.content) return c.json({ error: "content (SKILL.md text) required" }, 400);
   try {
-    return c.json(await skillStore.create({ tenantId: c.get("tenant_id"), content: body.content, name: body.name }), 201);
+    const tenantId = c.get("tenant_id");
+    // Re-scan server-side at install time — the client's report is display
+    // only. Hard blocks stop the install regardless of what the UI said;
+    // the human ratifies flags, never blocks.
+    const installedNames = (await skillStore.list(tenantId)).map((s) => s.name);
+    const report = scanSkillContent(body.content, { installedNames });
+    if (report.verdict === "blocked") {
+      return c.json({ error: "skill blocked by security scan", report }, 422);
+    }
+    const curated =
+      typeof body.source === "string" && body.source.startsWith("anthropics/skills/");
+    const row = await skillStore.create({
+      tenantId,
+      content: body.content,
+      name: body.name,
+      source: body.source,
+      contentHash: report.content_sha256,
+      securityStatus: curated && report.verdict === "pass" ? "curated" : report.verdict === "pass" ? "approved" : "flagged",
+      securityReport: JSON.stringify(report),
+    });
+    return c.json(row, 201);
   } catch (err) {
     return c.json({ error: err instanceof Error ? err.message : "create failed" }, 400);
   }
