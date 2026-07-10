@@ -32,6 +32,7 @@ import { getLogger } from "@open-managed-agents/observability";
 import type { MissionStore, MissionRow } from "./missions.js";
 import {
   decideMissionAction,
+  VERIFIER_TIMEOUT_CEILING_MS,
   type MissionVerdict,
   type MissionVerdictResult,
   type MissionVerifier,
@@ -133,7 +134,12 @@ export class NodeMissionSupervisor {
     return acted;
   }
 
-  private async step(mission: MissionRow): Promise<boolean> {
+  private async step(stale: MissionRow): Promise<boolean> {
+    // Re-read the row: the sweep list was fetched at tick start, and an
+    // earlier mission's verifiers can block for minutes — a stop issued
+    // mid-sweep must be honored before this mission acts on stale state.
+    const mission = await this.deps.missions.get(stale.tenant_id, stale.id);
+    if (!mission || mission.status !== "running") return false;
     const nowMs = this.now();
     const activeSession = mission.active_session_id
       ? await this.getSessionState(mission.active_session_id, nowMs)
@@ -200,7 +206,12 @@ export class NodeMissionSupervisor {
     const run = this.deps.runCommand ?? hostRunCommand;
     const results: MissionVerdictResult[] = [];
     for (const verifier of mission.verifiers as MissionVerifier[]) {
-      const timeoutMs = verifier.timeout_ms ?? DEFAULT_VERIFIER_TIMEOUT_MS;
+      // Clamp regardless of what the row says — the sweep is sequential, so
+      // a runaway timeout starves every other mission.
+      const timeoutMs = Math.min(
+        verifier.timeout_ms ?? DEFAULT_VERIFIER_TIMEOUT_MS,
+        VERIFIER_TIMEOUT_CEILING_MS,
+      );
       let res: CommandResult;
       try {
         res = await run(verifier.command, mission.workspace, timeoutMs);
@@ -240,6 +251,12 @@ export class NodeMissionSupervisor {
         });
     }
 
+    // Verifiers may have run for minutes — re-read status so a stop issued
+    // meanwhile isn't clobbered by a terminal transition. The verdict itself
+    // still persists below (harmless + informative on a stopped mission).
+    const current = await this.deps.missions.get(mission.tenant_id, mission.id);
+    const stillRunning = current?.status === "running";
+
     const outcome = decideMissionAction({
       status: mission.status,
       iteration: mission.iteration,
@@ -251,6 +268,17 @@ export class NodeMissionSupervisor {
       freshVerdict: verdict,
     });
     const base = { last_verdict: verdict, recent_verdicts: history };
+    if (!stillRunning) {
+      await this.deps.missions.update(mission.tenant_id, mission.id, {
+        ...base,
+        active_session_id: null,
+      });
+      log.info(
+        { op: "mission.verified_after_stop", mission_id: mission.id, iteration: verdict.iteration },
+        "mission left running state mid-verify — verdict recorded, status untouched",
+      );
+      return;
+    }
     if (outcome === "succeed") {
       await this.deps.missions.update(mission.tenant_id, mission.id, {
         ...base,
@@ -335,6 +363,11 @@ export class NodeMissionSupervisor {
         );
       }
     }
+
+    // Last look before committing to a spawn — a stop can land during the
+    // agent fetch / vault resolution above.
+    const current = await this.deps.missions.get(mission.tenant_id, mission.id);
+    if (current?.status !== "running") return;
 
     const { session } = await this.deps.sessions.create({
       tenantId: mission.tenant_id,
