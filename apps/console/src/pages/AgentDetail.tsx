@@ -511,16 +511,26 @@ function AuditTrailPanel({
     // this response is text/csv. Same auth headers it would send.
     const clerkToken = await getClerkBearerToken();
     const activeTenant = getActiveTenantId();
-    const res = await fetch(
-      `/v1/agents/${agentId}/evidence/activity?${qs.toString()}`,
-      {
-        credentials: "include",
-        headers: {
-          ...(clerkToken ? { authorization: `Bearer ${clerkToken}` } : {}),
-          ...(activeTenant ? { "x-active-tenant": activeTenant } : {}),
+    let res: Response;
+    try {
+      res = await fetch(
+        `/v1/agents/${agentId}/evidence/activity?${qs.toString()}`,
+        {
+          credentials: "include",
+          headers: {
+            ...(clerkToken ? { authorization: `Bearer ${clerkToken}` } : {}),
+            ...(activeTenant ? { "x-active-tenant": activeTenant } : {}),
+          },
         },
-      },
-    );
+      );
+    } catch (err) {
+      // Same network-failure toast api() gives — the caller fires this
+      // with `void`, so an uncaught rejection would vanish silently.
+      toast.error(
+        `Network error: ${err instanceof Error ? err.message : "fetch failed"}`,
+      );
+      return;
+    }
     if (!res.ok) {
       toast.error(`CSV export failed (HTTP ${res.status})`);
       return;
