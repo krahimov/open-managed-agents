@@ -327,7 +327,9 @@ export function getToolPermission(agentConfig: AgentConfig, toolName: string): s
   return "always_allow";
 }
 
-function getEnabledTools(tools: AgentConfig["tools"]): Set<string> {
+// Exported so the evidence capability statement reports the SAME surface
+// buildTools() registers — a disabled tool must not show up as allowed.
+export function getEnabledTools(tools: AgentConfig["tools"]): Set<string> {
   // Default = DEFAULT_TOOLS only. OPT_IN_TOOLS (browser) require an
   // explicit per-tool { enabled: true } in the agent's tools config.
   const defaultSet = new Set(DEFAULT_TOOLS);

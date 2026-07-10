@@ -70,7 +70,7 @@ import type { AgentConfig, CredentialConfig, EnvironmentConfig, SessionEvent } f
 import { generateEventId } from "@open-managed-agents/shared";
 import { DefaultHarness } from "@open-managed-agents/agent/harness/default-loop";
 import { ClaudeAgentSdkHarness } from "./lib/claude-agent-sdk-harness.js";
-import { buildTools, DEFAULT_TOOLS } from "@open-managed-agents/agent/harness/tools";
+import { ALL_TOOLS, buildTools, getEnabledTools } from "@open-managed-agents/agent/harness/tools";
 import { resolveModel, type ApiCompat } from "@open-managed-agents/agent/harness/provider";
 import { composeSystemPrompt } from "@open-managed-agents/agent/harness/platform-guidance";
 import type { HarnessContext } from "@open-managed-agents/agent/harness/interface";
@@ -1259,7 +1259,13 @@ v1.get("/agents/:id/evidence/capability", async (c) => {
     agentId,
   });
   const { entries, notes } = computeCapabilityStatement({
-    builtinTools: DEFAULT_TOOLS,
+    // Same enablement logic buildTools() runs, so the statement reflects the
+    // agent's ACTUAL registered surface: toolset config can disable defaults
+    // and opt into browser. Intersect with ALL_TOOLS — unknown names in a
+    // config never register, so they must not appear as capabilities.
+    builtinTools: [...getEnabledTools(agent.tools)].filter((n) =>
+      ALL_TOOLS.includes(n),
+    ),
     agent,
     policy,
   });

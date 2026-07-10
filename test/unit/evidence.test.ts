@@ -11,6 +11,7 @@ import {
   summarizeActivityEvent,
   type GrantVersionInput,
 } from "../../apps/main-node/src/lib/evidence";
+import { ALL_TOOLS, getEnabledTools } from "../../apps/agent/src/harness/tools";
 
 const BUILTINS = ["bash", "read", "web_fetch"] as const;
 
@@ -89,6 +90,35 @@ describe("computeCapabilityStatement", () => {
     });
     expect(entries.filter((e) => e.tool === "bash")).toHaveLength(1);
     expect(entries.some((e) => e.tool === "lookup_invoice")).toBe(true);
+  });
+
+  it("route composition: getEnabledTools-derived surface honors toolset config", () => {
+    // Mirrors the /evidence/capability route: builtinTools comes from
+    // getEnabledTools ∩ ALL_TOOLS so a disabled default never shows up as
+    // a capability and an opted-in browser does.
+    const tools: AgentConfig["tools"] = [
+      {
+        type: "agent_toolset_20260401",
+        configs: [
+          { name: "bash", enabled: false },
+          { name: "browser", enabled: true },
+          { name: "not_a_real_tool", enabled: true },
+        ],
+      },
+    ];
+    const builtinTools = [...getEnabledTools(tools)].filter((n) =>
+      ALL_TOOLS.includes(n),
+    );
+    const { entries } = computeCapabilityStatement({
+      builtinTools,
+      agent: agentWith({ tools }),
+      policy: null,
+    });
+    const names = entries.map((e) => e.tool);
+    expect(names).not.toContain("bash");
+    expect(names).not.toContain("not_a_real_tool");
+    expect(names).toContain("browser");
+    expect(names).toContain("read");
   });
 });
 
