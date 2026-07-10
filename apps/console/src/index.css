@@ -611,6 +611,32 @@ body,
   .skeleton-pulse {
     display: none !important;
   }
+
+  /* Evidence export: the Audit trail "Export" button adds
+     .print-audit-only to <body> for the duration of the print dialog so
+     ONLY the audit section prints (standalone authority record, no page
+     chrome or sibling panels). visibility (not display) keeps the layout
+     tree so the section retains its computed width and typography; the
+     section is then lifted to the page origin. */
+  body.print-audit-only * {
+    visibility: hidden;
+  }
+  body.print-audit-only .audit-trail-print,
+  body.print-audit-only .audit-trail-print * {
+    visibility: visible;
+  }
+  body.print-audit-only .audit-trail-print {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+  }
+
+  /* Interactive controls inside the audit section (date pickers, Export,
+     Download CSV) are meaningless on paper. */
+  .audit-no-print {
+    display: none !important;
+  }
 }
 
 /* ── Harness diff card (agent setup) ──────────────────────────────────────
