@@ -441,6 +441,13 @@ const { scanSkillContent, extractUrlFromCurl } = await import("./lib/skill-scan.
 const skillStore = new SkillStore(sql);
 await skillStore.ensureSchema();
 
+// ─── Missions (long-running agent loops under an outer supervisor) ─────────
+const { MissionStore, newMissionId } = await import("./lib/missions.js");
+const { validateMissionInput } = await import("./lib/mission-decision.js");
+const missionStore = new MissionStore(sql);
+await missionStore.ensureSchema();
+const missionsRoot = process.env.MISSIONS_DIR ?? "./data/missions";
+
 let memoryBlobs: import("@open-managed-agents/memory-store").BlobStore;
 let memoryBlobDescription: string;
 let memoryBlobLocalDir: string | null = null;
@@ -1853,6 +1860,86 @@ v1.delete("/skills/:id", async (c) => {
   const ok = await skillStore.delete(c.get("tenant_id"), c.req.param("id"));
   return ok ? c.body(null, 204) : c.json({ error: "not found" }, 404);
 });
+
+// ── Missions — long-running agent loops (Phase 1) ──
+// POST creates the goal contract + workspace; the supervisor pump
+// (node-mission-supervisor.ts, registered with the scheduler below) does
+// all the spawning/verifying. Stop only flips status — the in-flight
+// iteration finishes its turn but is never verified or respawned.
+v1.post("/missions", async (c) => {
+  const body = await c.req
+    .json<{ agent_id?: string; goal?: string; verifiers?: unknown; budget?: unknown }>()
+    .catch(() => null);
+  if (!body?.agent_id) return c.json({ error: "agent_id required" }, 400);
+  const tenantId = c.get("tenant_id");
+  const agent = await agentsService.get({ tenantId, agentId: body.agent_id });
+  if (!agent || agent.archived_at) return c.json({ error: "agent not found" }, 404);
+  let validated: ReturnType<typeof validateMissionInput>;
+  try {
+    validated = validateMissionInput(body);
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : "invalid mission" }, 400);
+  }
+  // Mint the id up front so the workspace (data/missions/<id> on the host)
+  // exists before the row does — the supervisor pump must never sweep a
+  // running mission whose workspace dir isn't there yet.
+  const missionId = newMissionId();
+  const workspace = resolve(missionsRoot, missionId);
+  mkdirSync(workspace, { recursive: true });
+  const mission = await missionStore.create({
+    id: missionId,
+    tenantId,
+    agentId: body.agent_id,
+    goal: validated.goal,
+    verifiers: validated.verifiers,
+    budget: validated.budget,
+    workspace,
+  });
+  return c.json(mission, 201);
+});
+v1.get("/missions", async (c) =>
+  c.json({ data: await missionStore.list(c.get("tenant_id")) }),
+);
+v1.get("/missions/:id", async (c) => {
+  const tenantId = c.get("tenant_id");
+  const mission = await missionStore.get(tenantId, c.req.param("id"));
+  if (!mission) return c.json({ error: "not found" }, 404);
+  // Iteration sessions carry metadata.mission_id (set at spawn time).
+  // Metadata is a JSON text column; the quoted-key LIKE match is exact
+  // enough for the store's own `"mission_id":"<id>"` serialization.
+  const rows = await sql
+    .prepare(
+      `SELECT id, status, title, created_at, updated_at, metadata FROM sessions
+        WHERE tenant_id = ? AND metadata LIKE ? ORDER BY created_at ASC`,
+    )
+    .bind(tenantId, `%"mission_id":"${mission.id}"%`)
+    .all<{ id: string; status: string; title: string; created_at: number; updated_at: number | null; metadata: string | null }>();
+  const iterations = (rows.results ?? []).map((r) => {
+    const meta = r.metadata ? (JSON.parse(r.metadata) as Record<string, unknown>) : {};
+    return {
+      session_id: r.id,
+      status: r.status,
+      title: r.title,
+      iteration: typeof meta.mission_iteration === "number" ? meta.mission_iteration : null,
+      created_at: Number(r.created_at),
+      updated_at: r.updated_at === null ? null : Number(r.updated_at),
+    };
+  });
+  return c.json({ ...mission, iterations });
+});
+v1.post("/missions/:id/stop", async (c) => {
+  const tenantId = c.get("tenant_id");
+  const mission = await missionStore.get(tenantId, c.req.param("id"));
+  if (!mission) return c.json({ error: "not found" }, 404);
+  if (mission.status !== "running") return c.json(mission);
+  const now = Date.now();
+  await missionStore.update(tenantId, mission.id, {
+    status: "stopped",
+    stopped_at: now,
+  });
+  return c.json({ ...mission, status: "stopped", stopped_at: now, updated_at: now });
+});
+
 v1.get("/integrations/github/credentials", (c) => c.json({ data: [] }));
 v1.get("/integrations/linear/credentials", (c) => c.json({ data: [] }));
 v1.get("/integrations/slack/credentials", (c) => c.json({ data: [] }));
@@ -2196,6 +2283,46 @@ serve({ fetch: app.fetch, port, hostname: host }, (info) => {
 // applied) webhook-events retention. Linear dispatch is left un-wired here
 // because main-node doesn't construct a LinearProvider; pass `linearSweeper`
 // when an in-process gateway lands.
+// Vault credentials → MCP servers for server-spawned session snapshots.
+// Console sessions get the Composio tool-router entry injected client-side
+// at create time; ambient + mission sessions derive the same entry from the
+// vault's composio_mcp credential (its mcp_server_url IS the persistent
+// tool-router session URL). Name mirrors the console's convention:
+// composio_<toolkits-joined>, so resolveNodeMcpProxyTarget's URL match
+// finds the credential and injects the api key at call time.
+async function resolveVaultMcpServersForSpawn(
+  tenantId: string,
+  vaultIds: string[],
+): Promise<Array<{ name: string; type: "url"; url: string }>> {
+  const grouped = await credentialService
+    .listByVaults({ tenantId, vaultIds })
+    .catch(() => []);
+  const servers: Array<{ name: string; type: "url"; url: string }> = [];
+  const seenUrls = new Set<string>();
+  for (const group of grouped) {
+    for (const cred of group.credentials) {
+      const c = cred as {
+        archived_at?: string | null;
+        auth?: { type?: string; mcp_server_url?: string; composio_toolkits?: string[] };
+      };
+      if (c.archived_at) continue;
+      const auth = c.auth;
+      if (auth?.type !== "composio_mcp") continue;
+      const url = auth.mcp_server_url?.trim();
+      if (!url || seenUrls.has(url)) continue;
+      seenUrls.add(url);
+      const toolkits = Array.isArray(auth.composio_toolkits)
+        ? auth.composio_toolkits.filter((t): t is string => typeof t === "string" && !!t)
+        : [];
+      const base = toolkits.length > 0 ? `composio_${toolkits.join("_")}` : "composio";
+      let name = base;
+      for (let i = 2; servers.some((s) => s.name === name); i++) name = `${base}_${i}`;
+      servers.push({ name, type: "url", url });
+    }
+  }
+  return servers;
+}
+
 const ambientDispatcher = new NodeAmbientDispatcher({
   ambientRules: ambientRulesService,
   agents: agentsService,
@@ -2205,42 +2332,28 @@ const ambientDispatcher = new NodeAmbientDispatcher({
   appendUserEvent: async (sessionId, _tenantId, _agentId, event) => {
     await sessionRouter.appendEvent(sessionId, event);
   },
-  // Vault credentials → MCP servers for the spawned snapshot. Console
-  // sessions get the Composio tool-router entry injected client-side at
-  // create time; ambient sessions derive the same entry from the vault's
-  // composio_mcp credential (its mcp_server_url IS the persistent
-  // tool-router session URL). Name mirrors the console's convention:
-  // composio_<toolkits-joined>, so resolveNodeMcpProxyTarget's URL match
-  // finds the credential and injects the api key at call time.
-  resolveVaultMcpServers: async (tenantId, vaultIds) => {
-    const grouped = await credentialService
-      .listByVaults({ tenantId, vaultIds })
-      .catch(() => []);
-    const servers: Array<{ name: string; type: "url"; url: string }> = [];
-    const seenUrls = new Set<string>();
-    for (const group of grouped) {
-      for (const cred of group.credentials) {
-        const c = cred as {
-          archived_at?: string | null;
-          auth?: { type?: string; mcp_server_url?: string; composio_toolkits?: string[] };
-        };
-        if (c.archived_at) continue;
-        const auth = c.auth;
-        if (auth?.type !== "composio_mcp") continue;
-        const url = auth.mcp_server_url?.trim();
-        if (!url || seenUrls.has(url)) continue;
-        seenUrls.add(url);
-        const toolkits = Array.isArray(auth.composio_toolkits)
-          ? auth.composio_toolkits.filter((t): t is string => typeof t === "string" && !!t)
-          : [];
-        const base = toolkits.length > 0 ? `composio_${toolkits.join("_")}` : "composio";
-        let name = base;
-        for (let i = 2; servers.some((s) => s.name === name); i++) name = `${base}_${i}`;
-        servers.push({ name, type: "url", url });
-      }
-    }
-    return servers;
+  resolveVaultMcpServers: (tenantId, vaultIds) =>
+    resolveVaultMcpServersForSpawn(tenantId, vaultIds),
+});
+
+// Mission supervisor — the outer loop above the harness. Shares the ambient
+// dispatcher's spawn recipe (agent snapshot + local-runtime env + vault MCP
+// derivation) so mission iterations behave like any other server-spawned
+// session.
+const { NodeMissionSupervisor } = await import("./lib/node-mission-supervisor.js");
+const missionSupervisor = new NodeMissionSupervisor({
+  missions: missionStore,
+  agents: agentsService,
+  sessions: sessionsService,
+  sql,
+  appendUserEvent: async (sessionId, _tenantId, _agentId, event) => {
+    await sessionRouter.appendEvent(sessionId, event);
   },
+  appendSessionEvent: async (sessionId, event) => {
+    await sessionRouter.appendEvent(sessionId, event);
+  },
+  resolveVaultMcpServers: (tenantId, vaultIds) =>
+    resolveVaultMcpServersForSpawn(tenantId, vaultIds),
 });
 
 const scheduler = buildNodeScheduler({
@@ -2253,6 +2366,7 @@ const scheduler = buildNodeScheduler({
   },
   memory: memoryService,
   ambientDispatcher,
+  missionSupervisor,
   integrationsSql: platformRootSecret ? sql : null,
   wakeups: { pump: () => sessionWakeups.pump() },
 });
