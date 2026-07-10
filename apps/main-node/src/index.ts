@@ -70,7 +70,7 @@ import type { AgentConfig, CredentialConfig, EnvironmentConfig, SessionEvent } f
 import { generateEventId } from "@open-managed-agents/shared";
 import { DefaultHarness } from "@open-managed-agents/agent/harness/default-loop";
 import { ClaudeAgentSdkHarness } from "./lib/claude-agent-sdk-harness.js";
-import { buildTools } from "@open-managed-agents/agent/harness/tools";
+import { buildTools, DEFAULT_TOOLS } from "@open-managed-agents/agent/harness/tools";
 import { resolveModel, type ApiCompat } from "@open-managed-agents/agent/harness/provider";
 import { composeSystemPrompt } from "@open-managed-agents/agent/harness/platform-guidance";
 import type { HarnessContext } from "@open-managed-agents/agent/harness/interface";
@@ -112,6 +112,13 @@ import {
 } from "./lib/node-install-bridge.js";
 import { OmaVaultResolver } from "@open-managed-agents/oma-cap-adapter";
 import { NodeSessionRouter } from "./lib/node-session-router.js";
+import {
+  buildApprovalHistory,
+  computeCapabilityStatement,
+  EVIDENCE_ACTIVITY_ROW_CAP,
+  formatActivityCsv,
+  queryEvidenceActivity,
+} from "./lib/evidence.js";
 import {
   nodeOutputsAdapter,
   nodeS3OutputsAdapter,
@@ -1234,6 +1241,97 @@ v1.use("*", async (c, next) => {
   await next();
 });
 
+// ── Evidence export — read-only audit projections (authority record) ──
+// Capability statement, approval history, activity log. Registered before
+// the /agents route mount so the literal /evidence/* segments can never be
+// swallowed by a param sub-route (same ordering gotcha as /skills/catalog
+// vs /skills/:id). All queries are tenant-scoped; nothing here writes.
+
+// GET /v1/agents/:id/evidence/capability — the agent's tool surface
+// evaluated through its active baseline grant.
+v1.get("/agents/:id/evidence/capability", async (c) => {
+  const tenantId = c.var.tenant_id;
+  const agentId = c.req.param("id");
+  const agent = await agentsService.get({ tenantId, agentId });
+  if (!agent) return c.json({ error: "Agent not found" }, 404);
+  const policy = await permissionGrantService.resolveEffectivePolicy({
+    tenantId,
+    agentId,
+  });
+  const { entries, notes } = computeCapabilityStatement({
+    builtinTools: DEFAULT_TOOLS,
+    agent,
+    policy,
+  });
+  return c.json({
+    agent_id: agentId,
+    grant_id: policy?.grant_id ?? null,
+    grant_version: policy?.grant_version ?? null,
+    generated_at: new Date().toISOString(),
+    entries,
+    notes,
+  });
+});
+
+// GET /v1/agents/:id/evidence/approvals — grant version lineage with
+// per-version rule diffs (who approved which change, when).
+v1.get("/agents/:id/evidence/approvals", async (c) => {
+  const tenantId = c.var.tenant_id;
+  const agentId = c.req.param("id");
+  const agent = await agentsService.get({ tenantId, agentId });
+  if (!agent) return c.json({ error: "Agent not found" }, 404);
+  const versions = await permissionGrantService.listBaselineVersions({
+    tenantId,
+    agentId,
+  });
+  return c.json({ agent_id: agentId, versions: buildApprovalHistory(versions) });
+});
+
+// GET /v1/agents/:id/evidence/activity?from=&to=&format= — audit frames +
+// per-session tool-use counts from the event log. format=csv streams a
+// text/csv attachment; default is JSON. Capped at 5000 rows.
+v1.get("/agents/:id/evidence/activity", async (c) => {
+  const tenantId = c.var.tenant_id;
+  const agentId = c.req.param("id");
+  const agent = await agentsService.get({ tenantId, agentId });
+  if (!agent) return c.json({ error: "Agent not found" }, 404);
+  const parseTs = (raw: string | undefined, fallback: number): number | null => {
+    if (raw === undefined || raw === "") return fallback;
+    const ms = Date.parse(raw);
+    return Number.isNaN(ms) ? null : ms;
+  };
+  const now = Date.now();
+  const fromMs = parseTs(c.req.query("from"), now - 7 * 24 * 60 * 60 * 1000);
+  const toMs = parseTs(c.req.query("to"), now);
+  if (fromMs === null || toMs === null) {
+    return c.json({ error: "from/to must be ISO-8601 timestamps" }, 400);
+  }
+  const { events, tool_use, truncated } = await queryEvidenceActivity({
+    sql,
+    tenantId,
+    agentId,
+    fromMs,
+    toMs,
+  });
+  if (c.req.query("format") === "csv") {
+    return new Response(formatActivityCsv(events), {
+      headers: {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": `attachment; filename="evidence-activity-${agentId}.csv"`,
+      },
+    });
+  }
+  return c.json({
+    agent_id: agentId,
+    from: new Date(fromMs).toISOString(),
+    to: new Date(toMs).toISOString(),
+    events,
+    tool_use,
+    truncated,
+    row_cap: EVIDENCE_ACTIVITY_ROW_CAP,
+  });
+});
+
 // Mount route bundles. Same paths CF uses; behavior preserved.
 // Flat per-tenant agent cap (MAX_AGENTS_PER_TENANT) — interim production
 // guard for every tenant until billing entitlements own limits.
@@ -1478,7 +1576,13 @@ v1.post("/skills/acquire", async (c) => {
 
     // Inject into the running session (its snapshot is frozen) — the
     // user.message both wakes the turn loop and carries the playbook.
+    // metadata stamps the ratifying actor + content hash so the evidence
+    // trail can attribute the attachment ("who approved, exactly what ran").
     if (body.session_id) {
+      const actor =
+        typeof c.var.user_id === "string" && c.var.user_id
+          ? c.var.user_id
+          : "default";
       await sessionRouter.appendEvent(body.session_id, {
         type: "user.message",
         id: generateEventId(),
@@ -1488,6 +1592,12 @@ v1.post("/skills/acquire", async (c) => {
             text: `[skill attached] "${skill.name}" is now attached to you. Its playbook follows — apply it and continue where you left off.\n\n---\n\n${skill.content}`,
           },
         ],
+        metadata: {
+          kind: "skill_attached",
+          actor,
+          skill_id: skill.id,
+          ...(skill.content_hash ? { content_hash: skill.content_hash } : {}),
+        },
       } as SessionEvent);
     }
     return c.json({ attached: true, skill_id: skill.id, name: skill.name });
