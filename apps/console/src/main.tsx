@@ -23,6 +23,8 @@ import { Dashboard } from "./pages/Dashboard";
 import { AgentsList } from "./pages/AgentsList";
 import { AgentDetail } from "./pages/AgentDetail";
 import { SessionsList } from "./pages/SessionsList";
+import { MissionsList } from "./pages/MissionsList";
+import { MissionDetail } from "./pages/MissionDetail";
 import { FilesList } from "./pages/FilesList";
 import { EnvironmentsList } from "./pages/EnvironmentsList";
 import { EnvironmentDetail } from "./pages/EnvironmentDetail";
@@ -122,6 +124,18 @@ const protectedRoutes: RouteObject[] = [
           const { SessionDetail } = await import("./pages/SessionDetail");
           return { Component: SessionDetail };
         },
+      },
+    ],
+  },
+  {
+    path: "missions",
+    handle: { crumb: "Missions" },
+    children: [
+      { index: true, element: <MissionsList /> },
+      {
+        path: ":id",
+        element: <MissionDetail />,
+        handle: { crumb: (m: UIMatch) => (m.params.id as string | undefined) ?? "Mission" },
       },
     ],
   },
