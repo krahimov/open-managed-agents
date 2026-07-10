@@ -1905,8 +1905,9 @@ v1.get("/missions/:id", async (c) => {
   const mission = await missionStore.get(tenantId, c.req.param("id"));
   if (!mission) return c.json({ error: "not found" }, 404);
   // Iteration sessions carry metadata.mission_id (set at spawn time).
-  // Metadata is a JSON text column; the quoted-key LIKE match is exact
-  // enough for the store's own `"mission_id":"<id>"` serialization.
+  // Metadata is a JSON text column; the quoted-key LIKE narrows the scan,
+  // but mission ids contain nanoid `_` (a LIKE single-char wildcard), so
+  // the parsed value is the authoritative match.
   const rows = await sql
     .prepare(
       `SELECT id, status, title, created_at, updated_at, metadata FROM sessions
@@ -1914,16 +1915,22 @@ v1.get("/missions/:id", async (c) => {
     )
     .bind(tenantId, `%"mission_id":"${mission.id}"%`)
     .all<{ id: string; status: string; title: string; created_at: number; updated_at: number | null; metadata: string | null }>();
-  const iterations = (rows.results ?? []).map((r) => {
-    const meta = r.metadata ? (JSON.parse(r.metadata) as Record<string, unknown>) : {};
-    return {
+  const iterations = (rows.results ?? []).flatMap((r) => {
+    let meta: Record<string, unknown> = {};
+    try {
+      meta = r.metadata ? (JSON.parse(r.metadata) as Record<string, unknown>) : {};
+    } catch {
+      return [];
+    }
+    if (meta.mission_id !== mission.id) return [];
+    return [{
       session_id: r.id,
       status: r.status,
       title: r.title,
       iteration: typeof meta.mission_iteration === "number" ? meta.mission_iteration : null,
       created_at: Number(r.created_at),
       updated_at: r.updated_at === null ? null : Number(r.updated_at),
-    };
+    }];
   });
   return c.json({ ...mission, iterations });
 });
