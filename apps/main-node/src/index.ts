@@ -1895,7 +1895,16 @@ v1.post("/missions", async (c) => {
     budget: validated.budget,
     workspace,
   });
-  return c.json(mission, 201);
+  // Spawn iteration 1 synchronously so the caller gets a session to land in
+  // (the console navigates straight there — missions have no page of their
+  // own). Failure is non-fatal: the pump retries on its next sweep.
+  let activeSessionId: string | null = null;
+  try {
+    activeSessionId = await missionSupervisor.kickoff(tenantId, missionId);
+  } catch {
+    // pump will pick it up
+  }
+  return c.json({ ...mission, active_session_id: activeSessionId }, 201);
 });
 v1.get("/missions", async (c) =>
   c.json({ data: await missionStore.list(c.get("tenant_id")) }),

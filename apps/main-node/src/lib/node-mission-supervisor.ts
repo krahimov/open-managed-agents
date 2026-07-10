@@ -117,6 +117,23 @@ export class NodeMissionSupervisor {
     return this.deps.now ? this.deps.now() : Date.now();
   }
 
+  /**
+   * Spawn the FIRST iteration synchronously — called by POST /v1/missions so
+   * the console can navigate straight into the iteration session instead of
+   * waiting out a pump sweep. No-ops unless the mission is running at
+   * iteration 0 with no active session; the pump owns everything after that.
+   */
+  async kickoff(tenantId: string, missionId: string): Promise<string | null> {
+    const mission = await this.deps.missions.get(tenantId, missionId);
+    if (!mission || mission.status !== "running") return null;
+    if (mission.iteration !== 0 || mission.active_session_id) {
+      return mission.active_session_id;
+    }
+    await this.spawnIteration(mission, this.now());
+    const after = await this.deps.missions.get(tenantId, missionId);
+    return after?.active_session_id ?? null;
+  }
+
   /** One sweep. Returns how many missions took an action (verify or spawn). */
   async tick(limit = 25): Promise<number> {
     const missions = await this.deps.missions.listRunning(limit);

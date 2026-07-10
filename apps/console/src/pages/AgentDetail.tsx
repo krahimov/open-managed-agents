@@ -6,6 +6,7 @@ import { useApiQuery } from "../lib/useApiQuery";
 import { GitHubIcon, LinearIcon, SlackIcon } from "../components/icons";
 import { Page } from "../components/Page";
 import { Modal } from "../components/Modal";
+import { RunUntilDoneDialog } from "../components/RunUntilDoneDialog";
 import { Field } from "../components/Field";
 import { PageHeader } from "../components/PageHeader";
 import { Button } from "@/components/ui/button";
@@ -61,6 +62,7 @@ export function AgentDetail() {
   const { api } = useApi();
   const nav = useNavigate();
   const [editing, setEditing] = useState(false);
+  const [showRunDialog, setShowRunDialog] = useState(false);
 
   // Single-resource fetches via TQ. `enabled: !!id` defers until the route
   // param is available; the publication queries inherit the same gate.
@@ -161,6 +163,12 @@ export function AgentDetail() {
               <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
                 Edit
               </Button>
+              {(agent as { metadata?: { long_running?: boolean } }).metadata
+                ?.long_running === true && (
+                <Button size="sm" onClick={() => setShowRunDialog(true)}>
+                  Run until done
+                </Button>
+              )}
               <Button
                 variant="outline"
                 size="sm"
@@ -183,6 +191,11 @@ export function AgentDetail() {
         {editing && (
           <EditAgentModal agent={agent} onClose={() => setEditing(false)} />
         )}
+        <RunUntilDoneDialog
+          agentId={agent.id}
+          open={showRunDialog}
+          onClose={() => setShowRunDialog(false)}
+        />
         {/* Properties grid */}
         <div className="grid grid-cols-[140px_1fr] gap-x-4 gap-y-2 max-w-2xl text-sm">
           <span className="text-fg-muted">ID</span><span className="font-mono text-xs">{agent.id}</span>
