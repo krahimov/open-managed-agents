@@ -6,6 +6,8 @@ import {
   decideMissionAction,
   validateMissionInput,
   verdictSignature,
+  MAX_VERIFIERS,
+  VERIFIER_TIMEOUT_CEILING_MS,
   type MissionDecisionInput,
   type MissionVerdict,
 } from "../../apps/main-node/src/lib/mission-decision";
@@ -316,6 +318,36 @@ describe("validateMissionInput", () => {
     expect(() =>
       validateMissionInput({ ...ok, verifiers: [{ kind: "llm", command: "x" }] }),
     ).toThrow(/kind/);
+  });
+
+  it("rejects more than MAX_VERIFIERS verifiers", () => {
+    const verifiers = Array.from({ length: MAX_VERIFIERS + 1 }, (_, i) => ({
+      kind: "command",
+      command: `check ${i}`,
+    }));
+    expect(() => validateMissionInput({ ...ok, verifiers })).toThrow(/at most/);
+    expect(() =>
+      validateMissionInput({ ...ok, verifiers: verifiers.slice(0, MAX_VERIFIERS) }),
+    ).not.toThrow();
+  });
+
+  it("caps timeout_ms at the ceiling (the sweep runs verifiers sequentially)", () => {
+    expect(() =>
+      validateMissionInput({
+        ...ok,
+        verifiers: [
+          { kind: "command", command: "x", timeout_ms: VERIFIER_TIMEOUT_CEILING_MS + 1 },
+        ],
+      }),
+    ).toThrow(/timeout_ms/);
+    expect(() =>
+      validateMissionInput({
+        ...ok,
+        verifiers: [
+          { kind: "command", command: "x", timeout_ms: VERIFIER_TIMEOUT_CEILING_MS },
+        ],
+      }),
+    ).not.toThrow();
   });
 
   it("rejects budget outside 1..200 iterations / 1..1440 minutes", () => {

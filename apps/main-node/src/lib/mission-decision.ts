@@ -118,6 +118,11 @@ export function decideMissionAction(input: MissionDecisionInput): MissionAction 
 
 export const MAX_ITERATIONS_CEILING = 200;
 export const WALL_CLOCK_MINUTES_CEILING = 1440;
+// Verifiers run sequentially inside the supervisor's (protected, non-
+// overlapping) sweep — one mission's verifier wall time starves every other
+// mission, so both the count and the per-command timeout are capped.
+export const MAX_VERIFIERS = 20;
+export const VERIFIER_TIMEOUT_CEILING_MS = 10 * 60_000;
 
 export function validateMissionInput(input: {
   goal?: unknown;
@@ -130,6 +135,9 @@ export function validateMissionInput(input: {
   if (!Array.isArray(input.verifiers) || input.verifiers.length === 0) {
     throw new Error("mission needs at least one verifier");
   }
+  if (input.verifiers.length > MAX_VERIFIERS) {
+    throw new Error(`mission allows at most ${MAX_VERIFIERS} verifiers`);
+  }
   const verifiers: MissionVerifier[] = input.verifiers.map((raw, i) => {
     const v = raw as { kind?: unknown; command?: unknown; timeout_ms?: unknown };
     if (v?.kind !== "command") {
@@ -139,8 +147,13 @@ export function validateMissionInput(input: {
     if (!command) throw new Error(`verifier[${i}]: command must be a non-empty string`);
     const timeout =
       v.timeout_ms === undefined ? undefined : Number(v.timeout_ms);
-    if (timeout !== undefined && (!Number.isFinite(timeout) || timeout <= 0)) {
-      throw new Error(`verifier[${i}]: timeout_ms must be a positive number`);
+    if (
+      timeout !== undefined &&
+      (!Number.isFinite(timeout) || timeout <= 0 || timeout > VERIFIER_TIMEOUT_CEILING_MS)
+    ) {
+      throw new Error(
+        `verifier[${i}]: timeout_ms must be a positive number ≤ ${VERIFIER_TIMEOUT_CEILING_MS}`,
+      );
     }
     return { kind: "command", command, ...(timeout !== undefined ? { timeout_ms: timeout } : {}) };
   });
