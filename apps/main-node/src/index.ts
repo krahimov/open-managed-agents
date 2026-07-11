@@ -1466,6 +1466,18 @@ v1.post("/skills/acquire", async (c) => {
 
     const agentRow = await agentsService.get({ tenantId, agentId: body.agent_id });
     if (!agentRow) return c.json({ error: "agent not found" }, 404);
+
+    // Tenant scoping on the injection target: a caller-supplied session_id
+    // must resolve within the caller's own tenant BEFORE we mutate anything
+    // — otherwise this endpoint would let one tenant append a user.message
+    // (with an arbitrary playbook) into another tenant's running session.
+    if (body.session_id) {
+      const session = await sessionsService
+        .get({ tenantId, sessionId: body.session_id })
+        .catch(() => null);
+      if (!session) return c.json({ error: "session not found" }, 404);
+    }
+
     const existingRefs =
       (agentRow as { skills?: Array<{ skill_id: string; type: string }> }).skills ?? [];
     if (!existingRefs.some((r) => r.skill_id === skill.id)) {
