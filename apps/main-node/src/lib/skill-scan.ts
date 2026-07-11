@@ -11,9 +11,11 @@
  *     (embedded URLs, shell-exec patterns, credential references,
  *     injection-family strings, typosquat proximity).
  *
- * The LLM judge tier layers on top later with the restrict-only ratchet:
- * it may lower pass→flagged→blocked, never raise. `judge: "skipped"`
- * marks reports produced before that tier exists.
+ * The LLM judge tier (skill-judge.ts) layers on top with the restrict-only
+ * ratchet: it may escalate pass→flagged→blocked, never lower a static
+ * verdict. `judge: "skipped"` marks reports where the judge did not run
+ * (no model card, provider failure/timeout, or the static verdict was
+ * already blocked).
  *
  * Verdicts are deliberately conservative-static: a scan pass is NOT an
  * endorsement — the human ratification step is the actual gate, and the
@@ -34,8 +36,10 @@ export interface SkillScanReport {
   findings: SkillScanFinding[];
   content_sha256: string;
   bytes: number;
-  /** LLM judge tier — "skipped" until it ships; then a verdict object. */
-  judge: "skipped";
+  /** LLM judge tier — "skipped" when the judge did not run; otherwise the
+   *  judge's OWN verdict + reasons (the report-level `verdict` above is
+   *  already the ratcheted max of static and judge). */
+  judge: "skipped" | { verdict: "pass" | "flagged" | "blocked"; reasons: string[] };
 }
 
 export function sha256Hex(text: string): string {

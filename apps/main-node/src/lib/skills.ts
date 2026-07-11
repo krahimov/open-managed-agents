@@ -22,6 +22,9 @@
 
 import { nanoid } from "nanoid";
 import type { SqlClient } from "@open-managed-agents/sql-client";
+// Module cycle with skill-scan.ts (it imports parseFrontmatter from here) —
+// safe: both edges are hoisted function declarations used only at call time.
+import { sha256Hex } from "./skill-scan.js";
 
 export interface SkillRow {
   id: string;
@@ -73,6 +76,19 @@ export function parseFrontmatter(content: string): { name?: string; description?
 /** kebab-case the skill name so it doubles as a directory name. */
 export function normalizeSkillName(raw: string): string {
   return raw.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
+}
+
+/**
+ * Hash-pin re-verification: what the human approved is what runs. True when
+ * the row has no pin (legacy install, pre-quarantine) or the stored content
+ * still hashes to the pinned content_hash. Every materialization path MUST
+ * check this and fail closed (skip the skill) on mismatch — a row whose
+ * content drifted from its approved hash is a tampered row.
+ */
+export function skillContentIntact(
+  row: Pick<SkillRow, "content" | "content_hash">,
+): boolean {
+  return !row.content_hash || sha256Hex(row.content) === row.content_hash;
 }
 
 export class SkillStore {
@@ -180,7 +196,10 @@ export class SkillStore {
   }
 
   /** Resolve agent skill refs ({type:"custom", skill_id}) to rows; unknown
-   *  ids are skipped (agent still runs, skill simply absent). */
+   *  ids are skipped (agent still runs, skill simply absent). Hash-pinned
+   *  rows are re-verified at this materialization boundary: content that no
+   *  longer matches the approved content_hash is skipped (fail closed) with
+   *  a warning — never handed to a session. */
   async resolveRefs(
     tenantId: string,
     refs: Array<{ skill_id: string; type: string }> | undefined,
@@ -189,7 +208,15 @@ export class SkillStore {
     for (const ref of refs ?? []) {
       if (ref.type !== "custom" || !ref.skill_id) continue;
       const row = await this.get(tenantId, ref.skill_id).catch(() => null);
-      if (row) out.push(row);
+      if (!row) continue;
+      if (!skillContentIntact(row)) {
+        console.warn(
+          `[skills] content-hash mismatch for skill ${row.id} ("${row.name}") — ` +
+            `stored content no longer matches approved hash ${row.content_hash}; skipping materialization`,
+        );
+        continue;
+      }
+      out.push(row);
     }
     return out;
   }

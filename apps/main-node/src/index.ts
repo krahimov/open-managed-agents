@@ -435,11 +435,50 @@ if (webhookStore) await webhookStore.ensureSchema();
 if (webhookStore) startWebhookDeliveryPoller({ store: webhookStore });
 
 // ─── Skills (SKILL.md storage + GitHub import) ─────────────────────────────
-const { SkillStore, parseFrontmatter: parseSkillFrontmatter } = await import("./lib/skills.js");
+const { SkillStore, parseFrontmatter: parseSkillFrontmatter, skillContentIntact } =
+  await import("./lib/skills.js");
 const { CURATED_SKILL_CATALOG } = await import("./lib/skill-catalog.js");
 const { scanSkillContent, extractUrlFromCurl } = await import("./lib/skill-scan.js");
+const { judgeSkillContent, applyJudgeVerdict } = await import("./lib/skill-judge.js");
 const skillStore = new SkillStore(sql);
 await skillStore.ensureSchema();
+
+/**
+ * Quarantine tier 2: run the LLM judge over a static scan report and merge
+ * with the restrict-only ratchet (judge can escalate, never lower). Skips —
+ * returning the report with judge:"skipped" — when the static verdict is
+ * already blocked (terminal), when the tenant has no usable default model
+ * card, or on any judge failure/timeout. Never throws.
+ */
+async function judgeAndMergeSkillReport(
+  tenantId: string,
+  content: string,
+  staticReport: import("./lib/skill-scan.js").SkillScanReport,
+): Promise<import("./lib/skill-scan.js").SkillScanReport> {
+  if (staticReport.verdict === "blocked") {
+    return applyJudgeVerdict(staticReport, "skipped");
+  }
+  let model: import("ai").LanguageModel | null = null;
+  try {
+    const card = await modelCardService.getDefault({ tenantId });
+    if (card) {
+      const apiKey = await modelCardService.getApiKey({ tenantId, cardId: card.id });
+      if (apiKey) {
+        model = resolveModel(
+          card.model,
+          apiKey,
+          card.base_url || undefined,
+          providerToCompat(card.provider),
+          card.custom_headers ?? undefined,
+        );
+      }
+    }
+  } catch {
+    model = null; // no card / decrypt failure ⇒ judge skips, static verdict stands
+  }
+  const judge = await judgeSkillContent({ model }, { content, staticReport });
+  return applyJudgeVerdict(staticReport, judge);
+}
 
 let memoryBlobs: import("@open-managed-agents/memory-store").BlobStore;
 let memoryBlobDescription: string;
@@ -1447,7 +1486,14 @@ v1.post("/skills/acquire", async (c) => {
       const cand = candidates[0];
       if (!cand) return c.json({ error: "no SKILL.md at source" }, 404);
       const installedNames = (await skillStore.list(tenantId)).map((s) => s.name);
-      const report = scanSkillContent(cand.content, { installedNames });
+      // Static scan + LLM judge (restrict-only ratchet) — same gate as the
+      // console install path; a judge escalation to blocked stops the
+      // acquire regardless of what any UI showed.
+      const report = await judgeAndMergeSkillReport(
+        tenantId,
+        cand.content,
+        scanSkillContent(cand.content, { installedNames }),
+      );
       if (report.verdict === "blocked") {
         return c.json({ error: "skill blocked by security scan", report }, 422);
       }
@@ -1463,6 +1509,19 @@ v1.post("/skills/acquire", async (c) => {
       });
     }
     if (!skill) return c.json({ error: "skill not found" }, 404);
+
+    // Hash-pin re-verification at this materialization boundary too: the
+    // playbook injected below is the stored content, so a row whose content
+    // drifted from its approved hash must fail closed here (same rule as
+    // SkillStore.resolveRefs).
+    if (!skillContentIntact(skill)) {
+      return c.json(
+        {
+          error: `skill "${skill.name}" failed content-hash re-verification — stored content no longer matches the hash approved at install`,
+        },
+        409,
+      );
+    }
 
     const agentRow = await agentsService.get({ tenantId, agentId: body.agent_id });
     if (!agentRow) return c.json({ error: "agent not found" }, 404);
@@ -1790,16 +1849,21 @@ v1.post("/skills/scan", async (c) => {
       : await skillStore.fetchFromSource(
           extractUrlFromCurl(body.source!) ?? body.source!,
         );
-    const data = candidates.map((cand) => {
-      const fm = parseSkillFrontmatter(cand.content);
-      return {
-        source: cand.source,
-        name: fm.name ?? "",
-        description: fm.description ?? "",
-        content: cand.content,
-        report: scanSkillContent(cand.content, { installedNames }),
-      };
-    });
+    const data = await Promise.all(
+      candidates.map(async (cand) => {
+        const fm = parseSkillFrontmatter(cand.content);
+        const staticReport = scanSkillContent(cand.content, { installedNames });
+        return {
+          source: cand.source,
+          name: fm.name ?? "",
+          description: fm.description ?? "",
+          content: cand.content,
+          // Tier 2 (LLM judge) rides on the static report — restrict-only
+          // ratchet, skipped when blocked already / no model card / failure.
+          report: await judgeAndMergeSkillReport(tenantId, cand.content, staticReport),
+        };
+      }),
+    );
     return c.json({ data });
   } catch (err) {
     return c.json({ error: err instanceof Error ? err.message : "scan failed" }, 400);
@@ -1813,9 +1877,14 @@ v1.post("/skills", async (c) => {
     const tenantId = c.get("tenant_id");
     // Re-scan server-side at install time — the client's report is display
     // only. Hard blocks stop the install regardless of what the UI said;
-    // the human ratifies flags, never blocks.
+    // the human ratifies flags, never blocks. The LLM judge tier runs here
+    // too (restrict-only): a judge escalation to blocked also 422s.
     const installedNames = (await skillStore.list(tenantId)).map((s) => s.name);
-    const report = scanSkillContent(body.content, { installedNames });
+    const report = await judgeAndMergeSkillReport(
+      tenantId,
+      body.content,
+      scanSkillContent(body.content, { installedNames }),
+    );
     if (report.verdict === "blocked") {
       return c.json({ error: "skill blocked by security scan", report }, 422);
     }
