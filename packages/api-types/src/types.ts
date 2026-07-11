@@ -938,6 +938,20 @@ export interface SystemSkillRequestEvent extends EventBase {
   description?: string;
 }
 
+// Mission supervisor verdict. Appended to the iteration's session after its
+// turn goes idle and the mission's verifier commands run against the shared
+// workspace — one frame per iteration, recording each command's pass/fail
+// plus an output snippet. `judge` is "skipped" in Phase 1 (verifiers only;
+// LLM judge joins later). Console renders it as a pass/fail chip row.
+export interface SystemMissionVerdictEvent extends EventBase {
+  type: "system.mission_verdict";
+  mission_id: string;
+  iteration: number;
+  all_pass: boolean;
+  results: Array<{ command: string; pass: boolean; output_snippet: string }>;
+  judge?: "skipped";
+}
+
 export type SessionEvent =
   | UserMessageEvent
   | UserInterruptEvent
@@ -990,7 +1004,8 @@ export type SessionEvent =
   | SystemPolicyDecisionEvent
   | SystemAccessRequestEvent
   | SystemAmbientRuleCreatedEvent
-  | SystemSkillRequestEvent;
+  | SystemSkillRequestEvent
+  | SystemMissionVerdictEvent;
 
 /**
  * Event types defined by Anthropic's Managed Agents spec — what their

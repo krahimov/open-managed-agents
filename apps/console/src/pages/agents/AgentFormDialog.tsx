@@ -203,6 +203,9 @@ const INITIAL_FORM = {
   toolOverrides: {} as Record<string, ToolOverride>,
   // Opt-in to the built-in `general_subagent` tool.
   enableGeneralSubagent: false,
+  // Long-running capability: sessions on this agent can carry a goal
+  // contract ("run until done") driven by the mission supervisor.
+  longRunning: false,
   ambientEnabled: false,
   ambientRuleName: "",
   ambientRuleDescription: "",
@@ -1000,6 +1003,7 @@ export function AgentFormDialog({
       if (form.composioToolkits.length > 0) {
         metadata.composio_toolkits = form.composioToolkits;
       }
+      if (form.longRunning) metadata.long_running = true;
       if (Object.keys(metadata).length > 0) payload.metadata = metadata;
       if (form.enableGeneralSubagent) {
         payload.enable_general_subagent = true;
@@ -1131,6 +1135,7 @@ export function AgentFormDialog({
     if (form.environmentId) metadata.default_environment_id = form.environmentId;
     if (form.defaultVaultIds.length > 0) metadata.default_vault_ids = form.defaultVaultIds;
     if (form.composioToolkits.length > 0) metadata.composio_toolkits = form.composioToolkits;
+    if (form.longRunning) metadata.long_running = true;
     if (Object.keys(metadata).length > 0) config.metadata = metadata;
     if (form.enableGeneralSubagent) {
       config.enable_general_subagent = true;
@@ -1223,6 +1228,7 @@ export function AgentFormDialog({
             dc.permission_policy?.type === "always_ask" ? "always_ask" : "always_allow",
           toolOverrides: overrides,
           enableGeneralSubagent: parsed.enable_general_subagent === true,
+          longRunning: (parsed.metadata as { long_running?: unknown } | undefined)?.long_running === true,
         });
       } catch {
         /* keep current form if parse fails */
@@ -2995,6 +3001,27 @@ function AgentsTab({
 }) {
   return (
     <div className="space-y-5">
+      {/* Long-running capability — opt-in. */}
+      <div className="rounded-md border border-border bg-bg-surface px-3 py-3">
+        <label className="flex items-start gap-2 text-sm cursor-pointer">
+          <input
+            type="checkbox"
+            checked={form.longRunning}
+            onChange={(e) => setForm({ ...form, longRunning: e.target.checked })}
+            className="accent-brand mt-0.5"
+          />
+          <div>
+            <div className="font-medium text-fg">Long-running</div>
+            <p className="text-xs text-fg-subtle mt-0.5">
+              Sessions can carry a goal contract: the agent iterates in fresh
+              contexts until the goal's verifier checks pass, budget runs out,
+              or it gets stuck — supervised, budgeted, every verdict logged.
+              Start one from the agent page via "Run until done".
+            </p>
+          </div>
+        </label>
+      </div>
+
       {/* Built-in general sub-agent — opt-in. */}
       <div className="rounded-md border border-border bg-bg-surface px-3 py-3">
         <label className="flex items-start gap-2 text-sm cursor-pointer">

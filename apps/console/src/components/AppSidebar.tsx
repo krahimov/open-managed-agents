@@ -24,6 +24,7 @@ import {
   RuntimesIcon,
   DashboardIcon,
   DeploymentsIcon,
+  DurationIcon,
   EnvIcon,
   FilesIcon,
   GitHubIcon,

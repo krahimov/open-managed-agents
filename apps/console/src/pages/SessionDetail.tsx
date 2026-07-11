@@ -11,6 +11,8 @@ import { Modal } from "../components/Modal";
 import { AccessRequestCard } from "../components/AccessRequestCard";
 import { AmbientRuleCard } from "../components/AmbientRuleCard";
 import { SkillRequestCard } from "../components/SkillRequestCard";
+import { MissionBanner } from "../components/MissionBanner";
+import { MissionVerdictCard } from "../components/MissionVerdictCard";
 import { Button } from "@/components/ui/button";
 import { AgentIcon, ClockIcon, DurationIcon, EnvIcon, VaultIcon } from "../components/icons";
 import { FilesPanel, ResourcePanel } from "./session-detail/Panels";
@@ -120,6 +122,7 @@ export function SessionDetail() {
     issueIdentifier?: string;
     workspaceId?: string;
   } | null>(null);
+  const [missionId, setMissionId] = useState<string | null>(null);
   const [slack, setSlack] = useState<{
     channelId?: string;
     threadTs?: string;
@@ -494,7 +497,10 @@ export function SessionDetail() {
         // display data — clients fetch resources on demand. Names appear a
         // tick later than the badge frame; until then the badge falls back
         // to the short-id label.
-        if (s.environment_id) {
+        // env_local_runtime is a synthetic id minted for ambient/mission
+        // spawns — there is no environments row to resolve, and the lookup
+        // only produces a spurious "Environment not found" toast.
+        if (s.environment_id && s.environment_id !== "env_local_runtime") {
           api<{ id: string; name?: string; description?: string }>(`/v1/environments/${s.environment_id}`)
             .then((env) => setSessionMeta((prev) => ({ ...prev, envSnapshot: env })))
             .catch(() => {});
@@ -507,6 +513,9 @@ export function SessionDetail() {
                 .catch(() => ({ id: vid })),
             ),
           ).then((vaults) => setSessionMeta((prev) => ({ ...prev, vaults })));
+        }
+        if (typeof s.metadata?.mission_id === "string") {
+          setMissionId(s.metadata.mission_id);
         }
         const linearMeta = s.metadata?.linear as
           | { issueId?: string; issueIdentifier?: string; workspaceId?: string }
@@ -867,6 +876,11 @@ export function SessionDetail() {
       )}
 
       {/* View tabs */}
+      {missionId && id && (
+        <div className="pl-3 pr-4 shrink-0">
+          <MissionBanner missionId={missionId} currentSessionId={id} />
+        </div>
+      )}
       <div role="tablist" aria-label="Session view" className="pl-3 pr-4 flex items-center gap-1 shrink-0">
         <ViewTab label="Conversation" active={view === "chat"} onClick={() => setView("chat")} />
         <ViewTab label="Timeline" active={view === "timeline"} onClick={() => setView("timeline")} />
@@ -1787,6 +1801,9 @@ function EventRender({
 
     case "system.ambient_rule_created":
       return <AmbientRuleCard event={event} />;
+
+    case "system.mission_verdict":
+      return <MissionVerdictCard event={event} />;
 
     case "system.skill_request":
       return <SkillRequestCard event={event} />;
