@@ -90,6 +90,12 @@ export function AccessRequestCard({
         // MCP OAuth callback reports the provider's display name — accept any
         // completion that lands while THIS card is the one connecting.
         complete();
+      } else if (data?.type === "oauth_error") {
+        // Popup-side failure (discovery, missing preset app, token exchange,
+        // provider proxy state) — surface it on the card instead of leaving
+        // "Waiting for provider…" forever.
+        setStatus("error");
+        setError((data as { message?: string }).message ?? "Provider authentication failed");
       }
     };
     window.addEventListener("message", handle);

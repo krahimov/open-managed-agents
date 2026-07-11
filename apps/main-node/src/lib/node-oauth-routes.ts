@@ -14,6 +14,9 @@ interface OAuthState {
   authorization_server: string;
   redirect_uri: string;
   resource_uri: string;
+  /** KV key of the cached dynamic client registration this flow used —
+   *  deleted when token exchange reports invalid_client. */
+  dcr_cache_key?: string;
 }
 
 interface ProtectedResourceMeta {
@@ -79,7 +82,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     try {
       meta = await discoverOAuthMeta(mcpServerUrl);
     } catch (err) {
-      return c.json({ error: `OAuth discovery failed: ${(err as Error).message}` }, 502);
+      return c.html(closeHtml("OAuth discovery failed", htmlEscape((err as Error).message)), 502);
     }
 
     const callerClientId = c.req.query("client_id");
@@ -87,14 +90,36 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     let clientId: string | null = callerClientId || null;
     let clientSecret: string | undefined = callerClientSecret || undefined;
 
+    // One dynamically-registered client per (issuer, callback), cached — a
+    // fresh registration on every attempt spams the provider's client store
+    // and aggravates proxy-state failures on retries (mcp.linear.app's
+    // "Invalid flow state"). Invalidated on invalid_client at token exchange.
+    const dcrCacheKey = `oauth_dcr:${meta.authServer.issuer}|${callbackUri}`;
     if (!clientId && meta.authServer.registration_endpoint) {
-      const reg = await dynamicClientRegistration(
-        meta.authServer.registration_endpoint,
-        callbackUri,
-      );
-      if (reg) {
-        clientId = reg.client_id;
-        clientSecret = reg.client_secret;
+      const cached = await deps.services.kv.get(dcrCacheKey).catch(() => null);
+      if (cached) {
+        try {
+          const parsed = JSON.parse(cached) as { client_id: string; client_secret?: string };
+          clientId = parsed.client_id;
+          clientSecret = parsed.client_secret;
+        } catch {
+          // fall through to fresh registration
+        }
+      }
+      if (!clientId) {
+        const reg = await dynamicClientRegistration(
+          meta.authServer.registration_endpoint,
+          callbackUri,
+        );
+        if (reg) {
+          clientId = reg.client_id;
+          clientSecret = reg.client_secret;
+          await deps.services.kv
+            .put(dcrCacheKey, JSON.stringify({ client_id: reg.client_id, client_secret: reg.client_secret }), {
+              expirationTtl: 60 * 60 * 24 * 30,
+            })
+            .catch(() => {});
+        }
       }
     }
 
@@ -107,12 +132,13 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
           clientId = presetClientId;
           clientSecret = presetClientSecret;
         } else {
-          return c.json(
-            {
-              error:
-                `${preset.label} MCP OAuth requires a pre-registered OAuth app with callback ${callbackUri}. ` +
-                `Set ${preset.clientIdEnv} and ${preset.clientSecretEnv} on the main-node server.`,
-            },
+          return c.html(
+            closeHtml(
+              `${preset.label} MCP OAuth needs a pre-registered app`,
+              htmlEscape(
+                `Create an OAuth app with callback ${callbackUri}, then set ${preset.clientIdEnv} and ${preset.clientSecretEnv} on the main-node server and retry.`,
+              ),
+            ),
             501,
           );
         }
@@ -120,10 +146,13 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     }
 
     if (!clientId) {
-      return c.json(
-        {
-          error: `MCP server ${mcpServerUrl} does not support Dynamic Client Registration and no preset client_id is configured for issuer ${meta.authServer.issuer}.`,
-        },
+      return c.html(
+        closeHtml(
+          "OAuth client unavailable",
+          htmlEscape(
+            `MCP server ${mcpServerUrl} does not support Dynamic Client Registration and no preset client_id is configured for issuer ${meta.authServer.issuer}.`,
+          ),
+        ),
         501,
       );
     }
@@ -143,6 +172,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       authorization_server: meta.authServer.issuer,
       redirect_uri: clientRedirectUri || `${baseUrl}/`,
       resource_uri: meta.resource.resource,
+      dcr_cache_key: dcrCacheKey,
     };
 
     await deps.services.kv.put(`oauth_state:${state}`, JSON.stringify(oauthState), {
@@ -208,6 +238,11 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     if (!tokenRes.ok) {
       const errBody = await tokenRes.text().catch(() => "");
       await deps.services.kv.delete(stateKey);
+      // A dead cached registration surfaces as invalid_client — drop it so
+      // the next attempt re-registers instead of failing forever.
+      if (oauthState.dcr_cache_key && /invalid_client/i.test(errBody)) {
+        await deps.services.kv.delete(oauthState.dcr_cache_key).catch(() => {});
+      }
       return c.html(closeHtml("Token exchange failed", htmlEscape(errBody || String(tokenRes.status))), 502);
     }
 
@@ -568,8 +603,22 @@ async function probeMcpServer(
   }
 }
 
+/** Popup error page: broadcasts oauth_error on the openma-oauth channel so
+ *  connect cards/panels leave their "waiting" state and show the message,
+ *  then stays open (readable) with the details — a silent window.close()
+ *  buried every OAuth failure. */
 function closeHtml(title: string, body: string): string {
-  return `<html><body><h2>${htmlEscape(title)}</h2><p>${body}</p><script>window.close()</script></body></html>`;
+  const msg = JSON.stringify({ type: "oauth_error", message: `${title}: ${body}`.slice(0, 500) });
+  return `<html><body style="font-family:system-ui;max-width:36rem;margin:3rem auto;line-height:1.5">
+<h2>${htmlEscape(title)}</h2><p>${body}</p>
+<p style="color:#888">You can close this window.</p>
+<script>
+  (function(){
+    var msg = ${msg};
+    try { if (window.opener && !window.opener.closed) window.opener.postMessage(msg, "*"); } catch (e) {}
+    try { var bc = new BroadcastChannel("openma-oauth"); bc.postMessage(msg); bc.close(); } catch (e) {}
+  })();
+</script></body></html>`;
 }
 
 function htmlEscape(value: string): string {
