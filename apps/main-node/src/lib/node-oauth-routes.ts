@@ -269,22 +269,53 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       authorization_server: oauthState.authorization_server,
     };
 
-    if (oauthState.credential_id) {
-      await deps.services.credentials
-        .update({
+    try {
+      let credentialId = oauthState.credential_id;
+      if (!credentialId) {
+        // Reconnects are the common case: an earlier attempt (or the agent
+        // form) may already hold a credential for this server in this vault,
+        // and create() enforces one per mcp_server_url — failing here would
+        // discard a successful token exchange. Find-and-update instead.
+        const groups = await deps.services.credentials
+          .listByVaults({
+            tenantId: oauthState.tenant_id,
+            vaultIds: [oauthState.vault_id],
+          })
+          .catch(() => []);
+        const existing = groups
+          .flatMap((g) => g.credentials)
+          .find(
+            (cred) =>
+              (cred as { archived_at?: string | null }).archived_at == null &&
+              (cred as { auth?: { mcp_server_url?: string } }).auth?.mcp_server_url ===
+                oauthState.mcp_server_url,
+          );
+        if (existing) credentialId = (existing as { id: string }).id;
+      }
+      if (credentialId) {
+        await deps.services.credentials.update({
           tenantId: oauthState.tenant_id,
           vaultId: oauthState.vault_id,
-          credentialId: oauthState.credential_id,
+          credentialId,
           auth: credAuth,
-        })
-        .catch(() => {});
-    } else {
-      await deps.services.credentials.create({
-        tenantId: oauthState.tenant_id,
-        vaultId: oauthState.vault_id,
-        displayName: `${serverName} (OAuth)`,
-        auth: credAuth,
-      });
+        });
+      } else {
+        await deps.services.credentials.create({
+          tenantId: oauthState.tenant_id,
+          vaultId: oauthState.vault_id,
+          displayName: `${serverName} (OAuth)`,
+          auth: credAuth,
+        });
+      }
+    } catch (err) {
+      await deps.services.kv.delete(stateKey);
+      return c.html(
+        closeHtml(
+          "Could not store the credential",
+          htmlEscape(err instanceof Error ? err.message : "credential persistence failed"),
+        ),
+        500,
+      );
     }
 
     await deps.services.kv.delete(stateKey);
