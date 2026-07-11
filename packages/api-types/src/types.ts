@@ -77,6 +77,17 @@ export interface AgentConfig {
   aux_model?: string | { id: string; speed?: "standard" | "fast" };
   harness?: string;
   /**
+   * SESSION-SNAPSHOT-ONLY enrichment — never present on live agent rows.
+   * The access policy resolved from the agent's permission grants at
+   * session-create time and pinned into the session's agent_snapshot (the
+   * same enrichment pattern as the Slack signal-protocol system append and
+   * console-injected mcp_servers). Enforcement reads it wherever the
+   * snapshot flows: buildTools() filters the DefaultHarness tool dict, the
+   * claude-agent-sdk harness compiles it to SDK options. Mid-session grant
+   * edits never affect a running session — by design (snapshot determinism).
+   */
+  effective_policy?: import("./policy").EffectivePolicy;
+  /**
    * When set, agent runs on a user-registered local ACP runtime instead of
    * OMA's cloud SessionDO loop. `harness` MUST be "acp-proxy" for this to
    * take effect; SessionDO routes the AcpProxyHarness which proxies via the
@@ -841,6 +852,92 @@ export interface SystemUserMessageCancelledEvent extends EventBase {
   cancelled_at: number;
 }
 
+// Access-control audit frames. `system.policy_pinned` lands once at session
+// init recording the exact policy the session will enforce (grant lineage +
+// rules). `system.policy_decision` records a concrete enforcement decision —
+// in Phase 1 that's a tool filtered out of the model's tool dict by a deny
+// rule (the model never sees it); ask-gate decisions join in Phase 4. Like
+// other `system.*` frames, old SDK consumers ignore them silently.
+export interface SystemPolicyPinnedEvent extends EventBase {
+  type: "system.policy_pinned";
+  agent_id: string;
+  grant_id?: string;
+  grant_version?: number;
+  rules: import("./policy").PermissionRule[];
+}
+
+export interface SystemPolicyDecisionEvent extends EventBase {
+  type: "system.policy_decision";
+  tool_name: string;
+  effect: import("./policy").PermissionEffect;
+  /** Selector of the rule that decided; absent = default allow. */
+  selector?: string;
+  reason?: string;
+}
+
+// Agent-initiated credential request. Emitted when the agent calls its
+// `request_access` tool because a service it needs (Gmail, GitHub, a CRM…)
+// has no connected account / vault credential. Live consumers (Console)
+// render a connect card: one click opens the provider OAuth popup via the
+// existing Composio link flow, and on completion the console appends a
+// user.message telling the agent access is granted. The event is a request
+// record, not a grant — credentials only ever move through the vault flow.
+export interface SystemAccessRequestEvent extends EventBase {
+  type: "system.access_request";
+  /** Unique request id (also used by the UI to dedupe cards). */
+  request_id: string;
+  /** Toolkit/service slug, e.g. "gmail", "github", "hubspot". */
+  service: string;
+  /** Agent-provided one-liner shown to the user under the card title. */
+  reason: string;
+  /** Whether the tenant has a Composio key configured — when false the
+   *  card routes the user to Apps → Connect Composio first. */
+  composio_configured?: boolean;
+  /** Set when the requested service matched one of the agent's own URL MCP
+   *  servers by name — the card then runs the vault MCP OAuth flow against
+   *  this URL instead of the Composio connected-account flow. */
+  mcp_server_url?: string;
+}
+
+// Agent-created ambient rule. Emitted alongside the create_ambient_rule
+// tool result so live consumers (Console) render the new standing rule as a
+// card — cadence, wake mode, opening prompt, first wake — instead of a raw
+// tool-result blob. Like other system.* frames, old consumers ignore it.
+export interface SystemAmbientRuleCreatedEvent extends EventBase {
+  type: "system.ambient_rule_created";
+  rule_id: string;
+  name: string;
+  description?: string;
+  cron?: string;
+  timezone?: string;
+  wake_mode: string;
+  /** Opening user message each spawned session receives. */
+  prompt?: string;
+  next_wake_at?: string;
+}
+
+// Agent-initiated skill acquisition. Emitted when the agent calls its
+// request_skill tool ("this task needs the xlsx skill"). The console
+// renders an attach card showing provenance + scan status; approval runs
+// install-if-needed (quarantine-enforced) + attaches to the agent + injects
+// the skill into the running session. Same proposes/ratifies split as
+// access requests: the event is a request record, never an attachment.
+export interface SystemSkillRequestEvent extends EventBase {
+  type: "system.skill_request";
+  request_id: string;
+  agent_id: string;
+  /** Normalized skill name the agent asked for. */
+  skill_name: string;
+  reason: string;
+  /** Set when the name matched an installed tenant skill. */
+  skill_id?: string;
+  /** Set when the name matched a curated catalog entry (import source). */
+  catalog_source?: string;
+  /** installed | catalog | unknown — what the card should offer. */
+  resolution: "installed" | "catalog" | "unknown";
+  description?: string;
+}
+
 export type SessionEvent =
   | UserMessageEvent
   | UserInterruptEvent
@@ -888,7 +985,12 @@ export type SessionEvent =
   | AuxModelCallEvent
   | SystemUserMessagePendingEvent
   | SystemUserMessagePromotedEvent
-  | SystemUserMessageCancelledEvent;
+  | SystemUserMessageCancelledEvent
+  | SystemPolicyPinnedEvent
+  | SystemPolicyDecisionEvent
+  | SystemAccessRequestEvent
+  | SystemAmbientRuleCreatedEvent
+  | SystemSkillRequestEvent;
 
 /**
  * Event types defined by Anthropic's Managed Agents spec — what their

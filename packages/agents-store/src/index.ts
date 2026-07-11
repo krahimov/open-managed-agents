@@ -13,19 +13,26 @@
 
 export * from "./types";
 export * from "./ambient-types";
+export * from "./grants-types";
 export * from "./errors";
 export * from "./ports";
 export * from "./ambient-ports";
+export * from "./grants-ports";
 export { AgentService } from "./service";
 export type { AgentServiceDeps, NewAgentInput, UpdateAgentInput } from "./service";
 export { AmbientRuleService } from "./ambient-service";
 export type { AmbientRuleServiceDeps } from "./ambient-service";
+export { PermissionGrantService } from "./grants-service";
+export type { PermissionGrantServiceDeps } from "./grants-service";
 
 export {
   createCfAmbientRuleService,
   createCfAgentService,
+  createCfPermissionGrantService,
   createSqliteAmbientRuleService,
   createSqliteAgentService,
+  createSqlitePermissionGrantService,
   SqlAmbientRuleRepo,
   SqlAgentRepo,
+  SqlPermissionGrantRepo,
 } from "./adapters";

@@ -36,6 +36,13 @@
    "when": 1783395300000,
    "tag": "0004_drop_publication_installation_fks",
    "breakpoints": true
+  },
+  {
+   "idx": 5,
+   "version": "7",
+   "when": 1783529000000,
+   "tag": "0005_permission_grants",
+   "breakpoints": true
   }
  ]
 }

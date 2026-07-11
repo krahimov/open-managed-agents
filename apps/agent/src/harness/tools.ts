@@ -4,6 +4,7 @@ import { z } from "zod";
 import { anthropic } from "@ai-sdk/anthropic";
 import type { LanguageModel } from "ai";
 import type { AgentConfig, ToolsetConfig, CustomToolConfig, SessionEvent } from "@open-managed-agents/shared";
+import { evaluatePolicy } from "@open-managed-agents/shared";
 import type { ToMarkdownProvider } from "@open-managed-agents/markdown";
 import type { SandboxExecutor, ProcessHandle } from "./interface";
 import { nanoid } from "nanoid";
@@ -23,7 +24,7 @@ import type { BrowserHarness, BrowserBillingHook } from "@open-managed-agents/br
 /** Tools enabled by default when an agent has no explicit tools config.
  *  Excludes opt-in tools that bias the LLM away from cheaper alternatives
  *  — see OPT_IN_TOOLS below. */
-export const DEFAULT_TOOLS = ["bash", "read", "write", "edit", "glob", "grep", "web_fetch", "web_search", "schedule", "cancel_schedule", "list_schedules", "create_ambient_rule", "list_ambient_rules", "delete_ambient_rule"];
+export const DEFAULT_TOOLS = ["bash", "read", "write", "edit", "glob", "grep", "web_fetch", "web_search", "schedule", "cancel_schedule", "list_schedules", "create_ambient_rule", "list_ambient_rules", "delete_ambient_rule", "request_access", "find_skill", "request_skill"];
 
 /** Tools recognised but NOT registered by default — agents must opt in
  *  via tools config (`{ name: "browser", enabled: true }`).
@@ -46,6 +47,27 @@ const MAX_BASH_TIMEOUT = 600000;      // 10 minutes (CC max)
 // with `flushed 0 tool_uses` and no error log — opaque to debug.
 // 15s is generous: a healthy server replies in <1s.
 const MCP_SETUP_TIMEOUT_MS = 15_000;
+
+// Dedupe system.policy_decision deny frames per (session, tool): buildTools
+// rebuilds the dict every turn, and re-emitting the same denial into the
+// append-only event log each turn would drown the audit trail. Module scope
+// is safe — CF runs one session per SessionDO isolate; on Node the map is
+// capped so a long-lived process can't grow it unboundedly (eviction just
+// means a repeated audit frame, never a missed enforcement).
+const MAX_POLICY_AUDIT_SESSIONS = 2000;
+const policyDenyAuditedBySession = new Map<string, Set<string>>();
+function policyDenyAudited(sessionId: string): Set<string> {
+  let set = policyDenyAuditedBySession.get(sessionId);
+  if (!set) {
+    if (policyDenyAuditedBySession.size >= MAX_POLICY_AUDIT_SESSIONS) {
+      const oldest = policyDenyAuditedBySession.keys().next().value;
+      if (oldest !== undefined) policyDenyAuditedBySession.delete(oldest);
+    }
+    set = new Set();
+    policyDenyAuditedBySession.set(sessionId, set);
+  }
+  return set;
+}
 
 // System prompt for the auxiliary model when summarizing web pages fetched
 // by web_fetch. Designed for the OMA agent loop: the summary lands directly
@@ -446,6 +468,29 @@ export async function buildTools(
     >;
     /** Soft-delete one of this agent's ambient rules by id. */
     deleteAmbientRule?: (id: string) => Promise<{ deleted: boolean }>;
+    /** Agent-initiated credential request: append a system.access_request
+     *  event to THIS session so the console renders a one-click connect
+     *  card (Composio OAuth popup). Resolves with what the model should
+     *  know: the request id + whether the tenant even has Composio wired.
+     *  Node wires this through NodeSessionRouter; CF leaves it unset until
+     *  the connect-card flow lands there. */
+    requestServiceAccess?: (args: {
+      service: string;
+      reason: string;
+    }) => Promise<{ request_id: string; status: string; note?: string }>;
+    /** Search the tenant skill store + curated catalog by keyword — the
+     *  discovery half of agent-initiated skill acquisition. */
+    findSkills?: (query: string) => Promise<
+      Array<{ name: string; description: string; installed: boolean; source?: string }>
+    >;
+    /** Ask the user to attach a skill to THIS agent: appends a
+     *  system.skill_request event the console renders as an attach card.
+     *  Approval installs (quarantine-enforced), attaches, and injects the
+     *  skill into the running session. */
+    requestSkill?: (args: {
+      skill_name: string;
+      reason: string;
+    }) => Promise<{ request_id: string; status: string; note?: string }>;
   }
 ): Promise<Record<string, any>> {
   const enabled = getEnabledTools(agentConfig.tools);
@@ -1051,6 +1096,61 @@ export async function buildTools(
     });
   }
 
+  if (env?.requestServiceAccess && enabled.has("request_access")) {
+    tools.request_access = tool({
+      description:
+        "Ask the user to connect an external service you need but don't have access to (no connected " +
+        "account / credential) — e.g. Gmail, GitHub, Notion, HubSpot. Posts a connect card to the user's " +
+        "session view; they authenticate with one click and you receive a message when access is granted. " +
+        "Call this the moment a task needs a service you can't reach (a tool is missing, or its calls fail " +
+        "with an auth/not-connected error) instead of giving up or asking the user to paste secrets in chat. " +
+        "Never ask for API keys or passwords in the conversation. After calling, continue whatever work " +
+        "doesn't need the service, or end your turn and wait.",
+      inputSchema: z.object({
+        service: z
+          .string()
+          .min(1)
+          .max(64)
+          .describe("Service/toolkit slug, lowercase (e.g. \"gmail\", \"github\", \"notion\", \"hubspot\")"),
+        reason: z
+          .string()
+          .min(1)
+          .max(300)
+          .describe("One line shown to the user: what you need it for (e.g. \"to read this week's invoices\")"),
+      }),
+      execute: safe(async (args) => env.requestServiceAccess!(args)),
+    });
+  }
+
+  if (env?.findSkills && enabled.has("find_skill")) {
+    tools.find_skill = tool({
+      description:
+        "Search available skills (installed + curated catalog) by keyword. A skill is a SKILL.md " +
+        "playbook that teaches you how to do a class of task well (e.g. xlsx spreadsheets, pdf " +
+        "manipulation, frontend design). Use when a task would benefit from domain expertise you " +
+        "don't currently have loaded — then call request_skill to ask the user to attach one.",
+      inputSchema: z.object({
+        query: z.string().min(1).max(120).describe("Keywords, e.g. \"spreadsheet excel\" or \"pdf\""),
+      }),
+      execute: safe(async ({ query }) => ({ skills: await env.findSkills!(query) })),
+    });
+  }
+
+  if (env?.requestSkill && enabled.has("request_skill")) {
+    tools.request_skill = tool({
+      description:
+        "Ask the user to attach a skill to you (use find_skill first to discover the right name). " +
+        "Posts an attach card to the user's session view; on approval the skill is security-scanned, " +
+        "attached to your config, and its content is injected into THIS session so you can use it " +
+        "immediately. Continue other work or end your turn while you wait.",
+      inputSchema: z.object({
+        skill_name: z.string().min(1).max(64).describe("Skill name from find_skill (e.g. \"xlsx\")"),
+        reason: z.string().min(1).max(300).describe("One line shown to the user: why you need it"),
+      }),
+      execute: safe(async (args) => env.requestSkill!(args)),
+    });
+  }
+
   if (env?.listAmbientRules && enabled.has("list_ambient_rules")) {
     tools.list_ambient_rules = tool({
       description:
@@ -1338,6 +1438,43 @@ export async function buildTools(
         }
       }),
     });
+  }
+
+  // Access-policy gate (Phase 1). The policy was pinned into the agent
+  // snapshot at session create; this is the deterministic enforcement point
+  // for EVERY tool the DefaultHarness can call — built-ins, MCP (discovered
+  // dynamically above), delegation, custom. deny = the tool is dropped from
+  // the dict entirely, so the model cannot see or call it; ask = execute is
+  // stripped so the AI SDK surfaces a pending call (same mechanics as the
+  // legacy always_ask path below). Runs before the legacy pass so a policy
+  // "ask" and a config "always_ask" converge on the same shape.
+  const policy = agentConfig.effective_policy;
+  if (policy?.rules?.length) {
+    const audited = env?.sessionId ? policyDenyAudited(env.sessionId) : null;
+    for (const [name, t] of Object.entries(tools)) {
+      const decision = evaluatePolicy(policy, name);
+      if (decision.effect === "deny") {
+        delete tools[name];
+        if (audited && !audited.has(name)) {
+          audited.add(name);
+          env?.broadcastEvent?.({
+            type: "system.policy_decision",
+            tool_name: name,
+            effect: "deny",
+            selector: decision.selector,
+            reason: "tool hidden from model by pinned access policy",
+          } as SessionEvent);
+        }
+      } else if (decision.effect === "ask") {
+        tools[name] = tool({
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          description: (t as any).description,
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          inputSchema: (t as any).parameters || (t as any).inputSchema,
+          // No execute — AI SDK treats this as a pending tool call
+        });
+      }
+    }
   }
 
   // Strip execute from always_ask tools so AI SDK returns them as pending calls

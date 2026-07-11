@@ -65,8 +65,10 @@ import {
 import {
   AgentService,
   AmbientRuleService,
+  PermissionGrantService,
   createCfAmbientRuleService,
   createCfAgentService,
+  createCfPermissionGrantService,
 } from "@open-managed-agents/agents-store";
 import {
   EnvironmentService,
@@ -127,6 +129,7 @@ export interface Services {
   modelCards: ModelCardService;
   agents: AgentService;
   ambientRules: AmbientRuleService;
+  permissionGrants: PermissionGrantService;
   environments: EnvironmentService;
   outboundSnapshots: OutboundSnapshotService;
   sessionSecrets: SessionSecretService;
@@ -304,6 +307,10 @@ export function buildServices(env: Env, db: D1Database): Services {
     ambientRules: pickBackend(overrides, "ambientRules", {
       cf: () => createCfAmbientRuleService({ db }),
       // pg: () => createPgAmbientRuleService({ pg: getPgPool(env) }),
+    }),
+    permissionGrants: pickBackend(overrides, "permissionGrants", {
+      cf: () => createCfPermissionGrantService({ db }),
+      // pg: () => createPgPermissionGrantService({ pg: getPgPool(env) }),
     }),
     environments: pickBackend(overrides, "environments", {
       cf: () => createCfEnvironmentService({ db }),

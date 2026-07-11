@@ -35,7 +35,12 @@ import {
   type SessionEvent,
 } from "@open-managed-agents/api-types";
 import type { AgentConfig } from "@open-managed-agents/shared";
-import { generateId } from "@open-managed-agents/shared";
+import {
+  ccToolNameToOma,
+  compileSdkDisallowedTools,
+  evaluatePolicy,
+  generateId,
+} from "@open-managed-agents/shared";
 
 /** Fields a setup session may change on its own harness. */
 export interface HarnessPatch {
@@ -49,6 +54,13 @@ export interface HarnessPatch {
 
 /** OMA session id → SDK session id, for `resume` continuity across turns. */
 const sdkSessions = new Map<string, string>();
+
+/** OMA session id → last harness view broadcast from THAT session's
+ *  update_harness calls. ctx.agent is the frozen session snapshot, so after
+ *  the first edit it no longer reflects reality — this map keeps the true
+ *  "before" for diff rendering across a multi-edit setup conversation.
+ *  In-memory like sdkSessions: a restart just resets the diff baseline. */
+const lastHarnessViews = new Map<string, Record<string, unknown>>();
 
 /** Footgun guidance appended to every SDK-harness system prompt — distilled
  *  from real failed sessions (see git history for the gh api 404 incident). */
@@ -115,6 +127,50 @@ export interface ClaudeAgentSdkHarnessDeps {
     agentId: string,
     patch: HarnessPatch,
   ) => Promise<AgentConfig>;
+  /**
+   * Agent-initiated credential request (the `request_access` tool). Appends
+   * a system.access_request event to the session so the console renders a
+   * one-click Composio connect card. Wired in main-node to the same
+   * postAccessRequest helper the DefaultHarness buildTools hook uses.
+   */
+  requestServiceAccess?: (
+    tenantId: string,
+    sessionId: string,
+    args: { service: string; reason: string; mcp_server_url?: string },
+  ) => Promise<{ request_id: string; status: string; note?: string }>;
+  /**
+   * Create a standing ambient rule on the session's agent (the
+   * `create_ambient_rule` tool). Main-node wires this to the same
+   * createAmbientRuleFromSession helper the DefaultHarness buildTools hook
+   * uses — it arms the first wake and appends the ambient-rule card event.
+   */
+  createAmbientRule?: (
+    tenantId: string,
+    sessionId: string,
+    agentId: string,
+    args: {
+      name: string;
+      description?: string;
+      cron: string;
+      timezone?: string;
+      prompt: string;
+      wake_mode?: "observe" | "decide" | "act" | "escalate";
+    },
+  ) => Promise<{ id: string; next_wake_at?: string }>;
+  /** Skill discovery (the `find_skill` tool) — tenant store + curated
+   *  catalog keyword search, same helper as the DefaultHarness hook. */
+  findSkills?: (
+    tenantId: string,
+    query: string,
+  ) => Promise<Array<{ name: string; description: string; installed: boolean; source?: string }>>;
+  /** Skill acquisition request (the `request_skill` tool) — appends a
+   *  system.skill_request event the console renders as an attach card. */
+  requestSkill?: (
+    tenantId: string,
+    agentId: string,
+    sessionId: string,
+    args: { skill_name: string; reason: string },
+  ) => Promise<{ request_id: string; status: string; note?: string }>;
 }
 
 function workdirFor(sessionId: string): string {
@@ -191,8 +247,9 @@ function buildSetupPrompt(agent: AgentConfig): string {
     JSON.stringify(harnessView(agent), null, 2),
     "```",
     "",
-    "You have exactly one tool and no file, shell, or web access:",
+    "You have exactly two tools and no file, shell, or web access:",
     "- update_harness: change fields on your own harness. Call it after EACH meaningful answer so the live config on the user's screen stays in sync. Pass only the fields that changed.",
+    "- request_access: pop a one-click connect card in the user's setup panel for a service that needs credentials. Pass the service slug (for an MCP server you added, use its exact `name`) and a one-line reason. The user authenticates in the popup and you get a message when the account is connected.",
     "",
     "Harness fields you can refine:",
     "- name / description: a short label + one-line summary of what you do.",
@@ -208,7 +265,7 @@ function buildSetupPrompt(agent: AgentConfig): string {
     "4. Be concise. In a sentence, say what you just changed (e.g. \"I rewrote my system prompt around daily triage and added the Notion server\").",
     "5. When the user is satisfied, confirm your harness is set and that you're ready to run.",
     "",
-    "Never invent credentials or secrets. For an MCP server that needs auth, add the server and tell the user they'll connect credentials afterward.",
+    "Never invent credentials or secrets, and never ask the user to paste keys or tokens in chat. For an MCP server that needs auth, add the server with update_harness, then call request_access for it (one call per server) so the user can authenticate right here — don't defer it to \"afterward\".",
   ].join("\n");
 }
 
@@ -301,7 +358,11 @@ export class ClaudeAgentSdkHarness {
             isError: !this.#deps.updateAgent,
           };
         }
+        const sessionKey = ctx.session_id ?? "";
+        const before = lastHarnessViews.get(sessionKey) ?? harnessView(ctx.agent);
         const updated = await this.#deps.updateAgent(tenantId, agentId, patch);
+        const after = harnessView(updated);
+        lastHarnessViews.set(sessionKey, after);
         runtime.broadcast({
           type: "agent.message",
           id: generateId(),
@@ -309,7 +370,10 @@ export class ClaudeAgentSdkHarness {
           metadata: {
             harness: OMA_SETUP_HARNESS,
             kind: OMA_SETUP_KIND_HARNESS_UPDATED,
-            harness_config: harnessView(updated),
+            harness_config: after,
+            // Previous values for the changed fields — the console renders
+            // the update as a red/green diff card from these two views.
+            harness_previous: before,
             changed,
           },
         } as SessionEvent);
@@ -321,6 +385,161 @@ export class ClaudeAgentSdkHarness {
       name: "oma_setup",
       version: "1",
       tools: [updateHarness],
+    });
+  }
+
+  /** In-process MCP server exposing platform tools (request_access,
+   *  create_ambient_rule) to the SDK child in both setup and working
+   *  sessions. The child calls back over the in-process transport, so the
+   *  handlers run HERE and can append session events directly. */
+  #platformServer(ctx: HarnessContext, sessionId: string) {
+    const tenantId = ctx.tenant_id ?? "default";
+    const requestAccess = tool(
+      "request_access",
+      "Ask the user to connect an external service you need but don't have access to (no connected " +
+        "account / credential) — e.g. Gmail, GitHub, Notion, HubSpot. Posts a connect card to the user's " +
+        "session view; they authenticate with one click and you receive a message when access is granted. " +
+        "Call this the moment a task needs a service you can't reach (a tool is missing, or its calls fail " +
+        "with an auth/not-connected error) instead of giving up or asking the user to paste secrets in chat. " +
+        "Never ask for API keys or passwords in the conversation. After calling, continue whatever work " +
+        "doesn't need the service, or end your turn and wait.",
+      {
+        service: z
+          .string()
+          .describe('Service/toolkit slug, lowercase (e.g. "gmail", "github", "notion", "hubspot")'),
+        reason: z
+          .string()
+          .describe('One line shown to the user: what you need it for (e.g. "to read this week\'s invoices")'),
+      } as unknown as SdkToolSchema,
+      async (args) => {
+        const a = args as { service?: string; reason?: string };
+        if (!a.service?.trim()) {
+          return { content: [{ type: "text" as const, text: "service is required" }], isError: true };
+        }
+        // Requested service that names one of the agent's own URL MCP
+        // servers (e.g. the github/notion/linear servers it added during
+        // setup) → the card runs vault MCP OAuth against that URL rather
+        // than the Composio connected-account flow.
+        const slug = a.service.trim().toLowerCase();
+        const matched = (ctx.agent.mcp_servers ?? []).find(
+          (s) => s?.name?.trim().toLowerCase() === slug && s.type !== "stdio" && !!s.url,
+        );
+        const result = await this.#deps.requestServiceAccess!(tenantId, sessionId, {
+          service: a.service,
+          reason: a.reason?.trim() || "The agent needs this service for the current task.",
+          ...(matched?.url ? { mcp_server_url: matched.url } : {}),
+        });
+        return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+      },
+    );
+    const tools = [requestAccess];
+
+    if (this.#deps.createAmbientRule) {
+      tools.push(
+        tool(
+          "create_ambient_rule",
+          "Create a standing ambient rule on THIS agent: on the given cron, the platform starts a FRESH " +
+            "session of this agent and injects `prompt` as the opening user message. Ambient rules outlive " +
+            "this conversation — use them when the user asks for a recurring job (\"do deep research on X " +
+            "every day\", \"check my email every morning\", \"review PRs as they come in on a schedule\"). " +
+            "Confirm the cadence and the task with the user before creating one; the rule appears as a card " +
+            "in their session view and can be managed later in the console's Ambient panel.",
+          {
+            name: z.string().describe('Short human-readable rule name, e.g. "Daily PR triage"'),
+            description: z.string().optional().describe("One-line summary shown in the console"),
+            cron: z.string().describe('5-field cron cadence (e.g. "0 9 * * *" = 9:00 daily)'),
+            timezone: z.string().optional().describe('IANA timezone for the cron (e.g. "America/Los_Angeles"). Defaults to UTC.'),
+            prompt: z.string().describe("Opening user message for each spawned session — the standing task, written to future-you"),
+            wake_mode: z.enum(["observe", "decide", "act", "escalate"]).optional()
+              .describe("act = do the task; decide (default) = assess then act if warranted; observe = log only; escalate = flag a human"),
+          } as unknown as SdkToolSchema,
+          async (args) => {
+            const a = args as {
+              name?: string; description?: string; cron?: string;
+              timezone?: string; prompt?: string;
+              wake_mode?: "observe" | "decide" | "act" | "escalate";
+            };
+            if (!a.name?.trim() || !a.cron?.trim() || !a.prompt?.trim()) {
+              return {
+                content: [{ type: "text" as const, text: "name, cron, and prompt are required" }],
+                isError: true,
+              };
+            }
+            try {
+              const result = await this.#deps.createAmbientRule!(tenantId, sessionId, ctx.agent.id, {
+                name: a.name,
+                description: a.description,
+                cron: a.cron,
+                timezone: a.timezone,
+                prompt: a.prompt,
+                wake_mode: a.wake_mode,
+              });
+              return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+            } catch (err) {
+              return {
+                content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }],
+                isError: true,
+              };
+            }
+          },
+        ),
+      );
+    }
+
+    if (this.#deps.findSkills) {
+      tools.push(
+        tool(
+          "find_skill",
+          "Search available skills (installed + curated catalog) by keyword. A skill is a SKILL.md " +
+            "playbook that teaches you how to do a class of task well (e.g. xlsx spreadsheets, pdf " +
+            "manipulation, frontend design). Use when a task would benefit from domain expertise you " +
+            "don't currently have loaded — then call request_skill to ask the user to attach one.",
+          {
+            query: z.string().describe('Keywords, e.g. "spreadsheet excel" or "pdf"'),
+          } as unknown as SdkToolSchema,
+          async (args) => {
+            const a = args as { query?: string };
+            if (!a.query?.trim()) {
+              return { content: [{ type: "text" as const, text: "query is required" }], isError: true };
+            }
+            const skills = await this.#deps.findSkills!(tenantId, a.query);
+            return { content: [{ type: "text" as const, text: JSON.stringify({ skills }) }] };
+          },
+        ),
+      );
+    }
+
+    if (this.#deps.requestSkill) {
+      tools.push(
+        tool(
+          "request_skill",
+          "Ask the user to attach a skill to you (use find_skill first to discover the right name). " +
+            "Posts an attach card to the user's session view; on approval the skill is security-scanned, " +
+            "attached to your config, and its content is injected into THIS session so you can use it " +
+            "immediately. Continue other work or end your turn while you wait.",
+          {
+            skill_name: z.string().describe('Skill name from find_skill (e.g. "xlsx")'),
+            reason: z.string().describe("One line shown to the user: why you need it"),
+          } as unknown as SdkToolSchema,
+          async (args) => {
+            const a = args as { skill_name?: string; reason?: string };
+            if (!a.skill_name?.trim()) {
+              return { content: [{ type: "text" as const, text: "skill_name is required" }], isError: true };
+            }
+            const result = await this.#deps.requestSkill!(tenantId, ctx.agent.id, sessionId, {
+              skill_name: a.skill_name,
+              reason: a.reason?.trim() || "The agent needs this skill for the current task.",
+            });
+            return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+          },
+        ),
+      );
+    }
+
+    return createSdkMcpServer({
+      name: "oma_platform",
+      version: "1",
+      tools,
     });
   }
 
@@ -371,9 +590,32 @@ export class ClaudeAgentSdkHarness {
       sessionId,
     );
     const isSetup = sessionMeta?.["oma_setup"] === true && !!this.#deps.updateAgent;
-    const mcpServersForTurn = isSetup
-      ? { ...(mcpServers ?? {}), oma_setup: this.#setupServer(ctx, runtime) }
-      : mcpServers;
+    // request_access rides along in BOTH modes: in setup it's how the agent
+    // hands the user the OAuth popups for the servers it just added to its
+    // own harness; in working sessions it covers services hit mid-task.
+    type SdkMcpEntry =
+      | ReturnType<typeof createSdkMcpServer>
+      | { type: "http"; url: string; headers: Record<string, string> };
+    let mcpServersForTurn: Record<string, SdkMcpEntry> | undefined = mcpServers;
+    if (isSetup || this.#deps.requestServiceAccess) {
+      const withInProcess: Record<string, SdkMcpEntry> = { ...(mcpServers ?? {}) };
+      if (isSetup) withInProcess.oma_setup = this.#setupServer(ctx, runtime);
+      if (this.#deps.requestServiceAccess) {
+        withInProcess.oma_platform = this.#platformServer(ctx, sessionId);
+      }
+      mcpServersForTurn = withInProcess;
+    }
+
+    // The pinned access policy (snapshot enrichment set at session create).
+    // This harness never runs buildTools(), so the same policy is compiled
+    // into SDK-native controls: a static disallowedTools list for exact-name
+    // deny rules, plus a canUseTool backstop that re-evaluates every call in
+    // the OMA namespace (covers glob selectors and dynamically-discovered
+    // MCP tools). Phase 1 enforces deny only on this path — "ask" passes
+    // through until the SDK confirmation round-trip lands (plan Phase 4).
+    const policy = ctx.agent.effective_policy;
+    const hasPolicy = !!policy?.rules?.length;
+    const disallowedTools = compileSdkDisallowedTools(policy);
 
     try {
       const stream = query({
@@ -396,7 +638,39 @@ export class ClaudeAgentSdkHarness {
               },
           // Headless: OMA has no tool-confirmation round-trip on this path
           // yet, and the child is already scoped to a per-session workdir.
-          permissionMode: "bypassPermissions",
+          // With a pinned policy, bypassPermissions would skip canUseTool
+          // entirely — so policy sessions run permissionMode "default" and
+          // the callback below answers every check (deny per policy, allow
+          // otherwise), keeping the turn headless while enforcing the gate.
+          permissionMode: hasPolicy ? "default" : "bypassPermissions",
+          ...(disallowedTools.length > 0 ? { disallowedTools } : {}),
+          ...(hasPolicy
+            ? {
+                canUseTool: async (
+                  toolName: string,
+                  input: Record<string, unknown>,
+                ) => {
+                  const decision = evaluatePolicy(
+                    policy,
+                    ccToolNameToOma(toolName),
+                  );
+                  if (decision.effect === "deny") {
+                    runtime.broadcast({
+                      type: "system.policy_decision",
+                      tool_name: ccToolNameToOma(toolName),
+                      effect: "deny",
+                      selector: decision.selector,
+                      reason: "tool call denied by pinned access policy",
+                    } as SessionEvent);
+                    return {
+                      behavior: "deny" as const,
+                      message: `Denied by access policy (rule: ${decision.selector ?? "default"}). This tool is not available in this session.`,
+                    };
+                  }
+                  return { behavior: "allow" as const, updatedInput: input };
+                },
+              }
+            : {}),
           // Project scope only when skills are attached (discovery is
           // governed by settingSources; the cwd is platform-owned so
           // "project" exposes exactly what we materialized). Never "user" —
@@ -407,10 +681,54 @@ export class ClaudeAgentSdkHarness {
           // oma_setup MCP closure, and lock out any on-disk MCP config.
           ...(isSetup ? { tools: [], strictMcpConfig: true } : {}),
           maxTurns: isSetup ? 30 : 50,
+          // Token-level partial events so text streams into the console
+          // instead of landing as one block per assistant message.
+          includePartialMessages: true,
         },
       });
 
+      // Live text streaming. Each streamed text block gets a minted message
+      // id; the ids queue up in order and the canonical assistant message
+      // (which arrives after the block completes) consumes them FIFO so the
+      // committed agent.message carries the SAME id as its chunks — clients
+      // fold the stream bubble into the final message by that id.
+      const streamedTextIds: string[] = [];
+      let liveTextId: string | null = null;
+      let liveTextChars = 0;
+      const endLiveText = async (status: "completed" | "aborted") => {
+        if (!liveTextId) return;
+        const id = liveTextId;
+        liveTextId = null;
+        liveTextChars = 0;
+        await runtime.broadcastStreamEnd(id, status).catch(() => {});
+      };
+
       for await (const msg of stream) {
+        if (msg.type === "stream_event") {
+          const ev = (msg as { event?: { type?: string; content_block?: { type?: string }; delta?: { type?: string; text?: string } } }).event;
+          if (!ev) continue;
+          if (ev.type === "content_block_start" && ev.content_block?.type === "text") {
+            liveTextId = generateId();
+            liveTextChars = 0;
+            streamedTextIds.push(liveTextId);
+            await runtime.broadcastStreamStart(liveTextId).catch(() => {});
+          } else if (
+            ev.type === "content_block_delta" &&
+            ev.delta?.type === "text_delta" &&
+            liveTextId &&
+            ev.delta.text
+          ) {
+            liveTextChars += ev.delta.text.length;
+            await runtime.broadcastChunk(liveTextId, ev.delta.text).catch(() => {});
+          } else if (ev.type === "content_block_stop") {
+            // A zero-delta text block never produces a canonical agent.message
+            // (empty text is skipped below) — drop its queued id so later
+            // blocks don't fold onto the wrong message.
+            if (liveTextId && liveTextChars === 0) streamedTextIds.pop();
+            await endLiveText("completed");
+          }
+          continue;
+        }
         if (msg.type === "system" && "subtype" in msg && msg.subtype === "init") {
           sdkSessions.set(sessionId, (msg as { session_id: string }).session_id);
           continue;
@@ -419,9 +737,11 @@ export class ClaudeAgentSdkHarness {
           sdkSessions.set(sessionId, msg.session_id);
           for (const block of msg.message.content) {
             if (block.type === "text" && block.text.trim()) {
+              const streamedId = streamedTextIds.shift();
               runtime.broadcast({
                 type: "agent.message",
-                id: generateId(),
+                id: streamedId ?? generateId(),
+                ...(streamedId ? { message_id: streamedId } : {}),
                 content: [{ type: "text", text: block.text }],
               } as SessionEvent);
             } else if (block.type === "tool_use") {
@@ -468,5 +788,9 @@ export class ClaudeAgentSdkHarness {
       runtime.broadcast({ type: "session.error", error: message } as SessionEvent);
       throw err;
     }
+
+    // The endLiveText closure lives inside the try; any stream that died
+    // mid-block was already ended as "aborted" by the recovery scan or the
+    // catch above — nothing to clean up here.
   }
 }

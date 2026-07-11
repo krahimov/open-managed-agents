@@ -36,6 +36,7 @@ import {
 import {
   createSqliteAgentService,
   createSqliteAmbientRuleService,
+  createSqlitePermissionGrantService,
 } from "@open-managed-agents/agents-store";
 import {
   createSqliteMemoryStoreService,
@@ -408,6 +409,7 @@ if (clerkStore) {
 
 const agentsService = createSqliteAgentService({ db: drizzleDb });
 const ambientRulesService = createSqliteAmbientRuleService({ db: drizzleDb });
+const permissionGrantService = createSqlitePermissionGrantService({ db: drizzleDb });
 const vaultService = createSqliteVaultService({ db: drizzleDb });
 const credentialService = createSqliteCredentialService({ db: drizzleDb });
 const sessionsService = createSqliteSessionService({ db: drizzleDb });
@@ -435,7 +437,9 @@ if (webhookStore) await webhookStore.ensureSchema();
 if (webhookStore) startWebhookDeliveryPoller({ store: webhookStore });
 
 // ─── Skills (SKILL.md storage + GitHub import) ─────────────────────────────
-const { SkillStore } = await import("./lib/skills.js");
+const { SkillStore, parseFrontmatter: parseSkillFrontmatter } = await import("./lib/skills.js");
+const { CURATED_SKILL_CATALOG } = await import("./lib/skill-catalog.js");
+const { scanSkillContent, extractUrlFromCurl } = await import("./lib/skill-scan.js");
 const skillStore = new SkillStore(sql);
 await skillStore.ensureSchema();
 
@@ -705,27 +709,8 @@ const sessionRegistry = new SessionRegistry({
       // run" said in chat becomes a standing agent-level rule the ambient
       // dispatcher fires as fresh sessions. next_wake_at is armed here from
       // the cron so the rule is live the moment the tool returns.
-      createAmbientRule: async (a) => {
-        const timezone = a.timezone?.trim() || "UTC";
-        const next = new Cron(a.cron, { timezone }).nextRun();
-        if (!next) throw new Error(`cron "${a.cron}" has no future occurrence`);
-        const row = await ambientRulesService.create({
-          tenantId: context.tenantId,
-          agentId: agent.id,
-          input: {
-            name: a.name,
-            ...(a.description ? { description: a.description } : {}),
-            trigger: {
-              source: "schedule",
-              config: { cron: a.cron, timezone, prompt: a.prompt },
-            },
-            wake_mode: a.wake_mode ?? "decide",
-            next_wake_at: next.toISOString(),
-            created_by: `session:${context.sessionId}`,
-          },
-        });
-        return { id: row.id, next_wake_at: row.next_wake_at };
-      },
+      createAmbientRule: (a) =>
+        createAmbientRuleFromSession(context.tenantId, agent.id, context.sessionId, a),
       listAmbientRules: async () => {
         const rows = await ambientRulesService.listByAgent({
           tenantId: context.tenantId,
@@ -748,6 +733,20 @@ const sessionRegistry = new SessionRegistry({
         });
         return { deleted: true };
       },
+      // Agent-initiated credential requests — "I need Gmail for this" from
+      // inside the session becomes a connect card in the console; the user
+      // one-clicks through the provider OAuth popup and the agent gets a
+      // message when the account lands. No secrets ever transit the chat.
+      requestServiceAccess: (a) =>
+        postAccessRequest(context.tenantId, context.sessionId, {
+          ...a,
+          mcp_server_url: matchAgentMcpServer(agent, a.service),
+        }),
+      // Agent-initiated skill acquisition — discovery over the tenant store
+      // + curated catalog, and an attach-request card the human ratifies.
+      findSkills: (query) => findSkillsForTenant(context.tenantId, query),
+      requestSkill: (a) =>
+        postSkillRequest(context.tenantId, agent.id, context.sessionId, a),
     });
   },
   buildHarness: () => {
@@ -766,6 +765,15 @@ const sessionRegistry = new SessionRegistry({
       updateAgent: async (tenantId, agentId, patch) => {
         return await agentsService.update({ tenantId, agentId, input: patch });
       },
+      // request_access + create_ambient_rule on the SDK harness — same event
+      // pipeline as the DefaultHarness buildTools hooks.
+      requestServiceAccess: (tenantId, sessionId, a) =>
+        postAccessRequest(tenantId, sessionId, a),
+      createAmbientRule: (tenantId, sessionId, agentId, a) =>
+        createAmbientRuleFromSession(tenantId, agentId, sessionId, a),
+      findSkills: (tenantId, query) => findSkillsForTenant(tenantId, query),
+      requestSkill: (tenantId, agentId, sessionId, a) =>
+        postSkillRequest(tenantId, agentId, sessionId, a),
     });
     return {
       run: (ctx: unknown) => {
@@ -900,6 +908,7 @@ const services: RouteServices = {
   sql,
   agents: agentsService,
   ambientRules: ambientRulesService,
+  permissionGrants: permissionGrantService,
   vaults: vaultService,
   credentials: credentialService,
   memory: memoryService,
@@ -1237,6 +1246,9 @@ const maxAgentsPerTenant = resolveMaxAgentsPerTenant();
 v1.route("/agents", buildAgentRoutes({
   services,
   validateModel: validateNodeModel,
+  // Auth-enabled deployments must not accept client-supplied approved_by on
+  // grant writes — approvals are audit evidence and need verified identity.
+  requireVerifiedApprover: !authDisabled,
   ...(maxAgentsPerTenant
     ? { preCreateGate: buildAgentPreCreateGate({ sql, maxAgents: maxAgentsPerTenant }) }
     : {}),
@@ -1248,6 +1260,262 @@ const sessionRouter = new NodeSessionRouter({
   newEventLog,
   workQueue: sessionWorkQueue,
 });
+
+/**
+ * Create a standing ambient rule from inside a session — the backend half of
+ * the agent's `create_ambient_rule` tool on BOTH harnesses. Arms the first
+ * wake from the cron and appends a system.ambient_rule_created event so the
+ * console renders the new rule as a card instead of a raw tool result.
+ * Function declaration (hoisted) so the buildTools/buildHarness closures
+ * above can reference it.
+ */
+async function createAmbientRuleFromSession(
+  tenantId: string,
+  agentId: string,
+  sessionId: string,
+  a: {
+    name: string;
+    description?: string;
+    cron: string;
+    timezone?: string;
+    prompt: string;
+    wake_mode?: "observe" | "decide" | "act" | "escalate";
+  },
+): Promise<{ id: string; next_wake_at?: string }> {
+  const timezone = a.timezone?.trim() || "UTC";
+  const next = new Cron(a.cron, { timezone }).nextRun();
+  if (!next) throw new Error(`cron "${a.cron}" has no future occurrence`);
+  const row = await ambientRulesService.create({
+    tenantId,
+    agentId,
+    input: {
+      name: a.name,
+      ...(a.description ? { description: a.description } : {}),
+      trigger: {
+        source: "schedule",
+        config: { cron: a.cron, timezone, prompt: a.prompt },
+      },
+      wake_mode: a.wake_mode ?? "decide",
+      next_wake_at: next.toISOString(),
+      created_by: `session:${sessionId}`,
+    },
+  });
+  await sessionRouter
+    .appendEvent(sessionId, {
+      type: "system.ambient_rule_created",
+      id: generateEventId(),
+      rule_id: row.id,
+      name: row.name,
+      ...(a.description ? { description: a.description } : {}),
+      cron: a.cron,
+      timezone,
+      wake_mode: row.wake_mode,
+      prompt: a.prompt,
+      ...(row.next_wake_at ? { next_wake_at: row.next_wake_at } : {}),
+    } as SessionEvent)
+    .catch(() => {
+      // Card is presentation only — the rule itself is already created.
+    });
+  return { id: row.id, next_wake_at: row.next_wake_at };
+}
+
+/**
+ * Append a system.access_request event to a session — the backend half of
+ * the agent's `request_access` tool (both harnesses call this). The console
+ * renders the event as a one-click connect card wired to the existing
+ * Composio link/callback popup flow. Function declaration (hoisted) so the
+ * buildTools/buildHarness closures above can reference it.
+ */
+async function postAccessRequest(
+  tenantId: string,
+  sessionId: string,
+  args: { service: string; reason: string; mcp_server_url?: string },
+): Promise<{ request_id: string; status: string; note?: string }> {
+  const service = args.service.trim().toLowerCase();
+  const mcpServerUrl = args.mcp_server_url?.trim() || undefined;
+  const key = mcpServerUrl ? null : await composioKeyForTenant(tenantId).catch(() => null);
+  const requestId = `acreq-${generateEventId().replace(/^sevt-/, "")}`;
+  await sessionRouter.appendEvent(sessionId, {
+    type: "system.access_request",
+    id: generateEventId(),
+    request_id: requestId,
+    service,
+    reason: args.reason,
+    ...(mcpServerUrl
+      ? { mcp_server_url: mcpServerUrl }
+      : { composio_configured: !!key }),
+  } as SessionEvent);
+  return {
+    request_id: requestId,
+    status: "pending",
+    note:
+      mcpServerUrl || key
+        ? `Connect card for "${service}" posted to the user's session view. You'll receive a message when access is granted — continue any work that doesn't need it, or end your turn and wait.`
+        : `Request posted, but this workspace has no Composio account connected yet — the user is being guided to connect one (Console → Apps) before authorizing "${service}".`,
+  };
+}
+
+/** Match a requested service slug against the agent's own URL MCP servers by
+ *  name — when it hits, the connect card runs vault MCP OAuth against that
+ *  server instead of the Composio flow. */
+function matchAgentMcpServer(
+  agent: { mcp_servers?: Array<{ name?: string; type?: string; url?: string }> } | null | undefined,
+  service: string,
+): string | undefined {
+  const slug = service.trim().toLowerCase();
+  const hit = (agent?.mcp_servers ?? []).find(
+    (s) => s?.name?.trim().toLowerCase() === slug && s.type !== "stdio" && !!s.url,
+  );
+  return hit?.url;
+}
+/** Keyword search over installed skills + curated catalog (installed wins
+ *  name conflicts). The discovery half of agent skill acquisition. */
+async function findSkillsForTenant(
+  tenantId: string,
+  query: string,
+): Promise<Array<{ name: string; description: string; installed: boolean; source?: string }>> {
+  const tokens = query.toLowerCase().split(/\s+/).filter(Boolean);
+  const matches = (name: string, desc: string) => {
+    const hay = `${name} ${desc}`.toLowerCase();
+    return tokens.some((t) => hay.includes(t));
+  };
+  const installed = await skillStore.list(tenantId);
+  const out: Array<{ name: string; description: string; installed: boolean; source?: string }> = [];
+  for (const s of installed) {
+    if (matches(s.name, s.description)) {
+      out.push({ name: s.name, description: s.description.slice(0, 160), installed: true });
+    }
+  }
+  const have = new Set(out.map((s) => s.name));
+  for (const e of CURATED_SKILL_CATALOG) {
+    if (!have.has(e.name) && matches(e.name, e.description)) {
+      out.push({
+        name: e.name,
+        description: e.description.slice(0, 160),
+        installed: false,
+        source: e.source,
+      });
+    }
+  }
+  return out.slice(0, 8);
+}
+
+/** Append a system.skill_request event — backend half of the agent's
+ *  request_skill tool. Resolution tells the console card what one click
+ *  should do: attach an installed skill, or install-from-catalog first. */
+async function postSkillRequest(
+  tenantId: string,
+  agentId: string,
+  sessionId: string,
+  args: { skill_name: string; reason: string },
+): Promise<{ request_id: string; status: string; note?: string }> {
+  const name = args.skill_name.trim().toLowerCase();
+  const installed = (await skillStore.list(tenantId)).find((s) => s.name === name);
+  const catalog = installed ? undefined : CURATED_SKILL_CATALOG.find((e) => e.name === name);
+  const requestId = `skreq-${generateEventId().replace(/^sevt-/, "")}`;
+  await sessionRouter.appendEvent(sessionId, {
+    type: "system.skill_request",
+    id: generateEventId(),
+    request_id: requestId,
+    agent_id: agentId,
+    skill_name: name,
+    reason: args.reason,
+    ...(installed ? { skill_id: installed.id, description: installed.description } : {}),
+    ...(catalog ? { catalog_source: catalog.source, description: catalog.description } : {}),
+    resolution: installed ? "installed" : catalog ? "catalog" : "unknown",
+  } as SessionEvent);
+  return {
+    request_id: requestId,
+    status: "pending",
+    note: installed
+      ? `Attach card for installed skill "${name}" posted — you'll get its playbook in a message once the user approves.`
+      : catalog
+        ? `Attach card posted — "${name}" is in the curated catalog; approval will security-scan, install, and attach it.`
+        : `Request posted, but no skill named "${name}" exists in the store or catalog — the user can import one from a URL. Consider find_skill to check alternatives.`,
+  };
+}
+
+// Ratification endpoint behind the skill-request card: install if needed
+// (quarantine-enforced — blocked content 422s here regardless of UI),
+// attach to the agent's skills refs, and inject the playbook into the
+// running session so the agent can use it THIS turn (the session snapshot
+// is frozen, so a config-only attach wouldn't reach it until a new session).
+v1.post("/skills/acquire", async (c) => {
+  const body = await c.req
+    .json<{ agent_id?: string; session_id?: string; skill_id?: string; source?: string }>()
+    .catch(() => null);
+  if (!body?.agent_id || (!body.skill_id && !body.source)) {
+    return c.json({ error: "agent_id and one of skill_id | source required" }, 400);
+  }
+  const tenantId = c.get("tenant_id");
+  try {
+    let skill = body.skill_id ? await skillStore.get(tenantId, body.skill_id) : null;
+    if (!skill && body.source) {
+      const candidates = await skillStore.fetchFromSource(body.source);
+      const cand = candidates[0];
+      if (!cand) return c.json({ error: "no SKILL.md at source" }, 404);
+      const installedNames = (await skillStore.list(tenantId)).map((s) => s.name);
+      const report = scanSkillContent(cand.content, { installedNames });
+      if (report.verdict === "blocked") {
+        return c.json({ error: "skill blocked by security scan", report }, 422);
+      }
+      const curated = body.source.startsWith("anthropics/skills/");
+      skill = await skillStore.create({
+        tenantId,
+        content: cand.content,
+        source: cand.source,
+        contentHash: report.content_sha256,
+        securityStatus:
+          curated && report.verdict === "pass" ? "curated" : report.verdict === "pass" ? "approved" : "flagged",
+        securityReport: JSON.stringify(report),
+      });
+    }
+    if (!skill) return c.json({ error: "skill not found" }, 404);
+
+    const agentRow = await agentsService.get({ tenantId, agentId: body.agent_id });
+    if (!agentRow) return c.json({ error: "agent not found" }, 404);
+
+    // Tenant scoping on the injection target: a caller-supplied session_id
+    // must resolve within the caller's own tenant BEFORE we mutate anything
+    // — otherwise this endpoint would let one tenant append a user.message
+    // (with an arbitrary playbook) into another tenant's running session.
+    if (body.session_id) {
+      const session = await sessionsService
+        .get({ tenantId, sessionId: body.session_id })
+        .catch(() => null);
+      if (!session) return c.json({ error: "session not found" }, 404);
+    }
+
+    const existingRefs =
+      (agentRow as { skills?: Array<{ skill_id: string; type: string }> }).skills ?? [];
+    if (!existingRefs.some((r) => r.skill_id === skill.id)) {
+      await agentsService.update({
+        tenantId,
+        agentId: body.agent_id,
+        input: { skills: [...existingRefs, { type: "custom", skill_id: skill.id }] } as never,
+      });
+    }
+
+    // Inject into the running session (its snapshot is frozen) — the
+    // user.message both wakes the turn loop and carries the playbook.
+    if (body.session_id) {
+      await sessionRouter.appendEvent(body.session_id, {
+        type: "user.message",
+        id: generateEventId(),
+        content: [
+          {
+            type: "text",
+            text: `[skill attached] "${skill.name}" is now attached to you. Its playbook follows — apply it and continue where you left off.\n\n---\n\n${skill.content}`,
+          },
+        ],
+      } as SessionEvent);
+    }
+    return c.json({ attached: true, skill_id: skill.id, name: skill.name });
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : "acquire failed" }, 400);
+  }
+});
+
 const sessionRoutesApp = buildSessionRoutes({
   services,
   router: sessionRouter,
@@ -1509,11 +1777,82 @@ v1.get("/runtimes", (c) => {
 });
 // Skills — SKILL.md storage, agent-attachable, importable from GitHub.
 v1.get("/skills", async (c) => c.json({ data: await skillStore.list(c.get("tenant_id")) }));
+
+// Curated catalog — static in-repo manifest (anthropics/skills) annotated
+// with per-tenant installed state. Registered before /skills/:id so the
+// literal segment isn't swallowed by the param route.
+v1.get("/skills/catalog", async (c) => {
+  const installed = await skillStore.list(c.get("tenant_id"));
+  const names = new Set(installed.map((s) => s.name));
+  return c.json({
+    data: CURATED_SKILL_CATALOG.map((e) => ({
+      ...e,
+      curated: true,
+      installed: names.has(e.name),
+    })),
+  });
+});
+
+// Quarantine stage 1+2: fetch + static scan WITHOUT installing. Accepts a
+// URL, owner/repo[/path] shorthand, a pasted `curl …` one-liner (MCP Market
+// hands users those), or inline content. The console shows the returned
+// report card; approval calls POST /skills with the content.
+v1.post("/skills/scan", async (c) => {
+  const body = await c.req
+    .json<{ source?: string; content?: string }>()
+    .catch(() => null);
+  if (!body?.source && !body?.content) {
+    return c.json({ error: "source (URL / owner/repo / curl command) or content required" }, 400);
+  }
+  try {
+    const tenantId = c.get("tenant_id");
+    const installedNames = (await skillStore.list(tenantId)).map((s) => s.name);
+    const candidates = body.content
+      ? [{ content: body.content, source: body.source ?? "" }]
+      : await skillStore.fetchFromSource(
+          extractUrlFromCurl(body.source!) ?? body.source!,
+        );
+    const data = candidates.map((cand) => {
+      const fm = parseSkillFrontmatter(cand.content);
+      return {
+        source: cand.source,
+        name: fm.name ?? "",
+        description: fm.description ?? "",
+        content: cand.content,
+        report: scanSkillContent(cand.content, { installedNames }),
+      };
+    });
+    return c.json({ data });
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : "scan failed" }, 400);
+  }
+});
+
 v1.post("/skills", async (c) => {
-  const body = await c.req.json<{ content?: string; name?: string }>().catch(() => null);
+  const body = await c.req.json<{ content?: string; name?: string; source?: string }>().catch(() => null);
   if (!body?.content) return c.json({ error: "content (SKILL.md text) required" }, 400);
   try {
-    return c.json(await skillStore.create({ tenantId: c.get("tenant_id"), content: body.content, name: body.name }), 201);
+    const tenantId = c.get("tenant_id");
+    // Re-scan server-side at install time — the client's report is display
+    // only. Hard blocks stop the install regardless of what the UI said;
+    // the human ratifies flags, never blocks.
+    const installedNames = (await skillStore.list(tenantId)).map((s) => s.name);
+    const report = scanSkillContent(body.content, { installedNames });
+    if (report.verdict === "blocked") {
+      return c.json({ error: "skill blocked by security scan", report }, 422);
+    }
+    const curated =
+      typeof body.source === "string" && body.source.startsWith("anthropics/skills/");
+    const row = await skillStore.create({
+      tenantId,
+      content: body.content,
+      name: body.name,
+      source: body.source,
+      contentHash: report.content_sha256,
+      securityStatus: curated && report.verdict === "pass" ? "curated" : report.verdict === "pass" ? "approved" : "flagged",
+      securityReport: JSON.stringify(report),
+    });
+    return c.json(row, 201);
   } catch (err) {
     return c.json({ error: err instanceof Error ? err.message : "create failed" }, 400);
   }

@@ -22,6 +22,7 @@ export function cfRouteServices(c: Context<AppContextLike>): RouteServices {
     sql,
     agents: services.agents,
     ambientRules: services.ambientRules,
+    permissionGrants: services.permissionGrants,
     vaults: services.vaults,
     credentials: services.credentials,
     memory: services.memory,

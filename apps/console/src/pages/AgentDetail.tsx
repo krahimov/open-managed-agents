@@ -284,6 +284,8 @@ export function AgentDetail() {
         rules={ambientRulesRes?.data ?? []}
       />
 
+      <AccessPanel agentId={agent.id} />
+
       {/* System prompt */}
       {agent.system && (
         <div className="mt-8 max-w-2xl">
@@ -328,6 +330,95 @@ export function AgentDetail() {
         initialAgentId={agent.id}
       />
     </Page>
+  );
+}
+
+interface PermissionRuleView {
+  effect: "allow" | "ask" | "deny";
+  selector: string;
+  description?: string;
+}
+
+interface PermissionGrantView {
+  id: string;
+  version: number;
+  enabled: boolean;
+  rules: PermissionRuleView[];
+  approved_by: string;
+  created_at: string;
+}
+
+const EFFECT_CHIP: Record<PermissionRuleView["effect"], string> = {
+  allow: "text-success bg-success-subtle",
+  ask: "text-warning bg-warning-subtle",
+  deny: "text-danger bg-danger-subtle",
+};
+
+/**
+ * Access — read-only view of the agent's baseline permission grant
+ * (Phase 1). Grants are versioned and append-only; the active version is
+ * pinned into each new session's snapshot at create time, so edits here
+ * never affect running sessions. Editing flows through the API
+ * (PUT /v1/agents/:id/grants/baseline) — agent-authored proposals with
+ * diff approval land in Phase 2.
+ */
+function AccessPanel({ agentId }: { agentId: string }) {
+  const { data } = useApiQuery<{
+    baseline: PermissionGrantView | null;
+    versions: PermissionGrantView[];
+  }>(`/v1/agents/${agentId}/grants`, undefined, { enabled: true });
+
+  const baseline = data?.baseline ?? null;
+  const versions = data?.versions ?? [];
+
+  return (
+    <div className="mt-6 max-w-2xl">
+      <h2 className="font-display text-base font-semibold mb-2">Access</h2>
+      {!baseline || !baseline.enabled ? (
+        <div className="border border-border rounded-lg p-4 text-sm text-fg-subtle">
+          No access policy. This agent can use every tool its config exposes
+          (legacy behavior).
+          {baseline && !baseline.enabled && (
+            <span> The last grant (v{baseline.version}) is disabled.</span>
+          )}
+        </div>
+      ) : (
+        <div className="border border-border rounded-lg overflow-hidden">
+          <div className="flex items-center justify-between gap-3 px-4 py-2 bg-bg-surface/60 text-xs text-fg-muted">
+            <span>
+              Baseline grant <span className="font-mono">v{baseline.version}</span>
+              {" · "}applies to sessions created after approval
+            </span>
+            <span className="font-mono truncate">
+              approved by {baseline.approved_by}
+            </span>
+          </div>
+          <ul className="divide-y divide-border">
+            {baseline.rules.map((rule, i) => (
+              <li key={i} className="flex items-center gap-3 px-4 py-2 text-sm">
+                <span
+                  className={`inline-block rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${EFFECT_CHIP[rule.effect]}`}
+                >
+                  {rule.effect}
+                </span>
+                <span className="font-mono text-xs">{rule.selector}</span>
+                {rule.description && (
+                  <span className="text-xs text-fg-subtle truncate">
+                    {rule.description}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+          {versions.length > 1 && (
+            <div className="px-4 py-2 border-t border-border text-xs text-fg-subtle">
+              {versions.length} versions · latest{" "}
+              {new Date(baseline.created_at).toLocaleString()}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
