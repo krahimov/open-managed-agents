@@ -192,6 +192,12 @@ export interface AgentRoutesDeps {
   preCreateGate?: (input: {
     tenantId: string;
   }) => Promise<{ status: number; body: unknown } | null>;
+  /** When true (auth-enabled deployments), grant approvals REQUIRE a
+   *  verified user identity on the request — the client-supplied
+   *  approved_by fallback is refused so audit attribution can't be
+   *  spoofed by a tenant-scoped legacy API key. Auth-disabled dev keeps
+   *  the fallback (no identity exists to verify). */
+  requireVerifiedApprover?: boolean;
 }
 
 export function buildAgentRoutes(deps: AgentRoutesDeps) {
@@ -517,12 +523,20 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
       enabled?: unknown;
       approved_by?: unknown;
     };
+    const verifiedUser =
+      typeof c.var.user_id === "string" && c.var.user_id ? c.var.user_id : "";
+    if (deps.requireVerifiedApprover && !verifiedUser) {
+      return c.json(
+        {
+          error:
+            "user-scoped credential required: grant approvals need verified attribution — regenerate your API key (legacy keys lack user_id) or sign in with a session cookie",
+        },
+        403,
+      );
+    }
     const approvedBy =
-      typeof c.var.user_id === "string" && c.var.user_id
-        ? c.var.user_id
-        : typeof body.approved_by === "string"
-          ? body.approved_by
-          : "";
+      verifiedUser ||
+      (typeof body.approved_by === "string" ? body.approved_by : "");
     if (!approvedBy) {
       return c.json(
         { error: "approved_by is required (no authenticated user on request)" },

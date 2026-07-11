@@ -288,7 +288,11 @@ function isPrivateIp(ip: string): boolean {
   return /^f[cd]/i.test(ip) || /^fe80/i.test(ip);
 }
 
-async function urlAllowed(raw: string): Promise<boolean> {
+/** Shared SSRF gate: https-only public hosts (every resolved address must be
+ *  non-private). Also used by the skills import path — user-supplied URLs
+ *  must never read internal services. WEBHOOKS_ALLOW_PRIVATE=1 is the local-
+ *  dev escape hatch for both consumers. */
+export async function publicUrlAllowed(raw: string): Promise<boolean> {
   let u: URL;
   try {
     u = new URL(raw);
@@ -324,7 +328,7 @@ export function startWebhookDeliveryPoller(opts: {
         let ok = false;
         let status = "error";
         try {
-          if (!(await urlAllowed(d.url))) {
+          if (!(await publicUrlAllowed(d.url))) {
             status = "blocked_url";
           } else {
             const secret = await opts.store.secretFor(d.endpoint_id);

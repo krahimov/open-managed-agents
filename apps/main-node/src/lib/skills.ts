@@ -22,6 +22,7 @@
 
 import { nanoid } from "nanoid";
 import type { SqlClient } from "@open-managed-agents/sql-client";
+import { publicUrlAllowed } from "./webhooks.js";
 
 export interface SkillRow {
   id: string;
@@ -202,20 +203,36 @@ export class SkillStore {
   async fetchFromSource(
     source: string,
   ): Promise<Array<{ content: string; source: string }>> {
-    const fetchText = async (url: string): Promise<string | null> => {
+    const fetchText = async (
+      url: string,
+      redirect: "follow" | "error" | "manual" = "follow",
+    ): Promise<string | null> => {
       const res = await fetch(url, {
         headers: { "user-agent": "openma-skills-import/1.0" },
         signal: AbortSignal.timeout(15_000),
+        redirect,
       });
       if (!res.ok) return null;
       const text = await res.text();
       return text.length > MAX_SKILL_BYTES ? null : text;
     };
 
-    // Raw URL straight to a SKILL.md
+    // Raw URL straight to a SKILL.md. User-supplied, so it goes through the
+    // SSRF gate (public https hosts only) and redirects are refused — a
+    // public URL 302ing to an internal address must not be followed. The
+    // fixed-host GitHub fetches below skip both (host is ours to choose).
     if (/^https?:\/\//.test(source)) {
-      const text = await fetchText(source);
-      if (!text) throw new Error(`could not fetch ${source}`);
+      if (!(await publicUrlAllowed(source))) {
+        throw new Error(
+          "URL not allowed: skill imports fetch only public HTTPS hosts (private/internal addresses are blocked)",
+        );
+      }
+      const text = await fetchText(source, "error").catch(() => null);
+      if (!text) {
+        throw new Error(
+          `could not fetch ${source} (redirects are not followed — paste the final URL)`,
+        );
+      }
       return [{ content: text, source }];
     }
 

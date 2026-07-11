@@ -1241,6 +1241,9 @@ const maxAgentsPerTenant = resolveMaxAgentsPerTenant();
 v1.route("/agents", buildAgentRoutes({
   services,
   validateModel: validateNodeModel,
+  // Auth-enabled deployments must not accept client-supplied approved_by on
+  // grant writes — approvals are audit evidence and need verified identity.
+  requireVerifiedApprover: !authDisabled,
   ...(maxAgentsPerTenant
     ? { preCreateGate: buildAgentPreCreateGate({ sql, maxAgents: maxAgentsPerTenant }) }
     : {}),
