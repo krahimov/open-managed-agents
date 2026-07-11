@@ -1,7 +1,9 @@
 import { useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useParams, Link, useNavigate } from "react-router";
-import { useApi } from "../lib/api";
+import { toast } from "sonner";
+import { getActiveTenantId, useApi } from "../lib/api";
+import { getClerkBearerToken } from "../lib/clerk-auth";
 import { useApiQuery } from "../lib/useApiQuery";
 import { GitHubIcon, LinearIcon, SlackIcon } from "../components/icons";
 import { Page } from "../components/Page";
@@ -286,6 +288,8 @@ export function AgentDetail() {
 
       <AccessPanel agentId={agent.id} />
 
+      <AuditTrailPanel agentId={agent.id} agentName={agent.name} />
+
       {/* System prompt */}
       {agent.system && (
         <div className="mt-8 max-w-2xl">
@@ -418,6 +422,318 @@ function AccessPanel({ agentId }: { agentId: string }) {
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+// ── Audit trail (evidence export) ───────────────────────────────────────
+
+interface CapabilityEntryView {
+  tool: string;
+  effect: PermissionRuleView["effect"];
+  selector: string | null;
+}
+
+interface CapabilityView {
+  grant_id: string | null;
+  grant_version: number | null;
+  generated_at: string;
+  entries: CapabilityEntryView[];
+  notes: string[];
+}
+
+interface ApprovalVersionView extends PermissionGrantView {
+  diff: { added: PermissionRuleView[]; removed: PermissionRuleView[] };
+}
+
+interface ActivityView {
+  from: string;
+  to: string;
+  events: Array<{
+    ts_iso: string;
+    session_id: string;
+    event_type: string;
+    summary: string;
+  }>;
+  tool_use: Array<{
+    session_id: string;
+    tool_use_count: number;
+    mcp_tool_use_count: number;
+  }>;
+  truncated: boolean;
+  row_cap: number;
+}
+
+/** yyyy-mm-dd for <input type="date">. */
+const dateInputValue = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+
+/**
+ * Audit trail — the agent's authority record rendered from data that
+ * already exists: capability statement (tool surface evaluated through the
+ * pinned baseline grant), approval history (grant versions with rule
+ * diffs), and activity (audit frames + tool-use counts from the event
+ * log). Export prints just this section via the print-audit-only body
+ * class (see index.css); Download CSV streams the activity endpoint with
+ * format=csv.
+ */
+function AuditTrailPanel({
+  agentId,
+  agentName,
+}: {
+  agentId: string;
+  agentName: string;
+}) {
+  const [from, setFrom] = useState(() =>
+    dateInputValue(Date.now() - 7 * 24 * 60 * 60 * 1000),
+  );
+  const [to, setTo] = useState(() => dateInputValue(Date.now()));
+  // Date-only inputs → inclusive day bounds in the browser's timezone.
+  const fromIso = from ? new Date(`${from}T00:00:00`).toISOString() : undefined;
+  const toIso = to ? new Date(`${to}T23:59:59.999`).toISOString() : undefined;
+
+  const { data: capability } = useApiQuery<CapabilityView>(
+    `/v1/agents/${agentId}/evidence/capability`,
+  );
+  const { data: approvals } = useApiQuery<{ versions: ApprovalVersionView[] }>(
+    `/v1/agents/${agentId}/evidence/approvals`,
+  );
+  const { data: activity } = useApiQuery<ActivityView>(
+    `/v1/agents/${agentId}/evidence/activity`,
+    { from: fromIso, to: toIso },
+  );
+
+  const exportPrint = () => {
+    // Print just this section: the class scopes visibility in the print
+    // stylesheet. afterprint removes it so normal printing still works.
+    document.body.classList.add("print-audit-only");
+    window.addEventListener(
+      "afterprint",
+      () => document.body.classList.remove("print-audit-only"),
+      { once: true },
+    );
+    window.print();
+  };
+
+  const downloadCsv = async () => {
+    const qs = new URLSearchParams({ format: "csv" });
+    if (fromIso) qs.set("from", fromIso);
+    if (toIso) qs.set("to", toIso);
+    // Raw fetch instead of api(): the helper JSON-parses every body and
+    // this response is text/csv. Same auth headers it would send.
+    const clerkToken = await getClerkBearerToken();
+    const activeTenant = getActiveTenantId();
+    let res: Response;
+    try {
+      res = await fetch(
+        `/v1/agents/${agentId}/evidence/activity?${qs.toString()}`,
+        {
+          credentials: "include",
+          headers: {
+            ...(clerkToken ? { authorization: `Bearer ${clerkToken}` } : {}),
+            ...(activeTenant ? { "x-active-tenant": activeTenant } : {}),
+          },
+        },
+      );
+    } catch (err) {
+      // Same network-failure toast api() gives — the caller fires this
+      // with `void`, so an uncaught rejection would vanish silently.
+      toast.error(
+        `Network error: ${err instanceof Error ? err.message : "fetch failed"}`,
+      );
+      return;
+    }
+    if (!res.ok) {
+      toast.error(`CSV export failed (HTTP ${res.status})`);
+      return;
+    }
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `evidence-activity-${agentId}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const inputCls =
+    "px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg";
+
+  return (
+    <div className="mt-8 max-w-4xl audit-trail-print">
+      <div className="flex items-center justify-between gap-3 mb-3">
+        <div>
+          <h2 className="font-display text-base font-semibold">Audit trail</h2>
+          <p className="text-xs text-fg-subtle">
+            {agentName} · authority record generated{" "}
+            {capability ? new Date(capability.generated_at).toLocaleString() : "…"}
+          </p>
+        </div>
+        <Button variant="outline" size="sm" onClick={exportPrint} className="audit-no-print">
+          Export
+        </Button>
+      </div>
+
+      {/* Capability statement */}
+      <h3 className="font-display text-sm font-semibold mb-2">
+        Capability statement
+        {capability?.grant_id ? (
+          <span className="ml-2 font-mono text-xs font-normal text-fg-subtle">
+            grant {capability.grant_id} v{capability.grant_version}
+          </span>
+        ) : (
+          <span className="ml-2 text-xs font-normal text-fg-subtle">
+            no enabled grant — legacy allow-all
+          </span>
+        )}
+      </h3>
+      <div className="border border-border rounded-lg overflow-x-auto mb-2">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase">
+              <th className="text-left px-4 py-2">Tool</th>
+              <th className="text-left px-4 py-2">Effect</th>
+              <th className="text-left px-4 py-2">Rule</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(capability?.entries ?? []).map((e) => (
+              <tr key={e.tool} className="border-t border-border">
+                <td className="px-4 py-1.5 font-mono text-xs">{e.tool}</td>
+                <td className="px-4 py-1.5">
+                  <span
+                    className={`inline-block rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${EFFECT_CHIP[e.effect]}`}
+                  >
+                    {e.effect}
+                  </span>
+                </td>
+                <td className="px-4 py-1.5 font-mono text-xs text-fg-muted">
+                  {e.selector ?? "— default allow"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {(capability?.notes ?? []).map((n, i) => (
+        <p key={i} className="text-xs text-fg-subtle mb-1">
+          {n}
+        </p>
+      ))}
+
+      {/* Approval history */}
+      <h3 className="font-display text-sm font-semibold mt-6 mb-2">
+        Approval history
+      </h3>
+      {(approvals?.versions ?? []).length === 0 ? (
+        <div className="border border-border rounded-lg p-4 text-sm text-fg-subtle">
+          No grant versions yet — nothing has been approved for this agent.
+        </div>
+      ) : (
+        <div className="border border-border rounded-lg divide-y divide-border">
+          {(approvals?.versions ?? []).map((v) => (
+            <div key={v.version} className="px-4 py-2.5 text-sm">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                <span className="font-mono text-xs">v{v.version}</span>
+                {!v.enabled && <span className="text-xs text-warning">disabled</span>}
+                <span className="text-xs text-fg-muted">
+                  approved by <span className="font-mono">{v.approved_by}</span>
+                </span>
+                <span className="ml-auto text-xs text-fg-subtle">
+                  {new Date(v.created_at).toLocaleString()}
+                </span>
+              </div>
+              {(v.diff.added.length > 0 || v.diff.removed.length > 0) && (
+                <div className="mt-1.5 flex flex-wrap gap-1.5">
+                  {v.diff.added.map((r, i) => (
+                    <span
+                      key={`a${i}`}
+                      className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-success-subtle text-success"
+                    >
+                      + {r.effect} {r.selector}
+                    </span>
+                  ))}
+                  {v.diff.removed.map((r, i) => (
+                    <span
+                      key={`r${i}`}
+                      className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-danger-subtle text-danger"
+                    >
+                      − {r.effect} {r.selector}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Activity */}
+      <div className="flex flex-wrap items-center gap-3 mt-6 mb-2">
+        <h3 className="font-display text-sm font-semibold">Activity</h3>
+        <div className="flex items-center gap-2 audit-no-print">
+          <input
+            type="date"
+            value={from}
+            onChange={(e) => setFrom(e.target.value)}
+            className={inputCls}
+            aria-label="Activity from date"
+          />
+          <span className="text-xs text-fg-subtle">to</span>
+          <input
+            type="date"
+            value={to}
+            onChange={(e) => setTo(e.target.value)}
+            className={inputCls}
+            aria-label="Activity to date"
+          />
+        </div>
+        <button
+          onClick={() => void downloadCsv()}
+          className="ml-auto text-xs text-brand hover:underline audit-no-print"
+        >
+          Download CSV
+        </button>
+      </div>
+      {activity?.truncated && (
+        <p className="text-xs text-warning mb-2">
+          Showing the first {activity.row_cap} events in this range — narrow the
+          dates or use the CSV export.
+        </p>
+      )}
+      {(activity?.tool_use ?? []).length > 0 && (
+        <p className="text-xs text-fg-subtle mb-2">
+          Tool use:{" "}
+          {(activity?.tool_use ?? [])
+            .map(
+              (t) =>
+                `${t.session_id} (${t.tool_use_count} tool, ${t.mcp_tool_use_count} MCP)`,
+            )
+            .join(" · ")}
+        </p>
+      )}
+      <div className="border border-border rounded-lg overflow-hidden">
+        {(activity?.events ?? []).length === 0 ? (
+          <div className="px-4 py-6 text-sm text-fg-subtle">
+            No policy, skill, or access events in this range.
+          </div>
+        ) : (
+          <ul className="divide-y divide-border">
+            {(activity?.events ?? []).map((e, i) => (
+              <li key={i} className="flex items-baseline gap-3 px-4 py-1.5 text-sm">
+                <span className="font-mono text-xs text-fg-subtle whitespace-nowrap">
+                  {new Date(e.ts_iso).toLocaleString()}
+                </span>
+                <span className="min-w-0 truncate">{e.summary}</span>
+                <Link
+                  to={`/sessions/${e.session_id}`}
+                  className="ml-auto font-mono text-xs text-fg-subtle hover:text-fg whitespace-nowrap"
+                >
+                  {e.session_id.slice(0, 12)}…
+                </Link>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
     </div>
   );
 }

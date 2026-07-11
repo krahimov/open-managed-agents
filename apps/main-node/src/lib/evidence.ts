@@ -1,0 +1,276 @@
+// Evidence export — read-only audit projections over data that already
+// exists (grants, session_events). Three views:
+//
+//   capability  — what the agent CAN do right now: its tool surface
+//                 evaluated through the pinned baseline policy.
+//   approvals   — who approved what: grant version lineage with rule diffs.
+//   activity    — what it DID: policy/skill/access audit frames + per-session
+//                 tool-use counts from the event log.
+//
+// The compute functions are pure (unit-tested in test/unit/evidence.test.ts);
+// only queryEvidenceActivity touches SQL. Nothing here writes.
+
+import { evaluatePolicy } from "@open-managed-agents/shared";
+import type {
+  AgentConfig,
+  EffectivePolicy,
+  PermissionEffect,
+  PermissionRule,
+} from "@open-managed-agents/shared";
+import type { SqlClient } from "@open-managed-agents/sql-client";
+
+// ── Capability statement ────────────────────────────────────────────────
+
+export interface CapabilityEntry {
+  tool: string;
+  effect: PermissionEffect;
+  /** Selector of the winning rule; null = default allow (no rule matched). */
+  selector: string | null;
+}
+
+/**
+ * Enumerate the agent's tool surface and evaluate each name through the
+ * pinned policy. Built-in tools come from the caller (DEFAULT_TOOLS on the
+ * harness tools module — passed in so this stays pure and testable); custom
+ * tools from the agent config; MCP toolsets as one `mcp__<server>__*` row
+ * per server, because per-tool discovery only happens at session runtime.
+ */
+export function computeCapabilityStatement(opts: {
+  builtinTools: readonly string[];
+  agent: Pick<AgentConfig, "tools" | "mcp_servers">;
+  policy: EffectivePolicy | null;
+}): { entries: CapabilityEntry[]; notes: string[] } {
+  const names: string[] = [...opts.builtinTools];
+  for (const t of opts.agent.tools ?? []) {
+    if (t.type === "custom" && "name" in t && typeof t.name === "string" && t.name) {
+      names.push(t.name);
+    }
+  }
+  const mcpServers = (opts.agent.mcp_servers ?? []).filter((s) => !!s?.name);
+  for (const s of mcpServers) names.push(`mcp__${s.name}__*`);
+
+  const notes: string[] = [];
+  if (mcpServers.length > 0) {
+    notes.push(
+      "MCP tool lists are discovered at session runtime; mcp__<server>__* rows show the policy effect for the server namespace as a whole. Rules targeting individual MCP tools still apply at runtime but are not expanded here.",
+    );
+  }
+  if (!opts.policy) {
+    notes.push(
+      "No enabled baseline grant — every tool defaults to allow (legacy behavior).",
+    );
+  }
+
+  const seen = new Set<string>();
+  const entries: CapabilityEntry[] = [];
+  for (const name of names) {
+    if (seen.has(name)) continue;
+    seen.add(name);
+    const decision = evaluatePolicy(opts.policy, name);
+    entries.push({
+      tool: name,
+      effect: decision.effect,
+      selector: decision.selector ?? null,
+    });
+  }
+  return { entries, notes };
+}
+
+// ── Approval history ────────────────────────────────────────────────────
+
+/** Structural subset of PermissionGrantRow this module needs — keeps the
+ *  diff functions decoupled from the agents-store row type. */
+export interface GrantVersionInput {
+  id: string;
+  version: number;
+  enabled: boolean;
+  rules: PermissionRule[];
+  approved_by: string;
+  proposed_by?: string;
+  created_at: string;
+}
+
+export interface GrantRuleDiff {
+  added: PermissionRule[];
+  removed: PermissionRule[];
+}
+
+export interface ApprovalHistoryEntry extends GrantVersionInput {
+  diff: GrantRuleDiff;
+}
+
+/** Rule identity = effect + selector (description is annotation only). */
+export function diffPermissionRules(
+  prev: PermissionRule[] | undefined,
+  next: PermissionRule[],
+): GrantRuleDiff {
+  const key = (r: PermissionRule) => `${r.effect}\u0000${r.selector}`;
+  const prevKeys = new Set((prev ?? []).map(key));
+  const nextKeys = new Set(next.map(key));
+  return {
+    added: next.filter((r) => !prevKeys.has(key(r))),
+    removed: (prev ?? []).filter((r) => !nextKeys.has(key(r))),
+  };
+}
+
+/** Newest-first version list, each annotated with the rule diff against its
+ *  immediate predecessor (v1 diffs against the empty rule set). */
+export function buildApprovalHistory(
+  versions: GrantVersionInput[],
+): ApprovalHistoryEntry[] {
+  const sorted = [...versions].sort((a, b) => b.version - a.version);
+  return sorted.map((v, i) => ({
+    ...v,
+    diff: diffPermissionRules(sorted[i + 1]?.rules, v.rules),
+  }));
+}
+
+// ── Activity log ────────────────────────────────────────────────────────
+
+export const EVIDENCE_ACTIVITY_EVENT_TYPES = [
+  "system.policy_pinned",
+  "system.policy_decision",
+  "system.skill_request",
+  "system.access_request",
+] as const;
+
+export const EVIDENCE_ACTIVITY_ROW_CAP = 5000;
+
+export interface ActivityEventRow {
+  ts: number;
+  ts_iso: string;
+  session_id: string;
+  event_type: string;
+  summary: string;
+}
+
+export interface SessionToolUseCount {
+  session_id: string;
+  tool_use_count: number;
+  mcp_tool_use_count: number;
+}
+
+/** One-line human summary per audit frame (CSV column + console list). */
+export function summarizeActivityEvent(
+  type: string,
+  data: Record<string, unknown>,
+): string {
+  switch (type) {
+    case "system.policy_pinned": {
+      const rules = Array.isArray(data.rules) ? data.rules.length : 0;
+      const grant =
+        typeof data.grant_id === "string"
+          ? `grant ${data.grant_id} v${data.grant_version ?? "?"}`
+          : "no grant (allow-all)";
+      return `policy pinned: ${grant}, ${rules} rule${rules === 1 ? "" : "s"}`;
+    }
+    case "system.policy_decision":
+      return `policy ${data.effect}: ${data.tool_name}${
+        typeof data.selector === "string" ? ` (rule ${data.selector})` : ""
+      }`;
+    case "system.skill_request":
+      return `skill requested: ${data.skill_name} (${data.resolution ?? "unknown"})`;
+    case "system.access_request":
+      return `access requested: ${data.service}`;
+    default:
+      return type;
+  }
+}
+
+function csvCell(value: string): string {
+  return /[",\n\r]/.test(value) ? `"${value.replace(/"/g, '""')}"` : value;
+}
+
+export function formatActivityCsv(rows: ActivityEventRow[]): string {
+  const lines = ["ts_iso,session_id,event_type,summary"];
+  for (const r of rows) {
+    lines.push(
+      [r.ts_iso, r.session_id, r.event_type, r.summary].map(csvCell).join(","),
+    );
+  }
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * Audit frames + per-session tool-use counts for one agent in [fromMs, toMs].
+ * TENANT SCOPING IS SECURITY-CRITICAL: session_events has no tenant column,
+ * so every query joins sessions and filters on sessions.tenant_id.
+ */
+export async function queryEvidenceActivity(opts: {
+  sql: SqlClient;
+  tenantId: string;
+  agentId: string;
+  fromMs: number;
+  toMs: number;
+  rowCap?: number;
+}): Promise<{
+  events: ActivityEventRow[];
+  tool_use: SessionToolUseCount[];
+  truncated: boolean;
+}> {
+  const cap = opts.rowCap ?? EVIDENCE_ACTIVITY_ROW_CAP;
+  const placeholders = EVIDENCE_ACTIVITY_EVENT_TYPES.map(() => "?").join(", ");
+  const res = await opts.sql
+    .prepare(
+      `SELECT e.session_id AS session_id, e.type AS type, e.data AS data, e.ts AS ts
+       FROM session_events e
+       JOIN sessions s ON s.id = e.session_id
+       WHERE s.tenant_id = ? AND s.agent_id = ?
+         AND e.type IN (${placeholders})
+         AND e.ts >= ? AND e.ts <= ?
+       ORDER BY e.ts ASC, e.seq ASC
+       LIMIT ?`,
+    )
+    .bind(
+      opts.tenantId,
+      opts.agentId,
+      ...EVIDENCE_ACTIVITY_EVENT_TYPES,
+      opts.fromMs,
+      opts.toMs,
+      cap + 1,
+    )
+    .all<{ session_id: string; type: string; data: string; ts: number | string }>();
+  const raw = res.results ?? [];
+  const truncated = raw.length > cap;
+  const events = raw.slice(0, cap).map((r) => {
+    // Postgres returns BIGINT as string; SQLite as number.
+    const ts = Number(r.ts);
+    let data: Record<string, unknown> = {};
+    try {
+      data = JSON.parse(r.data) as Record<string, unknown>;
+    } catch {
+      // summary falls back to the bare event type
+    }
+    return {
+      ts,
+      ts_iso: new Date(ts).toISOString(),
+      session_id: r.session_id,
+      event_type: r.type,
+      summary: summarizeActivityEvent(r.type, data),
+    };
+  });
+
+  const counts = await opts.sql
+    .prepare(
+      `SELECT e.session_id AS session_id, e.type AS type, COUNT(*) AS n
+       FROM session_events e
+       JOIN sessions s ON s.id = e.session_id
+       WHERE s.tenant_id = ? AND s.agent_id = ?
+         AND e.type IN ('agent.tool_use', 'agent.mcp_tool_use')
+         AND e.ts >= ? AND e.ts <= ?
+       GROUP BY e.session_id, e.type`,
+    )
+    .bind(opts.tenantId, opts.agentId, opts.fromMs, opts.toMs)
+    .all<{ session_id: string; type: string; n: number | string }>();
+  const bySession = new Map<string, SessionToolUseCount>();
+  for (const row of counts.results ?? []) {
+    let entry = bySession.get(row.session_id);
+    if (!entry) {
+      entry = { session_id: row.session_id, tool_use_count: 0, mcp_tool_use_count: 0 };
+      bySession.set(row.session_id, entry);
+    }
+    if (row.type === "agent.tool_use") entry.tool_use_count = Number(row.n);
+    else entry.mcp_tool_use_count = Number(row.n);
+  }
+  return { events, tool_use: [...bySession.values()], truncated };
+}
