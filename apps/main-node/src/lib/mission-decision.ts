@@ -122,6 +122,11 @@ export const WALL_CLOCK_MINUTES_CEILING = 1440;
 // overlapping) sweep — one mission's verifier wall time starves every other
 // mission, so both the count and the per-command timeout are capped.
 export const MAX_VERIFIERS = 20;
+/** Cap on a single verifier command. Bounds storage/echo size, and stays
+ *  far under Linux's 128KB MAX_ARG_STRLEN — the supervisor passes the whole
+ *  command as ONE argv element to sh -c, so an oversized command would be
+ *  accepted at create time yet unable to ever exec on the prod target. */
+export const MAX_VERIFIER_COMMAND_CHARS = 4096;
 export const VERIFIER_TIMEOUT_CEILING_MS = 10 * 60_000;
 
 export function validateMissionInput(input: {
@@ -145,6 +150,11 @@ export function validateMissionInput(input: {
     }
     const command = typeof v.command === "string" ? v.command.trim() : "";
     if (!command) throw new Error(`verifier[${i}]: command must be a non-empty string`);
+    if (command.length > MAX_VERIFIER_COMMAND_CHARS) {
+      throw new Error(
+        `verifier[${i}]: command exceeds ${MAX_VERIFIER_COMMAND_CHARS} characters`,
+      );
+    }
     const timeout =
       v.timeout_ms === undefined ? undefined : Number(v.timeout_ms);
     if (

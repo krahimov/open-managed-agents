@@ -373,3 +373,24 @@ describe("validateMissionInput", () => {
     ).not.toThrow();
   });
 });
+
+describe("verifier command length cap", () => {
+  it("rejects a command over MAX_VERIFIER_COMMAND_CHARS", () => {
+    expect(() =>
+      validateMissionInput({
+        goal: "g",
+        verifiers: [{ kind: "command", command: "x".repeat(5000) }],
+        budget: { max_iterations: 3, wall_clock_minutes: 30 },
+      }),
+    ).toThrow(/exceeds 4096/);
+  });
+
+  it("accepts a command at the cap boundary", () => {
+    const v = validateMissionInput({
+      goal: "g",
+      verifiers: [{ kind: "command", command: "x".repeat(4096) }],
+      budget: { max_iterations: 3, wall_clock_minutes: 30 },
+    });
+    expect(v.verifiers[0].command.length).toBe(4096);
+  });
+});
