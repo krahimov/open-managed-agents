@@ -23,27 +23,22 @@ export function Logo({ size = "sm", className = "" }: LogoProps) {
       className={`shrink-0 text-brand ${className}`.trim()}
       xmlns="http://www.w3.org/2000/svg"
     >
-      <rect
-        x="5"
-        y="5"
-        width="22"
-        height="22"
-        rx="6"
-        fill="currentColor"
-        opacity="0.12"
-      />
-      <path
-        d="M10 21.5 15.2 10.5 18.7 18.2 22 12.2"
-        fill="none"
+      {/* Orrery mark: ring + hand from the hub, coral body on the ring.
+          Geometry is public/logo.svg's 64-grid halved; ink follows
+          currentColor so the sidebar/theme tints it, the orbiting body
+          keeps the brand coral. */}
+      <g
         stroke="currentColor"
-        strokeWidth="2.25"
+        strokeWidth="2.75"
         strokeLinecap="round"
         strokeLinejoin="round"
-      />
-      <circle cx="10" cy="21.5" r="2" fill="currentColor" />
-      <circle cx="15.2" cy="10.5" r="2" fill="currentColor" />
-      <circle cx="18.7" cy="18.2" r="2" fill="currentColor" />
-      <circle cx="22" cy="12.2" r="2" fill="currentColor" />
+        fill="none"
+      >
+        <path d="M16 16l6-6" />
+        <circle cx="16" cy="16" r="8.5" />
+      </g>
+      <circle cx="16" cy="16" r="2.25" fill="currentColor" />
+      <circle cx="22" cy="10" r="3.5" fill="#d9564a" />
     </svg>
   );
 }
