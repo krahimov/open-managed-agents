@@ -447,6 +447,7 @@ if (webhookStore) startWebhookDeliveryPoller({ store: webhookStore });
 const { SkillStore, parseFrontmatter: parseSkillFrontmatter, skillContentIntact } =
   await import("./lib/skills.js");
 const { CURATED_SKILL_CATALOG } = await import("./lib/skill-catalog.js");
+const { probeModelCard } = await import("./lib/model-card-probe.js");
 const { scanSkillContent, extractUrlFromCurl } = await import("./lib/skill-scan.js");
 const { judgeSkillContent, applyJudgeVerdict } = await import("./lib/skill-judge.js");
 const skillStore = new SkillStore(sql);
@@ -3256,7 +3257,17 @@ function mountNodeModelCardRoutes(v1App: NodeV1App): void {
         customHeaders: body.custom_headers ?? null,
         makeDefault: !!body.is_default,
       });
-      return c.json(toModelCardApiShape(card), 201);
+      // CF parity: the console reads `probe` off the create response and
+      // toasts "key verified" / "key didn't work: <upstream>". Without it a
+      // bad key saves silently and surfaces only as a dead first turn.
+      const probe = await probeModelCard({
+        provider: body.provider,
+        model: body.model || body.model_id,
+        apiKey: body.api_key,
+        baseUrl: body.base_url ?? null,
+        customHeaders: body.custom_headers ?? null,
+      });
+      return c.json({ ...toModelCardApiShape(card), probe }, 201);
     } catch (err) {
       if (err instanceof ModelCardDuplicateModelIdError) {
         return c.json({ error: err.message }, 409);
