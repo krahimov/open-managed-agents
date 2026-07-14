@@ -97,6 +97,13 @@ export function SessionChat({
   const [pending, setPending] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [status, setStatus] = useState<"idle" | "running">("idle");
+  /** Last turn failure, rendered as an inline banner. session.error's own
+   *  message is the generic "No output generated…"; the actionable cause
+   *  (401 bad api_key, rate limit, …) rides on the preceding
+   *  span.model_request_end with is_error — pair them like SessionDetail
+   *  does. Cleared when a later turn produces output. */
+  const [turnError, setTurnError] = useState<{ error: string; cause?: string } | null>(null);
+  const pendingCauseRef = useRef<string | null>(null);
   /** In-flight token streams keyed by message_id. An entry appears on
    *  stream_start (or a stray chunk after reconnect), grows per chunk, and
    *  is dropped when the canonical agent.message with the same id lands
@@ -127,6 +134,19 @@ export function SessionChat({
         else if (ev.type === "session.status_idle" || ev.type === "session.error") {
           setStatus("idle");
         }
+        if (ev.type === "span.model_request_end") {
+          const raw = ev as { data?: { is_error?: boolean; error_message?: string }; is_error?: boolean; error_message?: string };
+          const isErr = raw.data?.is_error ?? raw.is_error;
+          const msg = raw.data?.error_message ?? raw.error_message;
+          pendingCauseRef.current = isErr && msg ? msg : null;
+        }
+        if (ev.type === "session.error") {
+          setTurnError({
+            error: String((ev as { message?: string }).message ?? (ev as { error?: string }).error ?? "Turn failed"),
+            ...(pendingCauseRef.current ? { cause: pendingCauseRef.current } : {}),
+          });
+        }
+        if (ev.type === "agent.message") setTurnError(null);
         if (ev.type === "user.message") setPending(null);
 
         // Live token streaming — broadcast-only events, never in history.
@@ -267,6 +287,17 @@ export function SessionChat({
                 </MessageContent>
               </Message>
             ) : null,
+          )}
+          {turnError && (
+            <div className="max-w-2xl bg-danger-subtle rounded-lg px-4 py-2.5 text-sm text-danger">
+              <div className="font-medium">Turn failed</div>
+              <div className="mt-0.5 text-[12px] opacity-90">{turnError.error}</div>
+              {turnError.cause && (
+                <div className="mt-1.5 pt-1.5 border-t border-danger/20 text-[12px] font-mono break-all opacity-90">
+                  {turnError.cause}
+                </div>
+              )}
+            </div>
           )}
           {status === "running" && Object.keys(streams).length === 0 && (
             <div className="text-xs text-fg-subtle">Working…</div>
