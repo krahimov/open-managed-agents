@@ -807,6 +807,69 @@ const sessionRegistry = new SessionRegistry({
     const sdk = new ClaudeAgentSdkHarness({
       resolveMcpTarget: resolveNodeMcpProxyTarget,
       resolveSkills: (tenantId, refs) => skillStore.resolveRefs(tenantId, refs),
+      // Memory stores — the SDK harness has no sandbox mount, so materialize
+      // the session's attached stores into its workdir and sync edits back.
+      // Without this, memory is invisible to every SDK-harness agent.
+      memory: {
+        resolve: async (tenantId, sessionId) => {
+          const rows = await sql
+            .prepare(
+              `SELECT store_id, access FROM session_memory_stores WHERE session_id = ?`,
+            )
+            .bind(sessionId)
+            .all<{ store_id: string; access: string }>();
+          const out: Array<{
+            storeId: string;
+            name: string;
+            access: "read_write" | "read_only";
+            memories: Array<{ path: string; content: string }>;
+          }> = [];
+          for (const r of rows.results ?? []) {
+            const store = await memoryService
+              .getStore({ tenantId, storeId: r.store_id })
+              .catch(() => null);
+            if (!store) continue;
+            const metas = await memoryService
+              .listMemories({ tenantId, storeId: r.store_id })
+              .catch(() => []);
+            const memories: Array<{ path: string; content: string }> = [];
+            for (const m of metas) {
+              const full = await memoryService
+                .readByPath({ tenantId, storeId: r.store_id, path: m.path })
+                .catch(() => null);
+              memories.push({ path: m.path, content: full?.content ?? "" });
+            }
+            out.push({
+              storeId: r.store_id,
+              name: store.name,
+              access: r.access === "read_only" ? "read_only" : "read_write",
+              memories,
+            });
+          }
+          return out;
+        },
+        write: async ({ tenantId, sessionId, storeId, path: memPath, content, baseSha256 }) => {
+          try {
+            await memoryService.writeByPath({
+              tenantId,
+              storeId,
+              path: memPath,
+              content,
+              precondition: baseSha256
+                ? { type: "content_sha256", content_sha256: baseSha256 }
+                : { type: "not_exists" },
+              actor: { type: "agent_session", id: sessionId },
+            });
+            return { ok: true };
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            const conflict =
+              (err as { name?: string })?.name === "MemoryPreconditionFailedError" ||
+              /precondition|sha256|exists/i.test(msg);
+            return { ok: false, conflict, error: msg };
+          }
+        },
+      },
       // Setup-session support: the in-process oma_setup MCP server stages the
       // agent's refined harness in session metadata and, on finish, applies it
       // to the agent it belongs to.
@@ -1738,6 +1801,44 @@ const sessionRoutesApp = buildSessionRoutes({
     } as unknown as import("@open-managed-agents/shared").EnvironmentConfig;
   },
 });
+// Session memory-store attach/list — MUST be registered before the
+// v1.route("/sessions", ...) mount below, or that sub-app's wildcard
+// swallows /sessions/:id/memory_stores and returns a generic 404.
+v1.post("/sessions/:id/memory_stores", async (c) => {
+  const sid = c.req.param("id");
+  const session = await sql
+    .prepare(`SELECT id FROM sessions WHERE tenant_id = ? AND id = ?`)
+    .bind(c.var.tenant_id, sid)
+    .first();
+  if (!session) return c.json({ error: "Session not found" }, 404);
+  const body = await c.req.json<{ store_id: string; access?: string }>();
+  if (!body.store_id) return c.json({ error: "store_id is required" }, 400);
+  const store = await memoryService.getStore({
+    tenantId: c.var.tenant_id,
+    storeId: body.store_id,
+  });
+  if (!store) return c.json({ error: "Memory store not found" }, 404);
+  const access = body.access === "read_only" ? "read_only" : "read_write";
+  await sql
+    .prepare(
+      `INSERT INTO session_memory_stores (session_id, store_id, access, created_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(session_id, store_id) DO UPDATE SET access = excluded.access`,
+    )
+    .bind(sid, body.store_id, access, Date.now())
+    .run();
+  return c.json({ session_id: sid, store_id: body.store_id, access }, 201);
+});
+v1.get("/sessions/:id/memory_stores", async (c) => {
+  const r = await sql
+    .prepare(
+      `SELECT store_id, access, created_at FROM session_memory_stores WHERE session_id = ?`,
+    )
+    .bind(c.req.param("id"))
+    .all<{ store_id: string; access: string; created_at: number }>();
+  return c.json({ data: r.results ?? [] });
+});
+
 v1.route("/sessions", sessionRoutesApp);
 v1.route("/deployments", buildDeploymentRoutes({ services }));
 v1.route("/vaults", buildVaultRoutes({
@@ -2440,41 +2541,6 @@ const _capResolver = new OmaVaultResolver({
 void _capResolver;
 
 // ── Session ↔ memory_store binding (Node-specific; not in package yet) ──
-v1.post("/sessions/:id/memory_stores", async (c) => {
-  const sid = c.req.param("id");
-  const session = await sql
-    .prepare(`SELECT id FROM sessions WHERE tenant_id = ? AND id = ?`)
-    .bind(c.var.tenant_id, sid)
-    .first();
-  if (!session) return c.json({ error: "Session not found" }, 404);
-  const body = await c.req.json<{ store_id: string; access?: string }>();
-  if (!body.store_id) return c.json({ error: "store_id is required" }, 400);
-  const store = await memoryService.getStore({
-    tenantId: c.var.tenant_id,
-    storeId: body.store_id,
-  });
-  if (!store) return c.json({ error: "Memory store not found" }, 404);
-  const access = body.access === "read_only" ? "read_only" : "read_write";
-  await sql
-    .prepare(
-      `INSERT INTO session_memory_stores (session_id, store_id, access, created_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(session_id, store_id) DO UPDATE SET access = excluded.access`,
-    )
-    .bind(sid, body.store_id, access, Date.now())
-    .run();
-  return c.json({ session_id: sid, store_id: body.store_id, access }, 201);
-});
-v1.get("/sessions/:id/memory_stores", async (c) => {
-  const r = await sql
-    .prepare(
-      `SELECT store_id, access, created_at FROM session_memory_stores WHERE session_id = ?`,
-    )
-    .bind(c.req.param("id"))
-    .all<{ store_id: string; access: string; created_at: number }>();
-  return c.json({ data: r.results ?? [] });
-});
-
 // ── Console UI (optional) ──
 const consoleDir = process.env.CONSOLE_DIR;
 if (consoleDir) {

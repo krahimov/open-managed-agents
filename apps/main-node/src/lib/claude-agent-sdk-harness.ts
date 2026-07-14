@@ -24,7 +24,8 @@
  * login) is the only path left.
  */
 
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, writeFile, readFile, readdir } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import { createSdkMcpServer, query, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
@@ -102,6 +103,39 @@ export interface ClaudeAgentSdkHarnessDeps {
     tenantId: string,
     refs: Array<{ skill_id: string; type: string }> | undefined,
   ) => Promise<Array<{ name: string; content: string }>>;
+  /**
+   * Memory stores attached to a session. The DefaultHarness mounts these at
+   * /mnt/memory via the sandbox; this harness runs Claude Code in a host
+   * workdir with no sandbox mount, so instead we materialize each store's
+   * files into <cwd>/memory/<name>/ before the turn and write changed files
+   * back after (CAS-guarded, fail-closed on conflict). Without this, memory
+   * is invisible to SDK-harness agents entirely.
+   */
+  memory?: {
+    /** All stores attached to the session, with their current contents. */
+    resolve: (
+      tenantId: string,
+      sessionId: string,
+    ) => Promise<
+      Array<{
+        storeId: string;
+        name: string;
+        access: "read_write" | "read_only";
+        memories: Array<{ path: string; content: string }>;
+      }>
+    >;
+    /** Persist one file back. baseSha256=null asserts not_exists (new file);
+     *  a hash asserts compare-and-swap. Returns conflict=true when the remote
+     *  moved under us (we then keep the remote copy, never clobber). */
+    write: (args: {
+      tenantId: string;
+      sessionId: string;
+      storeId: string;
+      path: string;
+      content: string;
+      baseSha256: string | null;
+    }) => Promise<{ ok: boolean; conflict?: boolean; error?: string }>;
+  };
   /**
    * Read a session's metadata blob. Used by the builder toolset to load the
    * persisted draft (`metadata.harness_draft`) and the finalize guard
@@ -582,6 +616,66 @@ export class ClaudeAgentSdkHarness {
       }
     }
 
+    // Materialize attached memory stores into <cwd>/memory/<name>/<path>.
+    // The manifest records the base sha256 of every materialized file so the
+    // post-turn write-back can compare-and-swap (and detect new files). The
+    // DefaultHarness gets this for free via the sandbox mount; here we bridge
+    // the store into Claude Code's host workdir by hand.
+    const memoryManifest = new Map<
+      string,
+      { storeId: string; memPath: string; storeName: string; access: "read_write" | "read_only"; sha256: string }
+    >();
+    // Store lookup by directory name — lets write-back attribute NEW files
+    // (including the first file in a previously-empty store) to the right
+    // store id + access level.
+    const memoryStoreByName = new Map<string, { storeId: string; access: "read_write" | "read_only" }>();
+    let memoryGuidance = "";
+    if (this.#deps.memory && ctx.tenant_id) {
+      try {
+        const stores = await this.#deps.memory.resolve(ctx.tenant_id, sessionId);
+        const lines: string[] = [];
+        for (const store of stores) {
+          memoryStoreByName.set(store.name, { storeId: store.storeId, access: store.access });
+          const storeDir = path.join(cwd, "memory", store.name);
+          await mkdir(storeDir, { recursive: true });
+          for (const mem of store.memories) {
+            const abs = path.join(storeDir, mem.path);
+            await mkdir(path.dirname(abs), { recursive: true });
+            await writeFile(abs, mem.content, "utf8");
+            memoryManifest.set(abs, {
+              storeId: store.storeId,
+              memPath: mem.path,
+              storeName: store.name,
+              access: store.access,
+              sha256: sha256Hex(mem.content),
+            });
+          }
+          lines.push(
+            `  - ./memory/${store.name}/  (${store.memories.length} file(s)` +
+              (store.access === "read_only" ? ", READ-ONLY — do not edit" : ", read/write — edits persist") +
+              ")",
+          );
+        }
+        if (lines.length > 0) {
+          memoryGuidance = [
+            "",
+            "Persistent memory — these directories survive across sessions:",
+            ...lines,
+            "Read the relevant files at the START of a task to recall prior context, and",
+            "update read/write files as you learn durable facts. Files you create under a",
+            "read/write memory directory are saved back automatically when the turn ends.",
+          ].join("\n");
+        }
+      } catch (err) {
+        // memory is best-effort — a resolve failure must not block the turn
+        runtime.broadcast?.({
+          type: "session.warning",
+          source: "memory",
+          message: `memory materialization failed: ${err instanceof Error ? err.message : String(err)}`,
+        } as SessionEvent);
+      }
+    }
+
     // Setup sessions (the agent's first session, refining its own harness) run
     // a focused planning conversation with an in-process toolset and NO
     // built-in/coding tools. Flagged via session metadata at creation.
@@ -634,7 +728,10 @@ export class ClaudeAgentSdkHarness {
                 preset: "claude_code",
                 // CLI_NOTES: observed footguns in headless sessions (e.g. `gh
                 // api` with -f/-F silently switches GET→POST → bogus 404s).
-                append: [ctx.systemPrompt, CLI_NOTES].filter(Boolean).join("\n\n"),
+                // memoryGuidance points the agent at its materialized stores.
+                append: [ctx.systemPrompt, memoryGuidance, CLI_NOTES]
+                  .filter(Boolean)
+                  .join("\n\n"),
               },
           // Headless: OMA has no tool-confirmation round-trip on this path
           // yet, and the child is already scoped to a per-session workdir.
@@ -792,5 +889,97 @@ export class ClaudeAgentSdkHarness {
     // The endLiveText closure lives inside the try; any stream that died
     // mid-block was already ended as "aborted" by the recovery scan or the
     // catch above — nothing to clean up here.
+
+    // Turn finished cleanly (the catch above re-throws) — sync any memory
+    // edits back to their stores. Best-effort: a write-back failure must not
+    // fail the turn the agent already completed.
+    if (this.#deps.memory && ctx.tenant_id) {
+      await this.#writeBackMemory(
+        ctx.tenant_id,
+        sessionId,
+        cwd,
+        memoryManifest,
+        memoryStoreByName,
+        runtime,
+      ).catch(() => {});
+    }
   }
+
+  /** Scan <cwd>/memory after the turn and persist changed/new files back to
+   *  their stores. CAS-guarded (base sha for edits, not_exists for new files)
+   *  so a concurrent write elsewhere is never silently clobbered — on
+   *  conflict we keep the remote copy and surface a warning. Read-only stores
+   *  are skipped. */
+  async #writeBackMemory(
+    tenantId: string,
+    sessionId: string,
+    cwd: string,
+    manifest: Map<
+      string,
+      { storeId: string; memPath: string; storeName: string; access: "read_write" | "read_only"; sha256: string }
+    >,
+    storeByName: Map<string, { storeId: string; access: "read_write" | "read_only" }>,
+    runtime: HarnessContext["runtime"],
+  ): Promise<void> {
+    const memRoot = path.join(cwd, "memory");
+    const files = await walkFiles(memRoot).catch(() => [] as string[]);
+    let saved = 0;
+    const conflicts: string[] = [];
+    for (const abs of files) {
+      const rel = path.relative(memRoot, abs); // "<storeName>/<memPath...>"
+      const segs = rel.split(path.sep);
+      if (segs.length < 2) continue; // stray file directly under memory/
+      const storeName = segs[0];
+      const memPath = segs.slice(1).join("/");
+      const store = storeByName.get(storeName);
+      if (!store || store.access !== "read_write") continue;
+
+      let content: string;
+      try {
+        content = await readFile(abs, "utf8");
+      } catch {
+        continue;
+      }
+      const prior = manifest.get(abs);
+      if (prior && prior.sha256 === sha256Hex(content)) continue; // unchanged
+
+      const res = await this.#deps.memory!.write({
+        tenantId,
+        sessionId,
+        storeId: store.storeId,
+        path: memPath,
+        content,
+        baseSha256: prior ? prior.sha256 : null,
+      });
+      if (res.ok) saved++;
+      else if (res.conflict) conflicts.push(`${storeName}/${memPath}`);
+    }
+    if (saved > 0 || conflicts.length > 0) {
+      runtime.broadcast?.({
+        type: "session.warning",
+        source: "memory",
+        message:
+          `memory sync: ${saved} file(s) saved` +
+          (conflicts.length > 0
+            ? `; ${conflicts.length} kept remote copy on conflict (${conflicts.slice(0, 3).join(", ")}${conflicts.length > 3 ? "…" : ""})`
+            : ""),
+      } as SessionEvent);
+    }
+  }
+}
+
+/** Recursively list all files under a directory (absolute paths). */
+async function walkFiles(dir: string): Promise<string[]> {
+  const out: string[] = [];
+  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) out.push(...(await walkFiles(full)));
+    else if (e.isFile()) out.push(full);
+  }
+  return out;
+}
+
+function sha256Hex(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
 }
