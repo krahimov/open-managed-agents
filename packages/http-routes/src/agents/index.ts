@@ -16,7 +16,9 @@
 import { Hono } from "hono";
 import type {
   AgentConfig,
+  ReasoningLevel,
 } from "@open-managed-agents/shared";
+import { REASONING_LEVELS } from "@open-managed-agents/shared";
 import {
   AgentNotFoundError,
   AgentVersionMismatchError,
@@ -45,6 +47,7 @@ function formatAgent(agent: AgentConfig) {
         : { id: agent.aux_model.id, speed: agent.aux_model.speed || ("standard" as const) };
   }
   if (agent.harness) oma.harness = agent.harness;
+  if (agent.reasoning_level) oma.reasoning_level = agent.reasoning_level;
   if (agent.runtime_binding) oma.runtime_binding = agent.runtime_binding;
   if (agent.appendable_prompts && agent.appendable_prompts.length > 0) {
     oma.appendable_prompts = agent.appendable_prompts;
@@ -76,6 +79,7 @@ function formatAgent(agent: AgentConfig) {
   const {
     aux_model: _aux,
     harness: _harness,
+    reasoning_level: _rl,
     runtime_binding: _rb,
     appendable_prompts: _ap,
     callable_agents: _ca,
@@ -164,6 +168,19 @@ function multiagentToCallableAgents(
   return { list: out };
 }
 
+/** Validate an _oma.reasoning_level value. `undefined`/`null` are fine
+ *  (unset / clear); anything else must be one of the enum values. */
+function invalidReasoningLevel(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (
+    typeof value === "string" &&
+    (REASONING_LEVELS as readonly string[]).includes(value)
+  ) {
+    return null;
+  }
+  return `reasoning_level must be one of ${REASONING_LEVELS.join("|")}`;
+}
+
 export interface AgentRoutesDeps {
   services: RouteServicesArg;
   /** Optional model card validation. CF passes a function backed by
@@ -219,6 +236,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
       _oma?: {
         aux_model?: string | { id: string; speed?: "standard" | "fast" };
         harness?: string;
+        reasoning_level?: ReasoningLevel;
         runtime_binding?: AgentConfig["runtime_binding"];
         appendable_prompts?: string[];
       };
@@ -227,11 +245,15 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
     const ma = multiagentToCallableAgents(raw.multiagent);
     if (ma.error) return c.json({ error: ma.error }, 422);
 
+    const rlError = invalidReasoningLevel(raw._oma?.reasoning_level);
+    if (rlError) return c.json({ error: rlError }, 400);
+
     const body = {
       ...raw,
       callable_agents: ma.list,
       aux_model: raw._oma?.aux_model,
       harness: raw._oma?.harness,
+      reasoning_level: raw._oma?.reasoning_level,
       runtime_binding: raw._oma?.runtime_binding,
       appendable_prompts: raw._oma?.appendable_prompts,
     };
@@ -278,6 +300,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
         callable_agents: body.callable_agents,
         metadata: body.metadata,
         aux_model: body.aux_model,
+        reasoning_level: body.reasoning_level,
         appendable_prompts: body.appendable_prompts,
         runtime_binding: body.runtime_binding,
         enable_general_subagent: (body as { enable_general_subagent?: boolean })
@@ -593,6 +616,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
       _oma?: {
         aux_model?: string | { id: string; speed?: "standard" | "fast" } | null;
         harness?: string;
+        reasoning_level?: ReasoningLevel | null;
         runtime_binding?: AgentConfig["runtime_binding"] | null;
         appendable_prompts?: string[] | null;
       };
@@ -607,11 +631,15 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
       callableAgents = ma.list;
     }
 
+    const rlError = invalidReasoningLevel(raw._oma?.reasoning_level);
+    if (rlError) return c.json({ error: rlError }, 400);
+
     const body = {
       ...raw,
       callable_agents: callableAgents,
       aux_model: raw._oma?.aux_model,
       harness: raw._oma?.harness,
+      reasoning_level: raw._oma?.reasoning_level,
       runtime_binding: raw._oma?.runtime_binding,
       appendable_prompts: raw._oma?.appendable_prompts,
     };
@@ -658,6 +686,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
           callable_agents: body.callable_agents,
           metadata: body.metadata,
           aux_model: body.aux_model,
+          reasoning_level: body.reasoning_level,
           appendable_prompts: body.appendable_prompts,
           runtime_binding: body.runtime_binding,
           enable_general_subagent: (body as { enable_general_subagent?: boolean })

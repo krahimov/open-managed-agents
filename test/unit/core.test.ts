@@ -2,7 +2,7 @@
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 import { env, exports } from "cloudflare:workers";
 import { describe, it, expect } from "vitest";
-import { resolveModel, openAiReasoningProviderOptions } from "../../apps/agent/src/harness/provider";
+import { resolveModel, reasoningProviderOptions, isOpenAiResponsesModel } from "../../apps/agent/src/harness/provider";
 import { evaluateOutcome } from "../../apps/agent/src/harness/outcome-evaluator";
 import { outboundByHost } from "../../apps/agent/src/outbound";
 import { registerHarness } from "../../apps/agent/src/harness/registry";
@@ -112,40 +112,260 @@ describe("Provider", () => {
     expect(model.modelId).not.toContain("provider");
   });
 
-  describe("openAiReasoningProviderOptions — reasoning_effort:'none' guard", () => {
-    const oaiModel = (id: string) => resolveModel(id, "k", undefined, "oai");
+  describe("resolveModel — reasoning_level endpoint routing (OpenAI)", () => {
+    it("routes official OpenAI reasoning models to the Responses API when level > instant", () => {
+      const model = resolveModel("gpt-5.6-sol", "k", undefined, "oai", undefined, "high");
+      expect(isOpenAiResponsesModel(model)).toBe(true);
+    });
+
+    it("stays on chat/completions for level=instant", () => {
+      const model = resolveModel("gpt-5.6-sol", "k", undefined, "oai", undefined, "instant");
+      expect(isOpenAiResponsesModel(model)).toBe(false);
+    });
+
+    it("stays on chat/completions when level is unset (legacy callers)", () => {
+      const model = resolveModel("gpt-5.6-sol", "k", undefined, "oai");
+      expect(isOpenAiResponsesModel(model)).toBe(false);
+    });
+
+    it("stays on chat/completions for gateways even at level=high", () => {
+      const model = resolveModel("gpt-5.6-sol", "k", "https://gw.example.com/v1", "oai-compatible", undefined, "high");
+      expect(isOpenAiResponsesModel(model)).toBe(false);
+    });
+
+    it("stays on chat/completions for non-reasoning models (gpt-4o) at level=high", () => {
+      const model = resolveModel("gpt-4o", "k", undefined, "oai", undefined, "high");
+      expect(isOpenAiResponsesModel(model)).toBe(false);
+    });
+
+    it("responses-routed model keeps the wire model id", () => {
+      const model = resolveModel("gpt-5.6-sol", "k", undefined, "oai", undefined, "medium");
+      expect(typeof model !== "string" && model.modelId).toBe("gpt-5.6-sol");
+    });
+  });
+
+  describe("reasoningProviderOptions — unified level → provider knobs", () => {
+    const oaiModel = (id: string, level?: "instant" | "low" | "medium" | "high") =>
+      resolveModel(id, "k", undefined, "oai", undefined, level);
     const antModel = (id: string) => resolveModel(id, "k", undefined, "ant");
 
-    it("forces reasoning_effort:'none' for gpt-5* with tools", () => {
-      const opts = openAiReasoningProviderOptions(oaiModel("gpt-5.6-sol"), "gpt-5.6-sol", true);
+    // — the shipped floor (level unset / instant → chat endpoint) —
+
+    it("forces reasoning_effort:'none' for gpt-5* with tools when level unset", () => {
+      const opts = reasoningProviderOptions(oaiModel("gpt-5.6-sol"), "gpt-5.6-sol", undefined, true);
       expect(opts).toEqual({ openai: { reasoningEffort: "none" } });
     });
 
     it("forces it for o-series (o3) with tools", () => {
-      const opts = openAiReasoningProviderOptions(oaiModel("o3"), "o3", true);
+      const opts = reasoningProviderOptions(oaiModel("o3"), "o3", undefined, true);
+      expect(opts).toEqual({ openai: { reasoningEffort: "none" } });
+    });
+
+    it("forces it at level=instant with tools", () => {
+      const opts = reasoningProviderOptions(oaiModel("gpt-5.6-sol", "instant"), "gpt-5.6-sol", "instant", true);
       expect(opts).toEqual({ openai: { reasoningEffort: "none" } });
     });
 
     it("does NOT fire without tools (reasoning stays available)", () => {
-      expect(openAiReasoningProviderOptions(oaiModel("gpt-5.6-sol"), "gpt-5.6-sol", false)).toBeUndefined();
+      expect(reasoningProviderOptions(oaiModel("gpt-5.6-sol"), "gpt-5.6-sol", undefined, false)).toBeUndefined();
     });
 
     it("does NOT fire for non-reasoning OpenAI models (gpt-4o)", () => {
-      expect(openAiReasoningProviderOptions(oaiModel("gpt-4o"), "gpt-4o", true)).toBeUndefined();
-    });
-
-    it("does NOT fire for Anthropic models", () => {
-      expect(openAiReasoningProviderOptions(antModel("claude-sonnet-4-6"), "claude-sonnet-4-6", true)).toBeUndefined();
+      expect(reasoningProviderOptions(oaiModel("gpt-4o"), "gpt-4o", undefined, true)).toBeUndefined();
     });
 
     it("does NOT fire for gateway models that aren't gpt-5/o-series", () => {
       const gw = resolveModel("deepseek-chat", "k", "https://api.deepseek.com", "oai-compatible");
-      expect(openAiReasoningProviderOptions(gw, "deepseek-chat", true)).toBeUndefined();
+      expect(reasoningProviderOptions(gw, "deepseek-chat", undefined, true)).toBeUndefined();
     });
 
     it("strips provider prefix before matching", () => {
-      const opts = openAiReasoningProviderOptions(oaiModel("gpt-5.6-sol"), "openai/gpt-5.6-sol", true);
+      const opts = reasoningProviderOptions(oaiModel("gpt-5.6-sol"), "openai/gpt-5.6-sol", undefined, true);
       expect(opts).toEqual({ openai: { reasoningEffort: "none" } });
+    });
+
+    // — levels above instant on the Responses API —
+
+    it("passes the level's effort on the Responses API", () => {
+      const model = oaiModel("gpt-5.6-sol", "high");
+      expect(reasoningProviderOptions(model, "gpt-5.6-sol", "high", true)).toEqual({
+        openai: { reasoningEffort: "high" },
+      });
+    });
+
+    it("maps low/medium levels to matching efforts", () => {
+      expect(reasoningProviderOptions(oaiModel("o3", "low"), "o3", "low", true)).toEqual({
+        openai: { reasoningEffort: "low" },
+      });
+      expect(reasoningProviderOptions(oaiModel("o3", "medium"), "o3", "medium", true)).toEqual({
+        openai: { reasoningEffort: "medium" },
+      });
+    });
+
+    it("clamps to 'none' when a high level rides a chat-endpoint model (gateway)", () => {
+      // Gateways never route to responses, so even level=high must clamp.
+      const gw = resolveModel("gpt-5.6-sol", "k", "https://gw.example.com/v1", "oai-compatible", undefined, "high");
+      expect(reasoningProviderOptions(gw, "gpt-5.6-sol", "high", true)).toEqual({
+        openai: { reasoningEffort: "none" },
+      });
+    });
+
+    it("prefers the resolved model's wire id over the card handle", () => {
+      // Card handle "my-fast-model" wouldn't match the regex; the resolved
+      // wire model id (gpt-5.6-sol) is what the provider actually sees.
+      const model = oaiModel("gpt-5.6-sol");
+      expect(reasoningProviderOptions(model, "my-fast-model", undefined, true)).toEqual({
+        openai: { reasoningEffort: "none" },
+      });
+    });
+
+    // — Anthropic extended thinking —
+
+    it("enables Claude extended thinking with the level's budget", () => {
+      expect(reasoningProviderOptions(antModel("claude-sonnet-4-6"), "claude-sonnet-4-6", "low", true)).toEqual({
+        anthropic: { thinking: { type: "enabled", budgetTokens: 4096 } },
+      });
+      expect(reasoningProviderOptions(antModel("claude-sonnet-4-6"), "claude-sonnet-4-6", "medium", true)).toEqual({
+        anthropic: { thinking: { type: "enabled", budgetTokens: 16384 } },
+      });
+      expect(reasoningProviderOptions(antModel("claude-sonnet-4-6"), "claude-sonnet-4-6", "high", true)).toEqual({
+        anthropic: { thinking: { type: "enabled", budgetTokens: 32768 } },
+      });
+    });
+
+    it("thinking works regardless of tools (no Anthropic endpoint split)", () => {
+      expect(reasoningProviderOptions(antModel("claude-sonnet-4-6"), "claude-sonnet-4-6", "medium", false)).toEqual({
+        anthropic: { thinking: { type: "enabled", budgetTokens: 16384 } },
+      });
+    });
+
+    it("does NOT fire for Anthropic at instant / unset level", () => {
+      expect(reasoningProviderOptions(antModel("claude-sonnet-4-6"), "claude-sonnet-4-6", "instant", true)).toBeUndefined();
+      expect(reasoningProviderOptions(antModel("claude-sonnet-4-6"), "claude-sonnet-4-6", undefined, true)).toBeUndefined();
+    });
+
+    it("does NOT fire for non-Claude models on the Anthropic-compat path", () => {
+      const mm = resolveModel("MiniMax-M2", "k", "https://api.minimax.io/anthropic", "ant-compatible");
+      expect(reasoningProviderOptions(mm, "MiniMax-M2", "high", true)).toBeUndefined();
+    });
+  });
+
+  // Wire-level: stub globalThis.fetch and assert the ACTUAL request bodies
+  // the providers emit — reasoning.effort on /responses, reasoning_effort on
+  // /chat/completions, thinking.budget_tokens on /messages — plus the full
+  // ZDR fallback sequence (responses 400 → chat retry with effort clamped).
+  describe("reasoning wire-level (mocked fetch)", () => {
+    const PROMPT = [{ role: "user", content: [{ type: "text", text: "hi" }] }];
+    const TOOLS = [
+      { type: "function", name: "get_time", description: "d", inputSchema: { type: "object", properties: {} } },
+    ];
+    const CHAT_OK = {
+      id: "chatcmpl-1", object: "chat.completion", created: 0, model: "gpt-5.6-sol",
+      choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    };
+    const ANT_OK = {
+      id: "msg_1", type: "message", role: "assistant", model: "claude-sonnet-4-6",
+      content: [{ type: "text", text: "ok" }],
+      stop_reason: "end_turn", stop_sequence: null,
+      usage: { input_tokens: 1, output_tokens: 1 },
+    };
+    const ZDR_400 = {
+      error: { message: "Item with id 'fc_abc123' not found.", type: "invalid_request_error", code: null, param: null },
+    };
+
+    /** Install a fetch stub for the duration of fn. Returns every captured
+     *  call plus fn's outcome (never throws — callers assert on `error`). */
+    async function withMockFetch(responder, fn) {
+      const real = globalThis.fetch;
+      const calls = [];
+      globalThis.fetch = async (url, init) => {
+        const u = typeof url === "string" ? url : url instanceof URL ? url.toString() : url.url;
+        const body = init?.body ? JSON.parse(init.body) : undefined;
+        calls.push({ url: u, body });
+        return responder(u, body, calls.length);
+      };
+      try {
+        const result = await fn();
+        return { result, error: null, calls };
+      } catch (error) {
+        return { result: null, error, calls };
+      } finally {
+        globalThis.fetch = real;
+      }
+    }
+
+    const json = (status, body) =>
+      new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+
+    it("sends reasoning.effort on /responses for level=high", async () => {
+      const model = resolveModel("gpt-5.6-sol", "wire-key-effort", undefined, "oai", undefined, "high");
+      const { error, calls } = await withMockFetch(
+        // Generic (non-ZDR) 400 — the wrapper must rethrow, not fall back.
+        () => json(400, { error: { message: "boom", type: "server_error" } }),
+        () => model.doGenerate({ prompt: PROMPT, tools: TOOLS, providerOptions: { openai: { reasoningEffort: "high" } } }),
+      );
+      expect(error).toBeTruthy();
+      expect(calls.length).toBe(1);
+      expect(calls[0].url).toContain("/responses");
+      expect(calls[0].body.reasoning).toEqual({ effort: "high" });
+    });
+
+    it("ZDR fallback: responses 400 'fc_ not found' → chat retry with reasoning_effort:'none'", async () => {
+      const model = resolveModel("gpt-5.6-sol", "wire-key-zdr", undefined, "oai", undefined, "high");
+      const { result, error, calls } = await withMockFetch(
+        (url) => (url.includes("/responses") ? json(400, ZDR_400) : json(200, CHAT_OK)),
+        () => model.doGenerate({ prompt: PROMPT, tools: TOOLS, providerOptions: { openai: { reasoningEffort: "high" } } }),
+      );
+      expect(error).toBeNull();
+      expect(calls.length).toBe(2);
+      expect(calls[0].url).toContain("/responses");
+      expect(calls[1].url).toContain("/chat/completions");
+      expect(calls[1].body.reasoning_effort).toBe("none");
+      expect(result.content.some((p) => p.type === "text" && p.text === "ok")).toBe(true);
+
+      // The clamp is remembered per (api key, model): a freshly resolved
+      // model with the same key skips the doomed responses call entirely.
+      const again = resolveModel("gpt-5.6-sol", "wire-key-zdr", undefined, "oai", undefined, "high");
+      const second = await withMockFetch(
+        () => json(200, CHAT_OK),
+        () => again.doGenerate({ prompt: PROMPT, tools: TOOLS, providerOptions: { openai: { reasoningEffort: "high" } } }),
+      );
+      expect(second.error).toBeNull();
+      expect(second.calls.length).toBe(1);
+      expect(second.calls[0].url).toContain("/chat/completions");
+      expect(second.calls[0].body.reasoning_effort).toBe("none");
+    });
+
+    it("chat floor: instant-level gpt-5 with tools sends reasoning_effort:'none'", async () => {
+      const model = resolveModel("gpt-5.6-sol", "wire-key-floor", undefined, "oai");
+      const { error, calls } = await withMockFetch(
+        () => json(200, CHAT_OK),
+        () => model.doGenerate({
+          prompt: PROMPT,
+          tools: TOOLS,
+          providerOptions: reasoningProviderOptions(model, "gpt-5.6-sol", undefined, true),
+        }),
+      );
+      expect(error).toBeNull();
+      expect(calls[0].url).toContain("/chat/completions");
+      expect(calls[0].body.reasoning_effort).toBe("none");
+    });
+
+    it("Anthropic level=medium sends thinking.budget_tokens=16384 with max_tokens headroom", async () => {
+      const model = resolveModel("claude-sonnet-4-6", "wire-key-ant", undefined, "ant");
+      const { error, calls } = await withMockFetch(
+        () => json(200, ANT_OK),
+        () => model.doGenerate({
+          prompt: PROMPT,
+          providerOptions: reasoningProviderOptions(model, "claude-sonnet-4-6", "medium", true),
+        }),
+      );
+      expect(error).toBeNull();
+      expect(calls[0].url).toContain("/messages");
+      expect(calls[0].body.thinking).toEqual({ type: "enabled", budget_tokens: 16384 });
+      // @ai-sdk/anthropic adds the budget on top of max_tokens itself.
+      expect(calls[0].body.max_tokens).toBeGreaterThan(16384);
     });
   });
 });
