@@ -223,6 +223,32 @@ export function openAiSafeToolName(name: string): string {
   return `${name.slice(0, OPENAI_MAX_TOOL_NAME - 8)}_${suffix}`;
 }
 
+// ─── OpenAI reasoning-model + tools guard ────────────────────────────────
+//
+// OpenAI reasoning models (gpt-5*, o-series) reject the DEFAULT
+// reasoning_effort on /v1/chat/completions the moment function tools are
+// attached:
+//   "Function tools with reasoning_effort are not supported for
+//    gpt-5.6-sol in /v1/chat/completions. To use function tools, use
+//    /v1/responses or set reasoning_effort to 'none'." [400]
+// We deliberately stay on chat/completions (gateway + ZDR compat — see
+// resolveModel), so the fix is to force reasoning_effort:'none' for these
+// models whenever the turn carries tools (agent turns always do). Scoped by
+// model-id pattern so non-reasoning models (gpt-4o) and third-party gateways
+// serving non-gpt-5/o models are left untouched.
+const OPENAI_REASONING_MODEL_RE = /^(o[1-9]|gpt-5)/i;
+
+export function openAiReasoningProviderOptions(
+  model: LanguageModel,
+  modelId: string,
+  hasTools: boolean,
+): { openai: { reasoningEffort: "none" } } | undefined {
+  if (!hasTools || !isOpenAiCompatModel(model)) return undefined;
+  const bare = modelId.includes("/") ? modelId.split("/").slice(1).join("/") : modelId;
+  if (!OPENAI_REASONING_MODEL_RE.test(bare)) return undefined;
+  return { openai: { reasoningEffort: "none" } };
+}
+
 /** True when the resolved LanguageModel talks to an OpenAI-compat API
  *  (createOpenAI providers report provider ids like "openai.chat"). */
 export function isOpenAiCompatModel(model: LanguageModel): boolean {

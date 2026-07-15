@@ -2,7 +2,7 @@
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 import { env, exports } from "cloudflare:workers";
 import { describe, it, expect } from "vitest";
-import { resolveModel } from "../../apps/agent/src/harness/provider";
+import { resolveModel, openAiReasoningProviderOptions } from "../../apps/agent/src/harness/provider";
 import { evaluateOutcome } from "../../apps/agent/src/harness/outcome-evaluator";
 import { outboundByHost } from "../../apps/agent/src/outbound";
 import { registerHarness } from "../../apps/agent/src/harness/registry";
@@ -110,6 +110,43 @@ describe("Provider", () => {
     const model = resolveModel("provider/sub/claude-sonnet-4-6", "key");
     expect(model.modelId).toContain("claude-sonnet-4-6");
     expect(model.modelId).not.toContain("provider");
+  });
+
+  describe("openAiReasoningProviderOptions — reasoning_effort:'none' guard", () => {
+    const oaiModel = (id: string) => resolveModel(id, "k", undefined, "oai");
+    const antModel = (id: string) => resolveModel(id, "k", undefined, "ant");
+
+    it("forces reasoning_effort:'none' for gpt-5* with tools", () => {
+      const opts = openAiReasoningProviderOptions(oaiModel("gpt-5.6-sol"), "gpt-5.6-sol", true);
+      expect(opts).toEqual({ openai: { reasoningEffort: "none" } });
+    });
+
+    it("forces it for o-series (o3) with tools", () => {
+      const opts = openAiReasoningProviderOptions(oaiModel("o3"), "o3", true);
+      expect(opts).toEqual({ openai: { reasoningEffort: "none" } });
+    });
+
+    it("does NOT fire without tools (reasoning stays available)", () => {
+      expect(openAiReasoningProviderOptions(oaiModel("gpt-5.6-sol"), "gpt-5.6-sol", false)).toBeUndefined();
+    });
+
+    it("does NOT fire for non-reasoning OpenAI models (gpt-4o)", () => {
+      expect(openAiReasoningProviderOptions(oaiModel("gpt-4o"), "gpt-4o", true)).toBeUndefined();
+    });
+
+    it("does NOT fire for Anthropic models", () => {
+      expect(openAiReasoningProviderOptions(antModel("claude-sonnet-4-6"), "claude-sonnet-4-6", true)).toBeUndefined();
+    });
+
+    it("does NOT fire for gateway models that aren't gpt-5/o-series", () => {
+      const gw = resolveModel("deepseek-chat", "k", "https://api.deepseek.com", "oai-compatible");
+      expect(openAiReasoningProviderOptions(gw, "deepseek-chat", true)).toBeUndefined();
+    });
+
+    it("strips provider prefix before matching", () => {
+      const opts = openAiReasoningProviderOptions(oaiModel("gpt-5.6-sol"), "openai/gpt-5.6-sol", true);
+      expect(opts).toEqual({ openai: { reasoningEffort: "none" } });
+    });
   });
 });
 

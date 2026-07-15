@@ -8,7 +8,7 @@ import { SummarizeCompactionStrategy, resolveCompactionStrategy } from "./compac
 import type { CompactionStrategy } from "./compaction";
 import { ALL_TOOLS } from "./tools";
 import { llmLoggingMiddleware, llmLogKey } from "./llm-logging-middleware";
-import { isOpenAiCompatModel, sanitizeOpenAiToolNames } from "./provider";
+import { isOpenAiCompatModel, sanitizeOpenAiToolNames, openAiReasoningProviderOptions } from "./provider";
 
 // Single source of truth lives in ./tools.ts (ALL_TOOLS). Importing here so
 // adding a new toolset entry can't drift the event-classification list — the
@@ -425,6 +425,14 @@ export class DefaultHarness implements HarnessInterface {
         : undefined,
       messages: finalMessages,
       tools: cached.tools,
+      // OpenAI reasoning models (gpt-5*, o-series) 400 on chat/completions
+      // when function tools are present unless reasoning_effort is 'none'.
+      // Undefined for every other model — omitted from the request.
+      providerOptions: openAiReasoningProviderOptions(
+        model,
+        modelId,
+        Object.keys(cached.tools ?? {}).length > 0,
+      ),
       stopWhen: stepCountIs(100),
       abortSignal: runtime.abortSignal,
 
