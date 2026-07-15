@@ -638,7 +638,17 @@ export class DefaultHarness implements HarnessInterface {
         // shape of the success-path end so consumers can treat is_error as
         // the success/fail discriminator.
         if (!stepStartId) return;
-        let message = error instanceof Error ? error.message : String(error);
+        // Providers can surface IN-STREAM errors as plain objects, not Error
+        // instances — e.g. OpenAI Responses emits {type:'error', error:
+        // {type:'insufficient_quota'}} mid-stream. String() on those yields
+        // "[object Object]" in the event log (observed on prod 2026-07-15);
+        // JSON.stringify keeps the diagnostic.
+        let message =
+          error instanceof Error
+            ? error.message
+            : typeof error === "object" && error !== null
+              ? JSON.stringify(error)
+              : String(error);
         // AI SDK's APICallError exposes the upstream HTTP status + raw response
         // body, but `error.message` is only the HTTP statusText (e.g. "Bad
         // Request"). Surface the body too so consumers (oma sessions logs /
