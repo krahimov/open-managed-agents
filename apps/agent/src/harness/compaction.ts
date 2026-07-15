@@ -2,7 +2,7 @@ import { generateText } from "ai";
 import type { ModelMessage, LanguageModel } from "ai";
 import type { ContentBlock, SessionEvent } from "@open-managed-agents/shared";
 import { eventsToMessages } from "../runtime/history";
-import { isOpenAiCompatModel, sanitizeOpenAiToolNames } from "./provider";
+import { isOpenAiCompatModel, sanitizeOpenAiToolNames, reasoningProviderOptions } from "./provider";
 import type { HarnessRuntime } from "./interface";
 
 /**
@@ -194,6 +194,18 @@ export class SummarizeCompactionStrategy implements CompactionStrategy {
       toolChoice: "none",
       messages: [...cached.messages, summarizeRequest],
       maxOutputTokens: this.opts.maxSummaryTokens ?? 2000,
+      // Same floor as the main loop: OpenAI reasoning models on
+      // chat/completions 400 when tools ride along without
+      // reasoning_effort:'none' — tool_choice doesn't exempt them. Level
+      // is deliberately undefined (summarization never needs reasoning;
+      // the 2000-token output cap couldn't fit an Anthropic thinking
+      // budget anyway).
+      providerOptions: reasoningProviderOptions(
+        model,
+        modelId,
+        undefined,
+        Object.keys(cached.tools ?? {}).length > 0,
+      ),
     });
 
     runtime?.broadcast({

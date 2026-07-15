@@ -1,6 +1,7 @@
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
 import type { LanguageModel } from "ai";
+import type { ReasoningLevel } from "@open-managed-agents/shared";
 
 /**
  * API compatibility types:
@@ -124,6 +125,7 @@ export function resolveModel(
   baseURL?: string,
   compat?: ApiCompat,
   customHeaders?: Record<string, string>,
+  reasoningLevel?: ReasoningLevel,
 ): LanguageModel {
   const modelString = typeof model === "string" ? model : model.id;
 
@@ -144,7 +146,7 @@ export function resolveModel(
       headers: customHeaders,
       fetch: observingFetch,
     });
-    // Use chat/completions endpoint, not Responses API.
+    // Default to the chat/completions endpoint, not the Responses API.
     // Reasons:
     //   - Third-party OpenAI-compat gateways (CF AI Gateway, Groq, DeepSeek,
     //     xAI Grok, etc.) only support /v1/chat/completions
@@ -152,6 +154,27 @@ export function resolveModel(
     //     orgs with Zero Data Retention enabled get "Item with id 'fc_...' not
     //     found" errors mid-loop
     //   - chat/completions is the de-facto standard contract for OpenAI-compat
+    //
+    // The one exception: reasoning_level above "instant" on an OFFICIAL
+    // OpenAI reasoning model. chat/completions hard-400s on any
+    // reasoning_effort above 'none' when function tools are attached, so
+    // reasoning turns must ride /v1/responses. Gateways stay on chat (they
+    // don't serve /v1/responses), and the ZDR failure mode is handled by
+    // the fallback wrapper: on "Item with id 'fc_...' not found" the model
+    // clamps to chat + reasoning_effort:'none' and retries, so the turn
+    // never dies.
+    if (
+      effectiveCompat === "oai" &&
+      reasoningLevel !== undefined &&
+      reasoningLevel !== "instant" &&
+      OPENAI_REASONING_MODEL_RE.test(modelId)
+    ) {
+      return withZdrChatFallback(
+        openai.responses(modelId),
+        openai.chat(modelId),
+        `${fnv1a(apiKey).toString(36)}:${modelId}`,
+      );
+    }
     return openai.chat(modelId);
   }
 
@@ -223,30 +246,94 @@ export function openAiSafeToolName(name: string): string {
   return `${name.slice(0, OPENAI_MAX_TOOL_NAME - 8)}_${suffix}`;
 }
 
-// ─── OpenAI reasoning-model + tools guard ────────────────────────────────
+// ─── Unified reasoning-level → provider knobs ────────────────────────────
 //
-// OpenAI reasoning models (gpt-5*, o-series) reject the DEFAULT
-// reasoning_effort on /v1/chat/completions the moment function tools are
-// attached:
+// One user-facing enum (AgentConfig.reasoning_level, default "instant")
+// mapped per provider:
+//
+//   level   | OpenAI reasoning_effort | Anthropic thinking.budgetTokens
+//   --------|-------------------------|--------------------------------
+//   instant | none                    | disabled
+//   low     | low                     | 4k
+//   medium  | medium                  | 16k
+//   high    | high                    | 32k
+//
+// OpenAI constraint (the reason resolveModel forks endpoints): reasoning
+// models (gpt-5*, o-series) reject any reasoning_effort above 'none' on
+// /v1/chat/completions the moment function tools are attached:
 //   "Function tools with reasoning_effort are not supported for
 //    gpt-5.6-sol in /v1/chat/completions. To use function tools, use
 //    /v1/responses or set reasoning_effort to 'none'." [400]
-// We deliberately stay on chat/completions (gateway + ZDR compat — see
-// resolveModel), so the fix is to force reasoning_effort:'none' for these
-// models whenever the turn carries tools (agent turns always do). Scoped by
-// model-id pattern so non-reasoning models (gpt-4o) and third-party gateways
-// serving non-gpt-5/o models are left untouched.
+// So levels above instant only apply when the resolved model actually
+// rides the Responses API (official OpenAI); everything still on chat —
+// gateways, instant, the ZDR clamp — gets the forced-'none' floor
+// whenever the turn carries tools (agent turns always do). Scoped by
+// model-id pattern so non-reasoning models (gpt-4o) and third-party
+// gateways serving non-gpt-5/o models are left untouched.
+//
+// Anthropic has no endpoint split: extended thinking works on the normal
+// Messages API with tools. Scoped to known Claude models — third-party
+// ant-compatible providers (MiniMax, DeepSeek) don't take the parameter.
+// @ai-sdk/anthropic adds budgetTokens on top of max_tokens itself and
+// caps at the model's known max output, so no maxOutputTokens plumbing
+// is needed here.
 const OPENAI_REASONING_MODEL_RE = /^(o[1-9]|gpt-5)/i;
 
-export function openAiReasoningProviderOptions(
+const OPENAI_REASONING_EFFORT: Record<
+  Exclude<ReasoningLevel, "instant">,
+  "low" | "medium" | "high"
+> = { low: "low", medium: "medium", high: "high" };
+
+const ANTHROPIC_THINKING_BUDGET: Record<
+  Exclude<ReasoningLevel, "instant">,
+  number
+> = { low: 4096, medium: 16384, high: 32768 };
+
+export function reasoningProviderOptions(
   model: LanguageModel,
   modelId: string,
+  level: ReasoningLevel | undefined,
   hasTools: boolean,
-): { openai: { reasoningEffort: "none" } } | undefined {
-  if (!hasTools || !isOpenAiCompatModel(model)) return undefined;
-  const bare = modelId.includes("/") ? modelId.split("/").slice(1).join("/") : modelId;
-  if (!OPENAI_REASONING_MODEL_RE.test(bare)) return undefined;
-  return { openai: { reasoningEffort: "none" } };
+):
+  | { openai: { reasoningEffort: "none" | "low" | "medium" | "high" } }
+  | { anthropic: { thinking: { type: "enabled"; budgetTokens: number } } }
+  | undefined {
+  const effective: ReasoningLevel = level ?? "instant";
+  // Prefer the resolved model's wire-level id — the `modelId` arg is the
+  // agent's model-card HANDLE, which usually matches the wire model but
+  // isn't required to.
+  const wireId =
+    typeof model !== "string" && typeof model.modelId === "string"
+      ? model.modelId
+      : modelId;
+  const bare = wireId.includes("/") ? wireId.split("/").slice(1).join("/") : wireId;
+
+  if (isOpenAiCompatModel(model)) {
+    if (!OPENAI_REASONING_MODEL_RE.test(bare)) return undefined;
+    if (effective !== "instant" && isOpenAiResponsesModel(model)) {
+      return { openai: { reasoningEffort: OPENAI_REASONING_EFFORT[effective] } };
+    }
+    // Still on chat/completions (instant, gateway, or ZDR clamp) → the
+    // shipped floor: force 'none' whenever tools are present.
+    return hasTools ? { openai: { reasoningEffort: "none" } } : undefined;
+  }
+
+  if (
+    effective !== "instant" &&
+    isAnthropicModel(model) &&
+    bare.startsWith(KNOWN_CLAUDE_PREFIX)
+  ) {
+    return {
+      anthropic: {
+        thinking: {
+          type: "enabled",
+          budgetTokens: ANTHROPIC_THINKING_BUDGET[effective],
+        },
+      },
+    };
+  }
+
+  return undefined;
 }
 
 /** True when the resolved LanguageModel talks to an OpenAI-compat API
@@ -255,6 +342,119 @@ export function isOpenAiCompatModel(model: LanguageModel): boolean {
   if (typeof model === "string") return false;
   const provider = (model as { provider?: unknown }).provider;
   return typeof provider === "string" && provider.startsWith("openai");
+}
+
+/** True when the resolved model rides the OpenAI Responses API
+ *  ("openai.responses" — see resolveModel's reasoning-level fork). The
+ *  ZDR fallback wrapper reports "openai.chat" once clamped, so this
+ *  flips false mid-session exactly when the effort floor must return. */
+export function isOpenAiResponsesModel(model: LanguageModel): boolean {
+  if (typeof model === "string") return false;
+  const provider = (model as { provider?: unknown }).provider;
+  return (
+    typeof provider === "string" &&
+    provider.startsWith("openai") &&
+    provider.endsWith(".responses")
+  );
+}
+
+/** True when the resolved LanguageModel talks to an Anthropic-compat API
+ *  (createAnthropic providers report "anthropic.messages"). */
+export function isAnthropicModel(model: LanguageModel): boolean {
+  if (typeof model === "string") return false;
+  const provider = (model as { provider?: unknown }).provider;
+  return typeof provider === "string" && provider.startsWith("anthropic");
+}
+
+// ─── ZDR chat-fallback wrapper (Responses API → chat/completions) ───────
+//
+// Orgs with Zero Data Retention can't use the Responses API's server-side
+// item persistence: replaying history that references function-call items
+// 400s with "Item with id 'fc_...' not found". We can't detect ZDR up
+// front, so the responses-endpoint model is wrapped: on that specific
+// error it clamps to chat/completions + reasoning_effort:'none' (the only
+// effort chat accepts with tools) and retries the call in place — the
+// turn never dies. The clamp is remembered per (api key, model) for the
+// isolate's lifetime so subsequent turns skip the doomed responses call.
+
+const ZDR_ITEM_NOT_FOUND_RE = /item with id 'fc_[^']*' not found/i;
+const zdrClampedKeys = new Set<string>();
+
+function isZdrItemNotFoundError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { message?: unknown; responseBody?: unknown };
+  const text = `${typeof e.message === "string" ? e.message : ""} ${
+    typeof e.responseBody === "string" ? e.responseBody : ""
+  }`;
+  return ZDR_ITEM_NOT_FOUND_RE.test(text);
+}
+
+// Concrete V3 model type as returned by createOpenAI — the `LanguageModel`
+// union from "ai" also admits V2 models, whose call-options don't unify.
+type OpenAiLanguageModel = ReturnType<ReturnType<typeof createOpenAI>["chat"]>;
+type LanguageModelCallOptions = Parameters<OpenAiLanguageModel["doGenerate"]>[0];
+
+/** Rewrite call options for the chat retry: chat/completions with tools
+ *  only accepts reasoning_effort:'none'. */
+function clampCallOptions(options: LanguageModelCallOptions): LanguageModelCallOptions {
+  return {
+    ...options,
+    providerOptions: {
+      ...options.providerOptions,
+      openai: {
+        ...(options.providerOptions?.openai ?? {}),
+        reasoningEffort: "none",
+      },
+    },
+  };
+}
+
+function withZdrChatFallback(
+  responses: OpenAiLanguageModel,
+  chat: OpenAiLanguageModel,
+  clampKey: string,
+): OpenAiLanguageModel {
+  let clamped = zdrClampedKeys.has(clampKey);
+
+  const trip = (err: unknown): void => {
+    if (!isZdrItemNotFoundError(err)) throw err;
+    clamped = true;
+    zdrClampedKeys.add(clampKey);
+    console.warn(
+      `[provider.zdr] ${responses.modelId}: Responses API rejected function-call item replay (ZDR org?) — clamping to chat/completions + reasoning_effort:'none'`,
+    );
+  };
+
+  return {
+    specificationVersion: responses.specificationVersion,
+    get provider() {
+      return (clamped ? chat : responses).provider;
+    },
+    get modelId() {
+      return responses.modelId;
+    },
+    get supportedUrls() {
+      return (clamped ? chat : responses).supportedUrls;
+    },
+    async doGenerate(options: LanguageModelCallOptions) {
+      if (clamped) return chat.doGenerate(clampCallOptions(options));
+      try {
+        return await responses.doGenerate(options);
+      } catch (err) {
+        trip(err);
+        return chat.doGenerate(clampCallOptions(options));
+      }
+    },
+    async doStream(options: LanguageModelCallOptions) {
+      if (clamped) return chat.doStream(clampCallOptions(options));
+      try {
+        return await responses.doStream(options);
+      } catch (err) {
+        trip(err);
+        return chat.doStream(clampCallOptions(options));
+      }
+    },
+  } as OpenAiLanguageModel;
 }
 
 /**

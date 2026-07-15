@@ -172,9 +172,30 @@ const BUILTIN_TOOLS: Array<{ name: string; label: string; description: string }>
 
 type ToolOverride = "default" | "always_allow" | "always_ask" | "disabled";
 
+type ReasoningLevelValue = "instant" | "low" | "medium" | "high";
+
+const REASONING_LEVEL_OPTIONS: Array<{ value: ReasoningLevelValue; label: string; hint: string }> = [
+  { value: "instant", label: "Instant", hint: "no reasoning — fastest, cheapest" },
+  { value: "low", label: "Low", hint: "brief reasoning" },
+  { value: "medium", label: "Medium", hint: "moderate reasoning" },
+  { value: "high", label: "High", hint: "deep reasoning — slowest" },
+];
+
+/** Reasoning level only applies where the harness can map it: official
+ *  OpenAI reasoning models (gpt-5*, o-series → reasoning_effort) and
+ *  Anthropic Claude (→ extended-thinking budget). Hidden for gateways
+ *  (oai-compatible / ant-compatible) and non-reasoning models (gpt-4o). */
+function cardSupportsReasoningLevel(card: ModelCard | undefined): boolean {
+  if (!card) return false;
+  if (card.provider === "oai") return /^(o[1-9]|gpt-5)/i.test(card.model);
+  if (card.provider === "ant") return card.model.startsWith("claude-");
+  return false;
+}
+
 const INITIAL_FORM = {
   name: "",
   model: "",
+  reasoningLevel: "instant" as ReasoningLevelValue,
   system: "",
   description: "",
   modelCardId: "",
@@ -1019,6 +1040,15 @@ export function AgentFormDialog({
           },
         };
       }
+      // reasoning_level: only meaningful for cloud agents (local-runtime
+      // agents bring their own model), and "instant" is the server default
+      // so it's omitted rather than stored.
+      if (form.reasoningLevel !== "instant" && !form.runtimeId) {
+        payload._oma = {
+          ...((payload._oma as Record<string, unknown>) ?? {}),
+          reasoning_level: form.reasoningLevel,
+        };
+      }
 
       const agent = await api<Agent>("/v1/agents", {
         method: "POST",
@@ -1135,6 +1165,9 @@ export function AgentFormDialog({
     if (form.enableGeneralSubagent) {
       config.enable_general_subagent = true;
     }
+    if (form.reasoningLevel !== "instant" && !form.runtimeId) {
+      config._oma = { reasoning_level: form.reasoningLevel };
+    }
     return config;
   };
 
@@ -1223,6 +1256,11 @@ export function AgentFormDialog({
             dc.permission_policy?.type === "always_ask" ? "always_ask" : "always_allow",
           toolOverrides: overrides,
           enableGeneralSubagent: parsed.enable_general_subagent === true,
+          reasoningLevel: ((): ReasoningLevelValue => {
+            const rl = (parsed._oma as { reasoning_level?: unknown } | undefined)
+              ?.reasoning_level;
+            return rl === "low" || rl === "medium" || rl === "high" ? rl : "instant";
+          })(),
         });
       } catch {
         /* keep current form if parse fails */
@@ -1891,6 +1929,8 @@ function BasicTab({
   selectedCardId,
 }: BasicTabProps) {
   const runtimeRows = Array.isArray(runtimes) ? runtimes : [];
+  const selectedCard = modelCards.find((mc) => mc.id === selectedCardId);
+  const showReasoningLevel = !form.runtimeId && cardSupportsReasoningLevel(selectedCard);
   return (
     <div className="space-y-3">
       {createError && (
@@ -1951,6 +1991,35 @@ function BasicTab({
                   : "Select a model card..."
               }
             />
+            {showReasoningLevel && (
+              <div className="mt-2">
+                <label htmlFor="agent-reasoning-level" className="text-sm text-fg-muted block mb-1">
+                  Reasoning
+                </label>
+                <select
+                  id="agent-reasoning-level"
+                  value={form.reasoningLevel}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      reasoningLevel: e.target.value as ReasoningLevelValue,
+                    })
+                  }
+                  className={inputCls}
+                >
+                  {REASONING_LEVEL_OPTIONS.map((opt) => (
+                    <option key={opt.value} value={opt.value}>
+                      {opt.label} — {opt.hint}
+                    </option>
+                  ))}
+                </select>
+                <p className="text-xs text-fg-subtle mt-1">
+                  {selectedCard?.provider === "ant"
+                    ? "Maps to Claude extended thinking (token budget per level)."
+                    : "Maps to OpenAI reasoning effort; levels above Instant use the Responses API."}
+                </p>
+              </div>
+            )}
           </div>
         ))}
       {form.runtimeId && (

@@ -727,6 +727,7 @@ const sessionRegistry = new SessionRegistry({
       creds.baseURL,
       creds.apiCompat,
       creds.customHeaders,
+      agent.reasoning_level,
     );
   },
   buildTools: async (agent, sandbox, context) => {

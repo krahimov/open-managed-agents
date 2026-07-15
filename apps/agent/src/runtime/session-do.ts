@@ -4272,10 +4272,12 @@ export class SessionDO extends DurableObject<Env> {
 
     // Resolve model — `agent.model` is a card.model_id handle. The card
     // contains the wire-level LLM string we actually send to the provider.
+    // reasoning_level routes official-OpenAI reasoning models to the
+    // Responses API when above "instant" (see resolveModel).
     const handle = typeof agent.model === "string" ? agent.model : agent.model?.id;
     const effectiveHandle = handle || this.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
     const creds = await this.resolveModelCardCredentials(effectiveHandle);
-    const model = resolveModel(creds.model, creds.apiKey, creds.baseURL, creds.apiCompat, creds.customHeaders);
+    const model = resolveModel(creds.model, creds.apiKey, creds.baseURL, creds.apiCompat, creds.customHeaders, agent.reasoning_level);
 
     // Build system prompt: agent.system + platform guidance + skill /
     // memory_store / appendable_prompt content (the latter passed in as
