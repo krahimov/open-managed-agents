@@ -280,6 +280,7 @@ export class DaytonaSandbox implements SandboxExecutor {
     const sb = await this.ensureSandbox();
     await this.ensureParentDir(sb, target);
     await sb.fs.uploadFile(Buffer.from(content, "utf8"), target);
+    await this.syncAfterMutation(sb, target);
     return target;
   }
 
@@ -289,7 +290,37 @@ export class DaytonaSandbox implements SandboxExecutor {
     const sb = await this.ensureSandbox();
     await this.ensureParentDir(sb, target);
     await sb.fs.uploadFile(Buffer.from(bytes), target);
+    await this.syncAfterMutation(sb, target);
     return target;
+  }
+
+  /**
+   * Write-back after a FILE-TOOL mutation. exec() already syncs mounted
+   * resources in its finally (bash edits), but the write/edit tools go
+   * through fs.uploadFile — without this, a file written into
+   * /mnt/memory/<store>/ via the write tool never reached S3, so the
+   * "durable" memory evaporated with the sandbox (verified live on prod
+   * 2026-07-16: session 1 wrote codeword.md via the write tool, a fresh
+   * session's mount came up empty). Scoped to mutations under a mounted
+   * resource so plain workdir writes don't pay the sync round-trip.
+   */
+  private async syncAfterMutation(
+    sb: DaytonaSandboxInstance,
+    target: string,
+  ): Promise<void> {
+    const underMount =
+      [...this.mountedMemoryStores.values()].some((m) =>
+        target.startsWith(`${m.mountPoint}/`),
+      ) ||
+      (this.mountedOutputs
+        ? target.startsWith(`${this.mountedOutputs.mountPoint}/`)
+        : false);
+    if (!underMount) return;
+    await this.syncMountedResourcesToS3(sb).catch((err) => {
+      this.logger.warn(
+        `resource sync after file write failed: ${(err as Error).message}`,
+      );
+    });
   }
 
   async destroy(): Promise<void> {
