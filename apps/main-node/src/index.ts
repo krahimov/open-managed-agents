@@ -70,6 +70,7 @@ import type { AgentConfig, CredentialConfig, EnvironmentConfig, SessionEvent } f
 import { generateEventId } from "@open-managed-agents/shared";
 import { DefaultHarness } from "@open-managed-agents/agent/harness/default-loop";
 import { ClaudeAgentSdkHarness } from "./lib/claude-agent-sdk-harness.js";
+import { buildSetupPrompt, buildSetupTools } from "./lib/setup-harness.js";
 import { ALL_TOOLS, buildTools, getEnabledTools } from "@open-managed-agents/agent/harness/tools";
 import { resolveModel, type ApiCompat } from "@open-managed-agents/agent/harness/provider";
 import { composeSystemPrompt } from "@open-managed-agents/agent/harness/platform-guidance";
@@ -731,6 +732,33 @@ const sessionRegistry = new SessionRegistry({
     );
   },
   buildTools: async (agent, sandbox, context) => {
+    // Setup sessions (console post-create "refine your harness" flow,
+    // metadata.oma_setup) get ONLY the setup tool pair — no file/shell/web
+    // access by design. Same contract as the SDK harness's in-process
+    // oma_setup MCP server; without this, setup on the DefaultHarness
+    // (hosted/prod, where the SDK harness is gated off) could chat but
+    // never apply config changes.
+    const sessRow = await sessionsService.get({
+      tenantId: context.tenantId,
+      sessionId: context.sessionId,
+    });
+    if (sessRow?.metadata?.oma_setup === true) {
+      return buildSetupTools(agent, context.sessionId, {
+        updateAgent: (patch) =>
+          agentsService.update({
+            tenantId: context.tenantId,
+            agentId: agent.id,
+            input: patch,
+          }),
+        appendEvent: (event): Promise<unknown> =>
+          sessionRouter.appendEvent(context.sessionId, event),
+        requestAccess: (a) =>
+          postAccessRequest(context.tenantId, context.sessionId, {
+            ...a,
+            mcp_server_url: a.mcp_server_url ?? matchAgentMcpServer(agent, a.service),
+          }),
+      });
+    }
     const creds = await resolveNodeModelCredentials(agent, context.tenantId);
     return buildTools(agent, sandbox, {
       ANTHROPIC_API_KEY: creds.apiCompat.startsWith("ant") ? creds.apiKey : undefined,
@@ -857,7 +885,17 @@ const sessionRegistry = new SessionRegistry({
       sandbox: input.sandbox,
     });
     await runtime.refreshHistory();
-    const rawSystemPrompt = input.agent.system ?? "";
+    // Setup sessions replace the agent's own system prompt with the setup
+    // preamble (config-designer mode) — mirrors the SDK harness. Tools are
+    // swapped by the buildTools hook above; both key off metadata.oma_setup.
+    const setupRow = await sessionsService.get({
+      tenantId: input.tenantId,
+      sessionId: input.sessionId,
+    });
+    const isSetup = setupRow?.metadata?.oma_setup === true;
+    const rawSystemPrompt = isSetup
+      ? buildSetupPrompt(input.agent)
+      : input.agent.system ?? "";
     const memoryContext = await buildNodeMemoryPromptContext(input.tenantId, input.sessionId);
     return {
       agent: input.agent,
@@ -866,9 +904,13 @@ const sessionRegistry = new SessionRegistry({
       tenant_id: input.tenantId,
       tools: input.tools as HarnessContext["tools"],
       model: input.model,
-      systemPrompt: composeSystemPrompt(rawSystemPrompt, memoryContext.reminders),
+      // Setup mode: the preamble IS the whole prompt — no platform guidance
+      // (written for the working toolset) and no memory reminders.
+      systemPrompt: isSetup
+        ? rawSystemPrompt
+        : composeSystemPrompt(rawSystemPrompt, memoryContext.reminders),
       rawSystemPrompt,
-      platformReminders: memoryContext.reminders,
+      platformReminders: isSetup ? [] : memoryContext.reminders,
       env: {
         ANTHROPIC_API_KEY: creds.apiKey,
         ANTHROPIC_BASE_URL: creds.apiCompat.startsWith("ant") ? creds.baseURL : undefined,

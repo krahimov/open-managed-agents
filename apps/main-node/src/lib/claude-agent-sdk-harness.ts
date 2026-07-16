@@ -41,6 +41,7 @@ import {
   evaluatePolicy,
   generateId,
 } from "@open-managed-agents/shared";
+import { buildSetupPrompt, harnessView } from "./setup-harness.js";
 
 /** Fields a setup session may change on its own harness. */
 export interface HarnessPatch {
@@ -69,6 +70,10 @@ const CLI_NOTES = [
   "- `gh api`: quote any path containing `?`, and pass `-X GET` whenever you",
   "  use `-f`/`-F` for query params — otherwise gh switches the request to",
   "  POST and valid GET routes return 404.",
+  "- You have built-in WebSearch and WebFetch tools even when they are not in",
+  "  your immediate tool list — they may be DEFERRED: load them with ToolSearch",
+  "  (query \"select:WebSearch,WebFetch\") before concluding web access is",
+  "  unavailable. Do not assume connected MCP apps are the only search path.",
 ].join("\n");
 
 /** Subset of NodeMcpProxyTarget the harness needs (defined in index.ts). */
@@ -218,56 +223,8 @@ function textOfToolResult(content: unknown): string {
  */
 type SdkToolSchema = Parameters<typeof tool>[2];
 
-/** The user-meaningful slice of an AgentConfig (drops internal bookkeeping like
- *  id/version/created_at). Shared by the setup preamble and the broadcast. */
-function harnessView(agent: AgentConfig): Record<string, unknown> {
-  const view: Record<string, unknown> = {};
-  const model = typeof agent.model === "string" ? agent.model : agent.model?.id;
-  if (agent.name) view.name = agent.name;
-  if (agent.description) view.description = agent.description;
-  if (model) view.model = model;
-  if (agent.system) view.system = agent.system;
-  if (agent.mcp_servers?.length) view.mcp_servers = agent.mcp_servers;
-  if (agent.tools?.length) view.tools = agent.tools;
-  if (agent.skills?.length) view.skills = agent.skills;
-  return view;
-}
-
-/** Setup-mode preamble. Replaces the claude_code preset entirely (string
- *  systemPrompt) so the agent acts as a config designer refining ITS OWN
- *  harness, not a coding agent. The current harness is embedded so the agent
- *  can "scan its own harness" and clarify what the user wants. */
-function buildSetupPrompt(agent: AgentConfig): string {
-  return [
-    "You are an OMA agent that was just created and is now in SETUP MODE — a planning conversation to dial in your own configuration (your \"harness\") before you start doing real work.",
-    "",
-    "Below is your CURRENT harness. Read it, then interview the user to clarify what they actually want you to do, and refine your own harness to match.",
-    "",
-    "```json",
-    JSON.stringify(harnessView(agent), null, 2),
-    "```",
-    "",
-    "You have exactly two tools and no file, shell, or web access:",
-    "- update_harness: change fields on your own harness. Call it after EACH meaningful answer so the live config on the user's screen stays in sync. Pass only the fields that changed.",
-    "- request_access: pop a one-click connect card in the user's setup panel for a service that needs credentials. Pass the service slug (for an MCP server you added, use its exact `name`) and a one-line reason. The user authenticates in the popup and you get a message when the account is connected.",
-    "",
-    "Harness fields you can refine:",
-    "- name / description: a short label + one-line summary of what you do.",
-    "- model: your Claude model id (keep the current one unless the task clearly needs a stronger model).",
-    "- system: your system prompt — the heart of the harness. Write it in the second person, concrete and task-specific.",
-    "- mcp_servers: external tool servers, e.g. [{ \"name\": \"notion\", \"type\": \"url\", \"url\": \"https://mcp.notion.com/mcp\" }].",
-    "- skills: optional named skills.",
-    "",
-    "How to run setup:",
-    "1. Open by briefly reflecting your current purpose, then ask what the user wants you to do (or do differently).",
-    "2. Ask ONE focused question at a time. After each answer, immediately call update_harness with what you can refine now — usually a sharper system prompt first, then name/description, then any MCP servers or skills.",
-    "3. Keep tightening your system prompt as you learn more.",
-    "4. Be concise. In a sentence, say what you just changed (e.g. \"I rewrote my system prompt around daily triage and added the Notion server\").",
-    "5. When the user is satisfied, confirm your harness is set and that you're ready to run.",
-    "",
-    "Never invent credentials or secrets, and never ask the user to paste keys or tokens in chat. For an MCP server that needs auth, add the server with update_harness, then call request_access for it (one call per server) so the user can authenticate right here — don't defer it to \"afterward\".",
-  ].join("\n");
-}
+// harnessView + buildSetupPrompt live in ./setup-harness.ts — shared with the
+// DefaultHarness setup path so both harnesses run the identical setup contract.
 
 export class ClaudeAgentSdkHarness {
   #deps: ClaudeAgentSdkHarnessDeps;
