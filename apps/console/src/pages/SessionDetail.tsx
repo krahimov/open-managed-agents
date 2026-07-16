@@ -494,7 +494,10 @@ export function SessionDetail() {
         // display data — clients fetch resources on demand. Names appear a
         // tick later than the badge frame; until then the badge falls back
         // to the short-id label.
-        if (s.environment_id) {
+        // env_local_runtime is a synthetic id minted for ambient/mission
+        // spawns — there is no environments row to resolve, and the lookup
+        // only produces a spurious "Environment not found" toast.
+        if (s.environment_id && s.environment_id !== "env_local_runtime") {
           api<{ id: string; name?: string; description?: string }>(`/v1/environments/${s.environment_id}`)
             .then((env) => setSessionMeta((prev) => ({ ...prev, envSnapshot: env })))
             .catch(() => {});
