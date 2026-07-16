@@ -642,13 +642,20 @@ export class DefaultHarness implements HarnessInterface {
         // instances — e.g. OpenAI Responses emits {type:'error', error:
         // {type:'insufficient_quota'}} mid-stream. String() on those yields
         // "[object Object]" in the event log (observed on prod 2026-07-15);
-        // JSON.stringify keeps the diagnostic.
-        let message =
-          error instanceof Error
-            ? error.message
-            : typeof error === "object" && error !== null
-              ? JSON.stringify(error)
-              : String(error);
+        // JSON.stringify keeps the diagnostic. Circular objects would make
+        // stringify itself throw inside onError — fall back to String().
+        let message: string;
+        if (error instanceof Error) {
+          message = error.message;
+        } else if (typeof error === "object" && error !== null) {
+          try {
+            message = JSON.stringify(error);
+          } catch {
+            message = String(error);
+          }
+        } else {
+          message = String(error);
+        }
         // AI SDK's APICallError exposes the upstream HTTP status + raw response
         // body, but `error.message` is only the HTTP statusText (e.g. "Bad
         // Request"). Surface the body too so consumers (oma sessions logs /
