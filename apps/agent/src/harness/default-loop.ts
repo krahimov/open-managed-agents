@@ -383,6 +383,13 @@ export class DefaultHarness implements HarnessInterface {
       // per-step latch; reset on each onStepStart.
       let stepStartId: string | null = null;
       let stepSawFirstChunk = false;
+      // Last in-stream provider error (onError below). When the stream ends
+      // with finishReason="error" and the turn shipped nothing, this is the
+      // diagnostic the thrown ModelError carries — without it the turn
+      // "completes" silently: no reply, no session.error, just an idle
+      // session (observed 2026-07-15/16: OpenAI insufficient_quota mid-
+      // stream looked like "the model does not answer").
+      let lastStreamErrorMessage: string | null = null;
 
       const streamStartedAt = Date.now();
       console.log(`[stream] streamText START model=${modelId} messages=${finalMessages.length} tools=${Object.keys(cached.tools ?? {}).length}`);
@@ -637,7 +644,7 @@ export class DefaultHarness implements HarnessInterface {
         // we emitted in the start-step chunk hangs unpaired. Mirror the
         // shape of the success-path end so consumers can treat is_error as
         // the success/fail discriminator.
-        if (!stepStartId) return;
+        //
         // Providers can surface IN-STREAM errors as plain objects, not Error
         // instances — e.g. OpenAI Responses emits {type:'error', error:
         // {type:'insufficient_quota'}} mid-stream. String() on those yields
@@ -667,6 +674,11 @@ export class DefaultHarness implements HarnessInterface {
             message = `${message} [${e.statusCode ?? "?"}] ${e.responseBody ?? ""}`;
           }
         }
+        lastStreamErrorMessage = message;
+        // No open span (error before the first step start, or a late error
+        // after onStepFinish closed it) — the message is captured above for
+        // the finishReason==="error" throw; there's just no span to close.
+        if (!stepStartId) return;
         runtime.broadcast({
           type: "span.model_request_end",
           model: modelId,
@@ -807,6 +819,22 @@ export class DefaultHarness implements HarnessInterface {
         // for it; we know the class at the throw site, just type it.
         throw new ModelError(
           `silent_stop: model returned finish_reason=${finishReason} with empty text and no tool calls`,
+        );
+      }
+      // In-stream provider error that ended the stream (finish_reason=
+      // "error") with nothing shipped: streamText does NOT throw for these
+      // — onError fires, consumeStream completes, and without this check
+      // the turn "succeeds" with no reply and no session.error. The user
+      // sees a session that just goes idle (observed 2026-07-15/16:
+      // OpenAI insufficient_quota — "the model does not answer"). Throw
+      // with the captured diagnostic so the machine emits session.error
+      // and the console renders its error card.
+      if (finishReason === "error" && turnShippedNothing) {
+        if (currentMessageId) {
+          await runtime.broadcastStreamEnd(currentMessageId, "aborted", "stream_error");
+        }
+        throw new ModelError(
+          `model_stream_error: ${lastStreamErrorMessage ?? "provider stream ended in error with no output"}`,
         );
       }
       return { finishReason, text: finalText, toolCalls, toolResults, usage };

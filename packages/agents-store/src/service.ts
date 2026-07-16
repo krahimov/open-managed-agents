@@ -397,8 +397,16 @@ export class AgentService {
    *  keys still skips the version bump). */
   private detectChanges(existing: AgentRow, patch: UpdateAgentInput): boolean {
     for (const key of UPDATABLE_FIELDS) {
-      const next = (patch as unknown as Record<string, unknown>)[key];
+      let next = (patch as unknown as Record<string, unknown>)[key];
       if (next === undefined) continue;
+      // `null` means "clear" — normalize it to the value applyUpdate would
+      // write ("" for system/description, undefined otherwise) so clearing
+      // an already-clear field is a no-op instead of a version bump
+      // (JSON.stringify(null) !== JSON.stringify(undefined) made every
+      // repeated null-clear write a pointless history snapshot).
+      if (next === null) {
+        next = key === "system" || key === "description" ? "" : undefined;
+      }
       const current = (existing as unknown as Record<string, unknown>)[key];
       if (JSON.stringify(next) !== JSON.stringify(current)) return true;
     }
