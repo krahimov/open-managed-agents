@@ -763,6 +763,9 @@ const sessionRegistry = new SessionRegistry({
     return buildTools(agent, sandbox, {
       ANTHROPIC_API_KEY: creds.apiCompat.startsWith("ant") ? creds.apiKey : undefined,
       ANTHROPIC_BASE_URL: creds.apiCompat.startsWith("ant") ? creds.baseURL : undefined,
+      // When set, the default web_search tool rides Tavily instead of the
+      // rate-limit-prone DuckDuckGo scrape (see tools.ts web search block).
+      TAVILY_API_KEY: process.env.TAVILY_API_KEY,
       toMarkdown: toMarkdownProvider,
       environmentConfig: context.environment?.config as never,
       mcpBinding: nodeMcpBinding,

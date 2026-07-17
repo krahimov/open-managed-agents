@@ -1182,51 +1182,84 @@ export async function buildTools(
   if (toolTypes.has("web_search_20250305")) {
     tools.web_search = anthropic.tools.webSearch_20250305();
   } else if (toolTypes.has("web_search_ddg") || enabled.has("web_search")) {
-    // DuckDuckGo — default web search, free, no API key
+    // Default web search. Backend picked at build time:
+    //   - TAVILY_API_KEY present → Tavily API (reliable, rate-limit-free at
+    //     normal volumes). One env var upgrades every agent's default
+    //     search — no per-agent tool-type change needed.
+    //   - otherwise → DuckDuckGo scrape (free, no key), which throttles
+    //     bursts hard (observed: a lead-gen agent's 3 rapid searches all
+    //     rate-limited). One retry after a short backoff before giving up.
+    const tavilyDefaultKey = env?.TAVILY_API_KEY;
+
+    const ddgSearch = async (query: string, count: number): Promise<string> => {
+      // Step 1: Get VQD token from DuckDuckGo
+      const vqdRes = await fetch(`https://duckduckgo.com/?${new URLSearchParams({ q: query, ia: "web" })}`);
+      if (!vqdRes.ok) return `DuckDuckGo error: ${vqdRes.status}`;
+      const vqdText = await vqdRes.text();
+      const vqd = /vqd=['"](\d+-\d+(?:-\d+)?)['"]/?.exec(vqdText)?.[1];
+      if (!vqd) return "DuckDuckGo: failed to get search token";
+
+      // Step 2: Fetch search results
+      const params = new URLSearchParams({
+        q: query, l: "en-us", kl: "wt-wt", s: "0", dl: "en",
+        ct: "US", ss_mkt: "us", vqd, sp: "1", bpa: "1",
+      });
+      const searchRes = await fetch(`https://links.duckduckgo.com/d.js?${params}`);
+      if (!searchRes.ok) return `DuckDuckGo search error: ${searchRes.status}`;
+      const body = await searchRes.text();
+
+      if (body.includes("DDG.deep.anomalyDetectionBlock"))
+        return "DuckDuckGo rate limited. Try again in a moment.";
+
+      // Step 3: Parse results from JSONP-like response
+      const match = /DDG\.pageLayout\.load\('d',(\[.+?\])\);DDG\.duckbar\.load/.exec(body);
+      if (!match) return "DuckDuckGo: no results found";
+
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const raw = JSON.parse(match[1].replace(/\t/g, "    ")) as any[];
+      const results = raw
+        .filter((r) => r.u && !("n" in r))
+        .slice(0, count)
+        .map((r) => ({
+          title: r.t,
+          url: r.u,
+          description: (r.a || "").replace(/<\/?b>/g, ""),
+        }));
+
+      return JSON.stringify(results);
+    };
+
     tools.web_search = tool({
       description:
-        "Search the web using DuckDuckGo. Returns titles, URLs, and descriptions.",
+        "Search the web. Returns titles, URLs, and descriptions.",
       inputSchema: z.object({
         query: z.string().describe("Search query"),
         max_results: z.number().optional().describe("Max results (default 5)"),
       }),
       execute: safe(async ({ query, max_results }) => {
         const count = max_results || 5;
-        // Step 1: Get VQD token from DuckDuckGo
-        const vqdRes = await fetch(`https://duckduckgo.com/?${new URLSearchParams({ q: query, ia: "web" })}`);
-        if (!vqdRes.ok) return `DuckDuckGo error: ${vqdRes.status}`;
-        const vqdText = await vqdRes.text();
-        const vqd = /vqd=['"](\d+-\d+(?:-\d+)?)['"]/?.exec(vqdText)?.[1];
-        if (!vqd) return "DuckDuckGo: failed to get search token";
-
-        // Step 2: Fetch search results
-        const params = new URLSearchParams({
-          q: query, l: "en-us", kl: "wt-wt", s: "0", dl: "en",
-          ct: "US", ss_mkt: "us", vqd, sp: "1", bpa: "1",
-        });
-        const searchRes = await fetch(`https://links.duckduckgo.com/d.js?${params}`);
-        if (!searchRes.ok) return `DuckDuckGo search error: ${searchRes.status}`;
-        const body = await searchRes.text();
-
-        if (body.includes("DDG.deep.anomalyDetectionBlock"))
-          return "DuckDuckGo rate limited. Try again in a moment.";
-
-        // Step 3: Parse results from JSONP-like response
-        const match = /DDG\.pageLayout\.load\('d',(\[.+?\])\);DDG\.duckbar\.load/.exec(body);
-        if (!match) return "DuckDuckGo: no results found";
-
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const raw = JSON.parse(match[1].replace(/\t/g, "    ")) as any[];
-        const results = raw
-          .filter((r) => r.u && !("n" in r))
-          .slice(0, count)
-          .map((r) => ({
-            title: r.t,
-            url: r.u,
-            description: (r.a || "").replace(/<\/?b>/g, ""),
-          }));
-
-        return JSON.stringify(results);
+        if (tavilyDefaultKey) {
+          const res = await fetch("https://api.tavily.com/search", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ api_key: tavilyDefaultKey, query, max_results: count }),
+          });
+          if (res.ok) {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const data = (await res.json()) as any;
+            if (Array.isArray(data.results)) {
+              return JSON.stringify(
+                // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                data.results.map((r: any) => ({ title: r.title, url: r.url, description: r.content })),
+              );
+            }
+          }
+          // Tavily unavailable (bad key, outage, quota) → DDG below.
+        }
+        const first = await ddgSearch(query, count);
+        if (!first.startsWith("DuckDuckGo rate limited")) return first;
+        await new Promise((r) => setTimeout(r, 2500));
+        return ddgSearch(query, count);
       }),
     });
   }
