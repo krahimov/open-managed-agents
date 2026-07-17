@@ -196,6 +196,10 @@ export class SqlCredentialRepo implements CredentialRepo {
   }
 
   async countAll(tenantId: string, vaultId: string): Promise<number> {
+    // ACTIVE credentials only — this feeds the MAX_CREDENTIALS_PER_VAULT
+    // gate, and archived husks must not block new credentials (prod's
+    // Connected Apps vault: 20 archived composio rotations, 0 active,
+    // and every re-provision 400'd with "Maximum 20 credentials").
     const row = await getOne<{ c: number }>(
       this.db
         .select({ c: sql<number>`COUNT(*)` })
@@ -204,6 +208,7 @@ export class SqlCredentialRepo implements CredentialRepo {
           and(
             eq(credentials.tenant_id, tenantId),
             eq(credentials.vault_id, vaultId),
+            isNull(credentials.archived_at),
           ),
         ),
     );

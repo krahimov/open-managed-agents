@@ -138,9 +138,11 @@ export class InMemoryCredentialRepo implements CredentialRepo {
   }
 
   async countAll(tenantId: string, vaultId: string): Promise<number> {
+    // Active only — mirrors sql-credential-repo: the cap gate must not
+    // count archived husks.
     let n = 0;
     for (const c of this.byId.values()) {
-      if (c.tenant_id === tenantId && c.vault_id === vaultId) n++;
+      if (c.tenant_id === tenantId && c.vault_id === vaultId && !c.archived_at) n++;
     }
     return n;
   }
