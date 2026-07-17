@@ -582,6 +582,39 @@ export class SessionRegistry {
       // loadAgent runs every turn; the snapshot never changes.
       let agentSnapshot: AgentConfig | null | undefined;
 
+      // Per-session reasoning override: `session.metadata.reasoning_level`
+      // beats the agent's configured level for THIS session (the pattern
+      // the reasoning plan reserved — same metadata channel ambient/
+      // mission spawns use). Read fresh each turn so a mid-session
+      // PUT /v1/sessions/:id metadata change applies on the next message.
+      // Overlaying on the loadAgent result means buildModel (endpoint
+      // routing) and the harness (providerOptions) both see the effective
+      // level with no extra plumbing. Invalid values are ignored.
+      const applySessionReasoningOverride = async (
+        agent: AgentConfig | null,
+      ): Promise<AgentConfig | null> => {
+        if (!agent) return agent;
+        try {
+          const row = await this.deps.sql
+            .prepare(`SELECT metadata FROM sessions WHERE tenant_id = ? AND id = ?`)
+            .bind(tenantId, sessionId)
+            .first<{ metadata: string | Record<string, unknown> | null }>();
+          const raw = row?.metadata;
+          const meta = (raw == null
+            ? null
+            : typeof raw === "string"
+              ? JSON.parse(raw)
+              : raw) as { reasoning_level?: unknown } | null;
+          const rl = meta?.reasoning_level;
+          if (rl === "instant" || rl === "low" || rl === "medium" || rl === "high") {
+            if (agent.reasoning_level !== rl) return { ...agent, reasoning_level: rl };
+          }
+        } catch {
+          // Best-effort — a malformed metadata blob must not kill the turn.
+        }
+        return agent;
+      };
+
       const machine = new SessionStateMachine({
         sessionId,
         tenantId,
@@ -592,7 +625,7 @@ export class SessionRegistry {
             sessionRuntime.agentSnapshot &&
             (!sessionRuntime.agentSnapshot.id || sessionRuntime.agentSnapshot.id === agentId)
           ) {
-            return sessionRuntime.agentSnapshot;
+            return applySessionReasoningOverride(sessionRuntime.agentSnapshot);
           }
           // Prefer the session's frozen agent snapshot (CF SessionDO
           // parity). The snapshot carries per-session enrichments the live
@@ -619,9 +652,11 @@ export class SessionRegistry {
               agentSnapshot = null;
             }
           }
-          if (agentSnapshot && agentSnapshot.id === agentId) return agentSnapshot;
+          if (agentSnapshot && agentSnapshot.id === agentId) {
+            return applySessionReasoningOverride(agentSnapshot);
+          }
           const row = await this.deps.agentsService.get({ tenantId, agentId });
-          return row ?? null;
+          return applySessionReasoningOverride(row ?? null);
         },
         // Memory + outputs mounting happens in the orchestrator above.
         // SessionStateMachine still accepts the hooks for CF parity but
