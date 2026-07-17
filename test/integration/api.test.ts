@@ -34,7 +34,10 @@ async function createFullSession(opts?: { agentOverrides?: Record<string, unknow
     method: "POST",
     headers: HEADERS,
     body: JSON.stringify({
-      name: "Test Agent",
+      // Unique per call — POST /v1/agents now 409s on exact active-name
+      // duplicates (create-once doctrine), and this helper runs many times
+      // against shared storage.
+      name: `Test Agent ${Math.random().toString(36).slice(2, 8)}`,
       model: "claude-sonnet-4-6",
       system: "You are helpful.",
       tools: [{ type: "agent_toolset_20260401" }],
