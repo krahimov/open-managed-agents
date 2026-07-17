@@ -275,6 +275,36 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
       if (gate) return c.json(gate.body as object, gate.status as 403);
     }
 
+    // Create-once doctrine: an ACTIVE agent with the exact same name is
+    // almost always an accident — LLM-driven create flows (console setup,
+    // create-agent skill) re-creating on refinement instead of updating
+    // (the "general ops agent" triplets: three near-identical rows minted
+    // minutes apart). Refuse with 409 and point at the existing row.
+    // Deliberate copies opt out with metadata.allow_duplicate_name.
+    if (body.metadata?.allow_duplicate_name !== true) {
+      const wanted = body.name.trim().toLowerCase();
+      const page = await services.agents.listPage({
+        tenantId,
+        limit: 100,
+        q: body.name.trim(),
+        status: "active",
+      });
+      const existing = page.items.find(
+        (a) => a.name.trim().toLowerCase() === wanted,
+      );
+      if (existing) {
+        return c.json(
+          {
+            error:
+              `An active agent named "${body.name}" already exists (${existing.id}). ` +
+              "Update that agent instead, choose a different name, or pass " +
+              "metadata.allow_duplicate_name: true to create a deliberate copy.",
+          },
+          409,
+        );
+      }
+    }
+
     const isLocalRuntime = !!body.runtime_binding;
     if (!isLocalRuntime && deps.validateModel) {
       const r = await deps.validateModel(tenantId, body.model);

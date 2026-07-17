@@ -30,7 +30,8 @@ async function createAgentAndEnv(overrides?: {
   envBody?: Record<string, unknown>;
 }) {
   const agentRes = await post("/v1/agents", {
-    name: "Core Test Agent",
+    // Unique per call — the create route 409s on exact active-name dupes.
+    name: `Core Test Agent ${Math.random().toString(36).slice(2, 8)}`,
     model: "claude-sonnet-4-6",
     ...overrides?.agentBody,
   });
@@ -367,6 +368,50 @@ describe("Provider", () => {
       // @ai-sdk/anthropic adds the budget on top of max_tokens itself.
       expect(calls[0].body.max_tokens).toBeGreaterThan(16384);
     });
+  });
+});
+
+// ============================================================
+// 1b. Agent create — duplicate-name guard (create-once doctrine)
+// ============================================================
+describe("Agent create — duplicate-name guard", () => {
+  it("409s when an active agent with the exact same name exists", async () => {
+    const name = `Dup Guard ${Math.random().toString(36).slice(2, 8)}`;
+    const first = await post("/v1/agents", { name, model: "claude-sonnet-4-6" });
+    expect(first.status).toBe(201);
+    const second = await post("/v1/agents", { name, model: "claude-sonnet-4-6" });
+    expect(second.status).toBe(409);
+    const body = (await second.json()) as any;
+    // Error envelope is either the legacy bare string or the Anthropic-style
+    // { error: { type, message } } object depending on the app wrapper.
+    const msg = typeof body.error === "string" ? body.error : body.error?.message;
+    expect(String(msg)).toContain("already exists");
+  });
+
+  it("name match is case- and whitespace-insensitive", async () => {
+    const base = `Dup Case ${Math.random().toString(36).slice(2, 8)}`;
+    await post("/v1/agents", { name: base, model: "claude-sonnet-4-6" });
+    const dup = await post("/v1/agents", { name: `  ${base.toUpperCase()} `, model: "claude-sonnet-4-6" });
+    expect(dup.status).toBe(409);
+  });
+
+  it("metadata.allow_duplicate_name opts out for deliberate copies", async () => {
+    const name = `Dup Optout ${Math.random().toString(36).slice(2, 8)}`;
+    await post("/v1/agents", { name, model: "claude-sonnet-4-6" });
+    const copy = await post("/v1/agents", {
+      name,
+      model: "claude-sonnet-4-6",
+      metadata: { allow_duplicate_name: true },
+    });
+    expect(copy.status).toBe(201);
+  });
+
+  it("archived agents do not block name reuse", async () => {
+    const name = `Dup Archived ${Math.random().toString(36).slice(2, 8)}`;
+    const first = (await (await post("/v1/agents", { name, model: "claude-sonnet-4-6" })).json()) as any;
+    await post(`/v1/agents/${first.id}/archive`, {});
+    const again = await post("/v1/agents", { name, model: "claude-sonnet-4-6" });
+    expect(again.status).toBe(201);
   });
 });
 
