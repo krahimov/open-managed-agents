@@ -2638,6 +2638,7 @@ async function resolveNodeMcpProxyTarget(
   const grouped = await credentialService
     .listByVaults({ tenantId, vaultIds })
     .catch(() => []);
+  const composioCandidates: NodeMcpProxyTarget[] = [];
   for (const group of grouped) {
     for (const credential of group.credentials) {
       if ((credential as { archived_at?: string | null }).archived_at) continue;
@@ -2657,11 +2658,12 @@ async function resolveNodeMcpProxyTarget(
       if (auth.type === "composio_mcp") {
         const apiKey = resolveNodeComposioApiKey(auth);
         if (!apiKey) continue;
-        return {
+        composioCandidates.push({
           upstreamUrl: auth.mcp_server_url || server.url,
           upstreamToken: apiKey,
           upstreamAuthHeader: { name: "x-api-key", value: apiKey },
-        };
+        });
+        continue;
       }
 
       const token = auth.bearer_token ?? auth.token ?? auth.access_token;
@@ -2669,7 +2671,35 @@ async function resolveNodeMcpProxyTarget(
       return { upstreamUrl: server.url, upstreamToken: token };
     }
   }
+  // Composio credential selection: any tool-router URL matches any other
+  // (credentialMatchesMcpServerUrl), so the vault can yield several
+  // candidates. Prefer a CONCRETE per-session URL (…/tool_router/trs_*/mcp)
+  // over the generic sentinel (…/tool_router/v3/session/mcp) — the sentinel
+  // is not a servable endpoint (301s), and after a credential rotation a
+  // leftover sentinel credential silently won first-match, killing every
+  // Composio tool in the session (observed 2026-07-20 on the GC agent).
+  if (composioCandidates.length > 0) {
+    const concrete = composioCandidates.find(
+      (c) => !isGenericComposioSentinelUrl(c.upstreamUrl),
+    );
+    return concrete ?? composioCandidates[0];
+  }
   return null;
+}
+
+/** The session-less tool-router base URL the console historically baked
+ *  into agent configs and credentials. It only works as a *server name*
+ *  target for the proxy to swap — as an upstream it 301s. */
+function isGenericComposioSentinelUrl(raw: string): boolean {
+  try {
+    const url = new URL(raw);
+    return (
+      url.hostname === "app.composio.dev" &&
+      url.pathname.replace(/\/+$/, "") === "/tool_router/v3/session/mcp"
+    );
+  } catch {
+    return false;
+  }
 }
 
 function resolveNodeComposioApiKey(auth: { api_key?: string; api_key_env?: string }): string | null {
