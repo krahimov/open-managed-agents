@@ -68,7 +68,15 @@ export function AccessRequestCard({
               content: [
                 {
                   type: "text",
-                  text: `[access granted] ${service} is now connected — continue where you left off.`,
+                  // Composio grants change the tool surface mid-session
+                  // (the tool router's SEARCH_TOOLS results now include the
+                  // new toolkit) — without an explicit nudge, agents reason
+                  // from their earlier "no tools found" and give up
+                  // (observed: post-grant, an agent searched GitHub code
+                  // for a Drive upload instead of re-querying Composio).
+                  text: isMcpOauth
+                    ? `[access granted] ${service} is now connected — continue where you left off.`
+                    : `[access granted] ${service} is now connected. Your available actions have changed: re-run COMPOSIO_SEARCH_TOOLS for ${service} to discover its tools (do not assume earlier "no tools found" results still hold), then continue where you left off.`,
                 },
               ],
             },
