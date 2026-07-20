@@ -181,7 +181,15 @@ const COMPOSIO_NOT_CONNECTED =
   "Composio is not connected — configure COMPOSIO_API_KEY on the API server.";
 
 function normalizeComposioToolkitSlug(slug: string): string {
-  return slug.trim().toLowerCase();
+  // Composio toolkit slugs are bare alphanumerics ("googledrive",
+  // "googlecalendar"). Agents and users write human variants
+  // ("google-drive", "Google Drive", "google_drive") — strip separators so
+  // those resolve instead of flowing through as unknown slugs. An unknown
+  // slug is DANGEROUS, not just broken: Composio's auth_configs list
+  // silently ignores an unrecognized toolkit_slug filter and returns every
+  // config, which once routed a google-drive connect card to a LinkedIn
+  // OAuth page (first config in the unfiltered list).
+  return slug.trim().toLowerCase().replace(/[-_.\s]+/g, "");
 }
 
 function normalizeComposioApiKey(apiKey: string | null | undefined): string | undefined {
@@ -313,7 +321,18 @@ export async function getOrCreateComposioManagedAuthConfig(
     deps,
     `/api/v3.1/auth_configs?${params.toString()}`,
   );
-  const existing = (listed.items ?? []).find((cfg) => cfg.id && cfg.status !== "DISABLED");
+  // Composio silently IGNORES an unrecognized toolkit_slug filter and
+  // returns the full config list — picking the first item then hands the
+  // caller a random provider's OAuth (observed live: "google-drive" →
+  // LinkedIn). Only accept configs whose toolkit actually matches; a
+  // truly unknown slug falls through to the create call below, which
+  // fails loudly instead of misrouting.
+  const existing = (listed.items ?? []).find(
+    (cfg) =>
+      cfg.id &&
+      cfg.status !== "DISABLED" &&
+      normalizeComposioToolkitSlug(cfg.toolkit?.slug ?? "") === slug,
+  );
   if (existing) return existing;
 
   const created = await composioRequest<{
@@ -784,7 +803,53 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
         alias: body.alias,
         authConfigId: body.auth_config_id,
       });
-      return c.json(link, 201);
+
+      // Toolkit-locked tool-router sessions in this vault won't expose the
+      // new toolkit's tools even after the OAuth completes — the agent then
+      // reports "authorization succeeded but no tools found" (observed with
+      // a gmail+github-locked session and a google-drive grant). Re-provision
+      // any such credential with the union list; credential rotation is
+      // transparent to agents (the MCP proxy matches any Composio tool-router
+      // URL and always uses the ACTIVE credential's URL). Best-effort: a
+      // failure here must not break the link handoff.
+      let toolkitsExpanded = false;
+      try {
+        const requested = normalizeComposioToolkitSlug(body.toolkit);
+        const creds = await services.credentials.list({ tenantId, vaultId });
+        for (const cred of creds) {
+          if (cred.archived_at) continue;
+          const auth = (cred as unknown as CredentialConfig).auth as CredentialAuth & {
+            composio_toolkits?: string[];
+            composio_user_id?: string;
+          };
+          if (auth.type !== "composio_mcp") continue;
+          const locked = (auth.composio_toolkits ?? []).map(normalizeComposioToolkitSlug);
+          if (locked.length === 0 || locked.includes(requested)) continue;
+          const union = [...locked, requested];
+          const session = await createComposioToolRouterSession(composio.creds, {
+            user_id: auth.composio_user_id || userId,
+            toolkits: { enable: union },
+          });
+          await services.credentials.create({
+            tenantId,
+            vaultId,
+            displayName: cred.display_name,
+            auth: {
+              ...auth,
+              mcp_server_url: session.mcp.url,
+              composio_session_id: session.session_id,
+              composio_toolkits: union,
+            },
+          });
+          await services.credentials.archive({ tenantId, vaultId, credentialId: cred.id });
+          toolkitsExpanded = true;
+        }
+      } catch {
+        // Expansion is an enhancement to the grant, not a precondition for
+        // the OAuth link — swallow and let the card proceed.
+      }
+
+      return c.json({ ...link, toolkits_expanded: toolkitsExpanded }, 201);
     } catch (err) {
       return c.json({ error: (err as Error).message }, 502);
     }
