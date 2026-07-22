@@ -50,8 +50,10 @@ import type { AgentRow, AgentVersionRow } from "../types";
  */
 export class SqlAgentRepo implements AgentRepo {
   private readonly db: OmaDbBuilder;
-  constructor(db: OmaDb) {
+  private readonly dialect: "sqlite" | "postgres";
+  constructor(db: OmaDb, dialect: "sqlite" | "postgres" = "sqlite") {
     this.db = asBuilder(db);
+    this.dialect = dialect;
   }
 
   async insert(input: NewAgentInput): Promise<AgentRow> {
@@ -125,14 +127,18 @@ export class SqlAgentRepo implements AgentRepo {
     if (opts.createdBefore !== undefined)
       conds.push(lt(agents.created_at, opts.createdBefore));
     if (opts.q) {
-      // agents.name lives in the JSON config blob, so the q-filter has to
-      // pull it out via json_extract. SQLite's LIKE is ASCII-case-insensitive
-      // by default; we explicitly bind ESCAPE '\' so a user-supplied `%`/`_`
-      // is literal, not a wildcard. See escapeLikePattern.
-      // TODO: PG path needs json_extract → ->> rewrite (json_extract is SQLite-only).
+      // agents.name lives in the JSON config blob, so the q-filter needs
+      // dialect-specific JSON access — json_extract is SQLite-only (the PG
+      // path 500'd the first time this condition ran on prod, via the
+      // duplicate-name guard on create). config is a TEXT column on PG,
+      // hence the ::jsonb cast; ILIKE for parity with SQLite's ASCII-case-
+      // insensitive LIKE. ESCAPE '\' makes user-supplied `%`/`_` literal
+      // (see escapeLikePattern).
       const pattern = `%${escapeLikePattern(opts.q)}%`;
       conds.push(
-        sql`json_extract(${agents.config}, '$.name') LIKE ${pattern} ESCAPE '\\'`,
+        this.dialect === "postgres"
+          ? sql`(${agents.config}::jsonb ->> 'name') ILIKE ${pattern} ESCAPE '\\'`
+          : sql`json_extract(${agents.config}, '$.name') LIKE ${pattern} ESCAPE '\\'`,
       );
     }
     if (opts.after) {

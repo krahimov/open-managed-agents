@@ -57,11 +57,14 @@ export function createCfAmbientRuleService(
  * was tried and rejected for that reason.
  */
 export function createSqliteAgentService(
-  deps: { db: OmaDb },
+  deps: { db: OmaDb; dialect?: "sqlite" | "postgres" },
   opts?: { logger?: Logger },
 ): AgentService {
   return new AgentService({
-    repo: new SqlAgentRepo(deps.db),
+    // Dialect steers JSON-access SQL in the q-search (json_extract vs
+    // ::jsonb ->>). Defaults to sqlite, matching this factory's name —
+    // Node-PG deployments pass "postgres" explicitly.
+    repo: new SqlAgentRepo(deps.db, deps.dialect ?? "sqlite"),
     logger: opts?.logger,
   });
 }

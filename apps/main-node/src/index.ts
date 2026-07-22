@@ -415,7 +415,7 @@ if (clerkStore) {
 
 // ─── Stores ─────────────────────────────────────────────────────────────
 
-const agentsService = createSqliteAgentService({ db: drizzleDb });
+const agentsService = createSqliteAgentService({ db: drizzleDb, dialect });
 const ambientRulesService = createSqliteAmbientRuleService({ db: drizzleDb });
 const permissionGrantService = createSqlitePermissionGrantService({ db: drizzleDb });
 const vaultService = createSqliteVaultService({ db: drizzleDb });
