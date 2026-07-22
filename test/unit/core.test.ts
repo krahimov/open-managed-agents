@@ -240,6 +240,19 @@ describe("Provider", () => {
       });
     });
 
+    it("Claude 4.8+/5.x use adaptive thinking + effort (enabled/budget 400s there)", () => {
+      expect(reasoningProviderOptions(antModel("claude-opus-4-8"), "claude-opus-4-8", "low", true)).toEqual({
+        anthropic: { thinking: { type: "adaptive" }, effort: "low" },
+      });
+      expect(reasoningProviderOptions(antModel("claude-fable-5"), "claude-fable-5", "high", true)).toEqual({
+        anthropic: { thinking: { type: "adaptive" }, effort: "high" },
+      });
+      // 4.7 and below keep the legacy budget shape.
+      expect(reasoningProviderOptions(antModel("claude-opus-4-7"), "claude-opus-4-7", "low", true)).toEqual({
+        anthropic: { thinking: { type: "enabled", budgetTokens: 4096 } },
+      });
+    });
+
     it("does NOT fire for Anthropic at instant / unset level", () => {
       expect(reasoningProviderOptions(antModel("claude-sonnet-4-6"), "claude-sonnet-4-6", "instant", true)).toBeUndefined();
       expect(reasoningProviderOptions(antModel("claude-sonnet-4-6"), "claude-sonnet-4-6", undefined, true)).toBeUndefined();

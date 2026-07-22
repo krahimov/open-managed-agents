@@ -289,6 +289,19 @@ const ANTHROPIC_THINKING_BUDGET: Record<
   number
 > = { low: 4096, medium: 16384, high: 32768 };
 
+/** Claude 4.8+ / 5.x reject the legacy thinking shape with a 400
+ *  ('"thinking.type.enabled" is not supported for this model — use
+ *  "thinking.type.adaptive" and "output_config.effort"', observed live on
+ *  claude-opus-4.8). Older models (sonnet/opus ≤4.7) only take the legacy
+ *  enabled+budgetTokens form. Version-gate on the wire id. */
+function anthropicUsesAdaptiveThinking(bareModelId: string): boolean {
+  const m = /^claude-[a-z]+(?:-[a-z]+)*-(\d+)(?:-(\d+))?/.exec(bareModelId);
+  if (!m) return false;
+  const major = Number(m[1]);
+  const minor = m[2] !== undefined ? Number(m[2]) : 0;
+  return major >= 5 || (major === 4 && minor >= 8);
+}
+
 export function reasoningProviderOptions(
   model: LanguageModel,
   modelId: string,
@@ -297,6 +310,7 @@ export function reasoningProviderOptions(
 ):
   | { openai: { reasoningEffort: "none" | "low" | "medium" | "high" } }
   | { anthropic: { thinking: { type: "enabled"; budgetTokens: number } } }
+  | { anthropic: { thinking: { type: "adaptive" }; effort: "low" | "medium" | "high" } }
   | undefined {
   const effective: ReasoningLevel = level ?? "instant";
   // Prefer the resolved model's wire-level id — the `modelId` arg is the
@@ -323,6 +337,14 @@ export function reasoningProviderOptions(
     isAnthropicModel(model) &&
     bare.startsWith(KNOWN_CLAUDE_PREFIX)
   ) {
+    if (anthropicUsesAdaptiveThinking(bare)) {
+      return {
+        anthropic: {
+          thinking: { type: "adaptive" },
+          effort: effective,
+        },
+      };
+    }
     return {
       anthropic: {
         thinking: {
