@@ -418,6 +418,12 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
 }
 
 function getBaseUrl(rawUrl: string): string {
+  // Behind a TLS-terminating proxy (Railway) the request URL reads http://,
+  // which poisons OAuth redirect_uris — providers exact-match the registered
+  // callback, and GitHub refuses plain http for non-localhost. Prefer the
+  // deployment's canonical PUBLIC_BASE_URL when configured.
+  const configured = process.env.PUBLIC_BASE_URL?.trim();
+  if (configured) return configured.replace(/\/+$/, "");
   const url = new URL(rawUrl);
   return `${url.protocol}//${url.host}`;
 }
