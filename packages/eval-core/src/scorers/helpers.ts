@@ -12,7 +12,9 @@ function parseData<T = Record<string, unknown>>(e: StoredEvent): T | null {
       return null;
     }
   }
-  return (e.data as T) ?? null;
+  // Node's event log returns flattened events (payload fields at the top
+  // level, no `data` envelope) — the event itself is the payload then.
+  return (e.data as T) ?? (e as unknown as T);
 }
 
 export interface ToolUseEvent {

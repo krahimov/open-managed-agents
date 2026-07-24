@@ -33,6 +33,10 @@ import type { NodeAmbientDispatcher } from "./node-ambient-dispatch.js";
 
 export interface NodeSchedulerDeps {
   evalServices: EvalRunnerServices;
+  /** Eval-runner sandbox binding — adapts the in-process SessionRouter to
+   *  the SandboxFetcher surface tickEvalRuns speaks. Null/omitted disables
+   *  eval runs on this host (tasks fail with "environment not ready"). */
+  evalSandbox?: SandboxFetcher | null;
   memory: MemoryStoreService;
   /** Ambient rule dispatcher — sweeps due ambient_rules and starts agent
    *  sessions. Skip when null (feature dormant until rules exist anyway). */
@@ -61,14 +65,15 @@ export function buildNodeScheduler(deps: NodeSchedulerDeps) {
 
   const scheduler = createNodeScheduler();
 
-  // Eval-tick: runs every minute by default. Node's eval runner has no
-  // SANDBOX_<env> binding to call into yet — until cloud environments
-  // land on Node, this just iterates `evals.listActive()` (empty under
-  // SQLite default) and exits. Cheap.
+  // Eval-tick: runs every minute by default. The sandbox "binding" on Node
+  // is the in-process SessionRouter adapter (eval-sandbox-fetcher.ts) —
+  // environment_id is irrelevant here because the Node registry provisions
+  // the sandbox lazily per session.
+  const evalSandbox = deps.evalSandbox ?? null;
   const evalCtx: EvalRunnerContext = {
     forEachShard: async (fn) => [await fn(deps.evalServices)],
     getServicesForTenant: async () => deps.evalServices,
-    getSandboxBinding: async (): Promise<SandboxFetcher | null> => null,
+    getSandboxBinding: async (): Promise<SandboxFetcher | null> => evalSandbox,
   };
   scheduler.register({
     name: "eval-tick",
