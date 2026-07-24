@@ -191,12 +191,15 @@ export async function buildTrajectory(
   const endedAt = deriveEndedAt(events, outcome);
   const summary = computeSummary(events, usage, session.created_at, endedAt);
 
-  const envConfig = session.environment_snapshot || fallbackEnv;
-  if (!envConfig) {
-    throw new Error(
-      `Cannot build trajectory: no environment_snapshot on session and fetchEnvironmentConfig returned null`,
-    );
-  }
+  // Environment config is descriptive metadata — a session against a
+  // synthetic/unregistered environment (Node's env_local_runtime) must still
+  // yield a trajectory, so fall back to a minimal stub instead of throwing.
+  const envConfig: EnvironmentConfig = session.environment_snapshot || fallbackEnv || {
+    id: session.environment_id ?? "env-unknown",
+    name: session.environment_id ?? "unknown",
+    config: { type: "unknown" },
+    created_at: session.created_at,
+  };
   if (!session.agent_snapshot) {
     throw new Error(`Cannot build trajectory: no agent_snapshot on session ${session.id}`);
   }
