@@ -161,7 +161,9 @@ function parseEventData(e: StoredEvent): unknown {
       return null;
     }
   }
-  return e.data;
+  // Node's event log returns flattened events (payload at top level, no
+  // `data` envelope) — fall back to the event itself.
+  return e.data ?? e;
 }
 
 function deriveEndedAt(events: StoredEvent[], outcome: TrajectoryOutcome): string | undefined {

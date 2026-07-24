@@ -213,7 +213,9 @@ function parseEventData(e: { data: string | object }): unknown {
       return null;
     }
   }
-  return e.data;
+  // Node's event log returns flattened events (payload at top level, no
+  // `data` envelope) — fall back to the event itself.
+  return e.data ?? e;
 }
 
 interface RubricVerdict {

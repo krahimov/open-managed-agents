@@ -115,6 +115,7 @@ import {
 } from "./lib/node-install-bridge.js";
 import { OmaVaultResolver } from "@open-managed-agents/oma-cap-adapter";
 import { NodeSessionRouter } from "./lib/node-session-router.js";
+import { buildEvalSandboxFetcher } from "./lib/eval-sandbox-fetcher.js";
 import {
   buildApprovalHistory,
   computeCapabilityStatement,
@@ -2702,6 +2703,7 @@ const scheduler = buildNodeScheduler({
     evals: evalsService,
     kv,
   },
+  evalSandbox: buildEvalSandboxFetcher(sessionRouter),
   memory: memoryService,
   ambientDispatcher,
   missionSupervisor,
