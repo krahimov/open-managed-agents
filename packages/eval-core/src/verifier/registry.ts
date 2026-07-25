@@ -10,6 +10,7 @@ import { ScriptVerifier } from "./builtins/script.js";
 import { CompositeVerifier } from "./builtins/composite.js";
 import { VerifiableVerifier } from "./builtins/verifiable.js";
 import { RewardModelVerifier } from "./builtins/reward_model.js";
+import { SpecLlmJudgeVerifier } from "./builtins/llm_judge_spec.js";
 
 export function verifierForSpec(spec: RewardSpec, ctx: VerifierContext): Verifier {
   switch (spec.type) {
@@ -21,6 +22,10 @@ export function verifierForSpec(spec: RewardSpec, ctx: VerifierContext): Verifie
       return new VerifiableVerifier(spec, ctx);
     case "reward_model":
       return new RewardModelVerifier(spec, ctx);
+    case "llm_judge":
+      // Judge resolution rides ctx.resolveJudge; without it the verifier
+      // degrades to a 0 score ("unavailable"), it never throws.
+      return new SpecLlmJudgeVerifier(spec, ctx);
     default: {
       // exhaustiveness check — every RewardSpec branch must be handled
       const _exhaustive: never = spec;

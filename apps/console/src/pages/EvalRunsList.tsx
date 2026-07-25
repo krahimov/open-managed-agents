@@ -9,6 +9,8 @@ import { FacetedFilter } from "../components/FacetedFilter";
 import { FilterChip } from "../components/FilterChip";
 import { RowActionsMenu } from "../components/RowActionsMenu";
 import { PopoverContent } from "@/components/ui/popover";
+import { Button } from "@/components/ui/button";
+import { NewEvalRunDialog } from "./evals/NewEvalRunDialog";
 
 interface EvalRunSummary {
   id: string;
@@ -81,6 +83,7 @@ function passRateStr(r: EvalRunSummary): string {
 export function EvalRunsList() {
   const nav = useNavigate();
   const { api } = useApi();
+  const [showCreate, setShowCreate] = useState(false);
 
   // Server-driven status filter. "any" → omit the param entirely so the
   // server returns all runs; anything else is whitelisted by the route's
@@ -274,6 +277,8 @@ export function EvalRunsList() {
 
   return (
     <DataTable<EvalRunSummary>
+      createLabel="+ New eval run"
+      onCreate={() => setShowCreate(true)}
       filters={filters}
       data={runs}
       loading={loading}
@@ -282,10 +287,15 @@ export function EvalRunsList() {
       columns={columns}
       emptyTitle={status === "any" ? "No eval runs yet" : "No matching eval runs"}
       emptyKind="eval"
+      emptyAction={
+        status === "any" && (
+          <Button onClick={() => setShowCreate(true)}>+ New eval run</Button>
+        )
+      }
       emptySubtitle={
         status === "any" ? (
           <p>
-            Submit one with{" "}
+            Or submit one with{" "}
             <code className="px-1 py-0.5 bg-bg-surface rounded text-fg-muted">POST /v1/evals/runs</code>{" "}
             or{" "}
             <code className="px-1 py-0.5 bg-bg-surface rounded text-fg-muted">npx tsx rl/tasks/terminal-bench/run-cloud.ts</code>.
@@ -294,6 +304,8 @@ export function EvalRunsList() {
           "Try clearing the status filter."
         )
       }
-    />
+    >
+      <NewEvalRunDialog open={showCreate} onClose={() => setShowCreate(false)} />
+    </DataTable>
   );
 }

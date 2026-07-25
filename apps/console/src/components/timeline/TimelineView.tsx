@@ -23,7 +23,17 @@ import {
  * TurnCard per turn with idle dividers between, and hosts the shared
  * right-side detail panel that any span click in any card populates.
  */
-export function TimelineView({ events }: { events: Event[] }) {
+export function TimelineView({
+  events,
+  scrollTarget,
+}: {
+  events: Event[];
+  /** Deep-link request: scroll to (and select the span containing) the
+   *  event with this id. `nonce` lets the same id re-trigger the scroll
+   *  on repeat clicks. Matches EventBase.id (sevt_*) or the trace-facts
+   *  `seq:<n>` fallback id. */
+  scrollTarget?: { eventId: string; nonce: number } | null;
+}) {
   const turns = useMemo(() => bucketIntoTurns(events), [events]);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [selection, setSelection] = useState<TimelineSelection | null>(null);
@@ -38,6 +48,26 @@ export function TimelineView({ events }: { events: Event[] }) {
       el.scrollTo({ top: el.scrollHeight, behavior: "auto" });
     }
   }, [turns.length]);
+
+  // Evidence deep-link: locate the turn (and span) holding the requested
+  // event, open the detail panel on it, and bring the turn card into view.
+  useEffect(() => {
+    if (!scrollTarget) return;
+    const { eventId } = scrollTarget;
+    const matches = (e: Event) =>
+      (e as { id?: string }).id === eventId
+      || (typeof (e as { seq?: number }).seq === "number" && `seq:${(e as { seq?: number }).seq}` === eventId);
+    const turn = turns.find((t) => t.events.some(matches));
+    if (!turn) return;
+    const { spans } = deriveSpans(turn.events);
+    const span = spans.find((s) => s.events.some(matches));
+    if (span) {
+      setSelection({ spanKey: span.key, spanLabel: span.label, events: span.events });
+    }
+    containerRef.current
+      ?.querySelector(`[data-turn-id="${turn.id}"]`)
+      ?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [scrollTarget]); // eslint-disable-line react-hooks/exhaustive-deps -- fire per click, not per event batch
 
   if (turns.length === 0) {
     return (
@@ -59,17 +89,20 @@ export function TimelineView({ events }: { events: Event[] }) {
           return (
             <Fragment key={turn.id}>
               {idleMs > 0 && <IdleDivider ms={idleMs} nextKind={turn.triggerKind} />}
-              <TurnCard
-                turn={turn}
-                selection={selection}
-                onSelectSpan={(span) =>
-                  setSelection((cur) =>
-                    cur?.spanKey === span.key
-                      ? null
-                      : { spanKey: span.key, spanLabel: span.label, events: span.events },
-                  )
-                }
-              />
+              {/* data-turn-id anchors the evidence deep-link scroll above. */}
+              <div data-turn-id={turn.id}>
+                <TurnCard
+                  turn={turn}
+                  selection={selection}
+                  onSelectSpan={(span) =>
+                    setSelection((cur) =>
+                      cur?.spanKey === span.key
+                        ? null
+                        : { spanKey: span.key, spanLabel: span.label, events: span.events },
+                    )
+                  }
+                />
+              </div>
             </Fragment>
           );
         })}

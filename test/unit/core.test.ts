@@ -143,10 +143,15 @@ describe("Provider", () => {
       const model = resolveModel("gpt-5.6-sol", "k", undefined, "oai", undefined, "medium");
       expect(typeof model !== "string" && model.modelId).toBe("gpt-5.6-sol");
     });
+
+    it("routes to the Responses API at level=max (max behaves like high)", () => {
+      const model = resolveModel("gpt-5.6-sol", "k", undefined, "oai", undefined, "max");
+      expect(isOpenAiResponsesModel(model)).toBe(true);
+    });
   });
 
   describe("reasoningProviderOptions — unified level → provider knobs", () => {
-    const oaiModel = (id: string, level?: "instant" | "low" | "medium" | "high") =>
+    const oaiModel = (id: string, level?: "instant" | "low" | "medium" | "high" | "max") =>
       resolveModel(id, "k", undefined, "oai", undefined, level);
     const antModel = (id: string) => resolveModel(id, "k", undefined, "ant");
 
@@ -203,6 +208,19 @@ describe("Provider", () => {
       });
     });
 
+    it("maps max to 'xhigh' on the Responses API", () => {
+      expect(reasoningProviderOptions(oaiModel("gpt-5.6-sol", "max"), "gpt-5.6-sol", "max", true)).toEqual({
+        openai: { reasoningEffort: "xhigh" },
+      });
+    });
+
+    it("clamps max to 'none' on chat-endpoint models (gateway) like high", () => {
+      const gw = resolveModel("gpt-5.6-sol", "k", "https://gw.example.com/v1", "oai-compatible", undefined, "max");
+      expect(reasoningProviderOptions(gw, "gpt-5.6-sol", "max", true)).toEqual({
+        openai: { reasoningEffort: "none" },
+      });
+    });
+
     it("clamps to 'none' when a high level rides a chat-endpoint model (gateway)", () => {
       // Gateways never route to responses, so even level=high must clamp.
       const gw = resolveModel("gpt-5.6-sol", "k", "https://gw.example.com/v1", "oai-compatible", undefined, "high");
@@ -250,6 +268,38 @@ describe("Provider", () => {
       // 4.7 and below keep the legacy budget shape.
       expect(reasoningProviderOptions(antModel("claude-opus-4-7"), "claude-opus-4-7", "low", true)).toEqual({
         anthropic: { thinking: { type: "enabled", budgetTokens: 4096 } },
+      });
+    });
+
+    it("level=max: adaptive models get effort 'max', legacy get budgetTokens 65536", () => {
+      expect(reasoningProviderOptions(antModel("claude-fable-5"), "claude-fable-5", "max", true)).toEqual({
+        anthropic: { thinking: { type: "adaptive" }, effort: "max" },
+      });
+      expect(reasoningProviderOptions(antModel("claude-opus-4-8"), "claude-opus-4-8", "max", true)).toEqual({
+        anthropic: { thinking: { type: "adaptive" }, effort: "max" },
+      });
+      expect(reasoningProviderOptions(antModel("claude-sonnet-4-6"), "claude-sonnet-4-6", "max", true)).toEqual({
+        anthropic: { thinking: { type: "enabled", budgetTokens: 65536 } },
+      });
+    });
+
+    it("clamps legacy thinking budgets below the model's output cap", () => {
+      // sonnet-4-5 caps output at 64k: the SDK clamps max_tokens to 64000
+      // without shrinking budget_tokens, and the API rejects
+      // budget_tokens >= max_tokens — 65536 would 400 on every call.
+      expect(reasoningProviderOptions(antModel("claude-sonnet-4-5"), "claude-sonnet-4-5", "max", true)).toEqual({
+        anthropic: { thinking: { type: "enabled", budgetTokens: 55808 } },
+      });
+      expect(reasoningProviderOptions(antModel("claude-opus-4-5"), "claude-opus-4-5", "max", true)).toEqual({
+        anthropic: { thinking: { type: "enabled", budgetTokens: 55808 } },
+      });
+      // opus-4-1 caps at 32k — even high's 32768 must clamp.
+      expect(reasoningProviderOptions(antModel("claude-opus-4-1"), "claude-opus-4-1", "high", true)).toEqual({
+        anthropic: { thinking: { type: "enabled", budgetTokens: 23808 } },
+      });
+      // Levels that already fit stay byte-identical.
+      expect(reasoningProviderOptions(antModel("claude-sonnet-4-5"), "claude-sonnet-4-5", "high", true)).toEqual({
+        anthropic: { thinking: { type: "enabled", budgetTokens: 32768 } },
       });
     });
 
@@ -381,6 +431,35 @@ describe("Provider", () => {
       // @ai-sdk/anthropic adds the budget on top of max_tokens itself.
       expect(calls[0].body.max_tokens).toBeGreaterThan(16384);
     });
+  });
+});
+
+// ============================================================
+// 1a. Agent API — reasoning_level wire accept/reject
+// ============================================================
+describe("Agent API — reasoning_level wire validation", () => {
+  it("accepts max on create and echoes it in the _oma envelope", async () => {
+    const res = await post("/v1/agents", {
+      name: `Reasoning Max ${Math.random().toString(36).slice(2, 8)}`,
+      model: "claude-fable-5",
+      _oma: { reasoning_level: "max" },
+    });
+    expect(res.status).toBe(201);
+    const agent = (await res.json()) as any;
+    expect(agent._oma?.reasoning_level).toBe("max");
+  });
+
+  it("400s on a bogus reasoning_level", async () => {
+    const res = await post("/v1/agents", {
+      name: `Reasoning Bogus ${Math.random().toString(36).slice(2, 8)}`,
+      model: "claude-fable-5",
+      _oma: { reasoning_level: "ultra" },
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as any;
+    const msg = typeof body.error === "string" ? body.error : body.error?.message;
+    expect(String(msg)).toContain("reasoning_level must be one of");
+    expect(String(msg)).toContain("max");
   });
 });
 

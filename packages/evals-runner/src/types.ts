@@ -13,6 +13,8 @@ export interface EvalTaskSpec {
   timeout_ms?: number;
   trials?: number;
   reward?: RewardSpec;
+  /** A trial passes iff final_reward >= this (evals-design §6). Default 1.0. */
+  pass_threshold?: number;
 }
 
 export type { EvalRunStatus };
@@ -38,6 +40,13 @@ export interface EvalTaskResult {
   trial_pass_count?: number;
   trial_total?: number;
   error?: string;
+  // §6 metrics — set once every trial is terminal; additive to status.
+  /** ≥1 trial's reward cleared pass_threshold (capability view). */
+  pass_at_k?: boolean;
+  /** ALL trials cleared pass_threshold (reliability view). */
+  pass_all_k?: boolean;
+  reward_mean?: number;
+  reward_std?: number;
 }
 
 export interface EvalRunRecord {
@@ -52,6 +61,9 @@ export interface EvalRunRecord {
   task_count: number;
   completed_count: number;
   failed_count: number;
+  /** §6 rollup: tasks with pass_at_k / pass_all_k true. */
+  tasks_pass_at_k?: number;
+  tasks_pass_all_k?: number;
   tasks: EvalTaskResult[];
   error?: string;
 }
@@ -76,6 +88,8 @@ export function rowToRecord(row: import("@open-managed-agents/evals-store").Eval
     task_count: partial.task_count ?? 0,
     completed_count: partial.completed_count ?? 0,
     failed_count: partial.failed_count ?? 0,
+    tasks_pass_at_k: partial.tasks_pass_at_k,
+    tasks_pass_all_k: partial.tasks_pass_all_k,
     tasks: partial.tasks ?? [],
   };
 }
@@ -85,6 +99,8 @@ export function extractResults(run: EvalRunRecord): unknown {
     task_count: run.task_count,
     completed_count: run.completed_count,
     failed_count: run.failed_count,
+    tasks_pass_at_k: run.tasks_pass_at_k,
+    tasks_pass_all_k: run.tasks_pass_all_k,
     tasks: run.tasks,
   };
 }

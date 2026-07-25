@@ -32,11 +32,17 @@ interface EvalTask {
     setup_script?: string;
     timeout_ms?: number;
     trials?: number;
+    pass_threshold?: number;
   };
   status: "pending" | "running" | "completed" | "failed";
   trials: EvalTrial[];
   trial_pass_count?: number;
   trial_total?: number;
+  /** §6 metrics — stamped by the runner once every trial is terminal. */
+  pass_at_k?: boolean;
+  pass_all_k?: boolean;
+  reward_mean?: number;
+  reward_std?: number;
 }
 
 interface EvalRunDetail {
@@ -50,6 +56,9 @@ interface EvalRunDetail {
   task_count: number;
   completed_count: number;
   failed_count: number;
+  /** §6 rollups — tasks whose pass@k / pass^k is true. */
+  tasks_pass_at_k?: number;
+  tasks_pass_all_k?: number;
   tasks: EvalTask[];
 }
 
@@ -123,11 +132,11 @@ export function EvalRunDetail() {
       if (!tr.session_id) continue;
       // Avoid re-fetching anything already in flight, completed, or failed.
       if (trajectories.has(tr.session_id)) continue;
-      void fetchTrajectory(tr.session_id);
+      void fetchTrajectory(tr.session_id, tr.trajectory_id);
     }
   }
 
-  async function fetchTrajectory(sessionId: string) {
+  async function fetchTrajectory(sessionId: string, trajectoryId?: string) {
     setTrajectories(prev => {
       if (prev.has(sessionId)) return prev;
       const next = new Map(prev);
@@ -135,10 +144,21 @@ export function EvalRunDetail() {
       return next;
     });
     try {
-      const traj = await api<Trajectory>(`/v1/sessions/${sessionId}/trajectory`);
+      // The stored eval trajectory carries the runner's enrichment (reward
+      // with judge verdict metadata, trace_facts); the session route
+      // rebuilds fresh and lacks both. Fall back to the rebuild for trials
+      // that never finalized (no trajectory_id) or on 501 (CF KV-less).
+      let traj: Trajectory | null = null;
+      if (trajectoryId) {
+        traj = await api<Trajectory>(`/v1/evals/trajectories/${trajectoryId}`).catch(() => null);
+      }
+      if (!traj) {
+        traj = await api<Trajectory>(`/v1/sessions/${sessionId}/trajectory`);
+      }
+      const resolved = traj;
       setTrajectories(prev => {
         const next = new Map(prev);
-        next.set(sessionId, traj);
+        next.set(sessionId, resolved);
         return next;
       });
     } catch {
@@ -215,6 +235,28 @@ export function EvalRunDetail() {
               <span className="text-danger"> ({run.failed_count} failed)</span>
             )}
           </span>
+          {run.tasks_pass_at_k !== undefined && (
+            <>
+              <span className="text-fg-subtle">·</span>
+              <span>
+                pass@k{" "}
+                <span className="text-fg font-medium">
+                  {run.tasks_pass_at_k}/{run.task_count}
+                </span>
+              </span>
+            </>
+          )}
+          {run.tasks_pass_all_k !== undefined && (
+            <>
+              <span className="text-fg-subtle">·</span>
+              <span>
+                pass^k{" "}
+                <span className="text-fg font-medium">
+                  {run.tasks_pass_all_k}/{run.task_count}
+                </span>
+              </span>
+            </>
+          )}
           <span className="text-fg-subtle">·</span>
           <span>
             Duration{" "}
@@ -264,6 +306,8 @@ export function EvalRunDetail() {
               <th className="text-left px-3">Task</th>
               <th className="text-left px-3">Status</th>
               <th className="text-left px-3">Pass</th>
+              <th className="text-left px-3">pass@k / pass^k</th>
+              <th className="text-left px-3">Reward μ±σ</th>
               <th className="text-left px-3">Trials</th>
             </tr>
           </thead>
@@ -286,6 +330,17 @@ export function EvalRunDetail() {
                   <td className="px-3 py-2 text-fg font-medium">
                     {(t.trial_pass_count ?? 0)}/{t.trial_total ?? t.trials.length}
                   </td>
+                  <td className="px-3 py-2">
+                    <span className="inline-flex items-center gap-1">
+                      <MetricChip label="@k" value={t.pass_at_k} />
+                      <MetricChip label="^k" value={t.pass_all_k} />
+                    </span>
+                  </td>
+                  <td className="px-3 py-2 font-mono text-xs text-fg-muted">
+                    {t.reward_mean !== undefined
+                      ? `${t.reward_mean.toFixed(2)}±${(t.reward_std ?? 0).toFixed(2)}`
+                      : "—"}
+                  </td>
                   <td className="px-3 py-2 text-xs text-fg-muted rounded-r-lg">
                     {t.trials.map(tr => tr.status).join(", ")}
                   </td>
@@ -297,7 +352,7 @@ export function EvalRunDetail() {
                   // without needing a connecting border.
                   <tr key={`${t.id}-trials`} className="bg-bg-surface/30">
                     <td className="rounded-l-lg" />
-                    <td colSpan={4} className="px-3 py-3 space-y-3 rounded-r-lg">
+                    <td colSpan={6} className="px-3 py-3 space-y-3 rounded-r-lg">
                       <div className="overflow-x-auto">
                         <table className="w-full text-xs">
                         <thead>
@@ -308,7 +363,8 @@ export function EvalRunDetail() {
                             <th className="text-left py-1 pr-3 font-medium">Exit</th>
                             <th className="text-left py-1 pr-3 font-medium">Dur</th>
                             <th className="text-left py-1 pr-3 font-medium">Turns</th>
-                            <th className="text-left py-1 font-medium">Session</th>
+                            <th className="text-left py-1 pr-3 font-medium">Session</th>
+                            <th className="text-left py-1 font-medium" />
                           </tr>
                         </thead>
                         <tbody>
@@ -329,13 +385,26 @@ export function EvalRunDetail() {
                               <td className="py-1 pr-3 font-mono text-fg-muted">{tr.exit_code ?? "—"}</td>
                               <td className="py-1 pr-3 text-fg-muted">{durationStr(tr.started_at, tr.ended_at)}</td>
                               <td className="py-1 pr-3 text-fg-muted">{tr.turns ?? "—"}</td>
-                              <td className="py-1">
+                              <td className="py-1 pr-3">
                                 {tr.session_id ? (
                                   <Link
                                     to={`/sessions/${tr.session_id}`}
                                     className="text-brand hover:underline font-mono"
                                   >
                                     {tr.session_id}
+                                  </Link>
+                                ) : (
+                                  <span className="text-fg-subtle">—</span>
+                                )}
+                              </td>
+                              <td className="py-1">
+                                {tr.session_id ? (
+                                  <Link
+                                    to={`/evals/${run.id}/trials/${encodeURIComponent(t.id)}/${tr.trial_index}`}
+                                    className="text-fg-muted hover:text-brand whitespace-nowrap"
+                                    title="Trial detail — timeline, verdict, trace facts"
+                                  >
+                                    detail →
                                   </Link>
                                 ) : (
                                   <span className="text-fg-subtle">—</span>
@@ -427,6 +496,23 @@ export function EvalRunDetail() {
         </table>
       </div>
     </div>
+  );
+}
+
+/** pass@k / pass^k chip. Undefined (metrics not computed yet — trials
+ *  still running or legacy run) renders a muted dash chip so the column
+ *  reads "pending", not "failed". */
+function MetricChip({ label, value }: { label: string; value: boolean | undefined }) {
+  const cls =
+    value === undefined
+      ? "bg-bg-surface text-fg-subtle"
+      : value
+      ? "bg-success-subtle text-success"
+      : "bg-danger-subtle text-danger";
+  return (
+    <span className={`inline-flex items-center gap-0.5 text-[10px] font-mono px-1.5 py-0.5 rounded ${cls}`}>
+      {label} {value === undefined ? "—" : value ? "✓" : "✗"}
+    </span>
   );
 }
 

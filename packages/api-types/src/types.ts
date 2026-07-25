@@ -43,21 +43,23 @@ export type ToolConfig = ToolsetConfig | CustomToolConfig;
 /**
  * Unified per-agent reasoning control, mapped per provider by the harness:
  *   - OpenAI reasoning models (gpt-5*, o-series): reasoning_effort
- *     none|low|medium|high. Levels above "instant" route official-OpenAI
- *     cards to the Responses API (chat/completions 400s on any effort
- *     above 'none' when function tools are attached).
- *   - Anthropic Claude: extended thinking budgetTokens (disabled/4k/16k/32k)
- *     on the normal Messages API.
+ *     none|low|medium|high|xhigh. Levels above "instant" route
+ *     official-OpenAI cards to the Responses API (chat/completions 400s on
+ *     any effort above 'none' when function tools are attached).
+ *   - Anthropic Claude: extended thinking budgetTokens
+ *     (disabled/4k/16k/32k/64k) on the normal Messages API; 4.8+/5.x take
+ *     adaptive thinking + effort instead.
  * Non-reasoning models and third-party gateways ignore the level (the
  * harness clamps to the safe no-reasoning behavior).
  */
-export type ReasoningLevel = "instant" | "low" | "medium" | "high";
+export type ReasoningLevel = "instant" | "low" | "medium" | "high" | "max";
 
 export const REASONING_LEVELS: readonly ReasoningLevel[] = [
   "instant",
   "low",
   "medium",
   "high",
+  "max",
 ];
 
 export interface AgentConfig {
@@ -550,7 +552,7 @@ export type RubricSpec =
  * end-to-end.
  */
 export interface OutcomeVerifierSpec {
-  type: "script" | "verifiable" | "composite" | "reward_model";
+  type: "script" | "verifiable" | "composite" | "reward_model" | "llm_judge";
   [key: string]: unknown;
 }
 

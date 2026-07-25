@@ -37,6 +37,9 @@ export interface NodeSchedulerDeps {
    *  the SandboxFetcher surface tickEvalRuns speaks. Null/omitted disables
    *  eval runs on this host (tasks fail with "environment not ready"). */
   evalSandbox?: SandboxFetcher | null;
+  /** llm_judge resolver (lib/eval-judge.ts). Null/omitted degrades
+   *  llm_judge reward specs to a 0 score with an "unavailable" reason. */
+  evalJudgeResolver?: EvalRunnerContext["resolveJudge"] | null;
   memory: MemoryStoreService;
   /** Ambient rule dispatcher — sweeps due ambient_rules and starts agent
    *  sessions. Skip when null (feature dormant until rules exist anyway). */
@@ -74,6 +77,7 @@ export function buildNodeScheduler(deps: NodeSchedulerDeps) {
     forEachShard: async (fn) => [await fn(deps.evalServices)],
     getServicesForTenant: async () => deps.evalServices,
     getSandboxBinding: async (): Promise<SandboxFetcher | null> => evalSandbox,
+    resolveJudge: deps.evalJudgeResolver ?? undefined,
   };
   scheduler.register({
     name: "eval-tick",

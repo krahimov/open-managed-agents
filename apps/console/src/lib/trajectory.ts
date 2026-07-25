@@ -15,11 +15,58 @@ export type TrajectoryOutcome =
   | "interrupted"
   | "running";
 
+/** One criterion row from an llm_judge verdict (evals-design §4.3). */
+export interface JudgeCriterionVerdict {
+  id: string;
+  pass: boolean;
+  /** Event ids / artifact refs (e.g. "sevt_abc123", "file:/workspace/x"). */
+  evidence: string[];
+  reasoning: string;
+}
+
+export interface JudgeVerdict {
+  criteria: JudgeCriterionVerdict[];
+  pass: boolean;
+  score: number;
+  summary: string;
+}
+
+/** Score.metadata as persisted by the llm_judge verifier. All fields
+ *  optional — non-judge verifiers store nothing here. */
+export interface RewardMetadata {
+  criteria?: Record<string, number>;
+  verdict?: JudgeVerdict;
+  judge_model_id?: string;
+  judge_reasoning_level?: string;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    total_tokens?: number;
+  };
+  [key: string]: unknown;
+}
+
 export interface RewardResult {
   raw_rewards: Record<string, number>;
   final_reward: number;
   verifier_id?: string;
   computed_at?: string;
+  metadata?: RewardMetadata;
+}
+
+/** Machine-extracted trace facts (evals-design §5). Mirror of
+ *  eval-core's TraceFacts — same leaf-package rationale as above. */
+export interface TraceFacts {
+  outcome: TrajectoryOutcome;
+  turns: number;
+  duration_ms: number;
+  token_usage: TrajectorySummary["token_usage"];
+  est_cost_usd?: number;
+  tools: Array<{ name: string; calls: number; errors: number }>;
+  exec_commands: Array<{ command_head: string; exit_code: number; event_id: string }>;
+  files_written: Array<{ path: string; event_id: string }>;
+  errors: Array<{ event_id: string; message_head: string }>;
+  repeated_call_loops: Array<{ tool: string; count: number }>;
 }
 
 export interface TrajectorySummary {
@@ -60,6 +107,8 @@ export interface Trajectory {
   reward?: RewardResult;
   completions?: unknown[];
   group_stats?: unknown;
+
+  trace_facts?: TraceFacts;
 
   summary: TrajectorySummary;
 }

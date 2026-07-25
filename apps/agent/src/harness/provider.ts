@@ -257,6 +257,8 @@ export function openAiSafeToolName(name: string): string {
 //   low     | low                     | 4k
 //   medium  | medium                  | 16k
 //   high    | high                    | 32k
+//   max     | xhigh                   | 64k, clamped below the model's
+//                                       output cap (4.8+/5.x: effort "max")
 //
 // OpenAI constraint (the reason resolveModel forks endpoints): reasoning
 // models (gpt-5*, o-series) reject any reasoning_effort above 'none' on
@@ -281,13 +283,41 @@ const OPENAI_REASONING_MODEL_RE = /^(o[1-9]|gpt-5)/i;
 
 const OPENAI_REASONING_EFFORT: Record<
   Exclude<ReasoningLevel, "instant">,
-  "low" | "medium" | "high"
-> = { low: "low", medium: "medium", high: "high" };
+  "low" | "medium" | "high" | "xhigh"
+> = { low: "low", medium: "medium", high: "high", max: "xhigh" };
 
 const ANTHROPIC_THINKING_BUDGET: Record<
   Exclude<ReasoningLevel, "instant">,
   number
-> = { low: 4096, medium: 16384, high: 32768 };
+> = { low: 4096, medium: 16384, high: 32768, max: 65536 };
+
+/** Known max-output caps for legacy (pre-adaptive) Claude models.
+ *  @ai-sdk/anthropic clamps max_tokens to the model's known cap WITHOUT
+ *  shrinking thinking.budget_tokens, and the API rejects
+ *  budget_tokens >= max_tokens — so a 65536 "max" budget on a 64k-cap
+ *  model (sonnet/opus/haiku-4-5), or high's 32768 on a 32k-cap model
+ *  (opus-4 / opus-4-1), 400s on every call. Conservative 64k default for
+ *  unlisted ids. */
+function anthropicLegacyMaxOutput(bare: string): number {
+  if (/^claude-(sonnet|opus)-4-6/.test(bare)) return 128_000;
+  // opus-4 / opus-4-1 (optionally date-stamped, e.g. claude-opus-4-20250514).
+  if (/^claude-opus-4(-1)?($|-\d{6,})/.test(bare)) return 32_000;
+  if (/^claude-3-5-/.test(bare)) return 8_192;
+  return 64_000;
+}
+
+/** Headroom kept below the cap so the visible answer isn't starved when
+ *  the SDK clamps max_tokens to the model cap. */
+const ANTHROPIC_THINKING_HEADROOM = 8_192;
+
+function anthropicLegacyThinkingBudget(
+  level: Exclude<ReasoningLevel, "instant">,
+  bare: string,
+): number {
+  const ceiling = anthropicLegacyMaxOutput(bare) - ANTHROPIC_THINKING_HEADROOM;
+  // 1024 is Anthropic's minimum thinking budget.
+  return Math.max(1024, Math.min(ANTHROPIC_THINKING_BUDGET[level], ceiling));
+}
 
 /** Claude 4.8+ / 5.x reject the legacy thinking shape with a 400
  *  ('"thinking.type.enabled" is not supported for this model — use
@@ -308,9 +338,9 @@ export function reasoningProviderOptions(
   level: ReasoningLevel | undefined,
   hasTools: boolean,
 ):
-  | { openai: { reasoningEffort: "none" | "low" | "medium" | "high" } }
+  | { openai: { reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh" } }
   | { anthropic: { thinking: { type: "enabled"; budgetTokens: number } } }
-  | { anthropic: { thinking: { type: "adaptive" }; effort: "low" | "medium" | "high" } }
+  | { anthropic: { thinking: { type: "adaptive" }; effort: "low" | "medium" | "high" | "max" } }
   | undefined {
   const effective: ReasoningLevel = level ?? "instant";
   // Prefer the resolved model's wire-level id — the `modelId` arg is the
@@ -349,7 +379,7 @@ export function reasoningProviderOptions(
       anthropic: {
         thinking: {
           type: "enabled",
-          budgetTokens: ANTHROPIC_THINKING_BUDGET[effective],
+          budgetTokens: anthropicLegacyThinkingBudget(effective, bare),
         },
       },
     };

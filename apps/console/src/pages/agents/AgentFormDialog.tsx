@@ -172,13 +172,14 @@ const BUILTIN_TOOLS: Array<{ name: string; label: string; description: string }>
 
 type ToolOverride = "default" | "always_allow" | "always_ask" | "disabled";
 
-type ReasoningLevelValue = "instant" | "low" | "medium" | "high";
+type ReasoningLevelValue = "instant" | "low" | "medium" | "high" | "max";
 
 const REASONING_LEVEL_OPTIONS: Array<{ value: ReasoningLevelValue; label: string; hint: string }> = [
   { value: "instant", label: "Instant", hint: "no reasoning — fastest, cheapest" },
   { value: "low", label: "Low", hint: "brief reasoning" },
   { value: "medium", label: "Medium", hint: "moderate reasoning" },
   { value: "high", label: "High", hint: "deep reasoning — slowest" },
+  { value: "max", label: "Max", hint: "maximum reasoning — for judges & hardest tasks" },
 ];
 
 /** Reasoning level only applies where the harness can map it: official
@@ -1259,7 +1260,9 @@ export function AgentFormDialog({
           reasoningLevel: ((): ReasoningLevelValue => {
             const rl = (parsed._oma as { reasoning_level?: unknown } | undefined)
               ?.reasoning_level;
-            return rl === "low" || rl === "medium" || rl === "high" ? rl : "instant";
+            return rl === "low" || rl === "medium" || rl === "high" || rl === "max"
+              ? rl
+              : "instant";
           })(),
         });
       } catch {

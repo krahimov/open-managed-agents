@@ -19,6 +19,7 @@ import type {
 } from "@open-managed-agents/evals-store";
 import type { AgentService } from "@open-managed-agents/agents-store";
 import type { EnvironmentService } from "@open-managed-agents/environments-store";
+import type { KvStore } from "@open-managed-agents/kv-store";
 import type { RewardSpec } from "@open-managed-agents/shared";
 
 interface Vars {
@@ -33,6 +34,8 @@ export interface EvalTaskSpec {
   timeout_ms?: number;
   trials?: number;
   reward?: RewardSpec;
+  /** A trial passes iff final_reward >= this (evals-design §6). Default 1.0. */
+  pass_threshold?: number;
 }
 
 export interface EvalRoutesDeps {
@@ -41,6 +44,12 @@ export interface EvalRoutesDeps {
   /** Optional. When omitted we don't 404 on missing environments — Node
    *  doesn't have a per-tenant environments store yet (P5 work). */
   environments?: EnvironmentService;
+  /** Optional. Backs GET /trajectories/:id — the eval runner stores the
+   *  enriched trajectory (reward metadata, trace_facts) in KV under
+   *  `t:<tenant>:trajectory:<id>` (evals-runner kvKey). Runtimes without
+   *  a KV binding here get a clear 501 instead of a silent rebuild that
+   *  would drop the verdict + trace facts. */
+  kv?: KvStore;
 }
 
 export function buildEvalRoutes(deps: EvalRoutesDeps) {
@@ -64,6 +73,12 @@ export function buildEvalRoutes(deps: EvalRoutesDeps) {
       if (!task.id) return c.json({ error: `task missing id: ${JSON.stringify(task).slice(0, 100)}` }, 400);
       if (!Array.isArray(task.messages) || task.messages.length === 0) {
         return c.json({ error: `task ${task.id} requires non-empty messages array` }, 400);
+      }
+      if (
+        task.pass_threshold !== undefined &&
+        (typeof task.pass_threshold !== "number" || !Number.isFinite(task.pass_threshold))
+      ) {
+        return c.json({ error: `task ${task.id} pass_threshold must be a finite number` }, 400);
       }
     }
 
@@ -147,6 +162,22 @@ export function buildEvalRoutes(deps: EvalRoutesDeps) {
     return c.json({ data: runs.map(rowToApi) });
   });
 
+  // GET /v1/evals/trajectories/:id — stored (enriched) trajectory.
+  // The runner persists this at trial finalize with reward.metadata
+  // (llm_judge verdict, judge identity, usage) and trace_facts already
+  // stamped — unlike GET /v1/sessions/:id/trajectory, which rebuilds
+  // from events and carries neither.
+  app.get("/trajectories/:id", async (c) => {
+    if (!deps.kv) {
+      return c.json({ error: "stored trajectories unavailable on this runtime" }, 501);
+    }
+    const t = c.var.tenant_id;
+    // Key shape must match evals-runner kvKey(t, "trajectory", id).
+    const raw = await deps.kv.get(`t:${t}:trajectory:${c.req.param("id")}`);
+    if (raw === null) return c.json({ error: "Trajectory not found" }, 404);
+    return c.body(raw, 200, { "content-type": "application/json" });
+  });
+
   // GET /v1/evals/runs/:id — detail
   app.get("/runs/:id", async (c) => {
     const t = c.var.tenant_id;
@@ -184,6 +215,8 @@ function rowToApi(run: EvalRunRow) {
     completed_count?: number;
     failed_count?: number;
     tasks?: unknown[];
+    tasks_pass_at_k?: number;
+    tasks_pass_all_k?: number;
   };
   return {
     id: run.id,
@@ -199,5 +232,8 @@ function rowToApi(run: EvalRunRow) {
     completed_count: partial.completed_count ?? 0,
     failed_count: partial.failed_count ?? 0,
     tasks: partial.tasks ?? [],
+    // §6 rollups — computed by the runner tick, absent on legacy rows.
+    ...(partial.tasks_pass_at_k !== undefined ? { tasks_pass_at_k: partial.tasks_pass_at_k } : {}),
+    ...(partial.tasks_pass_all_k !== undefined ? { tasks_pass_all_k: partial.tasks_pass_all_k } : {}),
   };
 }

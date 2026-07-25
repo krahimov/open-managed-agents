@@ -73,6 +73,10 @@ export function buildCfEvalRunnerContext(env: Env): EvalRunnerContext {
     getServicesForTenant: (tenantId) => getServices(env, tenantId),
     getSandboxBinding: (tenantId, environmentId) =>
       getSandboxBinding(env, tenantId, environmentId),
+    // resolveJudge intentionally undefined: the router worker has no `ai`
+    // / provider-SDK surface (model handles live in apps/agent's session
+    // DO). llm_judge trials therefore score 0 with reason "llm_judge
+    // unavailable on this runtime" on CF until a judge path lands here.
   };
 }
 

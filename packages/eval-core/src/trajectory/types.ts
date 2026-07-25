@@ -5,6 +5,7 @@
 // projections to popular shapes (Anthropic Messages first; OTel/Inspect/RL later).
 
 import type { AgentConfig, EnvironmentConfig, StoredEvent } from "@open-managed-agents/api-types";
+import type { TraceFacts } from "./trace-facts.js";
 
 // --- Identity & lifecycle ---
 
@@ -52,6 +53,10 @@ export interface RewardResult {
   final_reward: number; // aggregated scalar [0, 1]
   verifier_id?: string;
   computed_at?: string;
+  /** Verifier-specific extras carried through from Score.metadata —
+   *  llm_judge stores the structured verdict, judge identity, and token
+   *  usage here so the console verdict card renders from storage. */
+  metadata?: Record<string, unknown>;
 }
 
 export interface GroupStats {
@@ -91,4 +96,9 @@ export interface Trajectory {
 
   // Aggregates (computed once at end, cached for fast eval)
   summary: TrajectorySummary;
+
+  // Code-extracted facts for the LLM judge + eval UI (evals-design §5).
+  // Optional: populated by extractTraceFacts(); older stored trajectories
+  // predate it.
+  trace_facts?: TraceFacts;
 }

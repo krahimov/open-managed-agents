@@ -10,7 +10,14 @@ export { NoRunVerifier } from "./builtins/no_run";
 export {
   LlmJudgeVerifier,
   createLlmJudgeVerifier,
+  buildAgentTranscript,
   type JudgeFn,
   type JudgeUsage,
   type LlmJudgeOpts,
 } from "./builtins/llm_judge";
+export {
+  SpecLlmJudgeVerifier,
+  parseJudgeVerdict,
+  type JudgeVerdict,
+  type JudgeCriterionVerdict,
+} from "./builtins/llm_judge_spec";
