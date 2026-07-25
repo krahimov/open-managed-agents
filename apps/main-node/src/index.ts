@@ -734,11 +734,12 @@ const sessionRegistry = new SessionRegistry({
   },
   buildTools: async (agent, sandbox, context) => {
     // Setup sessions (console post-create "refine your harness" flow,
-    // metadata.oma_setup) get ONLY the setup tool pair — no file/shell/web
-    // access by design. Same contract as the SDK harness's in-process
-    // oma_setup MCP server; without this, setup on the DefaultHarness
-    // (hosted/prod, where the SDK harness is gated off) could chat but
-    // never apply config changes.
+    // metadata.oma_setup) get the setup toolset — update_harness,
+    // request_access, plus read-only web_search/web_fetch for finding MCP
+    // endpoints; no file/shell access by design. Same contract as the SDK
+    // harness's in-process oma_setup MCP server; without this, setup on the
+    // DefaultHarness (hosted/prod, where the SDK harness is gated off)
+    // could chat but never apply config changes.
     const sessRow = await sessionsService.get({
       tenantId: context.tenantId,
       sessionId: context.sessionId,
@@ -758,6 +759,7 @@ const sessionRegistry = new SessionRegistry({
             ...a,
             mcp_server_url: a.mcp_server_url ?? matchAgentMcpServer(agent, a.service),
           }),
+        env: { TAVILY_API_KEY: process.env.TAVILY_API_KEY },
       });
     }
     const creds = await resolveNodeModelCredentials(agent, context.tenantId);
