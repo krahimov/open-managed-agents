@@ -83,11 +83,16 @@ export class SpecLlmJudgeVerifier implements Verifier {
       }
     }
     if (!resolved) {
+      // judge_error marks "the judge could not run" (infrastructure), as
+      // opposed to "the judge ran and failed the work". Consumers exclude
+      // such trials from pass@k/pass^k so provider outages don't read as
+      // agent failures (seen live: Anthropic credit exhaustion zeroed a
+      // whole run).
       return {
         pass: false,
         value: 0,
         reason: "llm_judge unavailable on this runtime",
-        metadata: { criteria: {} },
+        metadata: { criteria: {}, judge_error: true },
       };
     }
     this.resolvedModelId = resolved.judgeModelId;
@@ -125,6 +130,7 @@ export class SpecLlmJudgeVerifier implements Verifier {
       reason: `llm judge exhausted retries: ${lastErr.slice(0, 200)}`,
       metadata: {
         criteria: {},
+        judge_error: true,
         judge_model_id: resolved.judgeModelId,
         judge_reasoning_level: resolved.judgeReasoningLevel,
         ...(usage ? { usage } : {}),

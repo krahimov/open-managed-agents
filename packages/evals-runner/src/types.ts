@@ -30,6 +30,9 @@ export interface EvalTrialResult {
   ended_at?: string;
   finalize_retry_count?: number;
   reward?: number;
+  /** True when the judge could not run (provider outage, no resolver) —
+   *  the 0 reward says nothing about the agent, so metrics exclude it. */
+  ungraded?: boolean;
 }
 
 export interface EvalTaskResult {

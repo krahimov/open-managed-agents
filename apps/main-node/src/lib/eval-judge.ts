@@ -39,7 +39,13 @@ import { getLogger } from "@open-managed-agents/observability";
 
 const log = getLogger("eval-judge");
 
-const JUDGE_MAX_OUTPUT_TOKENS = 4096;
+// Generous on purpose: at reasoning_level "max" Anthropic's adaptive
+// thinking counts against maxOutputTokens, and a complex grading prompt can
+// burn >4k tokens of thinking BEFORE emitting the verdict — the call then
+// returns empty text, the parser retries, and the trial degrades to 0
+// (seen live on prod: csv-clean judge "verdict parse failure text=" ×4).
+// Cost is bounded by actual generation, not this ceiling.
+const JUDGE_MAX_OUTPUT_TOKENS = 32768;
 
 function providerToCompat(provider: string): ApiCompat {
   return provider === "oai" || provider === "oai-compatible"

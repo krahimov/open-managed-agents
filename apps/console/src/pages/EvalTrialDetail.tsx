@@ -209,7 +209,17 @@ export function EvalTrialDetail() {
             <span className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${statusCls(trial.status)}`}>
               {trial.status}
             </span>
-            {reward && (
+            {reward && meta?.judge_error === true ? (
+              // Judge infrastructure failure (provider outage, no resolver):
+              // the 0 reward says nothing about the agent — render as
+              // UNGRADED, never as FAIL.
+              <span
+                className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium bg-warning-subtle text-warning"
+                title={typeof meta.reason === "string" ? meta.reason : "judge could not run"}
+              >
+                UNGRADED · judge error
+              </span>
+            ) : reward ? (
               <span
                 className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full font-medium ${
                   reward.final_reward >= (task.spec.pass_threshold ?? 1)
@@ -220,7 +230,7 @@ export function EvalTrialDetail() {
               >
                 {rewardHeadline(reward)}
               </span>
-            )}
+            ) : null}
             {meta?.judge_model_id && (
               <span
                 className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-bg-surface text-fg-muted font-mono"
