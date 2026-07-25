@@ -210,22 +210,48 @@ export class SpecLlmJudgeVerifier implements Verifier {
     } catch {
       return ""; // sandbox gone — skip the whole section
     }
-    for (const path of filesWrittenFromTraceFacts(traj)) {
-      if (used >= WORKSPACE_CHAR_BUDGET) break;
+    const catted = new Set<string>();
+    const catFile = async (path: string): Promise<boolean> => {
       try {
-        const cat = await this.ctx.runExec(
+        const cat = await this.ctx.runExec!(
           `head -c ${WORKSPACE_FILE_CHAR_CAP} ${shellQuote(path)}`,
           { timeoutMs: 30_000 },
         );
-        if (cat.exit_code !== 0) continue;
+        if (cat.exit_code !== 0) return true;
+        catted.add(path.replace(/^\.\//, "").replace(/^.*\//, "")); // basename
         if (looksBinary(cat.output)) {
-          if (!push(`file:${path}\n(binary — listed, not inlined)`)) break;
-          continue;
+          return push(`file:${path}\n(binary — listed, not inlined)`);
         }
-        if (!push(`file:${path}\n${cat.output}`)) break;
+        return push(`file:${path}\n${cat.output}`);
       } catch {
-        // one unreadable file shouldn't sink the rest
+        return true; // one unreadable file shouldn't sink the rest
       }
+    };
+    for (const path of filesWrittenFromTraceFacts(traj)) {
+      if (used >= WORKSPACE_CHAR_BUDGET) break;
+      if (!(await catFile(path))) break;
+    }
+    // trace_facts.files_written only sees write-TOOL events — files created
+    // via bash (heredocs, scripts) are invisible to it, and a judge that
+    // only gets `ls -la` rightly refuses to grant credit it can't verify
+    // (seen live: correct cleaned.csv/report.md failed all criteria for
+    // lack of contents). Sweep small workspace files as a safety net.
+    try {
+      const found = await this.ctx.runExec(
+        `find . -maxdepth 2 -type f -size -64k | head -20`,
+        { timeoutMs: 30_000 },
+      );
+      if (found.exit_code === 0) {
+        for (const raw of found.output.split("\n")) {
+          const rel = raw.trim().replace(/^\.\//, "");
+          if (!rel || rel.startsWith(".")) continue;
+          if (catted.has(rel.replace(/^.*\//, ""))) continue;
+          if (used >= WORKSPACE_CHAR_BUDGET) break;
+          if (!(await catFile(rel))) break;
+        }
+      }
+    } catch {
+      // discovery sweep is best-effort
     }
     return parts.join("\n\n");
   }
