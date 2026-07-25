@@ -15,6 +15,7 @@
 
 import {
   buildTrajectory,
+  extractTraceFacts,
   verifierForSpec,
   NoRunVerifier,
   logWarn,
@@ -22,6 +23,8 @@ import {
   type Trajectory,
   type RewardResult,
   type VerifierContext,
+  type LlmJudgeRewardSpec,
+  type ResolvedJudge,
   type SessionRecord,
   type FullStatus,
 } from "@open-managed-agents/shared";
@@ -39,6 +42,7 @@ import {
   extractResults,
   kvKey,
 } from "./types";
+import { computeTaskMetrics, computeRunRollup } from "./metrics";
 
 /** Narrow services shape — just what the runner actually touches.
  *  Keeps the package decoupled from packages/services. CF satisfies
@@ -81,6 +85,16 @@ export interface EvalRunnerContext {
     tenantId: string,
     environmentId: string,
   ) => Promise<SandboxFetcher | null>;
+  /** Resolve an `llm_judge` RewardSpec into a runtime JudgeFn + identity
+   *  for the given tenant/agent (agent id drives the cross-family
+   *  default). Optional: runtimes without in-process model handles (CF
+   *  cron today) leave it undefined and llm_judge trials score 0 with an
+   *  "unavailable" reason. */
+  resolveJudge?: (
+    tenantId: string,
+    agentId: string,
+    spec: LlmJudgeRewardSpec,
+  ) => Promise<ResolvedJudge | null>;
 }
 
 // ---------- Sandbox fetch helper ----------
@@ -310,6 +324,9 @@ function buildVerifierContext(
       const data = (await res.json()) as { exit_code?: number; output?: string };
       return { exit_code: data.exit_code ?? -1, output: data.output ?? "" };
     },
+    resolveJudge: ctx.resolveJudge
+      ? (spec) => ctx.resolveJudge!(run.tenant_id, run.agent_id, spec)
+      : undefined,
   };
 }
 
@@ -377,11 +394,23 @@ async function runVerifier(
     if (typeof v === "number" && Number.isFinite(v)) persisted[k] = v;
   }
 
+  // Carry the verifier's metadata AND reason into storage — llm_judge puts
+  // the structured verdict + judge identity + usage in metadata (console
+  // Phase 4 renders the verdict card straight off the stored trajectory),
+  // while degrade paths ("llm_judge unavailable on this runtime", composite
+  // child failures) explain their 0 only via Score.reason. RewardResult has
+  // no reason field, so fold it into metadata or operators can't tell a
+  // judge that never ran from an agent that failed every criterion.
+  const metadata: Record<string, unknown> = {
+    ...(score.metadata ?? {}),
+    ...(score.reason ? { reason: score.reason } : {}),
+  };
   return {
     raw_rewards: persisted,
     final_reward: score.value,
     verifier_id: verifier.id,
     computed_at: computedAt,
+    ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
   };
 }
 
@@ -394,6 +423,34 @@ async function synthesizeNoRunReward(reasonHint: string): Promise<RewardResult> 
     verifier_id: verifier.id,
     computed_at: new Date().toISOString(),
   };
+}
+
+/**
+ * Trajectory v1 envelope enrichment — task_id / group_id / outcome /
+ * reward / trace_facts all wired BEFORE storage so the persisted
+ * trajectory is self-describing. Phase 3+4 (judge prompt, Console UI)
+ * read these directly. Exported for tests.
+ */
+export function finalizeTrajectoryForStorage(
+  trajectory: Trajectory,
+  opts: {
+    taskId: string;
+    groupId: string;
+    reward: RewardResult;
+    outcomeOverride?: Trajectory["outcome"];
+    trialError?: string;
+  },
+): Trajectory {
+  trajectory.task_id = opts.taskId;
+  trajectory.group_id = opts.groupId;
+  if (opts.outcomeOverride) {
+    trajectory.outcome = opts.outcomeOverride;
+  } else if (opts.trialError && /timeout/i.test(opts.trialError)) {
+    trajectory.outcome = "timeout";
+  }
+  trajectory.reward = opts.reward;
+  trajectory.trace_facts = extractTraceFacts(trajectory);
+  return trajectory;
 }
 
 async function buildAndStoreTrajectory(
@@ -448,17 +505,13 @@ async function buildAndStoreTrajectory(
     },
   });
 
-  // Trajectory v1 envelope enrichment — task_id / group_id / outcome /
-  // reward all wired BEFORE storage so the persisted trajectory is
-  // self-describing. Phase 3 (Console UI) reads these directly.
-  trajectory.task_id = task.spec.id;
-  trajectory.group_id = run.id;
-  if (outcomeOverride) {
-    trajectory.outcome = outcomeOverride;
-  } else if (trial.error && /timeout/i.test(trial.error)) {
-    trajectory.outcome = "timeout";
-  }
-  trajectory.reward = reward;
+  finalizeTrajectoryForStorage(trajectory, {
+    taskId: task.spec.id,
+    groupId: run.id,
+    reward,
+    outcomeOverride,
+    trialError: trial.error,
+  });
 
   // Trajectory storage goes through services.kv (CF: CONFIG_KV; Node:
   // SqlKvStore). Same key shape both runtimes.
@@ -623,6 +676,8 @@ async function advanceTask(
       task.status = "failed";
       task.error = task.trials.find((t) => t.error)?.error;
     }
+    // §6 metrics are additive — status semantics above stay untouched.
+    computeTaskMetrics(task);
   } else {
     task.status = "running";
   }
@@ -646,6 +701,7 @@ async function advanceRun(ctx: EvalRunnerContext, run: EvalRunRecord): Promise<v
 
   run.completed_count = run.tasks.filter((t) => t.status === "completed").length;
   run.failed_count = run.tasks.filter((t) => t.status === "failed").length;
+  computeRunRollup(run);
 
   if (run.completed_count + run.failed_count === run.task_count) {
     run.status = run.failed_count > 0 && run.completed_count === 0 ? "failed" : "completed";

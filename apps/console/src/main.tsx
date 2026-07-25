@@ -135,8 +135,25 @@ const protectedRoutes: RouteObject[] = [
       { index: true, element: <EvalRunsList /> },
       {
         path: ":id",
-        element: <EvalRunDetail />,
         handle: { crumb: (m: UIMatch) => (m.params.id as string | undefined) ?? "Eval Run" },
+        children: [
+          { index: true, element: <EvalRunDetail /> },
+          {
+            path: "trials/:taskId/:trialIndex",
+            handle: {
+              crumb: (m: UIMatch) =>
+                `${(m.params.taskId as string | undefined) ?? "task"} · trial ${
+                  (m.params.trialIndex as string | undefined) ?? "?"
+                }`,
+            },
+            // Lazy: pulls in TimelineView + trajectory panels, only
+            // needed once an operator drills into a trial.
+            lazy: async () => {
+              const { EvalTrialDetail } = await import("./pages/EvalTrialDetail");
+              return { Component: EvalTrialDetail };
+            },
+          },
+        ],
       },
     ],
   },

@@ -67,7 +67,7 @@ import { resolveModel } from "../harness/provider";
 import type { ApiCompat } from "../harness/provider";
 import type { LanguageModel } from "ai";
 import { generateText } from "ai";
-import { extractTextFromContent } from "@open-managed-agents/shared";
+import { extractTextFromContent, type JudgeFn } from "@open-managed-agents/shared";
 import {
   runOutcomeSupervisor,
   type ActiveOutcomeState,
@@ -4594,13 +4594,51 @@ export class SessionDO extends DurableObject<Env> {
       if (outcome) {
         const outcomeModelId =
           typeof agent.model === "string" ? agent.model : agent.model?.id;
+        const judgeWireModelId =
+          outcomeModelId || ctx.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
         const judgeModel = resolveModel(
-          outcomeModelId ||
-            ctx.env.ANTHROPIC_MODEL ||
-            "claude-sonnet-4-6",
+          judgeWireModelId,
           ctx.env.ANTHROPIC_API_KEY,
           ctx.env.ANTHROPIC_BASE_URL,
         );
+        // Shared judge closure: the rubric path (makeJudgeFn) emits a short
+        // verdict; the spec-driven llm_judge path (resolveJudge) emits nested
+        // per-criterion JSON and needs a larger output cap.
+        const makeJudge =
+          (maxOutputTokens: number): JudgeFn =>
+          async (prompt, signal) => {
+            const result = await generateText({
+              model: judgeModel,
+              system: prompt.system,
+              messages: [{ role: "user", content: prompt.user }],
+              maxOutputTokens,
+              abortSignal: signal,
+            });
+            const text =
+              result.text ||
+              extractTextFromContent(
+                (result as unknown as { content?: unknown }).content,
+              );
+            const u = (result as unknown as {
+              usage?: {
+                inputTokens?: number;
+                outputTokens?: number;
+                cachedInputTokens?: number;
+                cacheReadInputTokens?: number;
+                cacheCreationInputTokens?: number;
+              };
+            }).usage;
+            const usage = u
+              ? {
+                  input_tokens: u.inputTokens ?? 0,
+                  output_tokens: u.outputTokens ?? 0,
+                  cache_creation_input_tokens:
+                    u.cacheCreationInputTokens ?? u.cachedInputTokens,
+                  cache_read_input_tokens: u.cacheReadInputTokens,
+                }
+              : undefined;
+            return { text, usage };
+          };
         try {
           await runOutcomeSupervisor({
             outcome,
@@ -4638,40 +4676,21 @@ export class SessionDO extends DurableObject<Env> {
                   ? { exit_code: parseInt(m[1], 10), output: m[2] }
                   : { exit_code: -1, output: raw };
               },
+              // Outcome contracts may carry a spec-driven verifier of type
+              // "llm_judge" (OutcomeVerifierSpec advertises it) — without
+              // resolveJudge, SpecLlmJudgeVerifier degrades to a
+              // never-passing "unavailable" score and the supervisor burns
+              // full revision turns on unfixable feedback. This runtime
+              // can't look up tenant model cards, so judge.model_card_id
+              // is ignored and the session's own model judges (same
+              // lock-in as the rubric path's makeJudgeFn).
+              resolveJudge: async () => ({
+                judge: makeJudge(4096),
+                judgeModelId: judgeWireModelId,
+                judgeReasoningLevel: "instant",
+              }),
             }),
-            makeJudgeFn: () => async (prompt, signal) => {
-              const result = await generateText({
-                model: judgeModel,
-                system: prompt.system,
-                messages: [{ role: "user", content: prompt.user }],
-                maxOutputTokens: 800,
-                abortSignal: signal,
-              });
-              const text =
-                result.text ||
-                extractTextFromContent(
-                  (result as unknown as { content?: unknown }).content,
-                );
-              const u = (result as unknown as {
-                usage?: {
-                  inputTokens?: number;
-                  outputTokens?: number;
-                  cachedInputTokens?: number;
-                  cacheReadInputTokens?: number;
-                  cacheCreationInputTokens?: number;
-                };
-              }).usage;
-              const usage = u
-                ? {
-                    input_tokens: u.inputTokens ?? 0,
-                    output_tokens: u.outputTokens ?? 0,
-                    cache_creation_input_tokens:
-                      u.cacheCreationInputTokens ?? u.cachedInputTokens,
-                    cache_read_input_tokens: u.cacheReadInputTokens,
-                  }
-                : undefined;
-              return { text, usage };
-            },
+            makeJudgeFn: () => makeJudge(800),
             runHarnessTurn: async (msg) => {
               await harness.run({ ...ctx, userMessage: msg });
             },

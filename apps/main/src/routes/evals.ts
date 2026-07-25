@@ -26,6 +26,9 @@ async function dispatch(c: import("hono").Context<{
     evals: services.evals,
     agents: services.agents,
     environments: services.environments,
+    // CONFIG_KV-backed store — same one the eval runner tick writes stored
+    // trajectories through, so GET /trajectories/:id round-trips.
+    kv: services.kv,
   });
   // Strip the /v1/evals (or /v1/oma/evals) mount prefix so the package's
   // routes (declared as `/runs`, `/runs/:id`) match.

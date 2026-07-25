@@ -44,6 +44,7 @@ import type {
   SessionEvent,
   UserMessageEvent,
 } from "@open-managed-agents/shared";
+import { REASONING_LEVELS } from "@open-managed-agents/shared";
 import { mountResources } from "@open-managed-agents/agent/runtime/resource-mounter";
 import type { LanguageModel } from "ai";
 import { getLogger } from "@open-managed-agents/observability";
@@ -606,8 +607,13 @@ export class SessionRegistry {
               ? JSON.parse(raw)
               : raw) as { reasoning_level?: unknown } | null;
           const rl = meta?.reasoning_level;
-          if (rl === "instant" || rl === "low" || rl === "medium" || rl === "high") {
-            if (agent.reasoning_level !== rl) return { ...agent, reasoning_level: rl };
+          if (
+            typeof rl === "string" &&
+            (REASONING_LEVELS as readonly string[]).includes(rl)
+          ) {
+            if (agent.reasoning_level !== rl) {
+              return { ...agent, reasoning_level: rl as AgentConfig["reasoning_level"] };
+            }
           }
         } catch {
           // Best-effort — a malformed metadata blob must not kill the turn.

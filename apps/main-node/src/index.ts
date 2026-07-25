@@ -2061,6 +2061,9 @@ v1.route("/evals", buildEvalRoutes({
   agents: agentsService,
   // Node has no per-tenant cloud environments yet — leave the optional
   // dep undefined so the route accepts any environment_id without 404ing.
+  // Same SqlKvStore instance the eval runner writes trajectories through
+  // (see evalServices below) — keys are tenant-prefixed by the runner.
+  kv,
 }));
 mountNodeModelCardRoutes(v1);
 mountNodeModelsRoutes(v1);
@@ -2501,6 +2504,7 @@ app.route("/v1/oma/deployments", buildDeploymentRoutes({ services }));
 app.route("/v1/oma/evals", buildEvalRoutes({
   evals: evalsService,
   agents: agentsService,
+  kv,
 }));
 
 // /v1/oma/integrations mirror — same factory used twice. New OMA-only
@@ -2695,6 +2699,7 @@ const missionSupervisor = new NodeMissionSupervisor({
     resolveVaultMcpServersForSpawn(tenantId, vaultIds),
 });
 
+const { buildNodeJudgeResolver } = await import("./lib/eval-judge.js");
 const scheduler = buildNodeScheduler({
   evalServices: {
     agents: agentsService,
@@ -2704,6 +2709,10 @@ const scheduler = buildNodeScheduler({
     kv,
   },
   evalSandbox: buildEvalSandboxFetcher(sessionRouter),
+  evalJudgeResolver: buildNodeJudgeResolver({
+    modelCards: modelCardService,
+    agents: agentsService,
+  }),
   memory: memoryService,
   ambientDispatcher,
   missionSupervisor,

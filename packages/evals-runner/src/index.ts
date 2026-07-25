@@ -11,10 +11,18 @@
 export {
   tickEvalRuns,
   loadRun,
+  finalizeTrajectoryForStorage,
   type EvalRunnerContext,
   type EvalRunnerServices,
   type SandboxFetcher,
 } from "./tick";
+export {
+  DEFAULT_PASS_THRESHOLD,
+  passThresholdOf,
+  trialPassed,
+  computeTaskMetrics,
+  computeRunRollup,
+} from "./metrics";
 export type {
   EvalRunRecord,
   EvalTaskSpec,
@@ -23,3 +31,10 @@ export type {
   EvalRunStatus,
 } from "./types";
 export { rowToRecord, extractResults, kvKey } from "./types";
+export {
+  selectJudgeCard,
+  providerFamily,
+  judgeTier,
+  type JudgeCandidateCard,
+  type ProviderFamily,
+} from "./judge-selection";

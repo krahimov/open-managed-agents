@@ -183,9 +183,10 @@ export function createLlmJudgeVerifier(opts: LlmJudgeOpts): LlmJudgeVerifier {
  * evaluateOutcome inlined: concat all `agent.message` text content.
  * Keeps the verdict comparable across the migration so an existing
  * outcome that satisfied under the old judge keeps satisfying under the
- * new one (modulo prompt wording).
+ * new one (modulo prompt wording). Exported for the spec-driven judge's
+ * `include_transcript` escape hatch.
  */
-function buildAgentTranscript(traj: Trajectory): string {
+export function buildAgentTranscript(traj: Trajectory): string {
   const out: string[] = [];
   let used = 0;
   for (const e of traj.events) {
@@ -205,7 +206,9 @@ function buildAgentTranscript(traj: Trajectory): string {
   return out.join("\n\n");
 }
 
-function parseEventData(e: { data: string | object }): unknown {
+/** Parse a StoredEvent's payload; tolerates Node's flattened event shape.
+ *  Shared with the spec-driven judge builtin. */
+export function parseEventData(e: { data: string | object }): unknown {
   if (typeof e.data === "string") {
     try {
       return JSON.parse(e.data);

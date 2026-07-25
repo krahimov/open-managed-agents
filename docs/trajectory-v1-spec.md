@@ -153,6 +153,7 @@ export interface RewardResult {
   // Optional metadata for debugging
   verifier_id?: string;                  // which scorer produced this
   computed_at?: string;
+  metadata?: Record<string, unknown>;    // verifier extras (llm_judge: verdict, judge identity, usage)
 }
 
 export interface GroupStats {

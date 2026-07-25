@@ -18,6 +18,21 @@
 
 import type { Trajectory } from "../trajectory/types.js";
 import type { Score } from "../scorers/types.js";
+// Type-only import — erased at runtime, so no module cycle with the builtin.
+import type { JudgeFn } from "./builtins/llm_judge.js";
+
+/**
+ * Runtime-resolved judge handle. `LanguageModel` isn't serializable, so
+ * the consumer (evals-runner tick, outcome supervisor) resolves the
+ * spec's `judge` block into a callable + identity pair and hands it in
+ * through VerifierContext.resolveJudge. Identity fields are persisted
+ * into Score.metadata so runs stay reproducible/comparable.
+ */
+export interface ResolvedJudge {
+  judge: JudgeFn;
+  judgeModelId: string;
+  judgeReasoningLevel: string;
+}
 
 /** Sandbox + session handle the script Verifier needs to run a verify
  *  command. Ignored by Verifiers that don't touch the sandbox. */
@@ -31,6 +46,14 @@ export interface VerifierContext {
    * `timeoutMs` when supplied.
    */
   runExec(cmd: string, opts?: { timeoutMs?: number }): Promise<{ exit_code: number; output: string }>;
+  /**
+   * Resolve an `llm_judge` spec into a runtime JudgeFn. Optional: keeps
+   * eval-core a leaf package (no `ai` / provider SDK imports) — runtimes
+   * that can build models wire this in; when absent (or when it returns
+   * null) the spec-driven judge verifier scores 0 with an "unavailable"
+   * reason instead of throwing.
+   */
+  resolveJudge?: (spec: LlmJudgeRewardSpec) => Promise<ResolvedJudge | null>;
 }
 
 /**
@@ -69,7 +92,8 @@ export type RewardSpec =
   | ScriptRewardSpec
   | RewardModelRewardSpec
   | CompositeRewardSpec
-  | VerifiableRewardSpec;
+  | VerifiableRewardSpec
+  | LlmJudgeRewardSpec;
 
 export interface ScriptRewardSpec {
   type: "script";
@@ -100,6 +124,32 @@ export interface CompositeRewardSpec {
     /** Human-readable name used as the criteria key. */
     name: string;
   }>;
+}
+
+/**
+ * Serializable LLM-judge spec (evals-design §4.1). The judge block is
+ * resolution *input* — the consumer maps it to a concrete model via
+ * VerifierContext.resolveJudge; the resolved identity is echoed back in
+ * Score.metadata (judge_model_id / judge_reasoning_level).
+ */
+export interface LlmJudgeRewardSpec {
+  type: "llm_judge";
+  /** Markdown rubric, per-criterion (see evals-design §4.3 template). */
+  rubric: string;
+  judge?: {
+    /** Tenant model card to judge with. Default: resolver picks. */
+    model_card_id?: string;
+    /** Reasoning level for the judge model. Default "max". */
+    reasoning_level?: string;
+    /** Prefer a judge from a different provider family than the agent
+     *  under eval (reduces self-preference bias). Default true. */
+    cross_family?: boolean;
+  };
+  /** Escape hatch for tasks where the conversation IS the artifact
+   *  (e.g. tone evals). Default false: the judge never sees the agent's
+   *  intermediate prose/self-narrative (anti-anchoring, §4.2). */
+  include_transcript?: boolean;
+  weights?: Record<string, number>;
 }
 
 export interface VerifiableRewardSpec {
