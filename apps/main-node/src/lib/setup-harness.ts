@@ -16,6 +16,7 @@
 
 import { tool } from "ai";
 import { z } from "zod";
+import { buildDefaultWebSearchTool } from "@open-managed-agents/agent/harness/tools";
 import {
   OMA_SETUP_HARNESS,
   OMA_SETUP_KIND_HARNESS_UPDATED,
@@ -53,9 +54,11 @@ export function buildSetupPrompt(agent: AgentConfig): string {
     JSON.stringify(harnessView(agent), null, 2),
     "```",
     "",
-    "You have exactly two tools and no file, shell, or web access:",
+    "You have exactly four tools and no file or shell access:",
     "- update_harness: change fields on your own harness. Call it after EACH meaningful answer so the live config on the user's screen stays in sync. Pass only the fields that changed.",
     "- request_access: pop a one-click connect card in the user's setup panel for a service that needs credentials. Pass the service slug (for an MCP server you added, use its exact `name`) and a one-line reason. The user authenticates in the popup and you get a message when the account is connected.",
+    "- web_search: search the web. Use it to find a service's official MCP endpoint or docs instead of asking the user for URLs — e.g. search \"<service> MCP server\" and prefer the vendor's own domain.",
+    "- web_fetch: fetch a URL as text. Use it to read MCP docs pages and extract the exact server URL before adding it with update_harness.",
     "",
     "Harness fields you can refine:",
     "- name / description: a short label + one-line summary of what you do.",
@@ -96,15 +99,17 @@ export interface SetupToolsDeps {
     reason: string;
     mcp_server_url?: string;
   }) => Promise<{ request_id: string; status: string; note?: string }>;
+  /** Env for the read-only research tools (Tavily upgrade for web_search). */
+  env?: { TAVILY_API_KEY?: string };
 }
 
 /**
  * The DefaultHarness tool dict for a setup session: update_harness +
- * request_access, nothing else — setup has no file/shell/web access by
- * design. Handlers mirror the SDK harness's in-process MCP versions: the
- * harness update is applied to the real agent row and broadcast as an
- * `agent.message` tagged with the oma_setup metadata the console's diff
- * card renderer already understands.
+ * request_access + read-only web_search/web_fetch — no file or shell
+ * access by design. Handlers mirror the SDK harness's in-process MCP
+ * versions: the harness update is applied to the real agent row and
+ * broadcast as an `agent.message` tagged with the oma_setup metadata the
+ * console's diff card renderer already understands.
  */
 export function buildSetupTools(
   agent: AgentConfig,
@@ -178,6 +183,43 @@ export function buildSetupTools(
       execute: async (args: { service: string; reason: string; mcp_server_url?: string }) => {
         const res = await deps.requestAccess(args);
         return res.note ?? `Request ${res.request_id} posted (${res.status}).`;
+      },
+    }),
+    // Read-only research pair. Setup keeps NO file/shell access, but finding
+    // a service's official MCP endpoint is core setup work — without search
+    // the agent has to ask the user to go hunt for URLs (seen live: it
+    // refused "can you use websearch to find the rettel mcp").
+    web_search: buildDefaultWebSearchTool(deps.env),
+    web_fetch: tool({
+      description:
+        "Fetch a URL and return its text content (HTML tags stripped, truncated). Use to read MCP/API docs pages and extract exact server URLs.",
+      inputSchema: z.object({
+        url: z.string().describe("Absolute http(s) URL"),
+      }),
+      execute: async ({ url }: { url: string }) => {
+        try {
+          if (!/^https?:\/\//i.test(url)) return "web_fetch: only http(s) URLs are supported";
+          const res = await fetch(url, {
+            redirect: "follow",
+            headers: { "User-Agent": "oma-setup/1.0 (+https://github.com/krahimov/open-managed-agents)" },
+            signal: AbortSignal.timeout(20_000),
+          });
+          if (!res.ok) return `web_fetch: HTTP ${res.status}`;
+          const raw = await res.text();
+          // Crude readable-text pass — setup only needs to spot URLs and
+          // config snippets, not faithful markdown (the full web_fetch with
+          // the markdown converter lives in the agent harness).
+          const text = raw
+            .replace(/<script[\s\S]*?<\/script>/gi, " ")
+            .replace(/<style[\s\S]*?<\/style>/gi, " ")
+            .replace(/<[^>]+>/g, " ")
+            .replace(/&nbsp;/g, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+          return text.slice(0, 20_000) || "web_fetch: page had no readable text";
+        } catch (err) {
+          return `web_fetch failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
       },
     }),
   };
