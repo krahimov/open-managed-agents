@@ -635,6 +635,9 @@ async function advanceTrial(
     trial.status = "completed";
     trial.ended_at = new Date().toISOString();
     trial.reward = reward.final_reward;
+    if ((reward.metadata as { judge_error?: boolean } | undefined)?.judge_error === true) {
+      trial.ungraded = true;
+    }
     return true;
   } catch (err: unknown) {
     // Bounded retry: events fetch can transiently 500 under storage

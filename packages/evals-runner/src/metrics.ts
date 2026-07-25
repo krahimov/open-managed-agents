@@ -27,22 +27,33 @@ export function trialPassed(trial: EvalTrialResult, threshold: number): boolean 
  * whose trials have all reached a terminal state. Missing rewards count
  * as 0 in the mean/std (a crashed trial is a 0, not a gap — otherwise
  * flaky agents would look better than reliable ones).
+ *
+ * UNGRADED trials (judge infrastructure failed — provider outage, no
+ * resolver) are excluded from every metric: their 0 says nothing about
+ * the agent. A task where every trial is ungraded gets no metrics at
+ * all (undefined), which the console renders as "—".
  */
 export function computeTaskMetrics(task: EvalTaskResult): void {
   const threshold = passThresholdOf(task);
-  const trials = task.trials;
+  const trials = task.trials.filter((t) => t.ungraded !== true);
+  if (trials.length === 0) {
+    task.pass_at_k = undefined;
+    task.pass_all_k = undefined;
+    task.reward_mean = undefined;
+    task.reward_std = undefined;
+    return;
+  }
   const rewards = trials.map((t) =>
     typeof t.reward === "number" && Number.isFinite(t.reward) ? t.reward : 0,
   );
 
   task.pass_at_k = trials.some((t) => trialPassed(t, threshold));
-  task.pass_all_k = trials.length > 0 && trials.every((t) => trialPassed(t, threshold));
+  task.pass_all_k = trials.every((t) => trialPassed(t, threshold));
 
   const n = rewards.length;
-  const mean = n > 0 ? rewards.reduce((a, b) => a + b, 0) / n : 0;
+  const mean = rewards.reduce((a, b) => a + b, 0) / n;
   task.reward_mean = mean;
-  task.reward_std =
-    n > 0 ? Math.sqrt(rewards.reduce((a, r) => a + (r - mean) ** 2, 0) / n) : 0;
+  task.reward_std = Math.sqrt(rewards.reduce((a, r) => a + (r - mean) ** 2, 0) / n);
 }
 
 /** Run-level rollup: how many tasks cleared pass@k / pass^k. Tasks whose

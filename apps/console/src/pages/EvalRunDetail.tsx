@@ -537,6 +537,19 @@ function TrialReward({
 }) {
   if (trajectory && trajectory !== "loading" && trajectory !== "error" && trajectory.reward) {
     const r = trajectory.reward;
+    if (r.metadata?.judge_error === true) {
+      return (
+        <div className="leading-tight">
+          <div
+            className="text-warning font-semibold"
+            title={typeof r.metadata.reason === "string" ? r.metadata.reason : "judge could not run"}
+          >
+            UNGRADED
+          </div>
+          <div className="text-[10px] text-fg-subtle font-mono">judge error — excluded from metrics</div>
+        </div>
+      );
+    }
     const headline = rewardHeadline(r);
     const isPass = r.final_reward >= 0.99;
     const isFail = r.final_reward <= 0;

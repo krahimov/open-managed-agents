@@ -51,6 +51,7 @@ export class CompositeVerifier implements Verifier {
 
     const criteria: Record<string, number> = {};
     const reasons: string[] = [];
+    const judgeMeta: Record<string, unknown> = {};
     let weightedSum = 0;
     let totalWeight = 0;
     let allPass = true;
@@ -67,6 +68,7 @@ export class CompositeVerifier implements Verifier {
       totalWeight += weight;
       reasons.push(`${name}=${score.value.toFixed(3)} (${score.reason.slice(0, 80)})`);
       if (!score.pass) allPass = false;
+      absorbJudgeMetadata(judgeMeta, score);
     }
 
     const value = totalWeight > 0 ? weightedSum / totalWeight : 0;
@@ -74,13 +76,14 @@ export class CompositeVerifier implements Verifier {
       pass: allPass,
       value,
       reason: `composite: ${reasons.join("; ")}`,
-      metadata: { criteria },
+      metadata: { criteria, ...judgeMeta },
     };
   }
 
   private async checkSequentialWithGates(traj: Trajectory): Promise<Score> {
     const criteria: Record<string, number> = {};
     const reasons: string[] = [];
+    const judgeMeta: Record<string, unknown> = {};
     let weightedSum = 0;
     let totalWeight = 0;
     let allPass = true;
@@ -116,6 +119,7 @@ export class CompositeVerifier implements Verifier {
       totalWeight += c.weight;
       reasons.push(`${c.name}=${score.value.toFixed(3)} (${score.reason.slice(0, 80)})`);
       if (!score.pass) allPass = false;
+      absorbJudgeMetadata(judgeMeta, score);
     }
 
     const value = totalWeight > 0 ? weightedSum / totalWeight : 0;
@@ -123,7 +127,29 @@ export class CompositeVerifier implements Verifier {
       pass: allPass,
       value,
       reason: `composite: ${reasons.join("; ")}`,
-      metadata: { criteria },
+      metadata: { criteria, ...judgeMeta },
     };
   }
+}
+
+/**
+ * Surface an LLM-judge component's rich metadata on the composite score.
+ * Without this a judge inside a composite loses its verdict card in the
+ * console and its judge_error marker in the runner (found live: the only
+ * evidence of a judge-side billing outage was buried in the sub-score).
+ * First judge component wins — composing two LLM judges is not a
+ * supported shape today.
+ */
+function absorbJudgeMetadata(target: Record<string, unknown>, score: Score): void {
+  const md = score.metadata as Record<string, unknown> | undefined;
+  if (!md) return;
+  for (const key of [
+    "verdict",
+    "judge_model_id",
+    "judge_reasoning_level",
+    "usage",
+  ] as const) {
+    if (md[key] !== undefined && target[key] === undefined) target[key] = md[key];
+  }
+  if (md.judge_error === true) target.judge_error = true;
 }

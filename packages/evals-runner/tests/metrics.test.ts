@@ -96,6 +96,32 @@ describe("trialPassed", () => {
   });
 });
 
+describe("ungraded trials (judge infrastructure failure)", () => {
+  it("excludes ungraded trials from pass@k/pass^k and mean/std", () => {
+    const graded = trial(1);
+    const ungraded: EvalTrialResult = { trial_index: 1, status: "completed", reward: 0, ungraded: true };
+    const t = task([graded, ungraded]);
+    computeTaskMetrics(t);
+    // Without exclusion the ungraded 0 would sink pass^k and halve the mean.
+    expect(t.pass_at_k).toBe(true);
+    expect(t.pass_all_k).toBe(true);
+    expect(t.reward_mean).toBe(1);
+    expect(t.reward_std).toBe(0);
+  });
+
+  it("yields no metrics when every trial is ungraded", () => {
+    const t = task([
+      { trial_index: 0, status: "completed", reward: 0, ungraded: true },
+      { trial_index: 1, status: "completed", reward: 0, ungraded: true },
+    ]);
+    computeTaskMetrics(t);
+    expect(t.pass_at_k).toBeUndefined();
+    expect(t.pass_all_k).toBeUndefined();
+    expect(t.reward_mean).toBeUndefined();
+    expect(t.reward_std).toBeUndefined();
+  });
+});
+
 describe("computeRunRollup", () => {
   it("counts tasks with computed metrics; unfinished tasks don't count", () => {
     const t1 = task([trial(1), trial(1)]);

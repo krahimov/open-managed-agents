@@ -24,7 +24,13 @@ export function deriveSpans(events: Event[]): { spans: Span[]; totalMs: number }
       const t = Date.parse(pa);
       if (Number.isFinite(t)) return t;
     }
-    if (typeof e.ts === "number") return e.ts * 1000;
+    if (typeof e.ts === "number") {
+      // CF emits epoch seconds (~1.8e9); Node's event log emits epoch
+      // MILLISECONDS (~1.8e12). Blindly multiplying by 1000 inflated every
+      // Node span 1000× (2.7s TTFT rendered as "45m18s"). Anything past
+      // 1e12 is already milliseconds.
+      return e.ts > 1e12 ? e.ts : e.ts * 1000;
+    }
     return null;
   };
 

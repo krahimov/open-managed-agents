@@ -36,6 +36,10 @@ export interface JudgeVerdict {
 export interface RewardMetadata {
   criteria?: Record<string, number>;
   verdict?: JudgeVerdict;
+  /** Judge infrastructure failed (outage / no resolver) — reward 0 says
+   *  nothing about the agent; render UNGRADED, never FAIL. */
+  judge_error?: boolean;
+  reason?: string;
   judge_model_id?: string;
   judge_reasoning_level?: string;
   usage?: {
