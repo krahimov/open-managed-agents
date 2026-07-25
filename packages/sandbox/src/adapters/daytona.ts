@@ -183,34 +183,37 @@ export class DaytonaSandbox implements SandboxExecutor {
   async exec(command: string, timeout?: number): Promise<string> {
     const storagePolicyError = this.validateCommandStoragePolicy(command);
     if (storagePolicyError) return `[error: ${storagePolicyError}]`;
-    const sb = await this.ensureSandbox();
-    await this.syncMountedResourcesFromS3(sb);
-    const env = this.buildEnv(command);
-    const timeoutMs = timeout ?? this.opts.defaultTimeoutMs ?? 120_000;
-    const guardedCommand = this.withFileSizeLimit(command);
     try {
-      // Daytona's executeCommand timeout is in seconds; round up to the
-      // nearest second so a 100ms timeout doesn't degenerate to 0.
-      const r = await sb.process.executeCommand(
-        guardedCommand,
-        this.workdir(),
-        env,
-        Math.max(1, Math.ceil(timeoutMs / 1000)),
-      );
-      const stdout = r.artifacts?.stdout ?? "";
-      const stderr = r.artifacts?.stderr ?? "";
-      // Match @cloudflare/sandbox + LocalSubprocess: combined output, exit
-      // suffix on non-zero. The harness's bash tool parser keys off this.
-      const combined =
-        (stdout + (stderr ? `\n${stderr}` : "")).replace(/\s+$/, "") +
-        (r.exitCode !== 0 ? `\n[exit ${r.exitCode}]` : "");
-      return combined;
+      return await this.withSandboxRecovery("exec", async (sb) => {
+        await this.syncMountedResourcesFromS3(sb);
+        const env = this.buildEnv(command);
+        const timeoutMs = timeout ?? this.opts.defaultTimeoutMs ?? 120_000;
+        const guardedCommand = this.withFileSizeLimit(command);
+        try {
+          // Daytona's executeCommand timeout is in seconds; round up to the
+          // nearest second so a 100ms timeout doesn't degenerate to 0.
+          const r = await sb.process.executeCommand(
+            guardedCommand,
+            this.workdir(),
+            env,
+            Math.max(1, Math.ceil(timeoutMs / 1000)),
+          );
+          const stdout = r.artifacts?.stdout ?? "";
+          const stderr = r.artifacts?.stderr ?? "";
+          // Match @cloudflare/sandbox + LocalSubprocess: combined output, exit
+          // suffix on non-zero. The harness's bash tool parser keys off this.
+          const combined =
+            (stdout + (stderr ? `\n${stderr}` : "")).replace(/\s+$/, "") +
+            (r.exitCode !== 0 ? `\n[exit ${r.exitCode}]` : "");
+          return combined;
+        } finally {
+          await this.syncMountedResourcesToS3(sb).catch((err) => {
+            this.logger.warn(`resource sync after exec failed: ${(err as Error).message}`);
+          });
+        }
+      });
     } catch (err) {
       return `[error: ${(err as Error).message}]`;
-    } finally {
-      await this.syncMountedResourcesToS3(sb).catch((err) => {
-        this.logger.warn(`resource sync after exec failed: ${(err as Error).message}`);
-      });
     }
   }
 
@@ -263,35 +266,39 @@ export class DaytonaSandbox implements SandboxExecutor {
   }
 
   async readFile(path: string): Promise<string> {
-    const sb = await this.ensureSandbox();
-    const buf = await sb.fs.downloadFile(this.normalise(path));
-    return buf.toString("utf8");
+    return this.withSandboxRecovery("readFile", async (sb) => {
+      const buf = await sb.fs.downloadFile(this.normalise(path));
+      return buf.toString("utf8");
+    });
   }
 
   async readFileBytes(path: string): Promise<Uint8Array> {
-    const sb = await this.ensureSandbox();
-    const buf = await sb.fs.downloadFile(this.normalise(path));
-    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+    return this.withSandboxRecovery("readFileBytes", async (sb) => {
+      const buf = await sb.fs.downloadFile(this.normalise(path));
+      return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+    });
   }
 
   async writeFile(path: string, content: string): Promise<string> {
     const target = this.normalise(path);
     this.assertAllowedWrite(target, Buffer.byteLength(content, "utf8"));
-    const sb = await this.ensureSandbox();
-    await this.ensureParentDir(sb, target);
-    await sb.fs.uploadFile(Buffer.from(content, "utf8"), target);
-    await this.syncAfterMutation(sb, target);
-    return target;
+    return this.withSandboxRecovery("writeFile", async (sb) => {
+      await this.ensureParentDir(sb, target);
+      await sb.fs.uploadFile(Buffer.from(content, "utf8"), target);
+      await this.syncAfterMutation(sb, target);
+      return target;
+    });
   }
 
   async writeFileBytes(path: string, bytes: Uint8Array): Promise<string> {
     const target = this.normalise(path);
     this.assertAllowedWrite(target, bytes.byteLength);
-    const sb = await this.ensureSandbox();
-    await this.ensureParentDir(sb, target);
-    await sb.fs.uploadFile(Buffer.from(bytes), target);
-    await this.syncAfterMutation(sb, target);
-    return target;
+    return this.withSandboxRecovery("writeFileBytes", async (sb) => {
+      await this.ensureParentDir(sb, target);
+      await sb.fs.uploadFile(Buffer.from(bytes), target);
+      await this.syncAfterMutation(sb, target);
+      return target;
+    });
   }
 
   /**
@@ -373,6 +380,70 @@ export class DaytonaSandbox implements SandboxExecutor {
   // ── helpers ──────────────────────────────────────────────────────────────
 
   private pendingCaUpload: { hostPath: string } | null = null;
+
+  /** Daytona 404s a deleted/archived box with messages like
+   *  "not found: sandbox <uuid> not found (it has been deleted)". Keep the
+   *  match narrow — a missing FILE error must not trigger re-provisioning. */
+  private isSandboxGone(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return /has been (deleted|archived)|not found: sandbox|sandbox [0-9a-f][0-9a-f-]{7,} not found/i.test(msg);
+  }
+
+  /**
+   * Daytona auto-stops idle sandboxes and eventually deletes them
+   * server-side, while the Node registry can hold this adapter (and its
+   * cached sandbox handle) in memory for hours. Without recovery, every
+   * exec/file op on such a session fails "sandbox <id> not found (it has
+   * been deleted)" forever — seen live on prod 2026-07-25 (docs-agent
+   * session bricked after 7h idle). Recovery: drop the dead handle,
+   * provision a fresh box (bootstrap + CA upload re-run inside
+   * ensureSandbox), replay recorded memory/output mounts so durable state
+   * re-syncs from S3, then retry the operation once. Non-mounted workspace
+   * files are gone with the old box — callers see a fresh workdir instead
+   * of a permanent error loop.
+   */
+  private async withSandboxRecovery<T>(
+    op: string,
+    fn: (sb: DaytonaSandboxInstance) => Promise<T>,
+  ): Promise<T> {
+    const sb = await this.ensureSandbox();
+    try {
+      return await fn(sb);
+    } catch (err) {
+      if (!this.isSandboxGone(err)) throw err;
+      this.logger.warn(
+        `sandbox deleted upstream during ${op} — provisioning a replacement`,
+      );
+      this.sandboxPromise = null;
+      const fresh = await this.ensureSandbox();
+      await this.replayMounts(fresh);
+      return await fn(fresh);
+    }
+  }
+
+  private async replayMounts(sb: DaytonaSandboxInstance): Promise<void> {
+    for (const mount of this.mountedMemoryStores.values()) {
+      await this.runSetup(
+        sb,
+        `mkdir -p /mnt/memory && rm -rf ${shellEscape(mount.mountPoint)} && mkdir -p ${shellEscape(mount.mountPoint)}`,
+        "re-create memory mount",
+      );
+    }
+    if (this.mountedOutputs) {
+      await this.runSetup(
+        sb,
+        `mkdir -p /mnt/session && rm -rf ${shellEscape(this.mountedOutputs.mountPoint)} && mkdir -p ${shellEscape(this.mountedOutputs.mountPoint)}`,
+        "re-create outputs mount",
+      );
+    }
+    if (this.mountedMemoryStores.size > 0 || this.mountedOutputs) {
+      await this.syncMountedResourcesFromS3(sb).catch((err) => {
+        this.logger.warn(
+          `mount re-sync after sandbox recovery failed: ${(err as Error).message}`,
+        );
+      });
+    }
+  }
 
   private async ensureSandbox(): Promise<DaytonaSandboxInstance> {
     if (this.sandboxPromise) return this.sandboxPromise;
