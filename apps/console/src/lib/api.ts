@@ -125,7 +125,13 @@ export function useApi() {
   const api = useCallback(
     async function api<T = unknown>(
       path: string,
-      init?: RequestInit
+      init?: RequestInit & {
+        /** Suppress the automatic error toast for non-OK responses. For
+         *  probe-style calls where a failure is part of normal flow (e.g.
+         *  a 501 from a runtime that lacks the endpoint) and the caller
+         *  renders the outcome itself. The `ApiError` still throws. */
+        silentErrors?: boolean;
+      }
     ): Promise<T> {
       const activeTenant = getActiveTenantId();
       // Don't auto-set JSON content-type for FormData — the browser must add
@@ -207,7 +213,7 @@ export function useApi() {
         // the API path (e.g. "/v1/sessions: Insufficient balance.") which
         // leaked debug info into UX. Path + status still go to console for
         // dev triage.
-        if (!shouldSilenceAuthError(path, res.status)) {
+        if (!init?.silentErrors && !shouldSilenceAuthError(path, res.status)) {
           console.error(`[api] ${res.status} ${path}: ${info.message}`);
           toast.error(info.message);
         }

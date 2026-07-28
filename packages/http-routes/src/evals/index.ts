@@ -12,6 +12,7 @@
 // run create against a synthesized localhost env).
 
 import { Hono } from "hono";
+import { customAlphabet } from "nanoid";
 import type {
   EvalRunService,
   EvalRunRow,
@@ -19,7 +20,7 @@ import type {
 } from "@open-managed-agents/evals-store";
 import type { AgentService } from "@open-managed-agents/agents-store";
 import type { EnvironmentService } from "@open-managed-agents/environments-store";
-import type { KvStore } from "@open-managed-agents/kv-store";
+import { listAll, type KvStore } from "@open-managed-agents/kv-store";
 import type { RewardSpec } from "@open-managed-agents/shared";
 
 interface Vars {
@@ -38,6 +39,20 @@ export interface EvalTaskSpec {
   pass_threshold?: number;
 }
 
+/** Stored suite record (evals-design §8 save-as-eval). KV-backed at
+ *  `t:<tenant>:eval_suite:<id>` — no migration, mirrors trajectory storage. */
+export interface EvalSuite {
+  id: string;
+  name: string;
+  agent_id?: string;
+  judge?: { model_card_id?: string; reasoning_level?: string };
+  tasks: EvalTaskSpec[];
+  source_sessions?: string[];
+  baseline_run_id?: string;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface EvalRoutesDeps {
   evals: EvalRunService;
   agents: AgentService;
@@ -46,10 +61,64 @@ export interface EvalRoutesDeps {
   environments?: EnvironmentService;
   /** Optional. Backs GET /trajectories/:id — the eval runner stores the
    *  enriched trajectory (reward metadata, trace_facts) in KV under
-   *  `t:<tenant>:trajectory:<id>` (evals-runner kvKey). Runtimes without
-   *  a KV binding here get a clear 501 instead of a silent rebuild that
-   *  would drop the verdict + trace facts. */
+   *  `t:<tenant>:trajectory:<id>` (evals-runner kvKey). Also backs the
+   *  /suites CRUD. Runtimes without a KV binding here get a clear 501
+   *  instead of a silent rebuild that would drop the verdict + trace
+   *  facts. */
   kv?: KvStore;
+}
+
+// Lowercase alnum only — same alphabet as @oma/shared generateId.
+const suiteIdAlphabet = customAlphabet("0123456789abcdefghijklmnopqrstuvwxyz", 12);
+
+function suiteKey(tenantId: string, id: string): string {
+  return `t:${tenantId}:eval_suite:${id}`;
+}
+
+/** Per-task validation shared by POST /runs and the suite routes.
+ *  Returns an error message, or null when the task is valid. */
+function taskSpecError(task: EvalTaskSpec): string | null {
+  if (!task || typeof task !== "object") {
+    return `task must be an object: ${JSON.stringify(task).slice(0, 100)}`;
+  }
+  if (!task.id) return `task missing id: ${JSON.stringify(task).slice(0, 100)}`;
+  if (!Array.isArray(task.messages) || task.messages.length === 0) {
+    return `task ${task.id} requires non-empty messages array`;
+  }
+  if (
+    task.pass_threshold !== undefined &&
+    (typeof task.pass_threshold !== "number" || !Number.isFinite(task.pass_threshold))
+  ) {
+    return `task ${task.id} pass_threshold must be a finite number`;
+  }
+  return null;
+}
+
+function duplicateTaskId(tasks: EvalTaskSpec[]): string | null {
+  const seen = new Set<string>();
+  for (const task of tasks) {
+    if (seen.has(task.id)) return task.id;
+    seen.add(task.id);
+  }
+  return null;
+}
+
+/** Initial `results` JSON for a fresh run — shared by POST /runs and
+ *  POST /suites/:id/run so both create identical rows for the cron tick. */
+function buildInitialResults(tasks: EvalTaskSpec[]) {
+  return {
+    task_count: tasks.length,
+    completed_count: 0,
+    failed_count: 0,
+    tasks: tasks.map((spec) => {
+      const trialCount = Math.max(1, spec.trials || 1);
+      const trials = [];
+      for (let i = 0; i < trialCount; i++) {
+        trials.push({ trial_index: i, status: "pending" as EvalRunStatus });
+      }
+      return { id: spec.id, spec, status: "pending" as EvalRunStatus, trials, trial_total: trialCount };
+    }),
+  };
 }
 
 export function buildEvalRoutes(deps: EvalRoutesDeps) {
@@ -70,16 +139,8 @@ export function buildEvalRoutes(deps: EvalRoutesDeps) {
       return c.json({ error: "tasks array is required and must be non-empty" }, 400);
     }
     for (const task of body.tasks) {
-      if (!task.id) return c.json({ error: `task missing id: ${JSON.stringify(task).slice(0, 100)}` }, 400);
-      if (!Array.isArray(task.messages) || task.messages.length === 0) {
-        return c.json({ error: `task ${task.id} requires non-empty messages array` }, 400);
-      }
-      if (
-        task.pass_threshold !== undefined &&
-        (typeof task.pass_threshold !== "number" || !Number.isFinite(task.pass_threshold))
-      ) {
-        return c.json({ error: `task ${task.id} pass_threshold must be a finite number` }, 400);
-      }
+      const taskErr = taskSpecError(task);
+      if (taskErr) return c.json({ error: taskErr }, 400);
     }
 
     const [agentRow, envRow] = await Promise.all([
@@ -91,25 +152,11 @@ export function buildEvalRoutes(deps: EvalRoutesDeps) {
     if (!agentRow) return c.json({ error: "Agent not found" }, 404);
     if (deps.environments && !envRow) return c.json({ error: "Environment not found" }, 404);
 
-    const initialResults = {
-      task_count: body.tasks.length,
-      completed_count: 0,
-      failed_count: 0,
-      tasks: body.tasks.map((spec) => {
-        const trialCount = Math.max(1, spec.trials || 1);
-        const trials = [];
-        for (let i = 0; i < trialCount; i++) {
-          trials.push({ trial_index: i, status: "pending" as EvalRunStatus });
-        }
-        return { id: spec.id, spec, status: "pending" as EvalRunStatus, trials, trial_total: trialCount };
-      }),
-    };
-
     const run = await deps.evals.create({
       tenantId: t,
       agentId: body.agent_id,
       environmentId: body.environment_id,
-      results: initialResults,
+      results: buildInitialResults(body.tasks),
     });
 
     return c.json({ run_id: run.id, task_count: body.tasks.length });
@@ -206,6 +253,181 @@ export function buildEvalRoutes(deps: EvalRoutesDeps) {
     return c.json({ type: "eval_run_deleted", id });
   });
 
+  // ── Eval suites (evals-design §8 save-as-eval) ──────────────────────
+  // KV-backed CRUD + "run this suite". Same 501 posture as the stored-
+  // trajectory route: runtimes without a KV binding get a clear error.
+
+  // POST /v1/evals/suites — create
+  app.post("/suites", async (c) => {
+    if (!deps.kv) return c.json({ error: "suites unavailable on this runtime" }, 501);
+    const t = c.var.tenant_id;
+    const body = await c.req.json<Partial<EvalSuite>>().catch(() => null);
+    if (!body || typeof body.name !== "string" || !body.name.trim()) {
+      return c.json({ error: "name is required" }, 400);
+    }
+    // Empty tasks is allowed on create — the save-as-eval flow drafts a
+    // suite first and appends tasks one session at a time.
+    const tasks = body.tasks ?? [];
+    if (!Array.isArray(tasks)) return c.json({ error: "tasks must be an array" }, 400);
+    for (const task of tasks) {
+      const taskErr = taskSpecError(task);
+      if (taskErr) return c.json({ error: taskErr }, 400);
+    }
+    const dup = duplicateTaskId(tasks);
+    if (dup) return c.json({ error: `duplicate task id in suite: ${dup}` }, 400);
+
+    const now = new Date().toISOString();
+    const suite: EvalSuite = {
+      id: `evsuite-${suiteIdAlphabet()}`,
+      name: body.name.trim(),
+      ...(body.agent_id ? { agent_id: body.agent_id } : {}),
+      ...(body.judge ? { judge: body.judge } : {}),
+      tasks,
+      ...(Array.isArray(body.source_sessions) ? { source_sessions: body.source_sessions } : {}),
+      ...(body.baseline_run_id ? { baseline_run_id: body.baseline_run_id } : {}),
+      created_at: now,
+      updated_at: now,
+    };
+    await deps.kv.put(suiteKey(t, suite.id), JSON.stringify(suite));
+    return c.json(suite);
+  });
+
+  // GET /v1/evals/suites — list (tasks summarized as task_count)
+  app.get("/suites", async (c) => {
+    if (!deps.kv) return c.json({ error: "suites unavailable on this runtime" }, 501);
+    const t = c.var.tenant_id;
+    const kv = deps.kv;
+    const keys = await listAll(kv, `t:${t}:eval_suite:`);
+    const suites: EvalSuite[] = [];
+    for (const key of keys) {
+      const raw = await kv.get(key.name);
+      if (raw === null) continue;
+      try {
+        suites.push(JSON.parse(raw) as EvalSuite);
+      } catch {
+        // skip corrupt rows rather than failing the whole listing
+      }
+    }
+    suites.sort((a, b) => (a.updated_at < b.updated_at ? 1 : a.updated_at > b.updated_at ? -1 : 0));
+    return c.json({
+      data: suites.map(({ tasks, ...rest }) => ({
+        ...rest,
+        task_count: Array.isArray(tasks) ? tasks.length : 0,
+      })),
+    });
+  });
+
+  // GET /v1/evals/suites/:id — full suite
+  app.get("/suites/:id", async (c) => {
+    if (!deps.kv) return c.json({ error: "suites unavailable on this runtime" }, 501);
+    const raw = await deps.kv.get(suiteKey(c.var.tenant_id, c.req.param("id")));
+    if (raw === null) return c.json({ error: "Suite not found" }, 404);
+    return c.body(raw, 200, { "content-type": "application/json" });
+  });
+
+  // POST /v1/evals/suites/:id — partial update
+  app.post("/suites/:id", async (c) => {
+    if (!deps.kv) return c.json({ error: "suites unavailable on this runtime" }, 501);
+    const t = c.var.tenant_id;
+    const key = suiteKey(t, c.req.param("id"));
+    const raw = await deps.kv.get(key);
+    if (raw === null) return c.json({ error: "Suite not found" }, 404);
+    const suite = JSON.parse(raw) as EvalSuite;
+
+    const body = await c.req
+      .json<Partial<EvalSuite> & { append_task?: EvalTaskSpec }>()
+      .catch(() => null);
+    if (!body) return c.json({ error: "invalid JSON body" }, 400);
+
+    if (body.name !== undefined) {
+      if (typeof body.name !== "string" || !body.name.trim()) {
+        return c.json({ error: "name must be a non-empty string" }, 400);
+      }
+      suite.name = body.name.trim();
+    }
+    if (body.agent_id !== undefined) suite.agent_id = body.agent_id || undefined;
+    if (body.judge !== undefined) suite.judge = body.judge || undefined;
+    if (body.baseline_run_id !== undefined) suite.baseline_run_id = body.baseline_run_id || undefined;
+    if (body.tasks !== undefined) {
+      if (!Array.isArray(body.tasks)) return c.json({ error: "tasks must be an array" }, 400);
+      for (const task of body.tasks) {
+        const taskErr = taskSpecError(task);
+        if (taskErr) return c.json({ error: taskErr }, 400);
+      }
+      const dup = duplicateTaskId(body.tasks);
+      if (dup) return c.json({ error: `duplicate task id in suite: ${dup}` }, 400);
+      suite.tasks = body.tasks;
+    }
+    if (body.append_task !== undefined) {
+      const taskErr = taskSpecError(body.append_task);
+      if (taskErr) return c.json({ error: taskErr }, 400);
+      if (suite.tasks.some((task) => task.id === body.append_task!.id)) {
+        return c.json({ error: `task id already exists in suite: ${body.append_task.id}` }, 400);
+      }
+      suite.tasks = [...suite.tasks, body.append_task];
+    }
+
+    suite.updated_at = new Date().toISOString();
+    await deps.kv.put(key, JSON.stringify(suite));
+    return c.json(suite);
+  });
+
+  // DELETE /v1/evals/suites/:id — hard delete
+  app.delete("/suites/:id", async (c) => {
+    if (!deps.kv) return c.json({ error: "suites unavailable on this runtime" }, 501);
+    const t = c.var.tenant_id;
+    const id = c.req.param("id");
+    const key = suiteKey(t, id);
+    const raw = await deps.kv.get(key);
+    if (raw === null) return c.json({ error: "Suite not found" }, 404);
+    await deps.kv.delete(key);
+    return c.json({ type: "eval_suite_deleted", id });
+  });
+
+  // POST /v1/evals/suites/:id/run — launch a run from the suite's tasks.
+  // Identical row shape to POST /runs (shared buildInitialResults), plus
+  // suite provenance stamped into `results` — evals-runner rowToRecord /
+  // extractResults carry the two fields across ticks.
+  app.post("/suites/:id/run", async (c) => {
+    if (!deps.kv) return c.json({ error: "suites unavailable on this runtime" }, 501);
+    const t = c.var.tenant_id;
+    const raw = await deps.kv.get(suiteKey(t, c.req.param("id")));
+    if (raw === null) return c.json({ error: "Suite not found" }, 404);
+    const suite = JSON.parse(raw) as EvalSuite;
+
+    const body = await c.req
+      .json<{ agent_id?: string; environment_id?: string }>()
+      .catch(() => ({}) as { agent_id?: string; environment_id?: string });
+    const agentId = body.agent_id ?? suite.agent_id;
+    if (!agentId) return c.json({ error: "agent_id is required (suite has none pinned)" }, 400);
+    if (!body.environment_id) return c.json({ error: "environment_id is required" }, 400);
+    if (!Array.isArray(suite.tasks) || suite.tasks.length === 0) {
+      return c.json({ error: "suite has no tasks" }, 400);
+    }
+
+    const [agentRow, envRow] = await Promise.all([
+      deps.agents.get({ tenantId: t, agentId }),
+      deps.environments
+        ? deps.environments.get({ tenantId: t, environmentId: body.environment_id })
+        : Promise.resolve({} as unknown), // Node: skip env existence check
+    ]);
+    if (!agentRow) return c.json({ error: "Agent not found" }, 404);
+    if (deps.environments && !envRow) return c.json({ error: "Environment not found" }, 404);
+
+    const run = await deps.evals.create({
+      tenantId: t,
+      agentId,
+      environmentId: body.environment_id,
+      results: {
+        ...buildInitialResults(suite.tasks),
+        suite_id: suite.id,
+        suite_name: suite.name,
+      },
+    });
+
+    return c.json({ run_id: run.id, task_count: suite.tasks.length, suite_id: suite.id });
+  });
+
   return app;
 }
 
@@ -217,6 +439,8 @@ function rowToApi(run: EvalRunRow) {
     tasks?: unknown[];
     tasks_pass_at_k?: number;
     tasks_pass_all_k?: number;
+    suite_id?: string;
+    suite_name?: string;
   };
   return {
     id: run.id,
@@ -235,5 +459,8 @@ function rowToApi(run: EvalRunRow) {
     // §6 rollups — computed by the runner tick, absent on legacy rows.
     ...(partial.tasks_pass_at_k !== undefined ? { tasks_pass_at_k: partial.tasks_pass_at_k } : {}),
     ...(partial.tasks_pass_all_k !== undefined ? { tasks_pass_all_k: partial.tasks_pass_all_k } : {}),
+    // §8 suite provenance — present only on runs launched via /suites/:id/run.
+    ...(partial.suite_id !== undefined ? { suite_id: partial.suite_id } : {}),
+    ...(partial.suite_name !== undefined ? { suite_name: partial.suite_name } : {}),
   };
 }

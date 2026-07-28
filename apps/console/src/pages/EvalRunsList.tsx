@@ -11,6 +11,7 @@ import { RowActionsMenu } from "../components/RowActionsMenu";
 import { PopoverContent } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
 import { NewEvalRunDialog } from "./evals/NewEvalRunDialog";
+import { SuitesSection } from "./evals/SuitesSection";
 
 interface EvalRunSummary {
   id: string;
@@ -276,7 +277,12 @@ export function EvalRunsList() {
   );
 
   return (
-    <DataTable<EvalRunSummary>
+    <>
+      {/* Saved suites strip (§8 save-as-eval) — sits between the frozen
+          header and the runs rows, inside the scroll container. Renders
+          nothing when the tenant has no suites. */}
+      <SuitesSection />
+      <DataTable<EvalRunSummary>
       createLabel="+ New eval run"
       onCreate={() => setShowCreate(true)}
       filters={filters}
@@ -305,7 +311,8 @@ export function EvalRunsList() {
         )
       }
     >
-      <NewEvalRunDialog open={showCreate} onClose={() => setShowCreate(false)} />
-    </DataTable>
+        <NewEvalRunDialog open={showCreate} onClose={() => setShowCreate(false)} />
+      </DataTable>
+    </>
   );
 }

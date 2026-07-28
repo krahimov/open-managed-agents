@@ -22,6 +22,7 @@ import {
   TrajectoryViewerModal,
 } from "./session-detail/Trajectory";
 import { TimelineView } from "../components/timeline/TimelineView";
+import { SaveAsEvalDialog } from "./evals/SaveAsEvalDialog";
 import type { Event } from "../lib/events";
 import type { Trajectory, TrajectoryOutcome } from "../lib/trajectory";
 import { rewardHeadline, outcomeToStatusTone } from "../lib/trajectory";
@@ -117,6 +118,7 @@ export function SessionDetail() {
     | null
   >(null);
   const [showFiles, setShowFiles] = useState(false);
+  const [showSaveAsEval, setShowSaveAsEval] = useState(false);
   const [linear, setLinear] = useState<{
     issueId?: string;
     issueIdentifier?: string;
@@ -845,6 +847,15 @@ export function SessionDetail() {
                 {interrupting ? "Stopping…" : "Stop"}
               </button>
             )}
+            {/* Save as eval (§8 save-as-eval) — snapshot this session's
+                user messages + a judge-drafted rubric into a suite task. */}
+            <button
+              onClick={() => setShowSaveAsEval(true)}
+              className="inline-flex items-center justify-center px-2.5 py-1 min-h-11 sm:min-h-0 rounded-md text-xs font-medium bg-bg-surface/60 text-fg-muted hover:bg-bg-surface hover:text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+              title="Snapshot this session into an eval suite task"
+            >
+              Save as eval
+            </button>
             <button
               onClick={() => setShowFiles((v) => !v)}
               className={`inline-flex items-center justify-center px-2.5 py-1 min-h-11 sm:min-h-0 rounded-md text-xs font-medium transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
@@ -1294,6 +1305,16 @@ export function SessionDetail() {
         sessionId={id ?? ""}
         trajectory={trajectory}
       />
+      {id && (
+        <SaveAsEvalDialog
+          open={showSaveAsEval}
+          onClose={() => setShowSaveAsEval(false)}
+          sessionId={id}
+          agentId={sessionMeta.agentSnapshot?.id || agentId || undefined}
+          agentName={sessionMeta.agentSnapshot?.name}
+          environmentId={sessionMeta.environmentId}
+        />
+      )}
     </div>
   );
 }
