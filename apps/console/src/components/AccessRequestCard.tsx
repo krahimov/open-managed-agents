@@ -42,13 +42,23 @@ export function AccessRequestCard({
     reason?: string;
     composio_configured?: boolean;
     mcp_server_url?: string;
+    /** Server-side classification (postAccessRequest): how this service
+     *  actually authenticates. Absent on events from older deploys —
+     *  fall back to the pre-classification behavior then. */
+    auth_kind?: "mcp_oauth" | "mcp_api_key" | "llm_provider" | "composio";
   };
   const service = (ev.service ?? "service").toLowerCase();
-  const isMcpOauth = typeof ev.mcp_server_url === "string" && ev.mcp_server_url.length > 0;
+  const isMcpOauth =
+    typeof ev.mcp_server_url === "string" &&
+    ev.mcp_server_url.length > 0 &&
+    ev.auth_kind !== "mcp_api_key";
+  const isApiKeyMcp = ev.auth_kind === "mcp_api_key" && !!ev.mcp_server_url;
+  const isLlmProvider = ev.auth_kind === "llm_provider";
   const [status, setStatus] = useState<"pending" | "connecting" | "connected" | "error">(
     "pending",
   );
   const [error, setError] = useState<string | null>(null);
+  const [apiKey, setApiKey] = useState("");
   const notifiedRef = useRef(false);
 
   useEffect(() => {
@@ -138,6 +148,52 @@ export function AccessRequestCard({
     });
   };
 
+  /** API-key MCP path (e.g. Retell: `Authorization: Bearer <key>`). The key
+   *  goes straight into a static_bearer vault credential matched by the
+   *  server URL — the credential proxy injects it on every call, the agent
+   *  never sees it, and nothing lands in the transcript. */
+  const saveApiKey = async () => {
+    const token = apiKey.trim();
+    if (!token) return;
+    setError(null);
+    setStatus("connecting");
+    try {
+      const vault = await ensureVault();
+      await api(`/v1/vaults/${vault.id}/credentials`, {
+        method: "POST",
+        body: JSON.stringify({
+          display_name: `${service} API key`,
+          auth: { type: "static_bearer", token, mcp_server_url: ev.mcp_server_url },
+        }),
+      });
+      setApiKey("");
+      notifiedRef.current = true;
+      setStatus("connected");
+      await api(`/v1/sessions/${sessionId}/events`, {
+        method: "POST",
+        body: JSON.stringify({
+          events: [
+            {
+              type: "user.message",
+              content: [
+                {
+                  type: "text",
+                  text: `[access granted] The ${service} API key is saved in the vault — calls to ${ev.mcp_server_url} are now authenticated automatically. Continue where you left off.`,
+                },
+              ],
+            },
+          ],
+        }),
+      }).catch(() => {
+        toast.error("Key saved, but failed to notify the agent — send it a message to continue.");
+      });
+      toast.success(`${service} key saved to the vault.`);
+    } catch (err) {
+      setStatus("error");
+      setError(err instanceof Error ? err.message : "Failed to save the key");
+    }
+  };
+
   const connect = async () => {
     setError(null);
     setStatus("connecting");
@@ -196,7 +252,11 @@ export function AccessRequestCard({
         </div>
         {status === "connected" ? (
           <span className="text-xs font-medium text-success whitespace-nowrap">Connected ✓</span>
-        ) : composioUnavailable ? (
+        ) : isLlmProvider ? (
+          <Button asChild variant="outline" size="sm">
+            <Link to="/model-cards">Add key in Model Cards</Link>
+          </Button>
+        ) : isApiKeyMcp ? null : composioUnavailable ? (
           <Button asChild variant="outline" size="sm">
             <Link to="/integrations/apps">Connect Composio first</Link>
           </Button>
@@ -206,10 +266,34 @@ export function AccessRequestCard({
           </Button>
         )}
       </div>
+      {isApiKeyMcp && status !== "connected" && (
+        <form
+          className="mt-2 flex items-center gap-2"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void saveApiKey();
+          }}
+        >
+          <input
+            type="password"
+            value={apiKey}
+            onChange={(e) => setApiKey(e.target.value)}
+            placeholder={`${service} API key`}
+            autoComplete="off"
+            className="flex-1 min-w-0 h-8 rounded-md border border-border bg-bg px-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-brand"
+          />
+          <Button size="sm" type="submit" disabled={status === "connecting" || !apiKey.trim()}>
+            {status === "connecting" ? "Saving…" : "Save to vault"}
+          </Button>
+        </form>
+      )}
       {error && <div className="mt-2 text-xs text-danger">{error}</div>}
       <div className="mt-2 text-[11px] text-fg-subtle">
-        Authentication happens with the provider directly; the credential lands in your
-        Connected Apps vault — never in this conversation.
+        {isLlmProvider
+          ? "Model-provider keys are managed in Model Cards, not as connected apps — add the key there and the agent's model calls use it automatically."
+          : isApiKeyMcp
+            ? `This server authenticates with an API key (no OAuth). The key is stored as a vault credential bound to ${ev.mcp_server_url} — the proxy injects it per call; it never enters this conversation.`
+            : "Authentication happens with the provider directly; the credential lands in your Connected Apps vault — never in this conversation."}
       </div>
     </div>
   );

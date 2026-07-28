@@ -82,7 +82,20 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     try {
       meta = await discoverOAuthMeta(mcpServerUrl);
     } catch (err) {
-      return c.html(closeHtml("OAuth discovery failed", htmlEscape((err as Error).message)), 502);
+      // Discovery failing usually means the server doesn't speak OAuth at
+      // all (API-key MCPs like Retell) or the host is a dead third-party
+      // bridge — point the user at the working path instead of a bare 502.
+      return c.html(
+        closeHtml(
+          "OAuth discovery failed",
+          `${htmlEscape((err as Error).message)}<br><br>` +
+            `This usually means the server does not use OAuth. If it authenticates ` +
+            `with an API key, add it as a credential instead: Console → Credential ` +
+            `Vaults → Add credential (bearer) with this server's URL. Also double-check ` +
+            `you're using the vendor's official MCP endpoint, not a third-party mirror.`,
+        ),
+        502,
+      );
     }
 
     const callerClientId = c.req.query("client_id");
@@ -645,7 +658,9 @@ async function probeMcpServer(
  *  then stays open (readable) with the details — a silent window.close()
  *  buried every OAuth failure. */
 function closeHtml(title: string, body: string): string {
-  const msg = JSON.stringify({ type: "oauth_error", message: `${title}: ${body}`.slice(0, 500) });
+  // body may carry markup for the page; the postMessage variant is plain text.
+  const plain = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+  const msg = JSON.stringify({ type: "oauth_error", message: `${title}: ${plain}`.slice(0, 500) });
   return `<html><body style="font-family:system-ui;max-width:36rem;margin:3rem auto;line-height:1.5">
 <h2>${htmlEscape(title)}</h2><p>${body}</p>
 <p style="color:#888">You can close this window.</p>
