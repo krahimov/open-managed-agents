@@ -1589,6 +1589,46 @@ async function createAmbientRuleFromSession(
  * Composio link/callback popup flow. Function declaration (hoisted) so the
  * buildTools/buildHarness closures above can reference it.
  */
+/** Model providers are keyed via Model Cards, not connectable apps — a
+ *  request_access for one of these must not dead-end in a Composio 400
+ *  (observed live: "connect openai" → code 306). */
+const LLM_PROVIDER_SLUGS = new Set([
+  "openai", "anthropic", "google", "gemini", "google-gemini",
+  "openrouter", "mistral", "groq", "xai", "deepseek",
+]);
+
+/**
+ * Classify how a direct MCP server authenticates. RFC 9728: OAuth-capable
+ * servers advertise protected-resource metadata (or point at it from a
+ * WWW-Authenticate challenge). No metadata → the server almost certainly
+ * wants a static API key (e.g. Retell's `Authorization: Bearer <key>`), so
+ * the connect card should collect a key into the vault instead of opening
+ * an OAuth popup that dies in discovery.
+ */
+async function probeMcpAuthKind(url: string): Promise<"mcp_oauth" | "mcp_api_key"> {
+  try {
+    const u = new URL(url);
+    const meta = await fetch(`${u.origin}/.well-known/oauth-protected-resource`, {
+      redirect: "follow",
+      signal: AbortSignal.timeout(3500),
+    }).catch(() => null);
+    if (meta?.ok) {
+      const data = await meta.json().catch(() => null);
+      if (data && typeof data === "object") return "mcp_oauth";
+    }
+    const probe = await fetch(url, {
+      method: "GET",
+      signal: AbortSignal.timeout(3500),
+    }).catch(() => null);
+    const www = probe?.headers.get("www-authenticate") ?? "";
+    if (/resource_metadata|oauth/i.test(www)) return "mcp_oauth";
+  } catch {
+    // unreachable host → fall through; the key card still lets the user
+    // store a credential for when the server comes back
+  }
+  return "mcp_api_key";
+}
+
 async function postAccessRequest(
   tenantId: string,
   sessionId: string,
@@ -1596,7 +1636,14 @@ async function postAccessRequest(
 ): Promise<{ request_id: string; status: string; note?: string }> {
   const service = args.service.trim().toLowerCase();
   const mcpServerUrl = args.mcp_server_url?.trim() || undefined;
-  const key = mcpServerUrl ? null : await composioKeyForTenant(tenantId).catch(() => null);
+  const isLlmProvider = LLM_PROVIDER_SLUGS.has(service);
+  const authKind = isLlmProvider
+    ? "llm_provider"
+    : mcpServerUrl
+      ? await probeMcpAuthKind(mcpServerUrl)
+      : "composio";
+  const key =
+    authKind === "composio" ? await composioKeyForTenant(tenantId).catch(() => null) : null;
   const requestId = `acreq-${generateEventId().replace(/^sevt-/, "")}`;
   await sessionRouter.appendEvent(sessionId, {
     type: "system.access_request",
@@ -1604,18 +1651,19 @@ async function postAccessRequest(
     request_id: requestId,
     service,
     reason: args.reason,
-    ...(mcpServerUrl
-      ? { mcp_server_url: mcpServerUrl }
-      : { composio_configured: !!key }),
+    auth_kind: authKind,
+    ...(mcpServerUrl ? { mcp_server_url: mcpServerUrl } : {}),
+    ...(authKind === "composio" ? { composio_configured: !!key } : {}),
   } as SessionEvent);
-  return {
-    request_id: requestId,
-    status: "pending",
-    note:
-      mcpServerUrl || key
-        ? `Connect card for "${service}" posted to the user's session view. You'll receive a message when access is granted — continue any work that doesn't need it, or end your turn and wait.`
-        : `Request posted, but this workspace has no Composio account connected yet — the user is being guided to connect one (Console → Apps) before authorizing "${service}".`,
-  };
+  const note =
+    authKind === "llm_provider"
+      ? `"${service}" is a model provider, not a connectable app — its key belongs in Console → Model Cards, and the user has been pointed there. Don't wait on an OAuth grant; continue other work.`
+      : authKind === "mcp_api_key"
+        ? `"${service}" authenticates with an API key, not OAuth. The user is being asked to paste the key into the credential vault (it never enters this conversation) — you'll receive a message when it's saved.`
+        : authKind === "mcp_oauth" || key
+          ? `Connect card for "${service}" posted to the user's session view. You'll receive a message when access is granted — continue any work that doesn't need it, or end your turn and wait.`
+          : `Request posted, but this workspace has no Composio account connected yet — the user is being guided to connect one (Console → Apps) before authorizing "${service}".`;
+  return { request_id: requestId, status: "pending", note };
 }
 
 /** Match a requested service slug against the agent's own URL MCP servers by
