@@ -59,6 +59,10 @@ interface EvalRunDetail {
   /** §6 rollups — tasks whose pass@k / pass^k is true. */
   tasks_pass_at_k?: number;
   tasks_pass_all_k?: number;
+  /** §8 suite provenance — present only on runs launched via
+   *  POST /suites/:id/run (stamped into `results` at create). */
+  suite_id?: string;
+  suite_name?: string;
   tasks: EvalTask[];
 }
 
@@ -202,9 +206,19 @@ export function EvalRunDetail() {
           timestamp + pass/tasks/duration/agent/env all collapse into the
           single strip below the pill. */}
       <div className="space-y-2">
-        <span className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${statusCls(run.status)}`}>
-          {run.status}
-        </span>
+        <div className="flex items-center gap-2 flex-wrap">
+          <span className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${statusCls(run.status)}`}>
+            {run.status}
+          </span>
+          {(run.suite_name || run.suite_id) && (
+            <span
+              className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-bg-surface text-fg-muted"
+              title={run.suite_id}
+            >
+              suite: {run.suite_name || shortenId(run.suite_id)}
+            </span>
+          )}
+        </div>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-fg-muted">
           <span>
             Submitted{" "}

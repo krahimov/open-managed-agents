@@ -54,6 +54,16 @@ async function dispatch(c: import("hono").Context<{
   return wrapped.fetch(new Request(url, init), c.env, c.executionCtx);
 }
 
+// Save-as-eval drafting (evals-design §8) rebuilds the task from the
+// session's event log and runs the Node judge resolver — both live only in
+// apps/main-node (its POST /v1/evals/draft_task_from_session). Registered
+// before the catch-all so this runtime answers with the suites' 501
+// posture instead of a bare 404; the console detects it and drops to
+// hand-authoring the task.
+app.post("/draft_task_from_session", (c) =>
+  c.json({ error: "task drafting from a session is unavailable on this runtime" }, 501),
+);
+
 app.all("*", dispatch);
 
 export default app;

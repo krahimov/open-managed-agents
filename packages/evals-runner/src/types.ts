@@ -67,6 +67,10 @@ export interface EvalRunRecord {
   /** §6 rollup: tasks with pass_at_k / pass_all_k true. */
   tasks_pass_at_k?: number;
   tasks_pass_all_k?: number;
+  /** §8 provenance: set when the run was launched from a stored suite
+   *  (POST /v1/evals/suites/:id/run). */
+  suite_id?: string;
+  suite_name?: string;
   tasks: EvalTaskResult[];
   error?: string;
 }
@@ -93,6 +97,8 @@ export function rowToRecord(row: import("@open-managed-agents/evals-store").Eval
     failed_count: partial.failed_count ?? 0,
     tasks_pass_at_k: partial.tasks_pass_at_k,
     tasks_pass_all_k: partial.tasks_pass_all_k,
+    suite_id: partial.suite_id,
+    suite_name: partial.suite_name,
     tasks: partial.tasks ?? [],
   };
 }
@@ -104,6 +110,8 @@ export function extractResults(run: EvalRunRecord): unknown {
     failed_count: run.failed_count,
     tasks_pass_at_k: run.tasks_pass_at_k,
     tasks_pass_all_k: run.tasks_pass_all_k,
+    suite_id: run.suite_id,
+    suite_name: run.suite_name,
     tasks: run.tasks,
   };
 }

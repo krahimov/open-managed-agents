@@ -66,8 +66,9 @@ import {
 } from "@open-managed-agents/model-cards-store";
 import { toFileRecord } from "@open-managed-agents/files-store";
 import { SqlEventLog } from "@open-managed-agents/event-log/sql";
-import type { AgentConfig, CredentialConfig, EnvironmentConfig, SessionEvent } from "@open-managed-agents/shared";
-import { generateEventId } from "@open-managed-agents/shared";
+import type { AgentConfig, CredentialConfig, EnvironmentConfig, SessionEvent, Trajectory } from "@open-managed-agents/shared";
+import { generateEventId, extractTextFromContent, extractTraceFacts } from "@open-managed-agents/shared";
+import type { TraceFacts } from "@open-managed-agents/shared";
 import { DefaultHarness } from "@open-managed-agents/agent/harness/default-loop";
 import { ClaudeAgentSdkHarness } from "./lib/claude-agent-sdk-harness.js";
 import { buildSetupPrompt, buildSetupTools } from "./lib/setup-harness.js";
@@ -2007,6 +2008,202 @@ v1.route("/evals", buildEvalRoutes({
   // (see evalServices below) — keys are tenant-prefixed by the runner.
   kv,
 }));
+
+// ── Save-as-eval (evals-design §8): draft an EvalTaskSpec from a session ──
+// POST /v1/evals/draft_task_from_session {session_id, draft_rubric?}
+// Rebuilds task messages from the session's user.message events and asks
+// the tenant's judge model (same resolver the eval runner uses) to author
+// a §4.3 rubric grounded in what the session actually delivered. Any
+// judge failure degrades to a static TODO template — the endpoint never
+// 500s because of the LLM. setup_files/setup_script reconstruction is
+// out of scope; callers add workspace inputs by hand.
+// Generous: the drafter is the tenant's top-tier judge, often at max
+// reasoning — 15s aborted mid-thinking on real cards and always fell back
+// to the template. Drafting is a one-off interactive step with a visible
+// spinner; waiting beats a TODO-template rubric.
+const RUBRIC_DRAFT_TIMEOUT_MS = 45_000;
+const RUBRIC_PROMPT_CHAR_BUDGET = 6_000;
+
+// Shape-tolerant content read: Node's SqlEventLog returns flattened events
+// (payload at top level); CF-style rows carry a JSON-string `data` envelope.
+function storedEventContent(e: unknown): unknown {
+  const ev = e as { data?: unknown; content?: unknown };
+  if (typeof ev.data === "string") {
+    try {
+      return (JSON.parse(ev.data) as { content?: unknown }).content;
+    } catch {
+      return undefined;
+    }
+  }
+  const data = ev.data as { content?: unknown } | undefined;
+  return data?.content ?? ev.content;
+}
+
+function lastAgentMessageText(events: unknown[]): string {
+  for (let i = events.length - 1; i >= 0; i--) {
+    if ((events[i] as { type?: string }).type !== "agent.message") continue;
+    const text = extractTextFromContent(storedEventContent(events[i]));
+    if (text.trim()) return text;
+  }
+  return "";
+}
+
+function kebabSlug(s: string, max = 48): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, max)
+    .replace(/-+$/g, "");
+}
+
+function clip(s: string, max = RUBRIC_PROMPT_CHAR_BUDGET): string {
+  return s.length > max ? `${s.slice(0, max)}\n[...truncated]` : s;
+}
+
+function staticRubricTemplate(facts: TraceFacts): string {
+  const fileCriteria = facts.files_written.map((f, i) => {
+    const base = f.path.split("/").pop() ?? f.path;
+    const id = kebabSlug(base) || `artifact-${i + 1}`;
+    return `- id: file-${id} — TODO: ${f.path} exists and contains <describe the required content>.`;
+  });
+  return [
+    "Grade each criterion independently and cite evidence (event ids or file paths) for every verdict.",
+    "",
+    ...fileCriteria,
+    "- id: final-reply — TODO: the final agent message accurately reports what was delivered, with no unsupported claims.",
+    "",
+    "## Ignore",
+    "- TODO: stylistic choices, extra exploratory commands, harmless warnings.",
+    "",
+    "## Anticipated shortcuts",
+    "- TODO: hardcoding the expected output; claiming success without producing the artifact(s) above; deleting failing checks instead of fixing them.",
+  ].join("\n");
+}
+
+function buildRubricAuthorPrompt(input: {
+  messages: string[];
+  finalAgentMessage: string;
+  facts: TraceFacts;
+}): { system: string; user: string } {
+  const system = [
+    "You write grading rubrics for automated evaluation of AI agent tasks.",
+    "A separate judge model will later grade fresh attempts at the same task against your rubric — it sees only the task, the rubric, and the new attempt's artifacts, never this reference session.",
+    "The rubric describes what a GOOD outcome looks like; it must NOT narrate or reference this particular transcript.",
+    "Requirements:",
+    '- Each criterion on its own line, prefixed "- id: <kebab-case-id> — ", independently checkable, demanding concrete proof (file at a path with required content, command effect, claim in the final reply).',
+    "- Ground the criteria in what this session's final agent message and written files actually delivered.",
+    '- End with an "## Ignore" section (things graders must not penalize) and an "## Anticipated shortcuts" section (cheap fakes that must fail).',
+    "Output ONLY the rubric markdown — no preamble, no code fences.",
+  ].join("\n");
+
+  const factLines = [
+    `outcome: ${input.facts.outcome}`,
+    `files_written: ${input.facts.files_written.map((f) => f.path).join(", ") || "(none)"}`,
+    `tools used: ${input.facts.tools.map((t) => `${t.name}×${t.calls}`).join(", ") || "(none)"}`,
+  ].join("\n");
+
+  const user = [
+    "## Task input (the eval's user messages)",
+    clip(input.messages.join("\n\n---\n\n")),
+    "",
+    "## What the reference session delivered",
+    factLines,
+    "",
+    "### Final agent message",
+    clip(input.finalAgentMessage || "(none)"),
+    "",
+    "Write the rubric now.",
+  ].join("\n");
+
+  return { system, user };
+}
+
+v1.post("/evals/draft_task_from_session", async (c) => {
+  const tenantId = c.var.tenant_id;
+  const body = await c.req
+    .json<{ session_id?: string; draft_rubric?: boolean }>()
+    .catch(() => null);
+  if (!body?.session_id) return c.json({ error: "session_id is required" }, 400);
+
+  const session = await sessionsService.get({ tenantId, sessionId: body.session_id });
+  if (!session) return c.json({ error: "Session not found" }, 404);
+
+  const events = await newEventLog(session.id).getEventsAsync();
+  // user.message texts are the task input. "[access granted]" texts are
+  // connect-card wake-ups injected by the platform, not task input.
+  const messages: string[] = [];
+  for (const e of events) {
+    if ((e as { type?: string }).type !== "user.message") continue;
+    const text = extractTextFromContent(storedEventContent(e));
+    if (!text.trim() || text.startsWith("[access granted]")) continue;
+    messages.push(text);
+  }
+  if (messages.length === 0) {
+    return c.json({ error: "session has no user messages to draft a task from" }, 400);
+  }
+
+  const trajectory = (await sessionRouter.getTrajectory(session as never, {
+    fetchEnvironmentConfig: async () => null,
+  })) as Trajectory;
+  const facts = extractTraceFacts(trajectory);
+  const finalAgentMessage = lastAgentMessageText(trajectory.events as unknown[]);
+
+  let rubric: string | null = null;
+  let rubricDraftedBy = "template";
+  if (body.draft_rubric !== false) {
+    try {
+      const { buildNodeJudgeResolver } = await import("./lib/eval-judge.js");
+      const resolver = buildNodeJudgeResolver({
+        modelCards: modelCardService,
+        agents: agentsService,
+      });
+      // Cross-family selection keys off the agent under eval — the
+      // session's agent — exactly as at grading time.
+      const resolved = await resolver(tenantId, session.agent_id ?? "", {
+        type: "llm_judge",
+        rubric: "",
+      });
+      if (resolved) {
+        const ac = new AbortController();
+        const timer = setTimeout(() => ac.abort(), RUBRIC_DRAFT_TIMEOUT_MS);
+        try {
+          const res = await resolved.judge(
+            buildRubricAuthorPrompt({ messages, finalAgentMessage, facts }),
+            ac.signal,
+          );
+          const text = (res.text || "").trim();
+          if (text) {
+            rubric = text;
+            rubricDraftedBy = resolved.judgeModelId;
+          }
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+    } catch {
+      // any resolution/generation failure falls back to the static template
+    }
+  }
+  if (rubric === null) {
+    rubric = staticRubricTemplate(facts);
+    rubricDraftedBy = "template";
+  }
+
+  return c.json({
+    task: {
+      id: kebabSlug(session.title) || `task-${session.id.slice(-8)}`,
+      messages,
+      timeout_ms: 600000,
+      trials: 1,
+      reward: { type: "llm_judge", rubric },
+    },
+    agent_id: session.agent_id,
+    environment_id: session.environment_id,
+    rubric_drafted_by: rubricDraftedBy,
+  });
+});
+
 mountNodeModelCardRoutes(v1);
 mountNodeModelsRoutes(v1);
 mountNodeEnvironmentRoutes(v1);
