@@ -36,5 +36,13 @@ export interface AgentRecord {
     appendable_prompts?: string[];
     default_environment_id?: string;
     default_vault_ids?: string[];
+    reasoning_level?: string;
+    /** Cross-session memory. Absent/null = off (amnesiac by design). */
+    memory?: {
+      mode: "off" | "shared" | "per_user";
+      store_id?: string;
+      extract?: boolean;
+      push?: boolean;
+    } | null;
   };
 }

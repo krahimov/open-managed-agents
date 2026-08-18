@@ -11,14 +11,16 @@
 export { SqlMemoryStoreRepo } from "./sql-store-repo";
 export { SqlMemoryRepo } from "./sql-memory-repo";
 export { SqlMemoryVersionRepo } from "./sql-version-repo";
+export { SqlMemoryFactRepo, queryTerms, toFts5Match, toTsQuery, rankWithKindBoost } from "./sql-fact-repo";
 export { CfR2BlobStore } from "./cf-r2";
 
 import { SqlMemoryStoreRepo } from "./sql-store-repo";
 import { SqlMemoryRepo } from "./sql-memory-repo";
 import { SqlMemoryVersionRepo } from "./sql-version-repo";
+import { SqlMemoryFactRepo } from "./sql-fact-repo";
 import { CfR2BlobStore } from "./cf-r2";
 import { drizzle } from "drizzle-orm/d1";
-import type { OmaDb } from "@open-managed-agents/db-schema";
+import type { OmaDb, OmaDialect } from "@open-managed-agents/db-schema";
 import { MemoryStoreService } from "../service";
 import type { BlobStore, Logger } from "../ports";
 
@@ -51,13 +53,15 @@ export function createCfMemoryStoreService(
  * S3-compatible adapter (Tigris / MinIO / etc.).
  */
 export function createSqliteMemoryStoreService(
-  deps: { db: OmaDb; blobs: BlobStore },
+  deps: { db: OmaDb; blobs: BlobStore; dialect?: OmaDialect },
   opts?: { logger?: Logger },
 ): MemoryStoreService {
   return new MemoryStoreService({
     storeRepo: new SqlMemoryStoreRepo(deps.db),
     memoryRepo: new SqlMemoryRepo(deps.db),
     versionRepo: new SqlMemoryVersionRepo(deps.db),
+    // Facts index (memory-facts-design §3). Dialect picks the FTS idiom.
+    factRepo: new SqlMemoryFactRepo(deps.db, deps.dialect ?? "sqlite"),
     blobs: deps.blobs,
     logger: opts?.logger,
   });

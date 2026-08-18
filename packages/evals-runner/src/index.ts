@@ -11,10 +11,12 @@
 export {
   tickEvalRuns,
   loadRun,
+  regradeRun,
   finalizeTrajectoryForStorage,
   type EvalRunnerContext,
   type EvalRunnerServices,
   type SandboxFetcher,
+  type EvalMemoryPort,
 } from "./tick";
 export {
   DEFAULT_PASS_THRESHOLD,
@@ -29,8 +31,30 @@ export type {
   EvalTaskResult,
   EvalTrialResult,
   EvalRunStatus,
+  SimulationSpec,
+  SimulationPersonaSpec,
+  SimulationMemorySpec,
+  SimulationEpisode,
+  SimulationChaosRule,
+  FindingsReport,
 } from "./types";
 export { rowToRecord, extractResults, kvKey } from "./types";
+export {
+  buildPersonaPrompt,
+  parsePersonaTurn,
+  salvageRawMessage,
+  transcriptFromEvents,
+  aggregateFindings,
+  clipFinding,
+  maxTurnsOf,
+  effectiveSim,
+  episodeCount,
+  DEFAULT_MAX_TURNS,
+  HARD_MAX_TURNS,
+  SIM_DEFAULT_TIMEOUT_MS,
+  type PersonaTurn,
+  type TranscriptEntry,
+} from "./simulation";
 export {
   selectJudgeCard,
   providerFamily,

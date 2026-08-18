@@ -63,3 +63,41 @@ export const MEMORY_CONTENT_MAX_BYTES = 100 * 1024;
 /** Cap on `instructions` attached when a memory store is bound to a session,
  *  per the Anthropic spec (https://platform.claude.com/docs/en/managed-agents/memory). */
 export const MEMORY_STORE_INSTRUCTIONS_MAX_CHARS = 4096;
+
+// ---------- Memory facts (docs/memory-facts-design.md §3) ----------
+
+export type MemoryFactKind = "preference" | "decision" | "rule" | "entity" | "note";
+export type MemoryFactStatus = "active" | "superseded" | "retracted";
+
+export const MEMORY_FACT_KINDS: readonly MemoryFactKind[] = [
+  "preference",
+  "decision",
+  "rule",
+  "entity",
+  "note",
+];
+
+export interface MemoryFactRow {
+  id: string;
+  tenant_id: string;
+  store_id: string;
+  agent_id: string | null;
+  kind: MemoryFactKind;
+  /** Short noun phrase, e.g. "payroll vendor", "vendor contracts". */
+  subject: string;
+  /** One self-contained sentence. */
+  statement: string;
+  /** Rule/preference trigger, free text. */
+  applies_when: string | null;
+  confidence: number;
+  status: MemoryFactStatus;
+  supersedes_id: string | null;
+  source_path: string | null;
+  source_session_id: string | null;
+  source_event_id: string | null;
+  /** ms — when the underlying statement happened. */
+  observed_at: number;
+  created_at: number;
+  updated_at: number;
+}
+

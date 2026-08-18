@@ -74,7 +74,7 @@ import { ClaudeAgentSdkHarness } from "./lib/claude-agent-sdk-harness.js";
 import { buildSetupPrompt, buildSetupTools } from "./lib/setup-harness.js";
 import { ALL_TOOLS, buildTools, getEnabledTools } from "@open-managed-agents/agent/harness/tools";
 import { resolveModel, type ApiCompat } from "@open-managed-agents/agent/harness/provider";
-import { composeSystemPrompt } from "@open-managed-agents/agent/harness/platform-guidance";
+import { composeSystemPrompt, memoryGuidance } from "@open-managed-agents/agent/harness/platform-guidance";
 import type { HarnessContext } from "@open-managed-agents/agent/harness/interface";
 import { nodeToMarkdown } from "@open-managed-agents/markdown/adapters/node";
 import { applyBetterAuthSchema } from "@open-managed-agents/schema";
@@ -117,6 +117,9 @@ import {
 import { OmaVaultResolver } from "@open-managed-agents/oma-cap-adapter";
 import { NodeSessionRouter } from "./lib/node-session-router.js";
 import { buildEvalSandboxFetcher } from "./lib/eval-sandbox-fetcher.js";
+import { buildNodeEvalMemoryPort } from "./lib/eval-memory-port.js";
+import { buildAttachAgentMemory, sharedStoreName, anonymousStoreName } from "./lib/agent-memory-mode.js";
+import { MemoryExtractionRunner } from "./lib/memory-extraction-runner.js";
 import {
   buildApprovalHistory,
   computeCapabilityStatement,
@@ -544,8 +547,20 @@ if (
 const memoryService = createSqliteMemoryStoreService({
   db: drizzleDb,
   blobs: memoryBlobs,
+  // Facts index FTS idiom (memory-facts-design §3): FTS5 on SQLite,
+  // tsvector on Postgres.
+  dialect: usePostgres ? "pg" : "sqlite",
 });
-const memoryRepo = new SqlMemoryRepo(drizzleDb);
+// ONE SqlMemoryRepo instance shared by the service (REST writes) AND the
+// reflection paths (chokidar watcher / node queue / S3 poller). The
+// facts-extraction file trigger subscribes to this instance's write
+// observer — a second instance would silently miss every /mnt/memory edit.
+const memoryRepo = memoryService.repo as SqlMemoryRepo;
+
+// Memory fact extraction (memory-facts-design §4). The runner needs kv /
+// sessionRouter / sessionsService, which are constructed later — so the
+// registry tap and repo observer call through this late-bound holder.
+let memoryExtraction: import("./lib/memory-extraction-runner.js").MemoryExtractionRunner | null = null;
 // Memory blob watcher — wires chokidar fs events through
 // packages/queue's processMemoryEvent so CF + Node share one upsert
 // code path. PG mode uses the multi-replica-safe PG queue table; SQLite
@@ -714,11 +729,11 @@ async function buildSandbox(
 const sessionRegistry = new SessionRegistry({
   sql,
   hub,
-  onSessionEvent: webhookStore
-    ? (tenantId, sessionId, event) => {
-        void webhookStore.enqueueFor(tenantId, sessionId, event).catch(() => {});
-      }
-    : undefined,
+  onSessionEvent: (tenantId, sessionId, event) => {
+    if (webhookStore) void webhookStore.enqueueFor(tenantId, sessionId, event).catch(() => {});
+    // Memory fact extraction, trigger A (memory-facts-design §4).
+    memoryExtraction?.noteSessionEvent(tenantId, sessionId, (event as { type?: string }).type ?? "");
+  },
   agentsService,
   sessionsService,
   memoryService,
@@ -771,7 +786,15 @@ const sessionRegistry = new SessionRegistry({
       });
     }
     const creds = await resolveNodeModelCredentials(agent, context.tenantId);
-    return buildTools(agent, sandbox, {
+    // Cross-session memory tools (memory-facts-design §5): only when this
+    // session has ≥1 store attached and the facts index is available.
+    const memoryPort = await buildNodeMemoryToolsPort(context.tenantId, context.sessionId, agent.id);
+    // Simulation chaos injection: the eval runner stamps
+    // metadata.eval.chaos onto simulation sessions; wrap the finished tool
+    // dictionary so targeted tools fail deterministically per the rules
+    // (apps/agent/src/harness/chaos.ts). Non-eval sessions never carry it.
+    const chaosRules = (sessRow?.metadata as { eval?: { chaos?: unknown } } | null)?.eval?.chaos;
+    const built = await buildTools(agent, sandbox, {
       ANTHROPIC_API_KEY: creds.apiCompat.startsWith("ant") ? creds.apiKey : undefined,
       ANTHROPIC_BASE_URL: creds.apiCompat.startsWith("ant") ? creds.baseURL : undefined,
       // When set, the default web_search tool rides Tavily instead of the
@@ -837,6 +860,17 @@ const sessionRegistry = new SessionRegistry({
       findSkills: (query) => findSkillsForTenant(context.tenantId, query),
       requestSkill: (a) =>
         postSkillRequest(context.tenantId, agent.id, context.sessionId, a),
+      ...(memoryPort ? { memory: memoryPort } : {}),
+    });
+    if (!chaosRules) return built;
+    const { applyChaosRules } = await import("@open-managed-agents/agent/harness/chaos");
+    return applyChaosRules(built, chaosRules, {
+      sessionId: context.sessionId,
+      onInjected: (info: { tool: string; mode: string; call_index: number }) =>
+        logger.info(
+          { op: "sim.chaos.injected", session_id: context.sessionId, ...info },
+          "chaos: injected tool failure",
+        ),
     });
   },
   buildHarness: () => {
@@ -974,6 +1008,40 @@ const sessionRegistry = new SessionRegistry({
       ? buildSetupPrompt(input.agent)
       : input.agent.system ?? "";
     const memoryContext = await buildNodeMemoryPromptContext(input.tenantId, input.sessionId);
+    // PUSH (memory-facts-design §5): before the model runs, match the
+    // incoming turn against the attached stores' active facts and inject
+    // the top-k as a per-turn reminder — so a standing rule is in context
+    // at the moment it governs, without relying on the model to search.
+    // Local FTS, no LLM, ≤ MEMORY_PUSH_MAX facts. Recorded on the session
+    // stream as memory_pushed so the judge / console can see it.
+    const pushEnabled = (input.agent as { memory?: { push?: boolean } }).memory?.push !== false;
+    if (!isSetup && pushEnabled && memoryContext.storeIds.length > 0 && memoryService.factsEnabled()) {
+      try {
+        const pushed = await buildMemoryPushReminder({
+          tenantId: input.tenantId,
+          // per_user: push only from the principal's own store (env-bound
+          // stores are shared across principals).
+          storeIds:
+            memoryContext.mode === "per_user" && memoryContext.primaryStoreId
+              ? [memoryContext.primaryStoreId]
+              : memoryContext.storeIds,
+          userMessage: input.userMessage as unknown as { content?: unknown },
+          isFirstTurn: await isFirstUserTurn(input.sessionId),
+        });
+        if (pushed) {
+          memoryContext.reminders.push({ source: "memory:relevant", text: pushed.text });
+          await sessionRouter
+            .appendEvent(input.sessionId, {
+              type: "system.memory_pushed",
+              fact_ids: pushed.factIds,
+              count: pushed.factIds.length,
+            } as SessionEvent)
+            .catch(() => {});
+        }
+      } catch (err) {
+        logger.warn({ op: "memory.push", err }, "memory push failed; turn continues without it");
+      }
+    }
     return {
       agent: input.agent,
       userMessage: input.userMessage,
@@ -1860,12 +1928,118 @@ v1.post("/skills/acquire", async (c) => {
   }
 });
 
+// Memory fact extraction runner (memory-facts-design §4) — see the
+// late-bound holder above; the registry tap (trigger A) is already wired.
+memoryExtraction = new MemoryExtractionRunner({
+  memoryService,
+  kv,
+  listWritableStores: async (tenantId, sessionId) => {
+    const ctx = await buildNodeMemoryPromptContext(tenantId, sessionId);
+    const writable = ctx.storeIds.filter((id) => (ctx.access.get(id) ?? "read_write") === "read_write");
+    // Facts extracted from a session belong in the agent's OWN store when
+    // memory mode is on (per_user isolation; shared coherence). Put the
+    // primary first so the runner's stores[0] targets it; in per_user
+    // mode expose ONLY the primary.
+    if (ctx.primaryStoreId && writable.includes(ctx.primaryStoreId)) {
+      return ctx.mode === "per_user"
+        ? [ctx.primaryStoreId]
+        : [ctx.primaryStoreId, ...writable.filter((id) => id !== ctx.primaryStoreId)];
+    }
+    return ctx.mode === "per_user" ? [] : writable;
+  },
+  fetchEvents: async (sessionId, afterSeq) => {
+    const all = await newEventLog(sessionId).getEventsAsync(afterSeq);
+    return all as never;
+  },
+  sessionAgent: async (tenantId, sessionId) => {
+    const row = await sessionsService.get({ tenantId, sessionId });
+    if (!row?.agent_id) return null;
+    return { agentId: row.agent_id, auxModel: (row.agent_snapshot as { aux_model?: unknown } | null)?.aux_model };
+  },
+  resolveModel: async (tenantId, agentId) => {
+    const agent = await agentsService.get({ tenantId, agentId });
+    if (!agent) return null;
+    // Extractor rides the agent's aux_model when set (cheap tier by
+    // convention), else the agent's own model at low reasoning.
+    const target = agent.aux_model
+      ? { ...agent, model: agent.aux_model, reasoning_level: "low" as const }
+      : { ...agent, reasoning_level: "low" as const };
+    const creds = await resolveNodeModelCredentials(target as never, tenantId);
+    const model = resolveModel(creds.model, creds.apiKey, creds.baseURL, creds.apiCompat, creds.customHeaders, "low");
+    return { model, modelId: creds.model };
+  },
+  emitAuxCall: async (sessionId, ev) => {
+    await sessionRouter.appendEvent(sessionId, ev as never).catch(() => {});
+  },
+  shouldSkipSession: async (tenantId, sessionId) => {
+    // Eval / simulation sessions manage their own memory expectations;
+    // extraction there would leak scenario text into the agent's store.
+    const row = await sessionsService.get({ tenantId, sessionId });
+    if ((row?.metadata as { eval?: unknown } | null)?.eval) return true;
+    // Honor AgentMemoryConfig.extract (snapshotted on the session).
+    const snap = row?.agent_snapshot as { memory?: { extract?: boolean } } | null;
+    return snap?.memory?.extract === false;
+  },
+  log: (msg, ctx) => logger.info({ op: "memory.extract", ...ctx }, msg),
+});
+memoryService.repo.onFileWritten?.(({ storeId, path, actor }) => {
+  // Trigger B (memory-facts-design §4). The store row carries tenant_id, so
+  // resolve the tenant from it (multi-tenant safe). Agent-scoped stores are
+  // named agent-<id>-…; recover the agent id for extractor model
+  // resolution. Other stores skip file-trigger extraction for now.
+  void (async () => {
+    const store = await memoryStoreRowById(storeId);
+    if (!store) return;
+    const m = /^agent-(agent-[a-z0-9]+)-/.exec(store.name);
+    if (!m) return;
+    // Seeds planted by the eval runner + facts.md written by memory_remember
+    // are already indexed / not extraction inputs.
+    if (actor.type === "system" && actor.id === "eval-runner") return;
+    await memoryExtraction!.noteMemoryFileWrite(store.tenant_id, storeId, path, m[1]);
+  })().catch((err) => logger.warn({ op: "memory.extract.file_trigger", err }, "file trigger failed"));
+});
+
+/** Tenant-agnostic store lookup by id (the repo's rows carry tenant_id). */
+async function memoryStoreRowById(storeId: string): Promise<{ tenant_id: string; name: string } | null> {
+  const row = await sql
+    .prepare(`SELECT tenant_id, name FROM memory_stores WHERE id = ? LIMIT 1`)
+    .bind(storeId)
+    .first<{ tenant_id: string; name: string }>();
+  return row ?? null;
+}
+
 const sessionRoutesApp = buildSessionRoutes({
   services,
   router: sessionRouter,
   outputs: sessionOutputsBackend.adapter,
   lifecycle: {
     ...nodeSessionLifecycle({ files: filesService, filesBlob }),
+    // Agent-level cross-session memory (memory-facts-design §6): provision
+    // + attach the agent's own store per its `_oma.memory.mode` before the
+    // runtime inits, so /mnt/memory + the memory reminder are live on turn 1.
+    attachAgentMemory: buildAttachAgentMemory({
+      memoryService: memoryService as never,
+      attach: async ({ sessionId, storeId, access }) => {
+        await sql
+          .prepare(
+            `INSERT INTO session_memory_stores (session_id, store_id, access, created_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(session_id, store_id) DO UPDATE SET access = excluded.access`,
+          )
+          .bind(sessionId, storeId, access, Date.now())
+          .run();
+      },
+      pinAgentStore: async ({ tenantId, agentId, storeId }) => {
+        const row = await agentsService.get({ tenantId, agentId });
+        if (!row?.memory || row.memory.mode !== "shared" || row.memory.store_id) return;
+        await agentsService.update({
+          tenantId,
+          agentId,
+          input: { memory: { ...row.memory, store_id: storeId } },
+        });
+      },
+      log: (msg, ctx) => logger.info({ op: "memory.mode", ...ctx }, msg),
+    }),
     // Clerk Billing entitlement gate: free-plan tenants get a concurrent-
     // session cap (402), paid plans pass, non-Clerk tenants fail open.
     ...(clerkConfig && clerkStore && clerkConfig.billingEnforce
@@ -2309,6 +2483,138 @@ v1.post("/evals/draft_task_from_session", async (c) => {
     agent_id: session.agent_id,
     environment_id: session.environment_id,
     rubric_drafted_by: rubricDraftedBy,
+  });
+});
+
+// ── Simulations: draft scenarios from the agent's config ────────────────
+// POST /v1/evals/draft_scenarios {agent_id, count?, focus?}
+// The tenant's cross-family judge model reads the agent's configuration
+// (system prompt, tools, MCP servers) and proposes N realistic simulation
+// scenarios — persona + rubric included — as EDITABLE drafts the console
+// lets the user revise before saving to a suite or launching. Same degrade
+// posture as draft_task_from_session: any LLM failure falls back to one
+// static template scenario; the endpoint never 500s because of the LLM.
+// Pure helpers live in lib/scenario-drafting.ts (unit-tested there).
+v1.post("/evals/draft_scenarios", async (c) => {
+  const {
+    SCENARIO_DRAFT_TIMEOUT_MS,
+    SCENARIO_COUNT_MAX,
+    scenarioDraftError,
+    scenarioDraftToTask,
+    staticScenarioTemplate,
+    buildScenarioAuthorPrompt,
+    parseScenarioDrafts,
+  } = await import("./lib/scenario-drafting.js");
+  type ScenarioDraft = import("./lib/scenario-drafting.js").ScenarioDraft;
+
+  const tenantId = c.var.tenant_id;
+  const body = await c.req
+    .json<{ agent_id?: string; count?: number; focus?: string }>()
+    .catch(() => null);
+  if (!body?.agent_id) return c.json({ error: "agent_id is required" }, 400);
+  const count = Math.max(1, Math.min(body.count ?? 3, SCENARIO_COUNT_MAX));
+
+  const agent = await agentsService.get({ tenantId, agentId: body.agent_id });
+  if (!agent) return c.json({ error: "Agent not found" }, 404);
+
+  const toolNames = (agent.tools ?? []).map((t) =>
+    "name" in t && typeof t.name === "string" ? t.name : (t as { type?: string }).type ?? "?",
+  );
+  const mcpNames = (agent.mcp_servers ?? []).map((m) => m.name);
+
+  let drafts: ScenarioDraft[] = [];
+  let draftedBy = "template";
+  try {
+    const { buildNodeJudgeResolver } = await import("./lib/eval-judge.js");
+    const resolver = buildNodeJudgeResolver({
+      modelCards: modelCardService,
+      agents: agentsService,
+    });
+    const resolved = await resolver(tenantId, body.agent_id, { type: "llm_judge", rubric: "" });
+    if (resolved) {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), SCENARIO_DRAFT_TIMEOUT_MS);
+      try {
+        const res = await resolved.judge(
+          buildScenarioAuthorPrompt({
+            agent: { name: agent.name, system: agent.system },
+            toolNames,
+            mcpNames,
+            count,
+            focus: body.focus,
+          }),
+          ac.signal,
+        );
+        const parsed = parseScenarioDrafts(res.text || "");
+        drafts = parsed.filter((d) => scenarioDraftError(d) === null).slice(0, count);
+        if (drafts.length > 0) draftedBy = resolved.judgeModelId;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+  } catch {
+    // any resolution/generation failure falls back to the static template
+  }
+  if (drafts.length === 0) {
+    drafts = [staticScenarioTemplate(agent)];
+    draftedBy = "template";
+  }
+
+  // De-dup draft ids defensively — LLMs repeat slugs across scenarios.
+  const seen = new Set<string>();
+  const scenarios = drafts.map((d, i) => {
+    const task = scenarioDraftToTask(d, i);
+    let id = task.id as string;
+    while (seen.has(id)) id = `${id}-${i + 1}`;
+    seen.add(id);
+    return { ...task, id };
+  });
+
+  return c.json({ scenarios, drafted_by: draftedBy });
+});
+
+// ── Re-grade (evals-design §7): re-run verifiers on stored trajectories ──
+// POST /v1/evals/runs/:id/regrade {task_id?, trial_index?}
+// Conversations are NOT re-executed — only the judge/verifier runs again
+// against the persisted trajectory (workspace access best-effort). Lets
+// judge-side fixes and rubric edits correct verdicts for free. Node-only:
+// needs the in-process judge resolver.
+v1.post("/evals/runs/:id/regrade", async (c) => {
+  const { regradeRun } = await import("@open-managed-agents/evals-runner");
+  const { buildNodeJudgeResolver: buildResolver } = await import("./lib/eval-judge.js");
+  const tenantId = c.var.tenant_id;
+  const body = await c.req
+    .json<{ task_id?: string; trial_index?: number }>()
+    .catch(() => ({}) as { task_id?: string; trial_index?: number });
+
+  const evalCtxServices = {
+    agents: agentsService,
+    environments: environmentsService,
+    sessions: sessionsService,
+    evals: evalsService,
+    kv,
+  };
+  const sandbox = buildEvalSandboxFetcher(sessionRouter);
+  const result = await regradeRun(
+    {
+      forEachShard: async (fn) => [await fn(evalCtxServices as never)],
+      getServicesForTenant: async () => evalCtxServices as never,
+      getSandboxBinding: async () => sandbox,
+      resolveJudge: buildResolver({ modelCards: modelCardService, agents: agentsService }),
+      memory: buildNodeEvalMemoryPort({ memoryService: memoryService as never, sql }),
+    },
+    tenantId,
+    c.req.param("id"),
+    { taskId: body.task_id, trialIndex: body.trial_index },
+  );
+  if (!result) return c.json({ error: "Run not found" }, 404);
+  if ("error" in result) {
+    return c.json({ error: "run is still active; re-grade is only allowed on completed/failed runs" }, 400);
+  }
+  return c.json({
+    run_id: c.req.param("id"),
+    regraded: result.regraded,
+    skipped: result.skipped,
   });
 });
 
@@ -2960,6 +3266,7 @@ const scheduler = buildNodeScheduler({
     modelCards: modelCardService,
     agents: agentsService,
   }),
+  evalMemory: buildNodeEvalMemoryPort({ memoryService: memoryService as never, sql }),
   memory: memoryService,
   ambientDispatcher,
   missionSupervisor,
@@ -3467,6 +3774,9 @@ async function buildNodeMemoryPromptContext(
   sessionId: string,
 ): Promise<{
   storeIds: string[];
+  access: Map<string, "read_only" | "read_write">;
+  primaryStoreId: string | null;
+  mode: "off" | "shared" | "per_user";
   reminders: Array<{ source: string; text: string }>;
 }> {
   const attachments = new Map<string, {
@@ -3519,6 +3829,11 @@ async function buildNodeMemoryPromptContext(
   }
 
   const reminders: Array<{ source: string; text: string }> = [];
+  // Harness-agnostic memory usage guidance, only when ≥1 store is attached
+  // (memory-facts-design §7). Prepended so it precedes the per-store blocks.
+  if (attachments.size > 0) {
+    reminders.push({ source: "memory:guidance", text: memoryGuidance });
+  }
   for (const attachment of attachments.values()) {
     const store = await memoryService.getStore({
       tenantId,
@@ -3530,6 +3845,28 @@ async function buildNodeMemoryPromptContext(
       `## Memory store: ${store.name}`,
       `Mounted at /mnt/memory/${store.name}/ (${accessLabel})`,
     ];
+    // Catalog line (memory-facts-design §5): constant-size summary of the
+    // indexed facts so the agent knows what memory_search can find without
+    // reading the store. Best-effort — absent when the facts index is off.
+    if (memoryService.factsEnabled()) {
+      try {
+        const st = await memoryService.factStats({ tenantId, storeId: attachment.storeId });
+        if (st.total > 0) {
+          const kinds = ["rule", "preference", "decision", "entity", "note"]
+            .filter((k) => (st.byKind[k] ?? 0) > 0)
+            .map((k) => `${st.byKind[k]} ${k}${st.byKind[k] === 1 ? "" : "s"}`)
+            .join(" · ");
+          const age = st.lastUpdatedAt ? relativeAge(Date.now() - st.lastUpdatedAt) : null;
+          lines.push(
+            `Indexed facts: ${st.total} (${kinds})${age ? `. Last updated ${age}.` : "."} Use memory_search to look them up; memory_remember to add.`,
+          );
+        } else {
+          lines.push("Indexed facts: none yet. Use memory_remember when the user states a durable preference, rule, or decision.");
+        }
+      } catch {
+        // catalog is best-effort
+      }
+    }
     if (store.description) lines.push(store.description);
     if (attachment.instructions) lines.push(attachment.instructions);
     if (attachment.access === "read_only") {
@@ -3541,9 +3878,226 @@ async function buildNodeMemoryPromptContext(
     });
   }
 
+  // The agent's OWN store (memory-facts-design §6) is the PRIMARY target for
+  // push, extraction, and default memory_remember. Environment bindings may
+  // attach additional stores; in per_user mode those are shared across
+  // principals, so writing a user's facts there would leak them. Resolve
+  // the primary by the deterministic own-store NAME for this agent+mode
+  // (+ the pinned store_id for shared), and match it against attachments.
+  let primaryStoreId: string | null = null;
+  const snap = session?.agent_snapshot as { id?: string; memory?: { mode?: string; store_id?: string } } | null;
+  const mode = snap?.memory?.mode;
+  if (snap?.id && (mode === "shared" || mode === "per_user")) {
+    const candidates = new Set<string>();
+    if (mode === "shared" && snap.memory?.store_id) candidates.add(snap.memory.store_id);
+    // principal is not persisted on the session row; match by name for both
+    // the principal-keyed and the anonymous bucket.
+    const names = new Set<string>([
+      sharedStoreName(snap.id),
+      anonymousStoreName(snap.id),
+    ]);
+    for (const storeId of attachments.keys()) {
+      if (candidates.has(storeId)) { primaryStoreId = storeId; break; }
+    }
+    if (!primaryStoreId) {
+      for (const storeId of attachments.keys()) {
+        const st = await memoryService.getStore({ tenantId, storeId }).catch(() => null);
+        if (st && (names.has(st.name) || st.name.startsWith(`agent-${snap.id}-user-`))) { primaryStoreId = storeId; break; }
+      }
+    }
+  }
   return {
     storeIds: [...attachments.keys()],
+    access: new Map([...attachments.values()].map((a) => [a.storeId, a.access] as const)),
+    /** The agent's own store when memory mode is on and it is attached; else null. */
+    primaryStoreId,
+    mode: mode === "shared" || mode === "per_user" ? mode : "off",
     reminders,
+  };
+}
+
+const MEMORY_PUSH_MAX = 5;
+const MEMORY_PUSH_CHAR_CAP = 1_600; // ≈400 tokens
+
+/** Was this the session's first user turn? Cheap event-log scan bounded to
+ *  the head of the log. First turns also get the "always know" briefing. */
+async function isFirstUserTurn(sessionId: string): Promise<boolean> {
+  const evs = await newEventLog(sessionId).getEventsAsync(0);
+  let userTurns = 0;
+  for (const e of evs) {
+    if ((e as { type?: string }).type === "user.message") userTurns++;
+    if (userTurns > 1) return false;
+  }
+  return userTurns <= 1;
+}
+
+async function buildMemoryPushReminder(input: {
+  tenantId: string;
+  storeIds: string[];
+  userMessage: { content?: unknown };
+  isFirstTurn: boolean;
+}): Promise<{ text: string; factIds: string[] } | null> {
+  const turnText = extractTextFromContent(input.userMessage.content).trim();
+  const picks = new Map<string, Awaited<ReturnType<typeof memoryService.searchFacts>>[number]>();
+  // 1) Match the turn against standing rules/preferences (always eligible)
+  //    and other kinds on strong match (they rank below rules by kind boost).
+  if (turnText) {
+    const hits = await memoryService.searchFacts({
+      tenantId: input.tenantId,
+      storeIds: input.storeIds,
+      query: turnText.slice(0, 500),
+      limit: MEMORY_PUSH_MAX,
+    });
+    for (const f of hits) picks.set(f.id, f);
+  }
+  // 2) First turn: brief the model with the most recent rules/preferences
+  //    regardless of match ("what you should always know").
+  if (input.isFirstTurn && picks.size < MEMORY_PUSH_MAX) {
+    const brief = await memoryService.searchFacts({
+      tenantId: input.tenantId,
+      storeIds: input.storeIds,
+      kinds: ["rule", "preference"],
+      limit: MEMORY_PUSH_MAX,
+    });
+    for (const f of brief) {
+      if (picks.size >= MEMORY_PUSH_MAX) break;
+      picks.set(f.id, f);
+    }
+  }
+  if (picks.size === 0) return null;
+  const lines: string[] = [
+    "Relevant from memory (apply if pertinent to this turn; verify with memory_get if unsure):",
+  ];
+  let used = lines[0].length;
+  const factIds: string[] = [];
+  for (const f of picks.values()) {
+    const when = new Date(f.observed_at).toISOString().slice(0, 10);
+    const line = `- [${f.kind}] ${f.statement}${f.applies_when ? ` (applies when: ${f.applies_when})` : ""} (${when}${f.source_session_id ? `, session ${f.source_session_id}` : ""}; id ${f.id})`;
+    if (used + line.length > MEMORY_PUSH_CHAR_CAP) break;
+    lines.push(line);
+    used += line.length;
+    factIds.push(f.id);
+  }
+  if (factIds.length === 0) return null;
+  return { text: lines.join("\n"), factIds };
+}
+
+function relativeAge(ms: number): string {
+  const m = Math.floor(ms / 60_000);
+  if (m < 2) return "just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 48) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
+/**
+ * Facts port for the memory_* tools (memory-facts-design §5). Resolves the
+ * session's attached stores (env bindings + session_memory_stores — same
+ * sources as the prompt reminder) and closes over the memory service.
+ * Returns null when nothing is attached or the facts index is unavailable.
+ */
+async function buildNodeMemoryToolsPort(
+  tenantId: string,
+  sessionId: string,
+  agentId: string,
+): Promise<NonNullable<Parameters<typeof buildTools>[2]>["memory"] | null> {
+  if (!memoryService.factsEnabled()) return null;
+  const ctx = await buildNodeMemoryPromptContext(tenantId, sessionId);
+  if (ctx.storeIds.length === 0) return null;
+  const stores: Array<{ id: string; name: string; access: "read_only" | "read_write" }> = [];
+  for (const storeId of ctx.storeIds) {
+    const store = await memoryService.getStore({ tenantId, storeId });
+    if (!store) continue;
+    const access = ctx.access.get(storeId) ?? "read_write";
+    stores.push({ id: store.id, name: store.name, access });
+  }
+  if (stores.length === 0) return null;
+  // Scope: in per_user mode the ONLY store this principal may read/write
+  // through the facts tools is the agent's own (primary) store — env-bound
+  // stores are shared across principals. In shared/off modes all attached
+  // stores are in scope.
+  const perUser = (ctx.mode === "per_user");
+  const scoped = perUser && ctx.primaryStoreId ? stores.filter((s) => s.id === ctx.primaryStoreId) : stores;
+  const storeIds = scoped.map((s) => s.id);
+  const primary = ctx.primaryStoreId ? scoped.find((s) => s.id === ctx.primaryStoreId) ?? null : null;
+  const writable = (primary && primary.access === "read_write" ? primary : null) ?? scoped.find((s) => s.access === "read_write");
+  return {
+    stores: scoped,
+    search: async (args) =>
+      (
+        await memoryService.searchFacts({
+          tenantId,
+          storeIds,
+          query: args.query,
+          kinds: args.kinds as never,
+          subject: args.subject,
+          includeHistory: args.include_history,
+          limit: args.limit,
+        })
+      ).map((f) => ({
+        id: f.id,
+        kind: f.kind,
+        subject: f.subject,
+        statement: f.statement,
+        applies_when: f.applies_when,
+        observed_at: f.observed_at,
+        status: f.status,
+        source_path: f.source_path,
+        source_session_id: f.source_session_id,
+      })),
+    get: async (id) => {
+      const got = await memoryService.getFact({ tenantId, factId: id });
+      if (!got || !storeIds.includes(got.fact.store_id)) return null;
+      let source_excerpt: string | undefined;
+      if (got.fact.source_path) {
+        try {
+          const row = await memoryService.readByPath({ tenantId, storeId: got.fact.store_id, path: got.fact.source_path });
+          if (row?.content) source_excerpt = row.content.slice(0, 1_500);
+        } catch {
+          // excerpt is best-effort
+        }
+      }
+      return {
+        fact: {
+          id: got.fact.id, kind: got.fact.kind, subject: got.fact.subject, statement: got.fact.statement,
+          applies_when: got.fact.applies_when, observed_at: got.fact.observed_at, status: got.fact.status,
+          source_path: got.fact.source_path, source_session_id: got.fact.source_session_id,
+        },
+        chain: got.chain.map((c) => ({ id: c.id, statement: c.statement, observed_at: c.observed_at, status: c.status })),
+        source_excerpt,
+      };
+    },
+    remember: async (args) => {
+      const target = args.store_id ? stores.find((s) => s.id === args.store_id) : writable;
+      if (!target) throw new Error("no writable memory store attached to this session");
+      if (target.access !== "read_write") throw new Error(`memory store ${target.name} is read-only`);
+      const fact = await memoryService.rememberFact({
+        tenantId,
+        storeId: target.id,
+        agentId,
+        kind: args.kind as never,
+        subject: args.subject,
+        statement: args.statement,
+        appliesWhen: args.applies_when ?? null,
+        sourceSessionId: sessionId,
+      });
+      // Keep the file substrate authoritative + human-visible: append a
+      // line to <store>/facts.md (best-effort; the row is the index).
+      try {
+        const existing = await memoryService.readByPath({ tenantId, storeId: target.id, path: "facts.md" }).catch(() => null);
+        const date = new Date(fact.observed_at).toISOString().slice(0, 10);
+        const line = `- ${date} [${fact.kind}] ${fact.subject}: ${fact.statement}${fact.applies_when ? ` (applies when: ${fact.applies_when})` : ""}`;
+        const content = (existing?.content ? existing.content.replace(/\s+$/, "") + "\n" : "# Facts\n\n") + line + "\n";
+        await memoryService.writeByPath({
+          tenantId, storeId: target.id, path: "facts.md", content,
+          actor: { type: "agent_session", id: sessionId },
+        });
+      } catch (err) {
+        logger.warn({ op: "memory.remember.facts_md", err }, "facts.md append failed; fact row saved");
+      }
+      return { id: fact.id, superseded_id: fact.supersedes_id, store_id: target.id };
+    },
   };
 }
 

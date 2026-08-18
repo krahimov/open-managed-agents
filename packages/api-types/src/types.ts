@@ -62,6 +62,19 @@ export const REASONING_LEVELS: readonly ReasoningLevel[] = [
   "max",
 ];
 
+export type AgentMemoryMode = "off" | "shared" | "per_user";
+export const AGENT_MEMORY_MODES: readonly AgentMemoryMode[] = ["off", "shared", "per_user"];
+
+export interface AgentMemoryConfig {
+  mode: AgentMemoryMode;
+  /** Explicit store for `shared`; default: auto-provisioned per agent. */
+  store_id?: string;
+  /** Turn-end fact extraction. Default true when mode ≠ off. */
+  extract?: boolean;
+  /** Per-turn relevant-fact injection. Default true when mode ≠ off. */
+  push?: boolean;
+}
+
 export interface AgentConfig {
   id: string;
   name: string;
@@ -106,6 +119,15 @@ export interface AgentConfig {
    * (claude-agent-sdk, acp-proxy) ignore it.
    */
   reasoning_level?: ReasoningLevel;
+  /**
+   * Cross-session memory mode (docs/memory-facts-design.md §6). OMA-only,
+   * rides the `_oma` wire envelope like harness / reasoning_level.
+   *   off      — no store, no memory tools, no push; amnesiac by design (default)
+   *   shared   — one store per agent, auto-provisioned on first session
+   *   per_user — one store per (agent, principal), provisioned lazily
+   * Snapshotted onto sessions like every other config field.
+   */
+  memory?: AgentMemoryConfig;
   /**
    * SESSION-SNAPSHOT-ONLY enrichment — never present on live agent rows.
    * The access policy resolved from the agent's permission grants at
@@ -982,6 +1004,16 @@ export interface SystemMissionVerdictEvent extends EventBase {
   judge?: "skipped";
 }
 
+/** Cross-session memory (docs/memory-facts-design.md §5): the platform
+ *  pushed these fact ids into the agent's context for the turn that
+ *  follows. Emitted by the runtime before the model runs; consumed by trace
+ *  facts / the eval judge / the console. Extension (non-spec) event. */
+export interface SystemMemoryPushedEvent extends EventBase {
+  type: "system.memory_pushed";
+  fact_ids: string[];
+  count: number;
+}
+
 export type SessionEvent =
   | UserMessageEvent
   | UserInterruptEvent
@@ -1035,7 +1067,8 @@ export type SessionEvent =
   | SystemAccessRequestEvent
   | SystemAmbientRuleCreatedEvent
   | SystemSkillRequestEvent
-  | SystemMissionVerdictEvent;
+  | SystemMissionVerdictEvent
+  | SystemMemoryPushedEvent;
 
 /**
  * Event types defined by Anthropic's Managed Agents spec — what their

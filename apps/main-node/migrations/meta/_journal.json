@@ -43,6 +43,13 @@
    "when": 1783529000000,
    "tag": "0005_permission_grants",
    "breakpoints": true
+  },
+  {
+   "idx": 6,
+   "version": "7",
+   "when": 1786994288936,
+   "tag": "0006_memory_facts",
+   "breakpoints": true
   }
  ]
 }

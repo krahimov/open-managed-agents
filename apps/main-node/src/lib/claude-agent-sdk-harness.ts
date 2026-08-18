@@ -24,6 +24,7 @@
  * login) is the only path left.
  */
 
+import { memoryGuidance as sharedMemoryGuidance } from "@open-managed-agents/agent/harness/platform-guidance";
 import { mkdir, writeFile, readFile, readdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import path from "node:path";
@@ -616,11 +617,10 @@ export class ClaudeAgentSdkHarness {
         if (lines.length > 0) {
           memoryGuidance = [
             "",
-            "Persistent memory — these directories survive across sessions:",
+            sharedMemoryGuidance,
+            "Memory directories (survive across sessions):",
             ...lines,
-            "Read the relevant files at the START of a task to recall prior context, and",
-            "update read/write files as you learn durable facts. Files you create under a",
-            "read/write memory directory are saved back automatically when the turn ends.",
+            "Files you create or edit under a read/write memory directory are saved back automatically when the turn ends.",
           ].join("\n");
         }
       } catch (err) {

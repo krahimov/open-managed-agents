@@ -116,6 +116,9 @@ export interface NewMemoryVersionInput {
  * R2 event, deduped by (store_id, path, etag) — see apps/main/src/queue/memory-events.ts.
  */
 export interface MemoryRepo {
+  /** Optional write observer (memory-facts-design §4 trigger B). Implemented
+   *  by SqlMemoryRepo; fakes may omit it. */
+  onFileWritten?(listener: (info: { storeId: string; path: string; actor: Actor }) => void): () => void;
   /** Insert a new memory index row + version atomically. */
   createWithVersion(memory: NewMemoryRow, version: NewMemoryVersionInput): Promise<MemoryRow>;
 
@@ -256,4 +259,57 @@ export interface IdGenerator {
   storeId(): string;
   memoryId(): string;
   versionId(): string;
+  /** Optional: memory fact ids (mfact-…). Defaults to a random id. */
+  factId?(): string;
 }
+
+// ---------- Memory facts (docs/memory-facts-design.md §3) ----------
+
+import type { MemoryFactRow, MemoryFactKind, MemoryFactStatus } from "./types";
+
+export interface NewMemoryFactInput {
+  id: string;
+  tenantId: string;
+  storeId: string;
+  agentId?: string | null;
+  kind: MemoryFactKind;
+  subject: string;
+  statement: string;
+  appliesWhen?: string | null;
+  confidence?: number;
+  supersedesId?: string | null;
+  sourcePath?: string | null;
+  sourceSessionId?: string | null;
+  sourceEventId?: string | null;
+  observedAt: number;
+  createdAt: number;
+}
+
+export interface MemoryFactSearchOptions {
+  /** Free-text query — matched via FTS over subject/statement/applies_when.
+   *  Empty/undefined → filter-only listing ordered by observed_at desc. */
+  query?: string;
+  kinds?: MemoryFactKind[];
+  subject?: string;
+  /** Default ["active"]. */
+  statuses?: MemoryFactStatus[];
+  limit?: number;
+}
+
+export interface MemoryFactRepo {
+  insert(input: NewMemoryFactInput): Promise<MemoryFactRow>;
+  findById(id: string): Promise<MemoryFactRow | null>;
+  /** All facts for one store matching filters; FTS-ranked when `query` set. */
+  search(storeId: string, opts: MemoryFactSearchOptions): Promise<MemoryFactRow[]>;
+  /** Facts across several stores (a session may attach more than one). */
+  searchMany(storeIds: string[], opts: MemoryFactSearchOptions): Promise<MemoryFactRow[]>;
+  setStatus(id: string, status: MemoryFactStatus, updatedAt: number): Promise<void>;
+  /** Active facts on a subject in a store (supersession candidates). */
+  listActiveBySubject(storeId: string, subject: string): Promise<MemoryFactRow[]>;
+  /** Facts extracted from a given source file (re-extraction supersedes them). */
+  listBySourcePath(storeId: string, sourcePath: string): Promise<MemoryFactRow[]>;
+  /** Per-kind counts of active facts + most recent updated_at, for the catalog. */
+  stats(storeId: string): Promise<{ total: number; byKind: Record<string, number>; lastUpdatedAt: number | null }>;
+  deleteByStore(storeId: string): Promise<void>;
+}
+

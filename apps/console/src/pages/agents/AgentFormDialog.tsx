@@ -11,6 +11,7 @@ import { Select, SelectGroup, SelectGroupLabel, SelectOption } from "../../compo
 import { Combobox } from "../../components/Combobox";
 import { McpServerPickerModal } from "../../components/McpServerPickerModal";
 import { AmbientTriggerControls } from "../../components/AmbientTriggerControls";
+import { MemoryModeControl, parseMemoryMode, type MemoryMode } from "../../components/MemoryModeControl";
 import { AGENT_TEMPLATES, type AgentTemplate } from "../../lib/agent-templates";
 import {
   COMPOSIO_NOT_CONFIGURED_MESSAGE,
@@ -197,6 +198,8 @@ const INITIAL_FORM = {
   name: "",
   model: "",
   reasoningLevel: "instant" as ReasoningLevelValue,
+  /** `_oma.memory.mode`; "off" is the server default and is never sent. */
+  memoryMode: "off" as MemoryMode,
   system: "",
   description: "",
   modelCardId: "",
@@ -1054,6 +1057,14 @@ export function AgentFormDialog({
           reasoning_level: form.reasoningLevel,
         };
       }
+      // memory: "off" is the server default (absent field) — only persist
+      // shared / per_user. Same cloud-only gating as reasoning_level.
+      if (form.memoryMode !== "off" && !form.runtimeId) {
+        payload._oma = {
+          ...((payload._oma as Record<string, unknown>) ?? {}),
+          memory: { mode: form.memoryMode },
+        };
+      }
 
       const agent = await api<Agent>("/v1/agents", {
         method: "POST",
@@ -1174,6 +1185,12 @@ export function AgentFormDialog({
     if (form.reasoningLevel !== "instant" && !form.runtimeId) {
       config._oma = { reasoning_level: form.reasoningLevel };
     }
+    if (form.memoryMode !== "off" && !form.runtimeId) {
+      config._oma = {
+        ...((config._oma as Record<string, unknown>) ?? {}),
+        memory: { mode: form.memoryMode },
+      };
+    }
     return config;
   };
 
@@ -1270,6 +1287,9 @@ export function AgentFormDialog({
               ? rl
               : "instant";
           })(),
+          memoryMode: parseMemoryMode(
+            (parsed._oma as { memory?: unknown } | undefined)?.memory,
+          ),
         });
       } catch {
         /* keep current form if parse fails */
@@ -2029,6 +2049,15 @@ function BasicTab({
                 </p>
               </div>
             )}
+            <div className="mt-2">
+              <label htmlFor="agent-memory-mode" className="text-sm text-fg-muted block mb-1">
+                Memory
+              </label>
+              <MemoryModeControl
+                value={form.memoryMode}
+                onChange={(memoryMode) => setForm({ ...form, memoryMode })}
+              />
+            </div>
           </div>
         ))}
       {form.runtimeId && (

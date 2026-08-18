@@ -40,6 +40,8 @@ export interface NodeSchedulerDeps {
   /** llm_judge resolver (lib/eval-judge.ts). Null/omitted degrades
    *  llm_judge reward specs to a 0 score with an "unavailable" reason. */
   evalJudgeResolver?: EvalRunnerContext["resolveJudge"] | null;
+  /** Memory port for memory-aware simulations (optional). */
+  evalMemory?: EvalRunnerContext["memory"] | null;
   memory: MemoryStoreService;
   /** Ambient rule dispatcher — sweeps due ambient_rules and starts agent
    *  sessions. Skip when null (feature dormant until rules exist anyway). */
@@ -80,6 +82,7 @@ export function buildNodeScheduler(deps: NodeSchedulerDeps) {
     forEachShard: async (fn) => [await fn(deps.evalServices)],
     getServicesForTenant: async () => deps.evalServices,
     getSandboxBinding: async (): Promise<SandboxFetcher | null> => evalSandbox,
+    ...(deps.evalMemory ? { memory: deps.evalMemory } : {}),
     resolveJudge: deps.evalJudgeResolver ?? undefined,
   };
   scheduler.register({

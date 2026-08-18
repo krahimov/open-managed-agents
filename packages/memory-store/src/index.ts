@@ -36,5 +36,10 @@ export {
   SqlMemoryStoreRepo,
   SqlMemoryRepo,
   SqlMemoryVersionRepo,
+  SqlMemoryFactRepo,
   CfR2BlobStore,
+  queryTerms,
+  toFts5Match,
+  toTsQuery,
+  rankWithKindBoost,
 } from "./adapters";

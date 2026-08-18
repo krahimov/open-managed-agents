@@ -136,6 +136,15 @@ export interface LlmJudgeRewardSpec {
   type: "llm_judge";
   /** Markdown rubric, per-criterion (see evals-design §4.3 template). */
   rubric: string;
+  /** Optional grading context prepended to the judge prompt as "## Context"
+   *  (before "## Task"). Simulations put the scenario + persona goals +
+   *  termination condition here so the judge grades against what the
+   *  simulated user actually wanted. */
+  context?: string;
+  /** Ask the judge for structured findings alongside the verdict —
+   *  diagnostic observations (category/severity/evidence/recommendation)
+   *  for the agent's operator, independent of pass/fail. */
+  findings?: boolean;
   judge?: {
     /** Tenant model card to judge with. Default: resolver picks. */
     model_card_id?: string;

@@ -77,6 +77,24 @@ export interface OutputsAdapter {
 }
 
 export interface SessionLifecycleHooks {
+  /**
+   * Cross-session memory (memory-facts-design §6): resolve the agent's
+   * memory mode and attach the agent's own store to the new session —
+   * auto-provisioning `shared` per agent, or `per_user` per (agent,
+   * principal). Runs after the row exists and BEFORE runtime init so the
+   * store is mounted on turn 1. Composes with explicit env / session
+   * attachments (those add stores; this governs the agent's own). Absent
+   * on runtimes without the memory service. Failures are logged and
+   * never block session creation.
+   */
+  attachAgentMemory?: (input: {
+    tenantId: string;
+    sessionId: string;
+    agentId: string;
+    agentSnapshot: AgentConfig;
+    /** Calling principal for per_user partitioning (user id or API key id). */
+    principalId?: string;
+  }) => Promise<void>;
   /** Pre-create gate (USAGE_METER.canStartSandbox). Returns null to
    *  proceed; { status, body } to short-circuit. */
   preCreateGate?: (input: {
@@ -680,6 +698,20 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
       return mapSessionError(c, err);
     }
     const sessionId = session.id;
+
+    if (deps.lifecycle?.attachAgentMemory) {
+      try {
+        await deps.lifecycle.attachAgentMemory({
+          tenantId: t,
+          sessionId,
+          agentId,
+          agentSnapshot: sessionAgentSnapshot as AgentConfig,
+          principalId: c.var.user_id,
+        });
+      } catch (err) {
+        console.warn("[sessions] attachAgentMemory failed; session continues without agent memory", err);
+      }
+    }
 
     await persistGithubRepositoryResourceSecrets({
       services,

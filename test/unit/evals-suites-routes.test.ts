@@ -20,6 +20,20 @@ const TASK = {
   trials: 2,
 };
 
+const SIM_TASK = {
+  id: "sim-1",
+  simulation: {
+    scenario: "A customer cannot find their invoice from March.",
+    persona: {
+      identity: "Dana, a busy office manager with low technical patience",
+      goals: ["get the March invoice emailed to accounting"],
+      termination: "invoice is located or the agent gives up",
+    },
+    max_turns: 5,
+  },
+  reward: { type: "llm_judge", rubric: "- invoice-found: ...", include_transcript: true, findings: true },
+};
+
 function makeHarness(opts: { kv?: boolean } = {}) {
   const kv = new InMemoryKvStore();
   const { service: evals, repo } = createInMemoryEvalRunService();
@@ -172,6 +186,109 @@ describe("eval suites — CRUD", () => {
       });
       expect(res.status).toBe(501);
     }
+  });
+});
+
+describe("eval tasks — simulation validation", () => {
+  let h: ReturnType<typeof makeHarness>;
+  beforeEach(() => {
+    h = makeHarness();
+  });
+
+  async function postSuite(tasks: unknown[]) {
+    return h.app.request("/suites", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "sims", tasks }),
+    });
+  }
+
+  it("accepts a simulation task without messages, in suites and direct runs", async () => {
+    const res = await postSuite([SIM_TASK]);
+    expect(res.status).toBe(200);
+
+    const run = await h.app.request("/runs", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agent_id: "agent_1", environment_id: "env_1", tasks: [SIM_TASK] }),
+    });
+    expect(run.status).toBe(200);
+    const body = (await run.json()) as { run_id: string; task_count: number };
+    expect(body.task_count).toBe(1);
+  });
+
+  it("rejects a task with both messages and simulation, or neither", async () => {
+    const both = await postSuite([{ ...SIM_TASK, messages: ["hi"] }]);
+    expect(both.status).toBe(400);
+    const neither = await postSuite([{ id: "t" }]);
+    expect(neither.status).toBe(400);
+  });
+
+  it("rejects incomplete personas and out-of-range max_turns", async () => {
+    const cases = [
+      { ...SIM_TASK, simulation: { ...SIM_TASK.simulation, scenario: " " } },
+      { ...SIM_TASK, simulation: { ...SIM_TASK.simulation, persona: { ...SIM_TASK.simulation.persona, identity: "" } } },
+      { ...SIM_TASK, simulation: { ...SIM_TASK.simulation, persona: { ...SIM_TASK.simulation.persona, goals: [] } } },
+      { ...SIM_TASK, simulation: { ...SIM_TASK.simulation, persona: { ...SIM_TASK.simulation.persona, termination: "" } } },
+      { ...SIM_TASK, simulation: { ...SIM_TASK.simulation, max_turns: 0 } },
+      { ...SIM_TASK, simulation: { ...SIM_TASK.simulation, max_turns: 41 } },
+      { ...SIM_TASK, simulation: { ...SIM_TASK.simulation, persona: { ...SIM_TASK.simulation.persona, scripted_messages: [] } } },
+    ];
+    for (const task of cases) {
+      const res = await postSuite([task]);
+      expect(res.status, JSON.stringify(task.simulation)).toBe(400);
+    }
+  });
+
+  it("validates simulation.chaos rules", async () => {
+    const withChaos = (chaos) => ({ ...SIM_TASK, simulation: { ...SIM_TASK.simulation, chaos } });
+    expect((await postSuite([withChaos({ rules: [{ tool: "web_search", failure_rate: 0.3 }] })])).status).toBe(200);
+    expect((await postSuite([withChaos({ rules: [] })])).status).toBe(400);
+    expect((await postSuite([withChaos({ rules: [{ tool: "", failure_rate: 0.3 }] })])).status).toBe(400);
+    expect((await postSuite([withChaos({ rules: [{ tool: "bash", failure_rate: 2 }] })])).status).toBe(400);
+    expect((await postSuite([withChaos({ rules: [{ tool: "bash", failure_rate: 0.5, mode: "explode" }] })])).status).toBe(400);
+  });
+
+  it("validates simulation.memory_store and episodes", async () => {
+    const withSim = (extra) => ({ ...SIM_TASK, simulation: { ...SIM_TASK.simulation, ...extra } });
+    expect((await postSuite([withSim({ memory_store: { fresh: true } })])).status).toBe(200);
+    expect((await postSuite([withSim({ memory_store: { store_id: "mem_1", access: "read_only" } })])).status).toBe(200);
+    // seed_files only make sense for a fresh per-trial store
+    expect((await postSuite([withSim({ memory_store: { store_id: "mem_1",
+      seed_files: [{ path: "notes.md", content: "x" }] } })])).status).toBe(400);
+    expect((await postSuite([withSim({ memory_store: { fresh: true,
+      seed_files: [{ path: "notes.md", content: "x" }] } })])).status).toBe(200);
+    // exactly one of store_id | fresh
+    expect((await postSuite([withSim({ memory_store: {} })])).status).toBe(400);
+    expect((await postSuite([withSim({ memory_store: { store_id: "m", fresh: true } })])).status).toBe(400);
+    expect((await postSuite([withSim({ memory_store: { fresh: true, access: "rw" } })])).status).toBe(400);
+    // seed paths must be store-relative
+    expect((await postSuite([withSim({ memory_store: { fresh: true, seed_files: [{ path: "/abs.md", content: "x" }] } })])).status).toBe(400);
+    expect((await postSuite([withSim({ memory_store: { fresh: true, seed_files: [{ path: "../up.md", content: "x" }] } })])).status).toBe(400);
+    // episodes need memory_store; bounded; per-episode max_turns validated
+    expect((await postSuite([withSim({ episodes: [{ scenario: "later" }] })])).status).toBe(400);
+    expect((await postSuite([withSim({ memory_store: { fresh: true }, episodes: [{ scenario: "later" }] })])).status).toBe(200);
+    expect((await postSuite([withSim({ memory_store: { fresh: true }, episodes: [] })])).status).toBe(400);
+    expect((await postSuite([withSim({ memory_store: { fresh: true }, episodes: [{ max_turns: 0 }] })])).status).toBe(400);
+    expect((await postSuite([withSim({ memory_store: { fresh: true }, episodes: Array(6).fill({}) })])).status).toBe(400);
+  });
+
+  it("runs a suite containing a simulation task with the standard initial row shape", async () => {
+    const suite = await createSuite(h.app, { name: "sims", tasks: [SIM_TASK], agent_id: "agent_1" });
+    const res = await h.app.request(`/suites/${suite.id}/run`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ environment_id: "env_1" }),
+    });
+    expect(res.status).toBe(200);
+    const { run_id } = (await res.json()) as { run_id: string };
+    const run = await h.app.request(`/runs/${run_id}`);
+    const record = (await run.json()) as {
+      tasks: Array<{ id: string; spec: { simulation?: unknown }; trials: unknown[] }>;
+    };
+    expect(record.tasks[0].id).toBe("sim-1");
+    expect(record.tasks[0].spec.simulation).toBeDefined();
+    expect(record.tasks[0].trials).toHaveLength(1);
   });
 });
 

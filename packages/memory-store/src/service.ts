@@ -15,6 +15,8 @@ import type {
   Clock,
   IdGenerator,
   Logger,
+  MemoryFactRepo,
+  MemoryFactSearchOptions,
   MemoryRepo,
   MemoryStoreRepo,
   MemoryVersionRepo,
@@ -22,6 +24,9 @@ import type {
 import {
   Actor,
   MEMORY_CONTENT_MAX_BYTES,
+  MEMORY_FACT_KINDS,
+  MemoryFactKind,
+  MemoryFactRow,
   MemoryRow,
   MemoryStoreRow,
   MemoryVersionRow,
@@ -33,6 +38,9 @@ export interface MemoryStoreServiceDeps {
   memoryRepo: MemoryRepo;
   versionRepo: MemoryVersionRepo;
   blobs: BlobStore;
+  /** Optional: indexed facts (memory-facts-design §3). Runtimes without it
+   *  get a clear error from the fact methods instead of a crash. */
+  factRepo?: MemoryFactRepo;
   clock?: Clock;
   ids?: IdGenerator;
   logger?: Logger;
@@ -75,6 +83,7 @@ export interface MemoryStoreServiceDeps {
  */
 export class MemoryStoreService {
   private readonly storeRepo: MemoryStoreRepo;
+  private readonly factRepo: MemoryFactRepo | null;
   private readonly memoryRepo: MemoryRepo;
   private readonly versionRepo: MemoryVersionRepo;
   private readonly blobs: BlobStore;
@@ -87,6 +96,7 @@ export class MemoryStoreService {
     this.memoryRepo = deps.memoryRepo;
     this.versionRepo = deps.versionRepo;
     this.blobs = deps.blobs;
+    this.factRepo = deps.factRepo ?? null;
     this.clock = deps.clock ?? defaultClock;
     this.ids = deps.ids ?? defaultIds();
     this.logger = deps.logger ?? consoleLogger;
@@ -170,6 +180,9 @@ export class MemoryStoreService {
    * (eventual lifecycle GC will catch them). D1 cascade is via adapter batch.
    */
   async deleteStore(opts: { tenantId: string; storeId: string }): Promise<void> {
+    // Facts index cascade (memory-facts-design §3): orphaned per_user facts
+    // must not stay readable after their store is gone.
+    if (this.factRepo) await this.factRepo.deleteByStore(opts.storeId).catch(() => {});
     await this.requireStore(opts);
     // Best-effort R2 cleanup: scan and delete. 100KB cap × few thousand keys
     // is bounded; LIST iterates with cursors. We don't fail the store delete
@@ -638,6 +651,178 @@ export class MemoryStoreService {
    */
   async pruneVersionsOlderThan(cutoffMs: number): Promise<number> {
     return this.versionRepo.pruneOlderThan(cutoffMs);
+  }
+
+  // ============================================================
+  // Facts (memory-facts-design §3–5): the queryable index behind
+  // memory_search / memory_get / memory_remember and the per-turn push.
+  // ============================================================
+
+  private facts(): MemoryFactRepo {
+    if (!this.factRepo) throw new Error("memory facts are not enabled on this runtime");
+    return this.factRepo;
+  }
+
+  /** Feature check for callers that degrade gracefully (tools, catalog). */
+  factsEnabled(): boolean {
+    return this.factRepo !== null;
+  }
+
+  /** The underlying memory repo — for wiring write observers (§4 trigger B). */
+  get repo(): MemoryRepo {
+    return this.memoryRepo;
+  }
+
+  /**
+   * Record a durable fact. If `supersedesId` is set — or an active fact on the
+   * same subject exists and supersession-by-subject applies (default for
+   * rule/preference/decision) — the prior fact is marked superseded and
+   * linked via supersedes_id. An identical (kind, subject, statement) is
+   * idempotent and returns the existing row.
+   */
+  async rememberFact(opts: {
+    tenantId: string;
+    storeId: string;
+    agentId?: string | null;
+    kind: MemoryFactKind;
+    subject: string;
+    statement: string;
+    appliesWhen?: string | null;
+    confidence?: number;
+    supersedesId?: string | null;
+    supersedeSameSubject?: boolean;
+    sourcePath?: string | null;
+    sourceSessionId?: string | null;
+    sourceEventId?: string | null;
+    observedAt?: number;
+  }): Promise<MemoryFactRow> {
+    await this.requireStore(opts);
+    const facts = this.facts();
+    if (!MEMORY_FACT_KINDS.includes(opts.kind)) throw new Error(`invalid fact kind: ${opts.kind}`);
+    const subject = opts.subject.trim().toLowerCase().replace(/\s+/g, " ").slice(0, 120);
+    const statement = opts.statement.trim().slice(0, 1_000);
+    if (!subject) throw new Error("fact subject is required");
+    if (!statement) throw new Error("fact statement is required");
+    const now = this.clock.nowMs();
+
+    // Idempotency: an identical (kind, subject, statement) already active in
+    // this store is returned as-is — for EVERY kind, not just collapsing ones.
+    const prior = await facts.listActiveBySubject(opts.storeId, subject);
+    const dup = prior.find((p) => p.statement === statement && p.kind === opts.kind);
+    if (dup) return dup;
+
+    // Supersession: rule/preference/decision keep ONE active fact per
+    // (subject, kind) — every prior active fact of the SAME kind on the
+    // subject is retired (not just the newest). An explicit supersedesId is
+    // honored only if it lives in this store; otherwise ignored.
+    let supersedesId: string | null = null;
+    if (opts.supersedesId) {
+      const target = await facts.findById(opts.supersedesId);
+      if (target && target.store_id === opts.storeId) supersedesId = target.id;
+    }
+    const collapse =
+      opts.supersedeSameSubject ??
+      (opts.kind === "rule" || opts.kind === "preference" || opts.kind === "decision");
+    if (collapse) {
+      const sameKind = prior.filter((p) => p.kind === opts.kind);
+      if (!supersedesId && sameKind.length > 0) supersedesId = sameKind[0].id;
+      for (const p of sameKind) await facts.setStatus(p.id, "superseded", now);
+    }
+    if (supersedesId && !prior.some((p) => p.id === supersedesId)) {
+      const target = await facts.findById(supersedesId);
+      if (target && target.status === "active") await facts.setStatus(target.id, "superseded", now);
+    }
+    return facts.insert({
+      id: this.ids.factId ? this.ids.factId() : `mfact-${Math.random().toString(36).slice(2, 14)}`,
+      tenantId: opts.tenantId,
+      storeId: opts.storeId,
+      agentId: opts.agentId ?? null,
+      kind: opts.kind,
+      subject,
+      statement,
+      appliesWhen: opts.appliesWhen?.trim().slice(0, 300) ?? null,
+      confidence: opts.confidence ?? 1,
+      supersedesId,
+      sourcePath: opts.sourcePath ?? null,
+      sourceSessionId: opts.sourceSessionId ?? null,
+      sourceEventId: opts.sourceEventId ?? null,
+      observedAt: opts.observedAt ?? now,
+      createdAt: now,
+    });
+  }
+
+  async searchFacts(opts: {
+    tenantId: string;
+    storeIds: string[];
+    query?: string;
+    kinds?: MemoryFactKind[];
+    subject?: string;
+    includeHistory?: boolean;
+    limit?: number;
+  }): Promise<MemoryFactRow[]> {
+    const facts = this.facts();
+    for (const storeId of opts.storeIds) await this.requireStore({ tenantId: opts.tenantId, storeId });
+    const search: MemoryFactSearchOptions = {
+      query: opts.query,
+      kinds: opts.kinds,
+      subject: opts.subject,
+      statuses: opts.includeHistory ? ["active", "superseded"] : ["active"],
+      limit: opts.limit,
+    };
+    return facts.searchMany(opts.storeIds, search);
+  }
+
+  /** One fact plus its supersession chain (following supersedes_id backwards). */
+  async getFact(opts: {
+    tenantId: string;
+    factId: string;
+  }): Promise<{ fact: MemoryFactRow; chain: MemoryFactRow[] } | null> {
+    const facts = this.facts();
+    const fact = await facts.findById(opts.factId);
+    if (!fact || fact.tenant_id !== opts.tenantId) return null;
+    const chain: MemoryFactRow[] = [];
+    let cursor: MemoryFactRow | null = fact;
+    const seen = new Set<string>();
+    while (cursor?.supersedes_id && !seen.has(cursor.supersedes_id) && chain.length < 20) {
+      seen.add(cursor.supersedes_id);
+      const prev: MemoryFactRow | null = await facts.findById(cursor.supersedes_id);
+      if (!prev || prev.store_id !== fact.store_id || prev.tenant_id !== fact.tenant_id) break;
+      chain.push(prev);
+      cursor = prev;
+    }
+    return { fact, chain };
+  }
+
+  async retractFact(opts: { tenantId: string; factId: string }): Promise<boolean> {
+    const facts = this.facts();
+    const fact = await facts.findById(opts.factId);
+    if (!fact || fact.tenant_id !== opts.tenantId) return false;
+    await facts.setStatus(fact.id, "retracted", this.clock.nowMs());
+    return true;
+  }
+
+  /** Mark every active fact extracted from `sourcePath` as superseded —
+   *  called before re-extracting an edited memory file. */
+  async supersedeFactsFromPath(opts: {
+    tenantId: string;
+    storeId: string;
+    sourcePath: string;
+  }): Promise<number> {
+    await this.requireStore(opts);
+    const facts = this.facts();
+    const rows = await facts.listBySourcePath(opts.storeId, opts.sourcePath);
+    const now = this.clock.nowMs();
+    for (const r of rows) await facts.setStatus(r.id, "superseded", now);
+    return rows.length;
+  }
+
+  /** Per-store catalog numbers for the system-prompt line. */
+  async factStats(opts: {
+    tenantId: string;
+    storeId: string;
+  }): Promise<{ total: number; byKind: Record<string, number>; lastUpdatedAt: number | null }> {
+    await this.requireStore(opts);
+    return this.facts().stats(opts.storeId);
   }
 }
 
