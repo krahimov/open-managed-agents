@@ -12,7 +12,12 @@ import { defineConfig } from "vitest/config";
 
 export default defineConfig({
   test: {
-    pool: "threads",
+    // "forks" (child processes), not "threads": better-sqlite3 is a native
+    // addon and tearing down a worker THREAD that still holds it races with
+    // siblings → intermittent SIGSEGV (exit 139) at the end of multi-file
+    // runs (seen once the memory-facts tests opened a real :memory: DB).
+    // Processes take the addon down with them; no shared-thread hazard.
+    pool: "forks",
     include: ["test/**/*.test.ts"],
     // Each test spawns + kills a real main-node process — give them
     // headroom on slow CI.

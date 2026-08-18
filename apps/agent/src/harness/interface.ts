@@ -212,6 +212,16 @@ export interface HarnessContext {
    * before any user message, so it sits in the cached prefix forever.
    */
   platformReminders?: Array<{ source: string; text: string }>;
+  /**
+   * TURN-scoped reminders (memory-facts-design §5 push): content that is
+   * relevant to THIS turn only. The harness appends these to the current
+   * user message's content parts in the model context — never to the system
+   * prompt (which must stay byte-stable across turns for provider prompt
+   * caching) and never to the persisted user.message event (the transcript
+   * the user / persona / judge read stays exactly what the user said).
+   * Provenance is recorded separately (system.memory_pushed).
+   */
+  turnReminders?: Array<{ source: string; text: string }>;
 
   /**
    * Resolve a `file_id` (Anthropic Managed Agents ImageBlock/DocumentBlock
