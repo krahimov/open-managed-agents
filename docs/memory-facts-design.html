@@ -56,7 +56,7 @@ hr{border:0;border-top:1px solid var(--border);margin:32px 0}
 <a href="#12-open-questions">12. Open questions</a>
 <div class="status">proposed · 2026-07-29</div>
 </nav>
-<main><h1>Cross-Session Memory v2 — Indexed Facts, Push + Pull</h1><div class="meta">docs/memory-facts-design.md — rendered 2026-08-17</div>
+<main><h1>Cross-Session Memory v2 — Indexed Facts, Push + Pull</h1><div class="meta">docs/memory-facts-design.md — rendered 2026-08-18</div>
 <p>Status: <strong>accepted</strong> (2026-07-29). Build started same day. Owner: platform. Extends the existing memory-store
 stack (blob-backed stores mounted at <code>/mnt/memory/&lt;store&gt;/</code>); replaces nothing.</p>
 <h2 id="1-why">1. Why <a class="anchor" href="#1-why">#</a></h2>
@@ -505,6 +505,17 @@ PASS via a full-file <code>cat</code>.</p>
 <td><code>rule-applied-unprompted</code> should flip reliably (pass^k) — the fact is in context at draft time by construction</td>
 </tr>
 </tbody></table>
+<p><strong>Rubric note (2026-07-29, after push shipped).</strong> The original <code>memory-consulted</code>
+criterion required an <em>agent-initiated</em> read of memory. Once push exists that is the
+wrong question — a correct, memory-grounded answer with <code>pushed_fact_ids</code> non-empty and
+<code>searches: 0</code> is the <em>intended</em> outcome, not a failure. The suite&#39;s criterion now reads
+&quot;grounded in memory: pushed-and-used OR searched/read before answering; a lucky guess
+with neither fails&quot;. Recorded here so the benchmark&#39;s history is interpretable: the
+first post-push run (evrun-v5vnks9oh0h1ueeg) scored 0.625 under the OLD wording with
+<code>vendor-recalled</code> + <code>rule-applied-unprompted</code> both PASS — the memory system worked; the
+rubric was measuring a ritual. That run also exposed a real bug: three concurrent
+<code>memory_remember</code> calls lost a <code>facts.md</code> line (read-modify-write race) → fixed with a
+CAS-and-retry append (<code>appendFactsMdLine</code>), regression-tested.</p>
 <p>Add two scenarios to the suite before measuring: (a) a <strong>large store</strong> (200+ seeded
 facts) so full-file <code>cat</code> becomes visibly costly and pull-vs-push is meaningful; (b) a
 <strong>supersession</strong> case (vendor changed between episodes) so <code>memory_search</code> returning

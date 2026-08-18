@@ -19,14 +19,27 @@ import {
   rankWithKindBoost,
 } from "@open-managed-agents/memory-store";
 import type { MemoryStoreService } from "@open-managed-agents/memory-store";
+import { appendFactsMdLine } from "../src/lib/memory-runtime";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const TENANT = "t_facts";
 
+// Minimal in-memory BlobStore honoring the CAS preconditions the service
+// relies on (ifMatch etag / ifNoneMatch *) — put returns null on conflict.
 class MemBlobs {
-  private m = new Map<string, string>();
-  async putText(key: string, text: string) { this.m.set(key, text); return { etag: "e" }; }
-  async getText(key: string) { const t = this.m.get(key); return t === undefined ? null : { text: t, etag: "e" }; }
+  private m = new Map<string, { text: string; etag: string }>();
+  private n = 0;
+  async head(key: string) { const v = this.m.get(key); return v ? { etag: v.etag, size: v.text.length } : null; }
+  async getText(key: string) { const v = this.m.get(key); return v ? { text: v.text, etag: v.etag } : null; }
+  async put(key: string, text: string, opts?: { precondition?: { type: string; etag?: string } }) {
+    const cur = this.m.get(key);
+    const pc = opts?.precondition;
+    if (pc?.type === "ifNoneMatch" && cur) return null;
+    if (pc?.type === "ifMatch" && (!cur || cur.etag !== pc.etag)) return null;
+    const etag = `e${++this.n}`;
+    this.m.set(key, { text, etag });
+    return { etag, size: text.length };
+  }
   async delete(key: string) { this.m.delete(key); }
   async list() { return []; }
 }
@@ -195,3 +208,27 @@ describe("query helpers", () => {
     expect(out2.map((r: { id: string }) => r.id)).toEqual(["rule1","note0","rule3","note2"]);
   });
 });
+
+describe("facts.md atomic append (memory_remember lost-update regression)", () => {
+  it("3 concurrent appends all land (CAS + retry), in some order, no lines lost", async () => {
+    const store = await svc.createStore({ tenantId: TENANT, name: "cas-store" });
+    const lines = ["- 2026-08-18 [preference] a: one", "- 2026-08-18 [rule] b: two", "- 2026-08-18 [decision] c: three"];
+    await Promise.all(lines.map((line) => appendFactsMdLine(svc, { tenantId: TENANT, storeId: store.id, actor: { type: "system", id: "test" }, line })));
+    const row = await svc.readByPath({ tenantId: TENANT, storeId: store.id, path: "facts.md" });
+    expect(row).not.toBeNull();
+    const body = row!.content;
+    for (const l of lines) expect(body).toContain(l);
+    expect(body.startsWith("# Facts\n")).toBe(true);
+    // exactly three fact lines
+    expect(body.split("\n").filter((x) => x.startsWith("- ")).length).toBe(3);
+  });
+
+  it("sequential appends preserve order and the header once", async () => {
+    const store = await svc.createStore({ tenantId: TENANT, name: "cas-store-2" });
+    await appendFactsMdLine(svc, { tenantId: TENANT, storeId: store.id, actor: { type: "system", id: "t" }, line: "- x" });
+    await appendFactsMdLine(svc, { tenantId: TENANT, storeId: store.id, actor: { type: "system", id: "t" }, line: "- y" });
+    const row = await svc.readByPath({ tenantId: TENANT, storeId: store.id, path: "facts.md" });
+    expect(row!.content).toBe("# Facts\n\n- x\n- y\n");
+  });
+});
+

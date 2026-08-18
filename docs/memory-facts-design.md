@@ -441,6 +441,18 @@ PASS via a full-file `cat`.
 | + §3–5 tools + catalog (pull only) | recall cost drops (no full-file cat; check tokens_in); `memory-consulted` via `memory_search` |
 | + §5 push | `rule-applied-unprompted` should flip reliably (pass^k) — the fact is in context at draft time by construction |
 
+**Rubric note (2026-07-29, after push shipped).** The original `memory-consulted`
+criterion required an *agent-initiated* read of memory. Once push exists that is the
+wrong question — a correct, memory-grounded answer with `pushed_fact_ids` non-empty and
+`searches: 0` is the *intended* outcome, not a failure. The suite's criterion now reads
+"grounded in memory: pushed-and-used OR searched/read before answering; a lucky guess
+with neither fails". Recorded here so the benchmark's history is interpretable: the
+first post-push run (evrun-v5vnks9oh0h1ueeg) scored 0.625 under the OLD wording with
+`vendor-recalled` + `rule-applied-unprompted` both PASS — the memory system worked; the
+rubric was measuring a ritual. That run also exposed a real bug: three concurrent
+`memory_remember` calls lost a `facts.md` line (read-modify-write race) → fixed with a
+CAS-and-retry append (`appendFactsMdLine`), regression-tested.
+
 Add two scenarios to the suite before measuring: (a) a **large store** (200+ seeded
 facts) so full-file `cat` becomes visibly costly and pull-vs-push is meaningful; (b) a
 **supersession** case (vendor changed between episodes) so `memory_search` returning

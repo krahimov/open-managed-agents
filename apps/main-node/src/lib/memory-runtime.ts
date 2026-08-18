@@ -34,6 +34,47 @@ export interface MemoryPromptContext {
   reminders: Array<{ source: string; text: string }>;
 }
 
+/**
+ * Compare-and-swap append to <store>/facts.md. Reads the current file,
+ * writes it back with the CAS precondition (content_sha256 of what was
+ * read); on a precondition conflict — another remember landed in between —
+ * re-read and retry. Bounded retries; the LAST attempt is unconditional so
+ * an unusually hot store still converges rather than dropping the line.
+ * Exported for tests.
+ */
+export async function appendFactsMdLine(
+  memoryService: Pick<MemoryStoreService, "readByPath" | "writeByPath">,
+  input: { tenantId: string; storeId: string; actor: { type: "agent_session" | "system" | "user" | "api_key"; id: string }; line: string },
+  maxAttempts = 5,
+): Promise<void> {
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const existing = await memoryService.readByPath({ tenantId: input.tenantId, storeId: input.storeId, path: "facts.md" }).catch(() => null);
+    const base = existing?.content ? existing.content.replace(/\s+$/, "") + "\n" : "# Facts\n\n";
+    const content = base + input.line + "\n";
+    const precondition = attempt < maxAttempts
+      ? existing
+        ? ({ type: "content_sha256", content_sha256: existing.content_sha256 } as const)
+        : ({ type: "not_exists" } as const)
+      : undefined;
+    try {
+      await memoryService.writeByPath({
+        tenantId: input.tenantId,
+        storeId: input.storeId,
+        path: "facts.md",
+        content,
+        ...(precondition ? { precondition } : {}),
+        actor: input.actor as never,
+      });
+      return;
+    } catch (err) {
+      // Precondition conflicts (another writer landed between our read and
+      // write — covers both ifMatch and not_exists races) are retryable.
+      if ((err as { code?: string })?.code === "memory_precondition_failed" && attempt < maxAttempts) continue;
+      throw err;
+    }
+  }
+}
+
 export function createMemoryRuntime(deps: MemoryRuntimeDeps) {
   const { memoryService, sessionsService, sql, newEventLog, logger } = deps;
 
@@ -345,14 +386,15 @@ export function createMemoryRuntime(deps: MemoryRuntimeDeps) {
         });
         // Keep the file substrate authoritative + human-visible: append a
         // line to <store>/facts.md (best-effort; the row is the index).
+        // ATOMIC: concurrent memory_remember calls in one turn each did a
+        // read-modify-write here and LOST lines (seen live: 3 remembers → 2
+        // lines). Use the store's CAS precondition and retry on conflict.
         try {
-          const existing = await memoryService.readByPath({ tenantId, storeId: target.id, path: "facts.md" }).catch(() => null);
-          const date = new Date(fact.observed_at).toISOString().slice(0, 10);
-          const line = `- ${date} [${fact.kind}] ${fact.subject}: ${fact.statement}${fact.applies_when ? ` (applies when: ${fact.applies_when})` : ""}`;
-          const content = (existing?.content ? existing.content.replace(/\s+$/, "") + "\n" : "# Facts\n\n") + line + "\n";
-          await memoryService.writeByPath({
-            tenantId, storeId: target.id, path: "facts.md", content,
+          await appendFactsMdLine(memoryService, {
+            tenantId,
+            storeId: target.id,
             actor: { type: "agent_session", id: sessionId },
+            line: `- ${new Date(fact.observed_at).toISOString().slice(0, 10)} [${fact.kind}] ${fact.subject}: ${fact.statement}${fact.applies_when ? ` (applies when: ${fact.applies_when})` : ""}`,
           });
         } catch (err) {
           logger.warn({ op: "memory.remember.facts_md", err }, "facts.md append failed; fact row saved");
