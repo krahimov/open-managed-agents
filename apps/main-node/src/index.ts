@@ -1088,6 +1088,15 @@ const sessionWorkQueue = new NodeSessionWorkQueue({
   dialect,
   run: async (item) => {
     const entry = await sessionRegistry.getOrCreate(item.sessionId, item.tenantId);
+    // A parked "ask" tool resumes via resumeToolConfirmation; a normal
+    // user.message drives a fresh turn (and mirrors to Slack if applicable).
+    if (item.event.type === "user.tool_confirmation") {
+      await entry.machine.resumeToolConfirmation(
+        item.agentId,
+        item.event as import("@open-managed-agents/shared").UserToolConfirmationEvent,
+      );
+      return;
+    }
     await entry.machine.runHarnessTurn(item.agentId, item.event);
     // Best-effort, never throws — a Slack hiccup must not fail the turn.
     await slackReplyBridge?.mirrorTurnReply({
