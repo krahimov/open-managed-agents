@@ -170,6 +170,7 @@ import {
 import { PgEventStreamHub } from "./lib/pg-event-stream-hub";
 import { NodeHarnessRuntime } from "./lib/node-harness-runtime";
 import { NodeSessionWakeups } from "./lib/node-session-wakeups";
+import { NodeUsageTracker } from "./lib/node-usage-tracker";
 import {
   resolveClerkConfig,
   ClerkTokenVerifier,
@@ -972,6 +973,10 @@ const sessionRegistry = new SessionRegistry({
         sessionWakeups.schedule({ tenantId, sessionId, agentId, ...a }),
       cancelWakeup: (sessionId, id) => sessionWakeups.cancel(sessionId, id),
       listWakeups: (sessionId) => sessionWakeups.list(sessionId),
+      recordUsage: (tenantId, sessionId, agentId, u) =>
+        usageTracker
+          .record({ tenantId, sessionId, agentId, harness: "claude-agent-sdk", ...u })
+          .catch(() => {}),
     });
     // OpenAI sibling of the claude-agent-sdk harness — headless Codex CLI on
     // the host, billing to the ChatGPT/Codex subscription (`codex login`).
@@ -997,6 +1002,10 @@ const sessionRegistry = new SessionRegistry({
         sessionWakeups.schedule({ tenantId, sessionId, agentId, ...a }),
       cancelWakeup: (sessionId, id) => sessionWakeups.cancel(sessionId, id),
       listWakeups: (sessionId) => sessionWakeups.list(sessionId),
+      recordUsage: (tenantId, sessionId, agentId, u) =>
+        usageTracker
+          .record({ tenantId, sessionId, agentId, harness: "codex-sdk", ...u })
+          .catch(() => {}),
     });
     return {
       run: (ctx: unknown) => {
@@ -1043,6 +1052,27 @@ const sessionRegistry = new SessionRegistry({
       log: input.eventLog,
       hub,
       sandbox: input.sandbox,
+      // DefaultHarness usage tap: span.model_request_end events carry the
+      // per-call token buckets; SDK harnesses record through their own deps.
+      onModelUsage: ({ model, usage }) => {
+        const agentModel =
+          typeof input.agent.model === "string" ? input.agent.model : input.agent.model?.id;
+        void usageTracker
+          .record({
+            tenantId: input.tenantId,
+            sessionId: input.sessionId,
+            agentId: input.agent.id,
+            harness: input.agent.harness ?? "default",
+            model: model ?? agentModel ?? "unknown",
+            usage: {
+              input_tokens: usage.input_tokens,
+              cached_input_tokens: usage.cache_read_input_tokens,
+              cache_write_input_tokens: usage.cache_creation_input_tokens,
+              output_tokens: usage.output_tokens,
+            },
+          })
+          .catch(() => {});
+      },
     });
     await runtime.refreshHistory();
     // Setup sessions replace the agent's own system prompt with the setup
@@ -1191,6 +1221,11 @@ const sessionWakeups = new NodeSessionWakeups({
   },
 });
 await sessionWakeups.ensureSchema();
+
+// Token/cost usage analytics (console /usage). Rows are written by all three
+// harness paths; the report endpoint is GET /v1/usage.
+const usageTracker = new NodeUsageTracker({ sql, dialect });
+await usageTracker.ensureSchema();
 
 await sessionRegistry.bootstrap();
 void sessionWorkQueue.wakeAll().catch((err) => {
@@ -1572,6 +1607,15 @@ v1.get("/agents/:id/evidence/capability", async (c) => {
     entries,
     notes,
   });
+});
+
+// GET /v1/usage?since=<ms>&until=<ms> — token/cost analytics for the console
+// Usage page. Cost figures are API-price estimates (see node-usage-tracker.ts);
+// subscription-harness traffic shows what it WOULD have cost on API keys.
+v1.get("/usage", async (c) => {
+  const until = Number(c.req.query("until")) || Date.now();
+  const since = Number(c.req.query("since")) || until - 30 * 86400000;
+  return c.json(await usageTracker.report(c.var.tenant_id, since, until));
 });
 
 // GET /v1/agents/:id/evidence/approvals — grant version lineage with

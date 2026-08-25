@@ -206,6 +206,24 @@ export interface ClaudeAgentSdkHarnessDeps {
   listWakeups?: (
     sessionId: string,
   ) => Promise<Array<{ id: string; fire_at?: string; cron?: string; prompt: string; kind: "one_shot" | "cron" }>>;
+  /** Usage analytics tap — called per model on the SDK result message
+   *  (modelUsage map; falls back to aggregate usage). Best-effort. */
+  recordUsage?: (
+    tenantId: string,
+    sessionId: string,
+    agentId: string,
+    u: {
+      model: string;
+      costUsd?: number;
+      usage: {
+        input_tokens: number;
+        cached_input_tokens?: number;
+        cache_write_input_tokens?: number;
+        output_tokens: number;
+        reasoning_tokens?: number;
+      };
+    },
+  ) => Promise<void> | void;
 }
 
 function workdirFor(sessionId: string): string {
@@ -874,6 +892,61 @@ export class ClaudeAgentSdkHarness {
           continue;
         }
         if (msg.type === "result") {
+          const dep = this.#deps.recordUsage;
+          if (dep) {
+            // The SDK result message carries a per-model usage map (with the
+            // SDK's own cost accounting) and an aggregate fallback. Field
+            // names are read defensively — they're additive SDK surface.
+            const r = msg as unknown as {
+              modelUsage?: Record<
+                string,
+                {
+                  inputTokens?: number;
+                  outputTokens?: number;
+                  cacheReadInputTokens?: number;
+                  cacheCreationInputTokens?: number;
+                  costUSD?: number;
+                }
+              >;
+              usage?: {
+                input_tokens?: number;
+                output_tokens?: number;
+                cache_read_input_tokens?: number;
+                cache_creation_input_tokens?: number;
+              };
+              total_cost_usd?: number;
+            };
+            const tenantForUsage = ctx.tenant_id ?? "default";
+            if (r.modelUsage && Object.keys(r.modelUsage).length > 0) {
+              for (const [usedModel, u] of Object.entries(r.modelUsage)) {
+                void Promise.resolve(
+                  dep(tenantForUsage, sessionId, ctx.agent.id, {
+                    model: usedModel,
+                    costUsd: u.costUSD,
+                    usage: {
+                      input_tokens: u.inputTokens ?? 0,
+                      cached_input_tokens: u.cacheReadInputTokens ?? 0,
+                      cache_write_input_tokens: u.cacheCreationInputTokens ?? 0,
+                      output_tokens: u.outputTokens ?? 0,
+                    },
+                  }),
+                ).catch(() => {});
+              }
+            } else if (r.usage) {
+              void Promise.resolve(
+                dep(tenantForUsage, sessionId, ctx.agent.id, {
+                  model: model ?? "claude-default",
+                  costUsd: r.total_cost_usd,
+                  usage: {
+                    input_tokens: r.usage.input_tokens ?? 0,
+                    cached_input_tokens: r.usage.cache_read_input_tokens ?? 0,
+                    cache_write_input_tokens: r.usage.cache_creation_input_tokens ?? 0,
+                    output_tokens: r.usage.output_tokens ?? 0,
+                  },
+                }),
+              ).catch(() => {});
+            }
+          }
           if (msg.subtype !== "success") {
             throw new Error(`claude-agent-sdk turn failed: ${msg.subtype}`);
           }

@@ -148,6 +148,11 @@ export function SlackIcon({ className }: IconProps) {
 
 // ─── Generic UI icons ────────────────────────────────────────────────────
 
+// Usage/analytics — ascending line chart over a baseline.
+export function UsageIcon({ className }: IconProps) {
+  return <StrokeIcon className={className} d="M4 4v16h16M7.5 14.5l3.5-4 3 2.5 4.5-6" />;
+}
+
 export function ClockIcon({ className }: IconProps) {
   return <StrokeIcon className={className} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />;
 }

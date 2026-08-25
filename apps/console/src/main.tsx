@@ -129,6 +129,14 @@ const protectedRoutes: RouteObject[] = [
   },
   { path: "files", element: <FilesList />, handle: { crumb: "Files" } },
   {
+    path: "usage",
+    handle: { crumb: "Usage" },
+    lazy: async () => {
+      const { UsagePage } = await import("./pages/UsagePage");
+      return { Component: UsagePage };
+    },
+  },
+  {
     path: "evals",
     handle: { crumb: "Eval Runs" },
     children: [

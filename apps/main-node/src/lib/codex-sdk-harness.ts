@@ -163,6 +163,24 @@ export interface CodexSdkHarnessDeps {
   listWakeups?: (
     sessionId: string,
   ) => Promise<Array<{ id: string; fire_at?: string; cron?: string; prompt: string; kind: "one_shot" | "cron" }>>;
+  /** Usage analytics tap — called once per turn.completed with the turn's
+   *  token buckets (input_tokens = uncached portion). Best-effort. */
+  recordUsage?: (
+    tenantId: string,
+    sessionId: string,
+    agentId: string,
+    u: {
+      model: string;
+      costUsd?: number;
+      usage: {
+        input_tokens: number;
+        cached_input_tokens?: number;
+        cache_write_input_tokens?: number;
+        output_tokens: number;
+        reasoning_tokens?: number;
+      };
+    },
+  ) => Promise<void> | void;
   /** Test seam: build the Codex client. Defaults to `new Codex(options)`. */
   createCodex?: (options: CodexOptions) => CodexLike;
 }
@@ -759,8 +777,26 @@ export class CodexSdkHarness {
             throw new Error(`codex-sdk turn failed: ${event.error.message}`);
           case "error":
             throw new Error(`codex-sdk stream error: ${event.message}`);
+          case "turn.completed": {
+            const dep = this.#deps.recordUsage;
+            if (dep && event.usage) {
+              const us = event.usage;
+              void Promise.resolve(
+                dep(tenantId, sessionId, ctx.agent.id, {
+                  model: threadOptions.model ?? "codex-default",
+                  usage: {
+                    input_tokens: Math.max(0, us.input_tokens - us.cached_input_tokens),
+                    cached_input_tokens: us.cached_input_tokens,
+                    cache_write_input_tokens: us.cache_write_input_tokens,
+                    output_tokens: us.output_tokens,
+                    reasoning_tokens: us.reasoning_output_tokens,
+                  },
+                }),
+              ).catch(() => {});
+            }
+            break;
+          }
           case "turn.started":
-          case "turn.completed":
             break;
         }
       }

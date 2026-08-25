@@ -62,6 +62,19 @@ export interface NodeHarnessRuntimeOptions {
    *  LocalSubprocessSandbox for local dev, E2BSandbox / CloudflareSandbox
    *  in production. */
   sandbox: SandboxExecutor;
+  /** Usage tap: called for every broadcast span.model_request_end /
+   *  span.compaction_summarize_end that carries model_usage. This is how
+   *  self-host analytics captures DefaultHarness token usage (the harness
+   *  itself only emits events; see node-usage-tracker.ts). Must not throw. */
+  onModelUsage?: (info: {
+    model?: string;
+    usage: {
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+    };
+  }) => void;
 }
 
 export class NodeHarnessRuntime implements HarnessRuntime {
@@ -108,6 +121,27 @@ export class NodeHarnessRuntime implements HarnessRuntime {
    * comment above).
    */
   broadcast = (event: SessionEvent): void => {
+    if (
+      this.opts.onModelUsage &&
+      (event.type === "span.model_request_end" || event.type === "span.compaction_summarize_end")
+    ) {
+      const ev = event as {
+        model?: string;
+        model_usage?: {
+          input_tokens: number;
+          output_tokens: number;
+          cache_read_input_tokens?: number;
+          cache_creation_input_tokens?: number;
+        };
+      };
+      if (ev.model_usage) {
+        try {
+          this.opts.onModelUsage({ model: ev.model, usage: ev.model_usage });
+        } catch {
+          // usage tracking must never break the event pipeline
+        }
+      }
+    }
     this.history.appendInPlace(event);
     this.writeChain = this.writeChain
       .then(() => this.opts.log.appendAsync(event))

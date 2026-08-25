@@ -32,6 +32,7 @@ import {
   MemoryIcon,
   ModelCardsIcon,
   SessionsIcon,
+  UsageIcon,
   SkillsIcon,
   SlackIcon,
   VaultIcon,
@@ -64,6 +65,7 @@ const navGroups: NavGroup[] = [
       { to: "/sessions", label: "Sessions", icon: SessionsIcon },
       { to: "/files", label: "Files", icon: FilesIcon },
       { to: "/evals", label: "Eval Runs", icon: SessionsIcon },
+      { to: "/usage", label: "Usage", icon: UsageIcon },
     ],
   },
   {
