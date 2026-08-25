@@ -668,6 +668,11 @@ export class CodexSdkHarness {
       approvalPolicy: "never",
       sandboxMode: isSetup ? "read-only" : sandboxModeFromEnv(),
       networkAccessEnabled: true,
+      // Codex's default web search runs against a cached index — freshly
+      // deployed pages come back "not indexed" (observed live with a
+      // days-old vercel.app site) and the agent has to hand-fetch via the
+      // JS repl. Live mode searches the actual web.
+      webSearchMode: "live",
     };
     const priorThreadId = codexThreads.get(sessionId);
     const thread = priorThreadId
@@ -758,7 +763,10 @@ export class CodexSdkHarness {
         case "web_search":
           if (event === "completed") {
             broadcastToolUse(item, "web_search", { query: item.query });
-            broadcastToolResult(item, "search completed");
+            // Codex feeds search results straight into the model's context
+            // and never exposes them on the item — say so instead of a bare
+            // "completed" that reads like the search returned nothing.
+            broadcastToolResult(item, "results returned to the model (codex does not expose them)");
           }
           break;
         case "error":
