@@ -288,16 +288,23 @@ export function useApi() {
             reconnectToastShown = false;
             return;
           }
+          if (response.status >= 500) {
+            // 5xx is TRANSIENT here: a backend restart behind the dev proxy
+            // answers the reconnect with 502/500 while the server boots —
+            // treating that as fatal froze open session pages at their last
+            // rendered state (status chip stuck "Running", tools stuck
+            // mid-run) until a manual refresh. Fall through to onError's
+            // backoff; replay=1 heals the missed events on reconnect.
+            throw new Error(`status ${response.status}`);
+          }
           if (response.status >= 400) {
             // Surface stream open failures the same way as regular API calls —
             // previously a 401 / 500 on the SSE handshake meant the timeline
-            // just never updated. 4xx and 5xx alike get the same toast format
-            // so the user sees a real error message instead of silence.
+            // just never updated.
             const body = await response.json().catch(() => ({}));
             const message = readApiErrorMessage(body, response.status);
             toast.error(`/v1/sessions/${sessionId}/events/stream: ${message}`);
-            // Non-retriable: 401/403/404 won't fix themselves on retry, and
-            // hammering a 5xx that's surfaced to the user is also pointless.
+            // Non-retriable: 401/403/404 won't fix themselves on retry.
             throw new FatalSseError(message);
           }
           // Anything non-ok that isn't ≥400 (3xx etc.) — fall through to
