@@ -36,7 +36,8 @@
  * attached skills are materialized under <cwd>/skills/ and referenced there.
  */
 
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import { Codex } from "@openai/codex-sdk";
 import type {
@@ -225,6 +226,22 @@ const CODEX_REASONING_EFFORT: Record<ReasoningLevel, ModelReasoningEffort> = {
   high: "high",
   max: "xhigh",
 };
+
+/** Server names under [mcp_servers.*] in the host operator's codex config.
+ *  Best-effort regex scan — enough to enumerate names for enabled=false. */
+async function hostCodexMcpServerNames(): Promise<string[]> {
+  try {
+    const home = process.env.CODEX_HOME ?? path.join(homedir(), ".codex");
+    const toml = await readFile(path.join(home, "config.toml"), "utf8");
+    const names = new Set<string>();
+    for (const m of toml.matchAll(/^\s*\[mcp_servers\.("?)([^\].".]+)\1(?:\.[^\]]+)?\]/gm)) {
+      names.add(m[2]);
+    }
+    return [...names];
+  } catch {
+    return [];
+  }
+}
 
 function sandboxModeFromEnv(): "read-only" | "workspace-write" | "danger-full-access" {
   const v = process.env.OMA_CODEX_SANDBOX_MODE;
@@ -629,15 +646,28 @@ export class CodexSdkHarness {
     // classifies as approval-needing would otherwise auto-FAIL with
     // "MCP tool call requires approval, but approval policy is never".
     const agentMcpServers = isSetup ? undefined : await this.#mcpConfigFor(ctx, sessionId);
-    const mcpServers: Record<
-      string,
-      { url: string; http_headers: Record<string, string>; default_tools_approval_mode: string }
-    > = Object.fromEntries(
+    const omaServers = Object.fromEntries(
       Object.entries({
         ...(agentMcpServers ?? {}),
         ...(bridge ? { oma_platform: { url: bridge.url, http_headers: bridge.headers } } : {}),
       }).map(([name, server]) => [name, { ...server, default_tools_approval_mode: "approve" }]),
     );
+    // Host MCP servers from the operator's ~/.codex/config.toml (ChatGPT-app
+    // browser control, playwright, computer-use, …) otherwise merge into
+    // every agent session — observed live: an agent used the operator's
+    // browser-control REPL to try to drive their signed-in Chrome. Ambient
+    // sessions run unattended, so that's off by default; set
+    // OMA_CODEX_INHERIT_HOST_MCP=1 to opt back in.
+    const hostServerNames =
+      process.env.OMA_CODEX_INHERIT_HOST_MCP === "1" ? [] : await hostCodexMcpServerNames();
+    const mcpServers: Record<string, Record<string, string | boolean | Record<string, string>>> = {
+      ...Object.fromEntries(
+        hostServerNames
+          .filter((n) => !(n in omaServers))
+          .map((n) => [n, { enabled: false }]),
+      ),
+      ...omaServers,
+    };
     const codexOptions: CodexOptions = {
       env: curatedCodexEnv(),
       // Escape hatch when the vendored @openai/codex platform binary is
