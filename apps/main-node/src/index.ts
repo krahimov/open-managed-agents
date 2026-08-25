@@ -71,6 +71,8 @@ import { generateEventId, extractTextFromContent, extractTraceFacts } from "@ope
 import type { TraceFacts } from "@open-managed-agents/shared";
 import { DefaultHarness } from "@open-managed-agents/agent/harness/default-loop";
 import { ClaudeAgentSdkHarness } from "./lib/claude-agent-sdk-harness.js";
+import { CodexSdkHarness } from "./lib/codex-sdk-harness.js";
+import type { SdkMemoryPort } from "./lib/sdk-harness-memory.js";
 import { buildSetupPrompt, buildSetupTools } from "./lib/setup-harness.js";
 import { ALL_TOOLS, buildTools, getEnabledTools } from "@open-managed-agents/agent/harness/tools";
 import { resolveModel, type ApiCompat } from "@open-managed-agents/agent/harness/provider";
@@ -876,13 +878,11 @@ const sessionRegistry = new SessionRegistry({
   },
   buildHarness: () => {
     const def = new DefaultHarness();
-    const sdk = new ClaudeAgentSdkHarness({
-      resolveMcpTarget: resolveNodeMcpProxyTarget,
-      resolveSkills: (tenantId, refs) => skillStore.resolveRefs(tenantId, refs),
-      // Memory stores — the SDK harness has no sandbox mount, so materialize
-      // the session's attached stores into its workdir and sync edits back.
-      // Without this, memory is invisible to every SDK-harness agent.
-      memory: {
+    // Memory stores — the SDK harnesses have no sandbox mount, so they
+    // materialize the session's attached stores into their workdir and sync
+    // edits back. Without this, memory is invisible to every SDK-harness
+    // agent. Shared by claude-agent-sdk and codex-sdk.
+    const sdkMemoryPort: SdkMemoryPort = {
         resolve: async (tenantId, sessionId) => {
           const rows = await sql
             .prepare(
@@ -941,7 +941,11 @@ const sessionRegistry = new SessionRegistry({
             return { ok: false, conflict, error: msg };
           }
         },
-      },
+    };
+    const sdk = new ClaudeAgentSdkHarness({
+      resolveMcpTarget: resolveNodeMcpProxyTarget,
+      resolveSkills: (tenantId, refs) => skillStore.resolveRefs(tenantId, refs),
+      memory: sdkMemoryPort,
       // Setup-session support: the in-process oma_setup MCP server stages the
       // agent's refined harness in session metadata and, on finish, applies it
       // to the agent it belongs to.
@@ -963,6 +967,17 @@ const sessionRegistry = new SessionRegistry({
       requestSkill: (tenantId, agentId, sessionId, a) =>
         postSkillRequest(tenantId, agentId, sessionId, a),
     });
+    // OpenAI sibling of the claude-agent-sdk harness — headless Codex CLI on
+    // the host, billing to the ChatGPT/Codex subscription (`codex login`).
+    // No in-process MCP transport in the Codex SDK, so setup sessions and
+    // pinned policies are rejected inside the harness (fail-closed).
+    const codexSdk = new CodexSdkHarness({
+      resolveMcpTarget: resolveNodeMcpProxyTarget,
+      resolveSkills: (tenantId, refs) => skillStore.resolveRefs(tenantId, refs),
+      memory: sdkMemoryPort,
+      readSessionMetadata: async (tenantId, sessionId) =>
+        (await sessionsService.get({ tenantId, sessionId }))?.metadata ?? null,
+    });
     return {
       run: (ctx: unknown) => {
         const c = ctx as HarnessContext;
@@ -983,6 +998,19 @@ const sessionRegistry = new SessionRegistry({
             return Promise.reject(new Error(msg));
           }
           return sdk.run(c);
+        }
+        if (harness === "codex-sdk") {
+          // Same hard gate as claude-agent-sdk: runs the Codex CLI ON THE
+          // HOST with approvals disabled — single-operator/self-host only.
+          if (process.env.OMA_ENABLE_CODEX_SDK !== "1") {
+            const msg =
+              "codex-sdk harness is disabled on this deployment — it runs the " +
+              "OpenAI Codex CLI on the host and is intended for " +
+              "single-operator self-hosting. Set OMA_ENABLE_CODEX_SDK=1 to enable.";
+            c.runtime.broadcast({ type: "session.error", error: msg } as SessionEvent);
+            return Promise.reject(new Error(msg));
+          }
+          return codexSdk.run(c);
         }
         return def.run(c);
       },

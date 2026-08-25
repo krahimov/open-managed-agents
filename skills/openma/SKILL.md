@@ -87,6 +87,7 @@ The harness is the loop that drives the agent. Set per agent via
 |---------|-----------|
 | (default) | OMA's own loop: platform tools, MCP wiring, compaction, sub-agents |
 | `claude-agent-sdk` | Delegates the loop to headless Claude Code on the host. Subscription billing (CLAUDE_CODE_OAUTH_TOKEN) instead of API credits. Self-host only — gated behind `OMA_ENABLE_CLAUDE_AGENT_SDK=1`; never enable on a shared multi-tenant deploy. |
+| `codex-sdk` | Delegates the loop to the headless OpenAI Codex CLI on the host. ChatGPT/Codex subscription billing (`codex login`) instead of API credits. Best with OpenAI models (`gpt-*`, `o*`, `codex-*`; other ids fall back to the Codex default). Self-host only — gated behind `OMA_ENABLE_CODEX_SDK=1`; never enable on a shared multi-tenant deploy. No setup sessions or pinned access policies on this harness (fail-closed). |
 | `acp-proxy` | Proxies to a user-registered local ACP runtime (`_oma.runtime_binding` required) |
 
 ## Ambient Agents — schedules and event triggers
@@ -148,13 +149,15 @@ PUT /v1/agents/:id/grants/baseline
   `GET /v1/agents/:id/grants` returns the active baseline + history.
 - The policy is **pinned into the session snapshot at create time**: editing a
   grant affects sessions started afterward, never running ones.
-- Enforced on both harnesses (default loop and claude-agent-sdk).
+- Enforced on the default loop and claude-agent-sdk harnesses. The codex-sdk
+  harness cannot enforce per-tool policies and fails closed: sessions of a
+  policy-pinned agent are rejected there.
 
 ## Skills
 
 Store any SKILL.md and it auto-loads into the agent's sessions (attached via
 the agent's `skills` list; on the claude-agent-sdk harness they materialize as
-`.claude/skills/`):
+`.claude/skills/`, on codex-sdk as `skills/` indexed from AGENTS.md):
 
 ```
 POST /v1/skills            { "content": "<SKILL.md text>", "name": "optional" }

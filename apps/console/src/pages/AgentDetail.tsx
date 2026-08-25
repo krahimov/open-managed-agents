@@ -1160,6 +1160,7 @@ function EditAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void 
           >
             <option value="default">default — platform loop, model-card API billing</option>
             <option value="claude-agent-sdk">claude-agent-sdk — local Claude Code, subscription billing</option>
+            <option value="codex-sdk">codex-sdk — local OpenAI Codex, subscription billing</option>
             <option value="acp-proxy">acp-proxy — delegate to a registered local runtime</option>
           </select>
         </Field>

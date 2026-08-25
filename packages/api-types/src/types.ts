@@ -110,13 +110,22 @@ export interface AgentConfig {
    * returning raw content. Set this to opt into compressed tool results.
    */
   aux_model?: string | { id: string; speed?: "standard" | "fast" };
+  /**
+   * Which loop runs this agent's turns. "default" (unset) — OMA's platform
+   * loop, model-card API billing. "claude-agent-sdk" — headless Claude Code
+   * on the main-node host, Claude subscription billing (gated by
+   * OMA_ENABLE_CLAUDE_AGENT_SDK). "codex-sdk" — headless OpenAI Codex CLI on
+   * the main-node host, ChatGPT/Codex subscription billing (gated by
+   * OMA_ENABLE_CODEX_SDK). "acp-proxy" — delegate to a user-registered local
+   * runtime (see runtime_binding).
+   */
   harness?: string;
   /**
    * How hard the model should reason on this agent's turns. Default
    * (unset) = "instant" — no reasoning, the safe tier for every model.
    * See {@link ReasoningLevel} for the per-provider mapping. Applied by
    * the DefaultHarness; harnesses that delegate the loop elsewhere
-   * (claude-agent-sdk, acp-proxy) ignore it.
+   * (claude-agent-sdk, codex-sdk, acp-proxy) ignore it.
    */
   reasoning_level?: ReasoningLevel;
   /**

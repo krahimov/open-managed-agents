@@ -24,7 +24,7 @@ the platform handles sandboxed execution, credential management, and session sta
 - **Run agents ambiently** — standing rules wake an agent on a cron or an event (Slack, GitHub, Linear, webhook) with no human kicking it off
 - **Connect external services** via MCP servers (GitHub, Slack, Linear, Notion, etc.) with OAuth, plus hundreds more through Composio
 - **Control permissions** — versioned allow/ask/deny grants over every tool the agent can touch, enforced by the runtime
-- **Use any LLM** — Anthropic, OpenAI, or any OpenAI-compatible provider; or run through the claude-agent-sdk harness on a Claude subscription (self-host)
+- **Use any LLM** — Anthropic, OpenAI, or any OpenAI-compatible provider; or run through the claude-agent-sdk / codex-sdk harnesses on a Claude or ChatGPT subscription (self-host)
 - **Install skills** — store any SKILL.md (or import from GitHub) and it auto-loads into sessions
 - **Manage credentials** securely in vaults — agents get scoped access, secrets never leak
 - **Collaborate** — multi-user workspace with API key access for CLI/SDK integration
@@ -121,7 +121,9 @@ Newer surfaces (ambient rules, grants, skills, webhooks) live on the HTTP API
 - `agent_toolset_20260401` includes file ops, bash, web, schedule tools, and
   ambient-rule tools; `browser` is opt-in via toolset configs.
 - Harness: leave default unless the user runs self-host and asks for
-  subscription billing (`_oma.harness: "claude-agent-sdk"`, requires
-  `OMA_ENABLE_CLAUDE_AGENT_SDK=1` on the deployment).
+  subscription billing (`_oma.harness: "claude-agent-sdk"` for a Claude
+  subscription, requires `OMA_ENABLE_CLAUDE_AGENT_SDK=1`; or
+  `_oma.harness: "codex-sdk"` for a ChatGPT/Codex subscription with OpenAI
+  models, requires `OMA_ENABLE_CODEX_SDK=1`).
 - Sub-agents: `enable_general_subagent: true` for one-off delegation, or
   `multiagent.agents` roster for named collaborators.
