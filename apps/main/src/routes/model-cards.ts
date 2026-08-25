@@ -48,7 +48,8 @@ function toApiShape(card: ModelCardRow) {
  *   - "ant" / "anthropic" / "ant-compatible"  → POST {base}/v1/messages with
  *       max_tokens: 1, model: <model>, messages: [{role:user, content:"hi"}]
  *   - "oai" / "openai" / "oai-compatible"     → POST {base}/v1/chat/completions
- *       with max_completion_tokens: 1, model: <model>
+ *       with max_completion_tokens: 16, model: <model> (reasoning models
+ *       400 on a 1-token cap — budget is spent on reasoning first)
  *   - anything else                            → ok=null (skipped, can't probe)
  */
 async function probeModelCard(opts: {
@@ -83,7 +84,9 @@ async function probeModelCard(opts: {
     headers["authorization"] = `Bearer ${opts.apiKey}`;
     body = JSON.stringify({
       model: opts.model,
-      max_completion_tokens: 1,
+      // Reasoning models (gpt-5*) spend completion budget on reasoning
+      // before any output — a 1-token cap 400s even with a valid key.
+      max_completion_tokens: 16,
       messages: [{ role: "user", content: "hi" }],
     });
   }

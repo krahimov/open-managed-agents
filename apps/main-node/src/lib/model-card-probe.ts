@@ -43,7 +43,10 @@ export async function probeModelCard(opts: {
     headers["authorization"] = `Bearer ${opts.apiKey}`;
     body = JSON.stringify({
       model: opts.model,
-      max_completion_tokens: 1,
+      // Reasoning models (gpt-5*) spend completion budget on reasoning
+      // before any output — a 1-token cap makes them 400 with "max_tokens
+      // or model output limit was reached" even when the key is fine.
+      max_completion_tokens: 16,
       messages: [{ role: "user", content: "hi" }],
     });
   }

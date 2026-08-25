@@ -197,6 +197,11 @@ function cardSupportsReasoningLevel(card: ModelCard | undefined): boolean {
 const INITIAL_FORM = {
   name: "",
   model: "",
+  /** Execution loop. "default" = platform loop with model-card billing;
+   *  the SDK harnesses run headless Claude Code / Codex on the server host
+   *  and bill the host's subscription (self-host only, env-gated).
+   *  acp-proxy is not offered here — it's driven by the runtime binding. */
+  harness: "default" as "default" | "claude-agent-sdk" | "codex-sdk",
   reasoningLevel: "instant" as ReasoningLevelValue,
   /** `_oma.memory.mode`; "off" is the server default and is never sent. */
   memoryMode: "off" as MemoryMode,
@@ -1010,9 +1015,13 @@ export function AgentFormDialog({
       const ambientRuleBody = form.ambientEnabled ? buildAmbientRuleBody(form) : null;
       const defaultVaultIds = await ensureComposioCredentialForAgent();
       const mcpServers = mergedMcpServersForCreate();
+      // Subscription harnesses need no model card; an empty model falls back
+      // to "default", which matches neither harness's pass-through pattern so
+      // both use the subscription's own default model.
+      const subscriptionHarness = !form.runtimeId && form.harness !== "default";
       const payload: Record<string, unknown> = {
         name: form.name,
-        model: form.model,
+        model: subscriptionHarness ? form.model.trim() || "default" : form.model,
         system: form.system || undefined,
         description: form.description || undefined,
         tools: buildToolsField(),
@@ -1046,6 +1055,14 @@ export function AgentFormDialog({
               ? { local_skill_blocklist: form.localSkillBlocklist }
               : {}),
           },
+        };
+      }
+      // Subscription harness (claude-agent-sdk / codex-sdk) — mutually
+      // exclusive with the runtime-binding acp-proxy path above.
+      if (subscriptionHarness) {
+        payload._oma = {
+          ...((payload._oma as Record<string, unknown>) ?? {}),
+          harness: form.harness,
         };
       }
       // reasoning_level: only meaningful for cloud agents (local-runtime
@@ -1979,8 +1996,83 @@ function BasicTab({
           placeholder="Coding Assistant"
         />
       </div>
+      {/* Harness — which loop runs the agent. Hidden for local-runtime
+          agents (they're implicitly acp-proxy via the runtime binding). */}
+      {!form.runtimeId && (
+        <div>
+          <label htmlFor="agent-harness" className="text-sm text-fg-muted block mb-1">
+            Harness
+          </label>
+          <select
+            id="agent-harness"
+            value={form.harness}
+            onChange={(e) =>
+              setForm({ ...form, harness: e.target.value as typeof form.harness })
+            }
+            className={inputCls}
+          >
+            <option value="default">default — platform loop, model-card API billing</option>
+            <option value="claude-agent-sdk">
+              claude-agent-sdk — local Claude Code, subscription billing
+            </option>
+            <option value="codex-sdk">codex-sdk — local OpenAI Codex, subscription billing</option>
+          </select>
+          {form.harness !== "default" && (
+            <p className="text-xs text-fg-subtle mt-1">
+              Runs headless {form.harness === "codex-sdk" ? "Codex" : "Claude Code"} on the server
+              host and bills its {form.harness === "codex-sdk" ? "ChatGPT/Codex" : "Claude"}{" "}
+              subscription — no model card needed. Self-host only: requires{" "}
+              <code>
+                {form.harness === "codex-sdk"
+                  ? "OMA_ENABLE_CODEX_SDK=1"
+                  : "OMA_ENABLE_CLAUDE_AGENT_SDK=1"}
+              </code>{" "}
+              on the deployment.
+            </p>
+          )}
+        </div>
+      )}
+      {/* Subscription-harness model: free-text vendor model id, no card. */}
+      {!form.runtimeId && form.harness !== "default" && (
+        <div>
+          <label htmlFor="agent-sub-model" className="text-sm text-fg-muted block mb-1">
+            Model
+          </label>
+          <input
+            id="agent-sub-model"
+            value={form.model}
+            onChange={(e) => setForm({ ...form, model: e.target.value })}
+            className={inputCls}
+            placeholder={
+              form.harness === "codex-sdk"
+                ? "gpt-5.6-sol — blank = subscription default"
+                : "claude-sonnet-5 — blank = subscription default"
+            }
+          />
+          <div className="mt-2">
+            <label htmlFor="agent-sub-reasoning" className="text-sm text-fg-muted block mb-1">
+              Reasoning
+            </label>
+            <select
+              id="agent-sub-reasoning"
+              value={form.reasoningLevel}
+              onChange={(e) =>
+                setForm({ ...form, reasoningLevel: e.target.value as ReasoningLevelValue })
+              }
+              className={inputCls}
+            >
+              {REASONING_LEVEL_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>
+                  {opt.label} — {opt.hint}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+      )}
       {/* Model picker — see comments at the original call site. */}
       {!form.runtimeId &&
+        form.harness === "default" &&
         (modelCards.length === 0 ? (
           <p className="text-xs text-fg-subtle bg-bg-surface px-3 py-2 rounded-lg">
             No model cards configured. Cloud agents need at least one card to provide LLM
