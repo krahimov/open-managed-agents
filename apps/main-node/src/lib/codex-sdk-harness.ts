@@ -595,9 +595,21 @@ export class CodexSdkHarness {
             ...skillNames.map((n) => `  - ./skills/${n}/SKILL.md`),
           ].join("\n")
         : "";
+    // Observed live: the codex child sees the HOST OPERATOR's personal
+    // ~/.codex skills/AGENTS.md and follows them — e.g. an `openma` skill
+    // taught an agent to hunt for the `oma` CLI (absent in the workdir)
+    // instead of calling its oma_platform MCP tools. Draw the boundary
+    // explicitly; skills.enabled=false below trims the catalog too.
+    const platformNotes = [
+      "Platform notes:",
+      "- Anything under ~/.codex (skills, instructions, memories) is the host operator's",
+      "  personal setup, NOT part of this platform — ignore it.",
+      "- There is no `oma` CLI here. Platform actions (schedules/wake-ups, ambient rules,",
+      "  service access, skills) go through your oma_platform MCP tools.",
+    ].join("\n");
     const agentsMd = isSetup
       ? buildSetupPrompt(ctx.agent)
-      : [ctx.systemPrompt, materializedMemory.guidance, skillsGuidance]
+      : [ctx.systemPrompt, materializedMemory.guidance, skillsGuidance, platformNotes]
           .filter(Boolean)
           .join("\n\n");
     if (agentsMd) await writeFile(path.join(cwd, "AGENTS.md"), agentsMd, "utf8");
@@ -631,7 +643,13 @@ export class CodexSdkHarness {
       // Escape hatch when the vendored @openai/codex platform binary is
       // unavailable (e.g. its optional dependency failed to download).
       ...(process.env.OMA_CODEX_PATH ? { codexPathOverride: process.env.OMA_CODEX_PATH } : {}),
-      ...(Object.keys(mcpServers).length > 0 ? { config: { mcp_servers: mcpServers } } : {}),
+      config: {
+        // Keep the host operator's personal ~/.codex skill catalog out of
+        // agent sessions (see the platformNotes rationale above). OMA skills
+        // are unaffected — they ride <cwd>/skills + AGENTS.md.
+        skills: { enabled: false },
+        ...(Object.keys(mcpServers).length > 0 ? { mcp_servers: mcpServers } : {}),
+      },
     };
     const codex: CodexLike = this.#deps.createCodex
       ? this.#deps.createCodex(codexOptions)

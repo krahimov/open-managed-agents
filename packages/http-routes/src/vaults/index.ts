@@ -312,9 +312,12 @@ export async function getOrCreateComposioManagedAuthConfig(
   toolkitSlug: string,
 ): Promise<ComposioAuthConfig> {
   const slug = normalizeComposioToolkitSlug(toolkitSlug);
+  // No is_composio_managed filter: an existing CUSTOM auth config (user
+  // brought their own OAuth app via the Composio dashboard) is just as
+  // connectable — and for toolkits Composio has no managed app for
+  // (twitter/X), it's the ONLY way to connect.
   const params = new URLSearchParams({
     toolkit_slug: slug,
-    is_composio_managed: "true",
     limit: "50",
   });
   const listed = await composioRequest<{ items?: ComposioAuthConfig[] }>(
@@ -327,27 +330,44 @@ export async function getOrCreateComposioManagedAuthConfig(
   // LinkedIn). Only accept configs whose toolkit actually matches; a
   // truly unknown slug falls through to the create call below, which
   // fails loudly instead of misrouting.
-  const existing = (listed.items ?? []).find(
+  const matching = (listed.items ?? []).filter(
     (cfg) =>
       cfg.id &&
       cfg.status !== "DISABLED" &&
       normalizeComposioToolkitSlug(cfg.toolkit?.slug ?? "") === slug,
   );
+  const existing = matching.find((cfg) => cfg.is_composio_managed) ?? matching[0];
   if (existing) return existing;
 
-  const created = await composioRequest<{
-    auth_config?: ComposioAuthConfig;
-    toolkit?: { slug?: string };
-  }>(deps, "/api/v3.1/auth_configs", {
-    method: "POST",
-    body: JSON.stringify({
-      toolkit: { slug },
-    }),
-  });
-  if (!created.auth_config?.id) {
-    throw new Error("Composio auth config response did not include auth_config.id");
+  try {
+    const created = await composioRequest<{
+      auth_config?: ComposioAuthConfig;
+      toolkit?: { slug?: string };
+    }>(deps, "/api/v3.1/auth_configs", {
+      method: "POST",
+      body: JSON.stringify({
+        toolkit: { slug },
+      }),
+    });
+    if (!created.auth_config?.id) {
+      throw new Error("Composio auth config response did not include auth_config.id");
+    }
+    return created.auth_config;
+  } catch (err) {
+    // Composio code 306 (Auth_Config_DefaultAuthConfigNotFound): no managed
+    // OAuth app exists for this toolkit — the provider requires bring-your-
+    // own developer-app credentials (observed live with "twitter"/X).
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/DefaultAuthConfigNotFound|"code":\s*306/.test(msg)) {
+      throw new Error(
+        `Composio has no managed OAuth app for "${slug}" — this provider requires your own ` +
+          `developer-app credentials. Create an auth config for "${slug}" at app.composio.dev ` +
+          `→ Auth Configs (type "use_custom_auth" with your app's client_id/client_secret), ` +
+          `then click Connect again — it will be picked up automatically.`,
+      );
+    }
+    throw err;
   }
-  return created.auth_config;
 }
 
 export async function createComposioConnectedAccountLink(
