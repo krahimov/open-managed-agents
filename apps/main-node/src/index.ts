@@ -966,17 +966,37 @@ const sessionRegistry = new SessionRegistry({
       findSkills: (tenantId, query) => findSkillsForTenant(tenantId, query),
       requestSkill: (tenantId, agentId, sessionId, a) =>
         postSkillRequest(tenantId, agentId, sessionId, a),
+      // Self-scheduling — same NodeSessionWakeups singleton the DefaultHarness
+      // schedule tools use; the fired wakeup runs a normal turn on this harness.
+      scheduleWakeup: (tenantId, sessionId, agentId, a) =>
+        sessionWakeups.schedule({ tenantId, sessionId, agentId, ...a }),
+      cancelWakeup: (sessionId, id) => sessionWakeups.cancel(sessionId, id),
+      listWakeups: (sessionId) => sessionWakeups.list(sessionId),
     });
     // OpenAI sibling of the claude-agent-sdk harness — headless Codex CLI on
     // the host, billing to the ChatGPT/Codex subscription (`codex login`).
-    // No in-process MCP transport in the Codex SDK, so setup sessions and
-    // pinned policies are rejected inside the harness (fail-closed).
+    // Platform/setup tools ride a per-turn loopback MCP bridge; pinned
+    // policies are still rejected inside the harness (fail-closed).
     const codexSdk = new CodexSdkHarness({
       resolveMcpTarget: resolveNodeMcpProxyTarget,
       resolveSkills: (tenantId, refs) => skillStore.resolveRefs(tenantId, refs),
       memory: sdkMemoryPort,
       readSessionMetadata: async (tenantId, sessionId) =>
         (await sessionsService.get({ tenantId, sessionId }))?.metadata ?? null,
+      updateAgent: async (tenantId, agentId, patch) => {
+        return await agentsService.update({ tenantId, agentId, input: patch });
+      },
+      requestServiceAccess: (tenantId, sessionId, a) =>
+        postAccessRequest(tenantId, sessionId, a),
+      createAmbientRule: (tenantId, sessionId, agentId, a) =>
+        createAmbientRuleFromSession(tenantId, agentId, sessionId, a),
+      findSkills: (tenantId, query) => findSkillsForTenant(tenantId, query),
+      requestSkill: (tenantId, agentId, sessionId, a) =>
+        postSkillRequest(tenantId, agentId, sessionId, a),
+      scheduleWakeup: (tenantId, sessionId, agentId, a) =>
+        sessionWakeups.schedule({ tenantId, sessionId, agentId, ...a }),
+      cancelWakeup: (sessionId, id) => sessionWakeups.cancel(sessionId, id),
+      listWakeups: (sessionId) => sessionWakeups.list(sessionId),
     });
     return {
       run: (ctx: unknown) => {

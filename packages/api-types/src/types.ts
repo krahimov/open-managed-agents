@@ -124,8 +124,10 @@ export interface AgentConfig {
    * How hard the model should reason on this agent's turns. Default
    * (unset) = "instant" — no reasoning, the safe tier for every model.
    * See {@link ReasoningLevel} for the per-provider mapping. Applied by
-   * the DefaultHarness; harnesses that delegate the loop elsewhere
-   * (claude-agent-sdk, codex-sdk, acp-proxy) ignore it.
+   * the DefaultHarness (provider reasoning-effort / thinking budgets), the
+   * claude-agent-sdk harness (SDK effort / thinking-disabled), and the
+   * codex-sdk harness (modelReasoningEffort). acp-proxy ignores it — the
+   * local runtime owns its own model settings.
    */
   reasoning_level?: ReasoningLevel;
   /**

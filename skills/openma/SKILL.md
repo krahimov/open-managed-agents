@@ -87,7 +87,7 @@ The harness is the loop that drives the agent. Set per agent via
 |---------|-----------|
 | (default) | OMA's own loop: platform tools, MCP wiring, compaction, sub-agents |
 | `claude-agent-sdk` | Delegates the loop to headless Claude Code on the host. Subscription billing (CLAUDE_CODE_OAUTH_TOKEN) instead of API credits. Self-host only — gated behind `OMA_ENABLE_CLAUDE_AGENT_SDK=1`; never enable on a shared multi-tenant deploy. |
-| `codex-sdk` | Delegates the loop to the headless OpenAI Codex CLI on the host. ChatGPT/Codex subscription billing (`codex login`) instead of API credits. Best with OpenAI models (`gpt-*`, `o*`, `codex-*`; other ids fall back to the Codex default). Self-host only — gated behind `OMA_ENABLE_CODEX_SDK=1`; never enable on a shared multi-tenant deploy. No setup sessions or pinned access policies on this harness (fail-closed). |
+| `codex-sdk` | Delegates the loop to the headless OpenAI Codex CLI on the host. ChatGPT/Codex subscription billing (`codex login`) instead of API credits. Best with OpenAI models (`gpt-*`, `o*`, `codex-*`; other ids fall back to the Codex default — note Codex-on-ChatGPT only serves its own allowlisted models). Setup sessions, platform tools, and self-scheduling work via a loopback MCP bridge. Self-host only — gated behind `OMA_ENABLE_CODEX_SDK=1`; never enable on a shared multi-tenant deploy. Pinned access policies are rejected (fail-closed). |
 | `acp-proxy` | Proxies to a user-registered local ACP runtime (`_oma.runtime_binding` required) |
 
 ## Ambient Agents — schedules and event triggers

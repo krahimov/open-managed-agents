@@ -191,6 +191,21 @@ export interface ClaudeAgentSdkHarnessDeps {
     sessionId: string,
     args: { skill_name: string; reason: string },
   ) => Promise<{ request_id: string; status: string; note?: string }>;
+  /** Self-scheduling (the `schedule` / `cancel_schedule` / `list_schedules`
+   *  tools) — backed by NodeSessionWakeups. The fired wakeup enqueues a
+   *  synthetic user message that runs a normal turn on this harness, so
+   *  SDK-harness agents can self-schedule follow-ups like DefaultHarness
+   *  agents do. */
+  scheduleWakeup?: (
+    tenantId: string,
+    sessionId: string,
+    agentId: string,
+    args: { delay_seconds?: number; at?: string; cron?: string; prompt: string },
+  ) => Promise<{ id: string; fire_at?: string; cron?: string; kind: "one_shot" | "cron" }>;
+  cancelWakeup?: (sessionId: string, id: string) => Promise<{ cancelled: boolean }>;
+  listWakeups?: (
+    sessionId: string,
+  ) => Promise<Array<{ id: string; fire_at?: string; cron?: string; prompt: string; kind: "one_shot" | "cron" }>>;
 }
 
 function workdirFor(sessionId: string): string {
@@ -508,6 +523,76 @@ export class ClaudeAgentSdkHarness {
       );
     }
 
+    if (this.#deps.scheduleWakeup) {
+      tools.push(
+        tool(
+          "schedule",
+          "Schedule a future wake-up of THIS session: at the given time (or on the given cron), the " +
+            "platform injects `prompt` as a new user message and you run a normal turn on it. Use for " +
+            "self-scheduled follow-ups (\"check the deploy in 10 minutes\", \"poll until the PR is merged\"). " +
+            "Pass exactly one of delay_seconds, at, or cron.",
+          {
+            delay_seconds: z.number().int().min(5).max(604800).optional()
+              .describe("Fire once, N seconds from now (5s – 7 days)"),
+            at: z.string().optional().describe("Fire once at this ISO-8601 datetime"),
+            cron: z.string().optional().describe('Fire repeatedly on this 5-field cron (e.g. "*/15 * * * *")'),
+            prompt: z.string().min(1).max(4000)
+              .describe("The message future-you receives when the wake-up fires — the task, written to future-you"),
+          } as unknown as SdkToolSchema,
+          async (args) => {
+            const a = args as { delay_seconds?: number; at?: string; cron?: string; prompt?: string };
+            if (!a.prompt?.trim()) {
+              return { content: [{ type: "text" as const, text: "prompt is required" }], isError: true };
+            }
+            try {
+              const result = await this.#deps.scheduleWakeup!(tenantId, sessionId, ctx.agent.id, {
+                delay_seconds: a.delay_seconds,
+                at: a.at,
+                cron: a.cron,
+                prompt: a.prompt,
+              });
+              return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+            } catch (err) {
+              return {
+                content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }],
+                isError: true,
+              };
+            }
+          },
+        ),
+      );
+      if (this.#deps.cancelWakeup) {
+        tools.push(
+          tool(
+            "cancel_schedule",
+            "Cancel a pending wake-up created with the schedule tool.",
+            { id: z.string().describe("Schedule id returned by the schedule tool") } as unknown as SdkToolSchema,
+            async (args) => {
+              const a = args as { id?: string };
+              if (!a.id?.trim()) {
+                return { content: [{ type: "text" as const, text: "id is required" }], isError: true };
+              }
+              const result = await this.#deps.cancelWakeup!(sessionId, a.id);
+              return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
+            },
+          ),
+        );
+      }
+      if (this.#deps.listWakeups) {
+        tools.push(
+          tool(
+            "list_schedules",
+            "List this session's pending wake-ups.",
+            {} as unknown as SdkToolSchema,
+            async () => {
+              const schedules = await this.#deps.listWakeups!(sessionId);
+              return { content: [{ type: "text" as const, text: JSON.stringify({ schedules }) }] };
+            },
+          ),
+        );
+      }
+    }
+
     return createSdkMcpServer({
       name: "oma_platform",
       version: "1",
@@ -534,6 +619,17 @@ export class ClaudeAgentSdkHarness {
       typeof ctx.agent.model === "string" && ctx.agent.model.startsWith("claude")
         ? ctx.agent.model
         : undefined;
+
+    // reasoning_level → SDK thinking controls, mirroring the DefaultHarness
+    // mapping (provider.ts): instant disables thinking; low/medium/high/max
+    // map 1:1 onto the SDK's EffortLevel. Unset = SDK default ("high").
+    const level = ctx.agent.reasoning_level;
+    const reasoningOptions =
+      level === "instant"
+        ? { thinking: { type: "disabled" as const } }
+        : level
+          ? { effort: level }
+          : {};
 
     const mcpServers = await this.#mcpServersFor(ctx, sessionId);
 
@@ -622,6 +718,7 @@ export class ClaudeAgentSdkHarness {
           abortController: abort,
           resume: sdkSessions.get(sessionId),
           model,
+          ...reasoningOptions,
           mcpServers: mcpServersForTurn,
           systemPrompt: isSetup
             ? buildSetupPrompt(ctx.agent)

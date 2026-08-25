@@ -173,16 +173,45 @@ describe("CodexSdkHarness.run", () => {
     expect(calls.started).toHaveLength(0); // never reached the codex child
   });
 
-  it("rejects setup sessions with guidance (no in-process toolset)", async () => {
-    const calls = { started: [] as unknown[], resumed: [] };
+  it("maps reasoning_level onto codex modelReasoningEffort", async () => {
+    const events: ThreadEvent[] = [
+      { type: "thread.started", thread_id: "thr-r" },
+      { type: "item.completed", item: { id: "item_0", type: "agent_message", text: "ok" } },
+    ];
+    const calls = { started: [] as unknown[], resumed: [] as Array<{ id: string; options: unknown }> };
+    const harness = new CodexSdkHarness({ createCodex: () => fakeCodex(events, calls) });
+    const { ctx } = makeCtx({ agent: { id: "agent-1", model: "gpt-5.2", reasoning_level: "max" } });
+
+    await harness.run(ctx);
+    expect((calls.started[0] as { modelReasoningEffort?: string }).modelReasoningEffort).toBe("xhigh");
+  });
+
+  it("runs setup sessions over the MCP bridge (read-only sandbox, oma_platform server)", async () => {
+    const events: ThreadEvent[] = [
+      { type: "thread.started", thread_id: "thr-setup" },
+      { type: "item.completed", item: { id: "item_0", type: "agent_message", text: "let's configure you" } },
+    ];
+    const calls = { started: [] as unknown[], resumed: [] as Array<{ id: string; options: unknown }> };
+    const codexOptionsSeen: Array<Record<string, unknown>> = [];
     const harness = new CodexSdkHarness({
-      createCodex: () => fakeCodex([], calls),
+      createCodex: (options) => {
+        codexOptionsSeen.push(options as Record<string, unknown>);
+        return fakeCodex(events, calls);
+      },
       readSessionMetadata: async () => ({ oma_setup: true }),
+      updateAgent: async () => ({ id: "agent-1", name: "updated" }) as never,
     });
     const { ctx, broadcasts } = makeCtx();
 
-    await expect(harness.run(ctx)).rejects.toThrow(/Setup sessions/);
-    expect(broadcasts.some((b) => b.type === "session.error")).toBe(true);
-    expect(calls.started).toHaveLength(0);
+    await harness.run(ctx);
+
+    expect(broadcasts.some((b) => b.type === "session.error")).toBe(false);
+    expect((calls.started[0] as { sandboxMode?: string }).sandboxMode).toBe("read-only");
+    const config = codexOptionsSeen[0]?.config as
+      | { mcp_servers?: Record<string, { url: string; http_headers: Record<string, string> }> }
+      | undefined;
+    const bridgeEntry = config?.mcp_servers?.oma_platform;
+    expect(bridgeEntry?.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
+    expect(bridgeEntry?.http_headers.Authorization).toMatch(/^Bearer /);
   });
 });
