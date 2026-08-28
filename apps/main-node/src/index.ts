@@ -85,6 +85,8 @@ import {
   buildAgentRoutes,
   buildVaultRoutes,
   listComposioToolkits,
+  createComposioToolRouterSession,
+  listComposioConnectedAccounts,
   buildSessionRoutes,
   buildDeploymentRoutes,
   buildPublicGatewayRoutes,
@@ -1616,6 +1618,144 @@ v1.get("/usage", async (c) => {
   const until = Number(c.req.query("until")) || Date.now();
   const since = Number(c.req.query("since")) || until - 30 * 86400000;
   return c.json(await usageTracker.report(c.var.tenant_id, since, until));
+});
+
+// POST /v1/sessions/:id/composio/graft { toolkit, vault_id } — after a
+// Composio access grant, attach the connection to the session's AGENT.
+// The connect card only puts the account in a vault; an agent created with
+// no Composio wiring (no tool-router mcp_server, no default_vault_ids)
+// otherwise never sees the toolkit's tools — observed live: LinkedIn OAuth
+// succeeded but every session, including scheduled ones, had zero LinkedIn
+// actions. Ensures a tool-router credential covering the toolkit exists in
+// the vault, adds the composio mcp_server to the agent, and links the vault.
+v1.post("/sessions/:id/composio/graft", async (c) => {
+  const tenantId = c.var.tenant_id;
+  const sessionId = c.req.param("id");
+  const body = await c.req
+    .json<{ toolkit?: string; vault_id?: string }>()
+    .catch(() => ({}) as { toolkit?: string; vault_id?: string });
+  const toolkit = (body.toolkit ?? "").trim().toLowerCase();
+  const vaultId = (body.vault_id ?? "").trim();
+  if (!toolkit || !vaultId) {
+    return c.json({ error: "toolkit and vault_id are required" }, 400);
+  }
+  const session = await sessionsService.get({ tenantId, sessionId });
+  if (!session?.agent_id) return c.json({ error: "Session has no agent" }, 404);
+  const agent = await agentsService.get({ tenantId, agentId: session.agent_id });
+  if (!agent) return c.json({ error: "Agent not found" }, 404);
+
+  const metadata = { ...((agent.metadata as Record<string, unknown> | null) ?? {}) };
+  const priorToolkits = Array.isArray(metadata.composio_toolkits)
+    ? metadata.composio_toolkits.filter((t): t is string => typeof t === "string")
+    : [];
+  const toolkits = [...new Set([...priorToolkits, toolkit])];
+
+  // Vault: (re)provision the tool-router credential, binding the toolkits'
+  // ACTIVE connected accounts. Always re-provision after a grant: a session
+  // created before the OAuth completed (the link route re-provisions at
+  // LINK time, minutes before the popup finishes) treats the toolkit as
+  // unconnected forever — observed live: linkedin account ACTIVE, yet the
+  // router session reported "no active LinkedIn authentication".
+  const key = await composioKeyForTenant(tenantId).catch(() => null);
+  if (!key) {
+    return c.json({ error: "No Composio API key configured for this workspace" }, 503);
+  }
+  const creds = await credentialService.list({ tenantId, vaultId });
+  const active = creds.find(
+    (cr) =>
+      !cr.archived_at &&
+      (cr as unknown as { auth?: { type?: string } }).auth?.type === "composio_mcp",
+  );
+  const activeAuth = active
+    ? (active as unknown as {
+        auth: { composio_user_id?: string; composio_toolkits?: string[] };
+      }).auth
+    : null;
+  const composioUserId = activeAuth?.composio_user_id || `oma:${tenantId}:${vaultId}`;
+  const allToolkits = [
+    ...new Set([
+      ...(activeAuth?.composio_toolkits ?? []).map((t) => t.toLowerCase()),
+      ...toolkits,
+    ]),
+  ];
+  const accountList = await listComposioConnectedAccounts(
+    { apiKey: key.apiKey },
+    { userId: composioUserId },
+  ).catch(() => ({ items: [] as Array<never> }));
+  const connectedAccounts: Record<string, string> = {};
+  for (const acct of accountList.items as Array<{
+    id: string;
+    status?: string;
+    toolkit?: { slug?: string };
+  }>) {
+    const slug = (acct.toolkit?.slug ?? "").toLowerCase();
+    // Newest-first listing: keep the first ACTIVE account per toolkit.
+    if (slug && acct.status === "ACTIVE" && allToolkits.includes(slug) && !connectedAccounts[slug]) {
+      connectedAccounts[slug] = acct.id;
+    }
+  }
+  const routerSession = await createComposioToolRouterSession(
+    { apiKey: key.apiKey },
+    {
+      user_id: composioUserId,
+      toolkits: { enable: allToolkits },
+      ...(Object.keys(connectedAccounts).length > 0
+        ? { connected_accounts: connectedAccounts }
+        : {}),
+    },
+  );
+  await credentialService.create({
+    tenantId,
+    vaultId,
+    displayName: active?.display_name ?? `Composio Tool Router (${agent.name})`,
+    auth: {
+      type: "composio_mcp",
+      mcp_server_url: routerSession.mcp.url,
+      // Same shape the composio_tool_router_session route stores: env
+      // pointer for the platform key, raw key for a tenant-level one.
+      ...(key.source === "platform"
+        ? { api_key_env: "COMPOSIO_API_KEY" }
+        : { api_key: key.apiKey }),
+      composio_user_id: composioUserId,
+      composio_session_id: routerSession.session_id,
+      composio_toolkits: allToolkits,
+      ...(Object.keys(connectedAccounts).length > 0
+        ? { composio_connected_account_ids: Object.values(connectedAccounts) }
+        : {}),
+    },
+  });
+  if (active) {
+    await credentialService
+      .archive({ tenantId, vaultId, credentialId: active.id })
+      .catch(() => {});
+  }
+  const credentialCreated = true;
+
+  // Agent: tool-router mcp_server + vault link + toolkit list.
+  const servers = [...(agent.mcp_servers ?? [])];
+  const hasComposio = servers.some(
+    (s) => typeof s?.url === "string" && s.url.includes("composio.dev/tool_router"),
+  );
+  if (!hasComposio) {
+    servers.push({ name: "composio", type: "url", url: COMPOSIO_TOOL_ROUTER_URL });
+  }
+  const vaultIds = Array.isArray(metadata.default_vault_ids)
+    ? metadata.default_vault_ids.filter((v): v is string => typeof v === "string")
+    : [];
+  metadata.default_vault_ids = [...new Set([...vaultIds, vaultId])];
+  metadata.composio_toolkits = allToolkits;
+  await agentsService.update({
+    tenantId,
+    agentId: agent.id,
+    input: { mcp_servers: servers, metadata },
+  });
+  return c.json({
+    ok: true,
+    attached_server: !hasComposio,
+    credential_created: credentialCreated,
+    toolkits: allToolkits,
+    connected_accounts: connectedAccounts,
+  });
 });
 
 // GET /v1/agents/:id/evidence/approvals — grant version lineage with

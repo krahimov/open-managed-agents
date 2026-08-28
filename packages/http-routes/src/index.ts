@@ -16,7 +16,12 @@ export { resolveServices } from "./types";
 export { buildAgentRoutes } from "./agents";
 export type { AgentRoutesDeps } from "./agents";
 
-export { buildVaultRoutes, listComposioToolkits } from "./vaults";
+export {
+  buildVaultRoutes,
+  listComposioToolkits,
+  createComposioToolRouterSession,
+  listComposioConnectedAccounts,
+} from "./vaults";
 export type { VaultRoutesDeps } from "./vaults";
 
 export { buildSessionRoutes } from "./sessions";

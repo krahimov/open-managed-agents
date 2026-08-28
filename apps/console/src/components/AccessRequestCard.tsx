@@ -60,13 +60,37 @@ export function AccessRequestCard({
   const [error, setError] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState("");
   const notifiedRef = useRef(false);
+  /** Vault the Composio account landed in — needed post-OAuth to graft the
+   *  connection onto the session's agent (tool-router server + vault link). */
+  const vaultIdRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (status !== "connecting") return;
-    const complete = () => {
+    const complete = async () => {
       if (notifiedRef.current) return;
       notifiedRef.current = true;
       setStatus("connected");
+      // Graft the connection onto the session's AGENT (tool-router
+      // mcp_server + vault link + toolkit list). Without this, an agent
+      // created with no Composio wiring never sees the toolkit's tools —
+      // in this session or any future one, scheduled sessions included.
+      // Best-effort: the OAuth grant itself already succeeded.
+      let attachedServer = false;
+      if (!isMcpOauth && vaultIdRef.current) {
+        try {
+          const graft = await api<{ attached_server?: boolean }>(
+            `/v1/sessions/${sessionId}/composio/graft`,
+            {
+              method: "POST",
+              body: JSON.stringify({ toolkit: service, vault_id: vaultIdRef.current }),
+              silentErrors: true,
+            },
+          );
+          attachedServer = graft.attached_server === true;
+        } catch {
+          // agent stays unwired; the message below falls back to the nudge
+        }
+      }
       // Tell the agent — a plain user.message wakes the turn loop the same
       // way a typed reply would, so it picks the task back up.
       void api(`/v1/sessions/${sessionId}/events`, {
@@ -86,7 +110,9 @@ export function AccessRequestCard({
                   // for a Drive upload instead of re-querying Composio).
                   text: isMcpOauth
                     ? `[access granted] ${service} is now connected — continue where you left off.`
-                    : `[access granted] ${service} is now connected. Your available actions have changed: re-run COMPOSIO_SEARCH_TOOLS for ${service} to discover its tools (do not assume earlier "no tools found" results still hold), then continue where you left off.`,
+                    : attachedServer
+                      ? `[access granted] ${service} is now connected and its toolkit was attached to this agent. This running session may not expose the new tools yet — NEW sessions of this agent (including scheduled ones) will have them. Re-run COMPOSIO_SEARCH_TOOLS for ${service} to check what's visible here, then continue where you left off.`
+                      : `[access granted] ${service} is now connected. Your available actions have changed: re-run COMPOSIO_SEARCH_TOOLS for ${service} to discover its tools (do not assume earlier "no tools found" results still hold), then continue where you left off.`,
                 },
               ],
             },
@@ -103,11 +129,11 @@ export function AccessRequestCard({
       ).data;
       if (data?.type === "composio_auth_complete") {
         if (data.toolkit && data.toolkit.toLowerCase() !== service) return;
-        complete();
+        void complete();
       } else if (data?.type === "oauth_complete") {
         // MCP OAuth callback reports the provider's display name — accept any
         // completion that lands while THIS card is the one connecting.
-        complete();
+        void complete();
       } else if (data?.type === "oauth_error") {
         // Popup-side failure (discovery, missing preset app, token exchange,
         // provider proxy state) — surface it on the card instead of leaving
@@ -219,6 +245,7 @@ export function AccessRequestCard({
       const popup = window.open("", `composio-${service}`, "width=600,height=720,popup=yes");
       try {
         const vault = await ensureVault();
+        vaultIdRef.current = vault.id;
         const callbackUrl = `${window.location.origin}/composio/callback?toolkit=${encodeURIComponent(service)}`;
         const link = await api<{ redirect_url: string }>(
           `/v1/vaults/${vault.id}/credentials/composio_accounts/link`,
