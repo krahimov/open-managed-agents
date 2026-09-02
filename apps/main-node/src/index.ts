@@ -151,7 +151,11 @@ import {
   environmentMemoryStoreRefs,
   sandboxProviderFromEnvironment,
 } from "./lib/environment-runtime-config.js";
-import { buildNodeOAuthRoutes, type GrantNotification } from "./lib/node-oauth-routes.js";
+import {
+  buildNodeOAuthRoutes,
+  describeOAuthAppRequirement,
+  type GrantNotification,
+} from "./lib/node-oauth-routes.js";
 import {
   forwardNodeMcpRequestWithRefresh,
   type NodeMcpProxyRefresh,
@@ -1579,6 +1583,22 @@ async function postAccessRequest(
       : "composio";
   const key =
     authKind === "composio" ? await composioKeyForTenant(tenantId).catch(() => null) : null;
+  // Providers without Dynamic Client Registration (Slack, GitHub) need a
+  // one-time OAuth app before the popup can work — tell the card (guided
+  // setup) and the agent (so it sets the user's expectations) up front.
+  const oauthApp =
+    authKind === "mcp_oauth" && mcpServerUrl
+      ? await Promise.race([
+          describeOAuthAppRequirement({
+            deps: { services, env: process.env },
+            tenantId,
+            mcpServerUrl,
+            baseUrl: process.env.PUBLIC_BASE_URL ?? `http://localhost:${port}`,
+          }).catch(() => null),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 6000)),
+        ])
+      : null;
+  const needsAppSetup = !!oauthApp?.required && !oauthApp.configured;
   const requestId = `acreq-${generateEventId().replace(/^sevt-/, "")}`;
   await sessionRouter.appendEvent(sessionId, {
     type: "system.access_request",
@@ -1589,12 +1609,15 @@ async function postAccessRequest(
     auth_kind: authKind,
     ...(mcpServerUrl ? { mcp_server_url: mcpServerUrl } : {}),
     ...(authKind === "composio" ? { composio_configured: !!key } : {}),
+    ...(oauthApp?.required ? { oauth_app: oauthApp } : {}),
   } as SessionEvent);
   const note =
     authKind === "llm_provider"
       ? `"${service}" is a model provider, not a connectable app — its key belongs in Console → Model Cards, and the user has been pointed there. Don't wait on an OAuth grant; continue other work.`
       : authKind === "mcp_api_key"
         ? `"${service}" authenticates with an API key, not OAuth. The user is being asked to paste the key into the credential vault (it never enters this conversation) — you'll receive a message when it's saved.`
+        : needsAppSetup
+          ? `Connect card for "${service}" posted, but ${oauthApp?.label ?? service} requires a one-time OAuth app registration first (its MCP server has no automatic client registration). The card walks the user through creating the app and pasting its Client ID/Secret — tell the user it's a one-time setup step, then wait; you'll receive a message when access is granted.`
         : authKind === "mcp_oauth" || key
           ? `Connect card for "${service}" posted to the user's session view. You'll receive a message when access is granted — continue any work that doesn't need it, or end your turn and wait.`
           : `Request posted, but this workspace has no Composio account connected yet — the user is being guided to connect one (Console → Apps) before authorizing "${service}".`;

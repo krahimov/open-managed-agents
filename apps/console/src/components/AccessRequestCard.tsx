@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { useApi } from "../lib/api";
 import { Button } from "@/components/ui/button";
 import type { Event } from "../lib/events";
+import { OAuthAppSetupPanel, type OAuthAppRequirement } from "./OAuthAppSetupPanel";
 
 /**
  * Agent-initiated credential request — rendered when the agent calls its
@@ -52,6 +53,8 @@ export function AccessRequestCard({
      *  actually authenticates. Absent on events from older deploys —
      *  fall back to the pre-classification behavior then. */
     auth_kind?: "mcp_oauth" | "mcp_api_key" | "llm_provider" | "composio";
+    /** Server-side discovery: provider needs a one-time OAuth app first. */
+    oauth_app?: OAuthAppRequirement;
   };
   const service = (ev.service ?? "service").toLowerCase();
   const isMcpOauth =
@@ -65,6 +68,13 @@ export function AccessRequestCard({
   );
   const [error, setError] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState("");
+  // One-time OAuth-app requirement (Slack, GitHub…). Seeded from the event
+  // (postAccessRequest discovers it up front); also learned late from the
+  // popup's `oauth_app_required` error for events from older deploys.
+  const [appReq, setAppReq] = useState<OAuthAppRequirement | null>(
+    ev.oauth_app && ev.oauth_app.required ? ev.oauth_app : null,
+  );
+  const [savingApp, setSavingApp] = useState(false);
   const notifiedRef = useRef(granted);
 
   // Durable state wins over local popup bookkeeping: once the server has
@@ -135,11 +145,24 @@ export function AccessRequestCard({
         if (done.request_id && ev.request_id && done.request_id !== ev.request_id) return;
         complete({ grantRecorded: done.grant_recorded === true });
       } else if (data?.type === "oauth_error") {
-        // Popup-side failure (discovery, missing preset app, token exchange,
-        // provider proxy state) — surface it on the card instead of leaving
-        // "Waiting for provider…" forever.
+        const err = data as {
+          message?: string;
+          code?: string;
+          provider?: OAuthAppRequirement;
+        };
+        if (err.code === "oauth_app_required" && err.provider) {
+          // Not a failure the user can retry — switch the card into the
+          // guided one-time app setup.
+          setAppReq(err.provider);
+          setError(null);
+          setStatus("pending");
+          return;
+        }
+        // Popup-side failure (discovery, token exchange, provider proxy
+        // state) — surface it on the card instead of leaving "Waiting for
+        // provider…" forever.
         setStatus("error");
-        setError((data as { message?: string }).message ?? "Provider authentication failed");
+        setError(err.message ?? "Provider authentication failed");
       }
     };
     window.addEventListener("message", handle);
@@ -272,6 +295,27 @@ export function AccessRequestCard({
   };
 
   const composioUnavailable = !isMcpOauth && ev.composio_configured === false;
+  const needsAppSetup =
+    isMcpOauth && status !== "connected" && !!appReq?.required && !appReq.configured;
+
+  const saveOAuthApp = async (clientId: string, clientSecret: string) => {
+    if (!appReq) return;
+    setSavingApp(true);
+    setError(null);
+    try {
+      await api("/v1/oauth/apps", {
+        method: "PUT",
+        body: JSON.stringify({ issuer: appReq.issuer, client_id: clientId, client_secret: clientSecret }),
+      });
+      setAppReq({ ...appReq, configured: true, source: "tenant" });
+      toast.success(`${appReq.label} app saved — continuing to ${appReq.label}…`);
+      await connect();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `Failed to save the ${appReq.label} app`);
+    } finally {
+      setSavingApp(false);
+    }
+  };
 
   return (
     <div className="max-w-2xl border border-border rounded-lg bg-bg-surface px-4 py-3">
@@ -292,6 +336,8 @@ export function AccessRequestCard({
           <Button asChild variant="outline" size="sm">
             <Link to="/integrations/apps">Connect Composio first</Link>
           </Button>
+        ) : needsAppSetup ? (
+          <span className="text-xs font-medium text-warning whitespace-nowrap">Setup required</span>
         ) : (
           <Button size="sm" onClick={connect} disabled={status === "connecting"}>
             {status === "connecting" ? "Waiting for provider…" : `Connect ${service}`}
@@ -318,6 +364,9 @@ export function AccessRequestCard({
             {status === "connecting" ? "Saving…" : "Save to vault"}
           </Button>
         </form>
+      )}
+      {needsAppSetup && appReq && (
+        <OAuthAppSetupPanel requirement={appReq} saving={savingApp} onSave={saveOAuthApp} />
       )}
       {error && <div className="mt-2 text-xs text-danger">{error}</div>}
       <div className="mt-2 text-[11px] text-fg-subtle">
