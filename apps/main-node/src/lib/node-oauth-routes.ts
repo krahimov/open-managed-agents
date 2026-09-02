@@ -567,7 +567,7 @@ function presetForIssuer(issuer: string):
     },
     {
       label: "Slack",
-      test: /^https:\/\/slack\.com\/?$/,
+      test: /^https:\/\/(mcp\.)?slack\.com\/?$/,
       clientIdEnv: "SLACK_OAUTH_CLIENT_ID",
       clientSecretEnv: "SLACK_OAUTH_CLIENT_SECRET",
     },
