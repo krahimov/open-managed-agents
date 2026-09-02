@@ -153,6 +153,13 @@ export interface ClaudeAgentSdkHarnessDeps {
   findCredentialVault?: (tenantId: string, mcpServerUrl: string) => Promise<string | null>;
   /** Attach a vault to an agent's default vaults (idempotent). */
   attachVaultToAgent?: (tenantId: string, agentId: string, vaultId: string) => Promise<void>;
+  /** Setup sessions: reconcile the servers already on the harness (cards /
+   *  vault attach) once and return the status block for the preamble. */
+  setupAccessStatus?: (
+    tenantId: string,
+    sessionId: string,
+    agent: AgentConfig,
+  ) => Promise<string | undefined>;
   /**
    * Create a standing ambient rule on the session's agent (the
    * `create_ambient_rule` tool). Main-node wires this to the same
@@ -612,7 +619,15 @@ export class ClaudeAgentSdkHarness {
           model,
           mcpServers: mcpServersForTurn,
           systemPrompt: isSetup
-            ? buildSetupPrompt(ctx.agent)
+            ? buildSetupPrompt(ctx.agent, {
+                accessStatus: this.#deps.setupAccessStatus
+                  ? await this.#deps.setupAccessStatus(
+                      ctx.tenant_id ?? "default",
+                      ctx.session_id ?? "",
+                      ctx.agent,
+                    )
+                  : undefined,
+              })
             : {
                 type: "preset",
                 preset: "claude_code",

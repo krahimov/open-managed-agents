@@ -44,7 +44,10 @@ export function harnessView(agent: AgentConfig): Record<string, unknown> {
  *  acts as a config designer refining ITS OWN harness, not a working agent.
  *  The current harness is embedded so the agent can "scan its own harness"
  *  and clarify what the user wants. */
-export function buildSetupPrompt(agent: AgentConfig): string {
+export function buildSetupPrompt(
+  agent: AgentConfig,
+  opts: { accessStatus?: string } = {},
+): string {
   return [
     "You are an OMA agent that was just created and is now in SETUP MODE — a planning conversation to dial in your own configuration (your \"harness\") before you start doing real work.",
     "",
@@ -75,7 +78,24 @@ export function buildSetupPrompt(agent: AgentConfig): string {
     "5. When the user is satisfied, confirm your harness is set and that you're ready to run — but ONLY once every MCP server you added is connected. You receive a \"[access granted] <name>\" message per server; until then, say which connections are still pending in the setup panel instead of claiming you're ready.",
     "",
     "Never invent credentials or secrets, and never ask the user to paste keys or tokens in chat. Adding an MCP server with update_harness automatically posts its connect card in the setup panel; never tell the user authentication will happen \"afterward\" — it happens right here, and you must wait for the grant messages.",
+    ...(opts.accessStatus
+      ? [
+          "",
+          "CONNECTION STATUS of the MCP servers already on your harness (checked by the platform when this setup started):",
+          opts.accessStatus,
+          "Servers marked \"connect card posted\" are waiting on the user in the setup panel — mention that in your first reply, and never claim you're ready to run until you've received an \"[access granted] <name>\" message for each of them.",
+        ]
+      : []),
   ].join("\n");
+}
+
+/** Prompt block for the setup preamble: one line per server. */
+export function describeSetupAccessStatus(r: AutoAccessResult): string {
+  const lines: string[] = [];
+  for (const name of r.connected) lines.push(`- ${name}: connected (existing credential verified, vault attached)`);
+  for (const x of r.requested) lines.push(`- ${x.name}: connect card posted — waiting for the user${x.note && /one-time/i.test(x.note) ? " (needs a one-time app setup; the card guides them)" : ""}`);
+  for (const name of r.failed) lines.push(`- ${name}: could not post a connect card — call request_access for it`);
+  return lines.join("\n");
 }
 
 /** Per-session previous harness view, so consecutive update_harness calls

@@ -71,7 +71,12 @@ import { generateEventId, extractTextFromContent, extractTraceFacts } from "@ope
 import type { TraceFacts } from "@open-managed-agents/shared";
 import { DefaultHarness } from "@open-managed-agents/agent/harness/default-loop";
 import { ClaudeAgentSdkHarness } from "./lib/claude-agent-sdk-harness.js";
-import { buildSetupPrompt, buildSetupTools } from "./lib/setup-harness.js";
+import {
+  buildSetupPrompt,
+  buildSetupTools,
+  autoRequestAccessForNewServers,
+  describeSetupAccessStatus,
+} from "./lib/setup-harness.js";
 import { ALL_TOOLS, buildTools, getEnabledTools } from "@open-managed-agents/agent/harness/tools";
 import { resolveModel, type ApiCompat } from "@open-managed-agents/agent/harness/provider";
 import { composeSystemPrompt } from "@open-managed-agents/agent/harness/platform-guidance";
@@ -865,6 +870,7 @@ const sessionRegistry = new SessionRegistry({
         postAccessRequest(tenantId, sessionId, a),
       findCredentialVault: findCredentialVaultForUrl,
       attachVaultToAgent,
+      setupAccessStatus: ensureSetupAccessReconciled,
       createAmbientRule: (tenantId, sessionId, agentId, a) =>
         createAmbientRuleFromSession(tenantId, agentId, sessionId, a),
       findSkills: (tenantId, query) => findSkillsForTenant(tenantId, query),
@@ -913,8 +919,18 @@ const sessionRegistry = new SessionRegistry({
       sessionId: input.sessionId,
     });
     const isSetup = setupRow?.metadata?.oma_setup === true;
+    // Template-created agents arrive in setup with their MCP servers ALREADY
+    // on the harness, so update_harness never "adds" them and no card would
+    // be posted (seen live 2026-09-02: Incident commander template, four
+    // servers, zero cards). Reconcile every server once per setup session:
+    // verified/refreshed credential → vault attached; otherwise a connect
+    // card right now. The outcome rides in the preamble so the agent tells
+    // the user what's pending instead of inventing status.
+    const accessStatus = isSetup
+      ? await ensureSetupAccessReconciled(input.tenantId, input.sessionId, input.agent)
+      : undefined;
     const rawSystemPrompt = isSetup
-      ? buildSetupPrompt(input.agent)
+      ? buildSetupPrompt(input.agent, { accessStatus })
       : input.agent.system ?? "";
     const memoryContext = await buildNodeMemoryPromptContext(input.tenantId, input.sessionId);
     return {
@@ -1878,6 +1894,66 @@ v1.route(
   "/oauth",
   buildNodeOAuthRoutes({ services, env: process.env, onGranted: recordAccessGrant }),
 );
+
+type SetupAccessRecord = {
+  requested: Array<{ name: string; note?: string }>;
+  connected: string[];
+  failed: string[];
+  checked_at: number;
+};
+const setupAccessInFlight = new Map<string, Promise<string | undefined>>();
+
+/**
+ * Once per setup session: reconcile the MCP servers already on the agent
+ * (see the call site in buildHarness). Result persisted in session metadata
+ * (`setup_access`) so restarts and later turns reuse it instead of
+ * re-posting cards; servers added later are handled by update_harness.
+ */
+async function ensureSetupAccessReconciled(
+  tenantId: string,
+  sessionId: string,
+  agent: AgentConfig,
+): Promise<string | undefined> {
+  const format = (r: SetupAccessRecord) => {
+    const line = describeSetupAccessStatus(r);
+    return line.length > 0 ? line : undefined;
+  };
+  const row = await sessionsService.get({ tenantId, sessionId }).catch(() => null);
+  const stored = (row?.metadata as { setup_access?: SetupAccessRecord } | undefined)?.setup_access;
+  if (stored && Array.isArray(stored.connected)) return format(stored);
+
+  const inflight = setupAccessInFlight.get(sessionId);
+  if (inflight) return inflight;
+  const run = (async () => {
+    try {
+      const servers = (agent.mcp_servers ?? []).filter(
+        (srv) => srv?.type !== "stdio" && typeof srv?.url === "string" && !isComposioMcpUrl(srv.url),
+      );
+      if (servers.length === 0) return undefined;
+      const result = await autoRequestAccessForNewServers(undefined, servers, {
+        requestAccess: (a) => postAccessRequest(tenantId, sessionId, a),
+        findCredentialVault: (url) => findCredentialVaultForUrl(tenantId, url),
+        attachVault: (vaultId) => attachVaultToAgent(tenantId, agent.id, vaultId),
+      });
+      const record: SetupAccessRecord = { ...result, checked_at: Date.now() };
+      await sessionsService
+        .update({ tenantId, sessionId, metadata: { setup_access: record } })
+        .catch(() => {});
+      logger.info(
+        { op: "setup.access_reconciled", session_id: sessionId, agent_id: agent.id, ...result },
+        "setup access reconciled",
+      );
+      return format(record);
+    } catch (err) {
+      logger.warn({ err, op: "setup.access_reconcile_failed", session_id: sessionId }, "setup access reconcile failed");
+      return undefined;
+    } finally {
+      setupAccessInFlight.delete(sessionId);
+    }
+  })();
+  setupAccessInFlight.set(sessionId, run);
+  return run;
+}
 
 /** Union `vaultId` into the agent's default_vault_ids (metadata merge). */
 async function attachVaultToAgent(tenantId: string, agentId: string, vaultId: string): Promise<void> {

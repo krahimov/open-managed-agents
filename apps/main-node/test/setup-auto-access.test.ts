@@ -94,3 +94,44 @@ describe("autoRequestAccessForNewServers", () => {
     expect(describeAutoAccess(r)).toBe("");
   });
 });
+
+import { buildSetupPrompt, describeSetupAccessStatus } from "../src/lib/setup-harness";
+
+describe("setup preamble connection status", () => {
+  const agent = { id: "agent-1", name: "Incident commander", mcp_servers: [sentry, slack] } as never;
+
+  it("renders one line per server and the readiness rule when a status is supplied", () => {
+    const status = describeSetupAccessStatus({
+      connected: ["sentry"],
+      requested: [{ name: "slack", note: "requires a one-time OAuth app registration first" }, { name: "linear" }],
+      failed: ["github"],
+    });
+    expect(status.split("\n")).toEqual([
+      "- sentry: connected (existing credential verified, vault attached)",
+      "- slack: connect card posted — waiting for the user (needs a one-time app setup; the card guides them)",
+      "- linear: connect card posted — waiting for the user",
+      "- github: could not post a connect card — call request_access for it",
+    ]);
+    const prompt = buildSetupPrompt(agent, { accessStatus: status });
+    expect(prompt).toContain("CONNECTION STATUS of the MCP servers already on your harness");
+    expect(prompt).toContain("- slack: connect card posted");
+    expect(prompt).toContain("never claim you're ready to run");
+  });
+
+  it("omits the block when there is nothing to report", () => {
+    expect(buildSetupPrompt(agent)).not.toContain("CONNECTION STATUS");
+    expect(describeSetupAccessStatus({ connected: [], requested: [], failed: [] })).toBe("");
+  });
+
+  it("reconciling pre-existing servers treats every url server as new", async () => {
+    const requested: string[] = [];
+    const r = await autoRequestAccessForNewServers(undefined, [sentry, slack, stdio], {
+      requestAccess: async (a) => {
+        requested.push(a.service);
+        return { request_id: "x", status: "pending" };
+      },
+    });
+    expect(requested).toEqual(["sentry", "slack"]);
+    expect(r.requested.map((x) => x.name)).toEqual(["sentry", "slack"]);
+  });
+});
