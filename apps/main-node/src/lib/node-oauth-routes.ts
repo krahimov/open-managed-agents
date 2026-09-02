@@ -17,6 +17,15 @@ interface OAuthState {
   /** KV key of the cached dynamic client registration this flow used —
    *  deleted when token exchange reports invalid_client. */
   dcr_cache_key?: string;
+  /** Session + access-request the connect card is completing on behalf of.
+   *  When present the callback records the grant server-side (durable
+   *  system.access_granted + the "[access granted]" nudge) instead of
+   *  relying on the popup → card → POST /events browser handoff. */
+  session_id?: string;
+  request_id?: string;
+  /** Service slug from the access request (card-side name, e.g. "github"),
+   *  used for the grant text instead of the host-derived server name. */
+  service?: string;
 }
 
 interface ProtectedResourceMeta {
@@ -40,9 +49,22 @@ interface TokenResponse {
   token_type?: string;
 }
 
+export interface GrantNotification {
+  tenantId: string;
+  sessionId: string;
+  requestId?: string;
+  service: string;
+  vaultId: string;
+  mcpServerUrl: string;
+}
+
 export interface NodeOAuthRoutesDeps {
   services: RouteServices;
   env?: Record<string, string | undefined>;
+  /** Called after a credential is persisted for a flow that carried a
+   *  session_id: records the grant on the session and wakes the agent.
+   *  Failures are swallowed — the credential is already stored. */
+  onGranted?: (grant: GrantNotification) => Promise<void>;
 }
 
 type NodeOAuthVars = {
@@ -57,6 +79,9 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     const vaultId = c.req.query("vault_id");
     const credentialId = c.req.query("credential_id");
     const clientRedirectUri = c.req.query("redirect_uri");
+    const sessionIdParam = c.req.query("session_id")?.trim() || undefined;
+    const requestIdParam = c.req.query("request_id")?.trim() || undefined;
+    const serviceParam = c.req.query("service")?.trim().toLowerCase() || undefined;
 
     if (!mcpServerUrl || !vaultId) {
       return c.json({ error: "mcp_server_url and vault_id are required" }, 400);
@@ -186,6 +211,9 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       redirect_uri: clientRedirectUri || `${baseUrl}/`,
       resource_uri: meta.resource.resource,
       dcr_cache_key: dcrCacheKey,
+      session_id: sessionIdParam,
+      request_id: requestIdParam,
+      service: serviceParam,
     };
 
     await deps.services.kv.put(`oauth_state:${state}`, JSON.stringify(oauthState), {
@@ -334,6 +362,30 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     await deps.services.kv.delete(stateKey);
     const probeResult = await probeMcpServer(oauthState.mcp_server_url, tokens.access_token);
 
+    // Record the grant server-side. Until now the ONLY thing telling the
+    // agent "access granted" was the console card, which had to be mounted,
+    // in its `connecting` state and listening on the BroadcastChannel at the
+    // exact moment this page loaded — a reload, navigation or re-render in
+    // between silently dropped the grant (seen live 2026-09-02: Sentry
+    // credential stored, agent still told "Sentry needs authorization").
+    const grantService = oauthState.service ?? serverName;
+    let grantRecorded = false;
+    if (oauthState.session_id && deps.onGranted) {
+      try {
+        await deps.onGranted({
+          tenantId: oauthState.tenant_id,
+          sessionId: oauthState.session_id,
+          requestId: oauthState.request_id,
+          service: grantService,
+          vaultId: oauthState.vault_id,
+          mcpServerUrl: oauthState.mcp_server_url,
+        });
+        grantRecorded = true;
+      } catch {
+        // The card falls back to posting the nudge itself.
+      }
+    }
+
     const redirectUrl = new URL(oauthState.redirect_uri);
     redirectUrl.searchParams.set("oauth", "success");
     redirectUrl.searchParams.set("service", serverName);
@@ -347,8 +399,14 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
         (function(){
           var msg = ${JSON.stringify({
             type: "oauth_complete",
-            service: serverName,
+            service: grantService,
+            server_name: serverName,
             vault_id: oauthState.vault_id,
+            request_id: oauthState.request_id ?? null,
+            session_id: oauthState.session_id ?? null,
+            // true → the server already appended the grant + nudge; the
+            // card must NOT post a second "[access granted]" message.
+            grant_recorded: grantRecorded,
             probe_ok: probeResult.ok,
             probe_message: probeResult.message ?? null,
           })};

@@ -151,7 +151,11 @@ import {
   environmentMemoryStoreRefs,
   sandboxProviderFromEnvironment,
 } from "./lib/environment-runtime-config.js";
-import { buildNodeOAuthRoutes } from "./lib/node-oauth-routes.js";
+import { buildNodeOAuthRoutes, type GrantNotification } from "./lib/node-oauth-routes.js";
+import {
+  forwardNodeMcpRequestWithRefresh,
+  type NodeMcpProxyRefresh,
+} from "./lib/node-mcp-proxy.js";
 import { NodeSessionWorkQueue } from "./lib/node-session-work-queue.js";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
@@ -1842,7 +1846,71 @@ v1.route("/vaults", buildVaultRoutes({
       (await resolveTenantComposioKey(tenantId))?.apiKey ?? null,
   },
 }));
-v1.route("/oauth", buildNodeOAuthRoutes({ services, env: process.env }));
+v1.route(
+  "/oauth",
+  buildNodeOAuthRoutes({ services, env: process.env, onGranted: recordAccessGrant }),
+);
+
+/**
+ * Server-side half of a connect card: the OAuth callback persisted a vault
+ * credential for a flow the card started from a session, so (1) record a
+ * durable system.access_granted on that session, (2) nudge the agent with
+ * the same "[access granted]" user.message the card used to post from the
+ * browser, and (3) graft the vault onto the session's agent so its future
+ * sessions (scheduled ones included) actually carry the credential —
+ * setup-created agents otherwise ended up with NO default vault and every
+ * OAuth MCP server 401'd despite valid credentials in "Connected Apps".
+ */
+async function recordAccessGrant(grant: GrantNotification): Promise<void> {
+  const session = await sessionsService.get({
+    tenantId: grant.tenantId,
+    sessionId: grant.sessionId,
+  });
+  if (!session || session.archived_at) return;
+
+  await sessionRouter.appendEvent(grant.sessionId, {
+    type: "system.access_granted",
+    id: generateEventId(),
+    request_id: grant.requestId ?? "",
+    service: grant.service,
+    vault_id: grant.vaultId,
+    mcp_server_url: grant.mcpServerUrl,
+  } as SessionEvent);
+
+  if (session.agent_id) {
+    try {
+      const agent = await agentsService.get({ tenantId: grant.tenantId, agentId: session.agent_id });
+      const current = (agent?.metadata as { default_vault_ids?: unknown } | undefined)
+        ?.default_vault_ids;
+      const ids = Array.isArray(current)
+        ? current.filter((id): id is string => typeof id === "string" && id.length > 0)
+        : [];
+      if (agent && !ids.includes(grant.vaultId)) {
+        await agentsService.update({
+          tenantId: grant.tenantId,
+          agentId: session.agent_id,
+          input: { metadata: { default_vault_ids: [...ids, grant.vaultId] } },
+        });
+      }
+    } catch (err) {
+      logger.warn(
+        { err, op: "oauth.grant_vault_graft_failed", session_id: grant.sessionId },
+        "credential stored but could not attach the vault to the agent",
+      );
+    }
+  }
+
+  await sessionRouter.appendEvent(grant.sessionId, {
+    type: "user.message",
+    id: generateEventId(),
+    content: [
+      {
+        type: "text",
+        text: `[access granted] ${grant.service} is now connected — continue where you left off.`,
+      },
+    ],
+  } as SessionEvent);
+}
 // ── Composio key resolution ────────────────────────────────────────────────
 // Managed-first: tenants paste their own Composio key in the console (stored
 // as a composio_mcp vault credential — same shape the MCP proxy already
@@ -2846,6 +2914,8 @@ type NodeMcpProxyTarget = {
   upstreamUrl: string;
   upstreamToken: string;
   upstreamAuthHeader?: { name: string; value: string };
+  /** mcp_oauth credentials: lets the proxy renew expired access tokens. */
+  refresh?: NodeMcpProxyRefresh;
 };
 
 const nodeMcpBinding = {
@@ -2870,7 +2940,16 @@ const nodeMcpBinding = {
     const body = ["GET", "HEAD"].includes(request.method)
       ? null
       : await request.arrayBuffer();
-    return forwardNodeMcpRequest(target, request.method, inboundHeaders, body);
+    // Renews expired mcp_oauth tokens (pre-emptively / on 401) — before this
+    // the Node proxy never refreshed, so one-hour tokens (Sentry) died
+    // mid-day and every call 401'd until the user reconnected.
+    return forwardNodeMcpRequestWithRefresh(
+      target,
+      undefined,
+      request.method,
+      inboundHeaders,
+      body,
+    );
   },
 };
 
@@ -2909,6 +2988,11 @@ async function resolveNodeMcpProxyTarget(
             access_token?: string;
             api_key?: string;
             api_key_env?: string;
+            refresh_token?: string;
+            token_endpoint?: string;
+            client_id?: string;
+            client_secret?: string;
+            expires_at?: string;
           }
         | undefined;
       if (!auth || !credentialMatchesMcpServerUrl(auth, server.url)) continue;
@@ -2926,7 +3010,33 @@ async function resolveNodeMcpProxyTarget(
 
       const token = auth.bearer_token ?? auth.token ?? auth.access_token;
       if (!token) continue;
-      return { upstreamUrl: server.url, upstreamToken: token };
+      const credentialId = (credential as { id: string }).id;
+      const vaultId = group.vault_id;
+      const refresh: NodeMcpProxyRefresh | undefined =
+        auth.type === "mcp_oauth" && auth.refresh_token && auth.token_endpoint
+          ? {
+              refreshToken: auth.refresh_token,
+              tokenEndpoint: auth.token_endpoint,
+              clientId: auth.client_id,
+              clientSecret: auth.client_secret,
+              expiresAtMs: auth.expires_at ? Date.parse(auth.expires_at) || undefined : undefined,
+              persist: async (t) => {
+                await credentialService.refreshAuth({
+                  tenantId,
+                  vaultId,
+                  credentialId,
+                  auth: {
+                    access_token: t.access_token,
+                    refresh_token: t.refresh_token,
+                    expires_at: t.expires_in
+                      ? new Date(Date.now() + t.expires_in * 1000).toISOString()
+                      : undefined,
+                  },
+                });
+              },
+            }
+          : undefined;
+      return { upstreamUrl: server.url, upstreamToken: token, ...(refresh ? { refresh } : {}) };
     }
   }
   // Composio credential selection: any tool-router URL matches any other

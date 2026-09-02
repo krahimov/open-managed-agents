@@ -26,8 +26,14 @@ import type { Event } from "../lib/events";
 export function AccessRequestCard({
   event,
   sessionId: sessionIdProp,
+  granted = false,
 }: {
   event: Event;
+  /** True when the session's event log already holds a
+   *  system.access_granted for this request — the server recorded the
+   *  grant, so the card renders "Connected" regardless of popup state or
+   *  page reloads. */
+  granted?: boolean;
   /** Session to notify on completion. Defaults to the :id route param
    *  (SessionDetail); SessionChat must pass it explicitly — its route
    *  param is the AGENT id. */
@@ -55,18 +61,34 @@ export function AccessRequestCard({
   const isApiKeyMcp = ev.auth_kind === "mcp_api_key" && !!ev.mcp_server_url;
   const isLlmProvider = ev.auth_kind === "llm_provider";
   const [status, setStatus] = useState<"pending" | "connecting" | "connected" | "error">(
-    "pending",
+    granted ? "connected" : "pending",
   );
   const [error, setError] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState("");
-  const notifiedRef = useRef(false);
+  const notifiedRef = useRef(granted);
+
+  // Durable state wins over local popup bookkeeping: once the server has
+  // written system.access_granted for this request, flip to Connected even
+  // if this card never saw the popup finish (reload / re-render / other tab).
+  useEffect(() => {
+    if (!granted) return;
+    notifiedRef.current = true;
+    setStatus("connected");
+  }, [granted]);
 
   useEffect(() => {
     if (status !== "connecting") return;
-    const complete = () => {
+    const complete = (opts: { grantRecorded?: boolean } = {}) => {
       if (notifiedRef.current) return;
       notifiedRef.current = true;
       setStatus("connected");
+      if (opts.grantRecorded) {
+        // The OAuth callback already appended system.access_granted + the
+        // "[access granted]" nudge server-side — posting again would wake
+        // the agent twice with a duplicate message.
+        toast.success(`${service} connected.`);
+        return;
+      }
       // Tell the agent — a plain user.message wakes the turn loop the same
       // way a typed reply would, so it picks the task back up.
       void api(`/v1/sessions/${sessionId}/events`, {
@@ -105,9 +127,13 @@ export function AccessRequestCard({
         if (data.toolkit && data.toolkit.toLowerCase() !== service) return;
         complete();
       } else if (data?.type === "oauth_complete") {
-        // MCP OAuth callback reports the provider's display name — accept any
-        // completion that lands while THIS card is the one connecting.
-        complete();
+        // Only THIS request's completion. Older callback pages carry no
+        // request_id; accept those to stay compatible. Without this check
+        // every connecting card completed on ANY popup finishing (seen live:
+        // one GitHub popup → linear + github + github grants in one second).
+        const done = data as { request_id?: string | null; grant_recorded?: boolean };
+        if (done.request_id && ev.request_id && done.request_id !== ev.request_id) return;
+        complete({ grantRecorded: done.grant_recorded === true });
       } else if (data?.type === "oauth_error") {
         // Popup-side failure (discovery, missing preset app, token exchange,
         // provider proxy state) — surface it on the card instead of leaving
@@ -206,7 +232,13 @@ export function AccessRequestCard({
           mcp_server_url: ev.mcp_server_url!,
           vault_id: vault.id,
           redirect_uri: window.location.href,
+          service,
         });
+        // Let the callback record the grant on the session itself (and
+        // graft the vault onto the agent) — the browser handoff below is
+        // then only cosmetic.
+        if (sessionId) params.set("session_id", sessionId);
+        if (ev.request_id) params.set("request_id", ev.request_id);
         window.open(
           `/v1/oauth/authorize?${params.toString()}`,
           `oauth-${service}`,
