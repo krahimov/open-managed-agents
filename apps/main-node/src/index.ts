@@ -158,6 +158,7 @@ import {
 } from "./lib/node-oauth-routes.js";
 import {
   forwardNodeMcpRequestWithRefresh,
+  verifyMcpCredential,
   type NodeMcpProxyRefresh,
 } from "./lib/node-mcp-proxy.js";
 import { NodeSessionWorkQueue } from "./lib/node-session-work-queue.js";
@@ -1894,10 +1895,13 @@ async function attachVaultToAgent(tenantId: string, agentId: string, vaultId: st
   });
 }
 
-/** Vault id holding an ACTIVE credential bound to `mcpServerUrl` (any of the
+/** Vault id holding a WORKING credential bound to `mcpServerUrl` (any of the
  *  tenant's vaults), or null. Setup uses it to skip the connect card for a
  *  server the workspace already authorized (e.g. Sentry connected by an
- *  earlier agent) and just attach that vault. */
+ *  earlier agent) and just attach that vault. "Working" is verified live:
+ *  the token is probed, expired OAuth tokens are refreshed (and persisted)
+ *  first, and a credential the provider rejects does NOT count — the card
+ *  is posted instead and the OAuth callback upserts the row. */
 async function findCredentialVaultForUrl(tenantId: string, mcpServerUrl: string): Promise<string | null> {
   const target = normalizeMcpUrlForMatch(mcpServerUrl);
   if (!target) return null;
@@ -1908,8 +1912,50 @@ async function findCredentialVaultForUrl(tenantId: string, mcpServerUrl: string)
   for (const group of grouped) {
     for (const cred of group.credentials) {
       if ((cred as { archived_at?: string | null }).archived_at) continue;
-      const url = (cred as { auth?: { mcp_server_url?: string } }).auth?.mcp_server_url;
-      if (url && normalizeMcpUrlForMatch(url) === target) return group.vault_id;
+      const auth = (cred as unknown as { auth?: Record<string, unknown> }).auth ?? {};
+      const url = auth.mcp_server_url;
+      if (typeof url !== "string" || normalizeMcpUrlForMatch(url) !== target) continue;
+      const token = [auth.bearer_token, auth.token, auth.access_token].find(
+        (t): t is string => typeof t === "string" && t.length > 0,
+      );
+      if (!token) {
+        // API-key / composio shapes: nothing to probe with a bearer — trust the row.
+        return group.vault_id;
+      }
+      const credentialId = (cred as { id: string }).id;
+      const vaultId = group.vault_id;
+      const refresh: NodeMcpProxyRefresh | undefined =
+        auth.type === "mcp_oauth" &&
+        typeof auth.refresh_token === "string" &&
+        typeof auth.token_endpoint === "string"
+          ? {
+              refreshToken: auth.refresh_token,
+              tokenEndpoint: auth.token_endpoint,
+              clientId: typeof auth.client_id === "string" ? auth.client_id : undefined,
+              clientSecret: typeof auth.client_secret === "string" ? auth.client_secret : undefined,
+              persist: async (t) => {
+                await credentialService.refreshAuth({
+                  tenantId,
+                  vaultId,
+                  credentialId,
+                  auth: {
+                    access_token: t.access_token,
+                    refresh_token: t.refresh_token,
+                    expires_at: t.expires_in
+                      ? new Date(Date.now() + t.expires_in * 1000).toISOString()
+                      : undefined,
+                  },
+                });
+              },
+            }
+          : undefined;
+      const check = await verifyMcpCredential({ url: mcpServerUrl, token, refresh });
+      logger.info(
+        { op: "setup.credential_check", mcp_server_url: mcpServerUrl, credential_id: credentialId, result: check },
+        "setup credential check",
+      );
+      if (check !== "invalid") return vaultId;
+      // rejected → keep looking (another vault may hold a live one)
     }
   }
   return null;

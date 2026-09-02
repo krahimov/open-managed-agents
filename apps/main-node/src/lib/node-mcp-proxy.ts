@@ -75,6 +75,66 @@ export async function refreshNodeMcpOAuthToken(
   };
 }
 
+export type McpCredentialCheck = "ok" | "refreshed" | "invalid" | "unreachable";
+
+/**
+ * Is this stored credential actually usable against its MCP server?
+ * Probes tools/list with the access token; on 401/403 tries a refresh
+ * (when refresh metadata exists), persists rotated tokens and re-probes.
+ * "unreachable" = network/timeout — the caller decides (setup treats it as
+ * "can't tell, assume fine" so a flaky provider doesn't spam connect cards).
+ * Added after setup reported Linear + Sentry "already connected" on the
+ * strength of expired rows alone (2026-09-02).
+ */
+export async function verifyMcpCredential(
+  input: { url: string; token: string; refresh?: NodeMcpProxyRefresh },
+  fetcher: typeof fetch = fetch,
+  timeoutMs = 6000,
+): Promise<McpCredentialCheck> {
+  const probe = async (token: string): Promise<number | null> => {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const res = await fetcher(input.url, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+        signal: ac.signal,
+      });
+      try {
+        await res.body?.cancel();
+      } catch {
+        /* ignore */
+      }
+      return res.status;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  const authRejected = (status: number) => status === 401 || status === 403;
+
+  const first = await probe(input.token);
+  if (first === null) return "unreachable";
+  if (!authRejected(first)) return "ok";
+  if (!input.refresh) return "invalid";
+  const next = await refreshNodeMcpOAuthToken(input.refresh, fetcher);
+  if (!next) return "invalid";
+  try {
+    await input.refresh.persist(next);
+  } catch {
+    /* best-effort */
+  }
+  const second = await probe(next.access_token);
+  if (second === null) return "unreachable";
+  return authRejected(second) ? "invalid" : "refreshed";
+}
+
 /**
  * forwardNodeMcpRequest + token renewal. Order:
  *   1. stored expiry already passed (or about to) → refresh first;

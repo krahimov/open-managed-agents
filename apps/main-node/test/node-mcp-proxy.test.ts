@@ -3,6 +3,7 @@ import {
   buildNodeMcpForwardUrl,
   forwardNodeMcpRequest,
   forwardNodeMcpRequestWithRefresh,
+  verifyMcpCredential,
 } from "../src/lib/node-mcp-proxy";
 
 describe("node MCP proxy", () => {
@@ -165,6 +166,64 @@ describe("node MCP proxy", () => {
       const res = await forwardNodeMcpRequestWithRefresh(target, undefined, "POST", new Headers(), "{}", fetcher);
       expect(res.status).toBe(401);
       expect(log).toEqual(["https://mcp.sentry.dev/mcp"]);
+    });
+  });
+
+  describe("verifyMcpCredential", () => {
+    const url = "https://mcp.linear.app/mcp";
+    const mk = (upstream: (auth: string | null) => Response, tokenOk = true) => {
+      const log: Array<string | null> = [];
+      const fetcher: typeof fetch = (async (input, init) => {
+        const req = input instanceof Request ? input : new Request(input, init);
+        if (req.url.endsWith("/oauth/token")) {
+          log.push("refresh");
+          return tokenOk
+            ? Response.json({ access_token: "fresh", refresh_token: "rt2", expires_in: 3600 })
+            : new Response("bad", { status: 400 });
+        }
+        const auth = req.headers.get("authorization");
+        log.push(auth);
+        return upstream(auth);
+      }) as typeof fetch;
+      return { fetcher, log };
+    };
+    const refresh = (persisted: unknown[]) => ({
+      refreshToken: "rt",
+      tokenEndpoint: "https://mcp.linear.app/oauth/token",
+      persist: async (t: unknown) => void persisted.push(t),
+    });
+
+    it("ok when the stored token is accepted (any non-auth status counts)", async () => {
+      const a = mk(() => new Response("{}", { status: 200 }));
+      expect(await verifyMcpCredential({ url, token: "t" }, a.fetcher)).toBe("ok");
+      const b = mk(() => new Response("bad request", { status: 400 }));
+      expect(await verifyMcpCredential({ url, token: "t" }, b.fetcher)).toBe("ok");
+    });
+
+    it("refreshes an expired token, persists it and re-probes", async () => {
+      const persisted: unknown[] = [];
+      const { fetcher, log } = mk((auth) =>
+        auth === "Bearer fresh" ? new Response("{}") : new Response("nope", { status: 401 }),
+      );
+      expect(await verifyMcpCredential({ url, token: "stale", refresh: refresh(persisted) }, fetcher)).toBe(
+        "refreshed",
+      );
+      expect(log).toEqual(["Bearer stale", "refresh", "Bearer fresh"]);
+      expect(persisted).toEqual([{ access_token: "fresh", refresh_token: "rt2", expires_in: 3600 }]);
+    });
+
+    it("invalid when rejected and no refresh is possible, or refresh fails", async () => {
+      const a = mk(() => new Response("nope", { status: 401 }));
+      expect(await verifyMcpCredential({ url, token: "stale" }, a.fetcher)).toBe("invalid");
+      const b = mk(() => new Response("nope", { status: 401 }), false);
+      expect(await verifyMcpCredential({ url, token: "stale", refresh: refresh([]) }, b.fetcher)).toBe("invalid");
+    });
+
+    it("unreachable on network failure", async () => {
+      const fetcher: typeof fetch = (async () => {
+        throw new Error("ECONNRESET");
+      }) as typeof fetch;
+      expect(await verifyMcpCredential({ url, token: "t" }, fetcher)).toBe("unreachable");
     });
   });
 });
