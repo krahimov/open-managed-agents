@@ -135,3 +135,41 @@ describe("setup preamble connection status", () => {
     expect(r.requested.map((x) => x.name)).toEqual(["sentry", "slack"]);
   });
 });
+
+
+import { buildSetupTools } from "../src/lib/setup-harness";
+
+describe("setup toolset: create_ambient_rule", () => {
+  const agent = { id: "agent-1", name: "Incident commander", mcp_servers: [] } as never;
+  const base = {
+    updateAgent: async () => agent,
+    appendEvent: async () => undefined,
+    requestAccess: async () => ({ request_id: "x", status: "pending" }),
+  };
+
+  it("is offered only when the dep is wired, and reports the created rule", async () => {
+    expect(buildSetupTools(agent, "sess-1", base)).not.toHaveProperty("create_ambient_rule");
+    const created: unknown[] = [];
+    const tools = buildSetupTools(agent, "sess-1", {
+      ...base,
+      createAmbientRule: async (a) => {
+        created.push(a);
+        return { id: "amb_1", next_wake_at: "2026-09-02T18:00:00.000Z" };
+      },
+    });
+    expect(tools).toHaveProperty("create_ambient_rule");
+    const out = await tools.create_ambient_rule.execute(
+      { name: "Incident sweep", cron: "*/15 * * * *", prompt: "Check Sentry and Railway." },
+      { toolCallId: "t1", messages: [] },
+    );
+    expect(created).toHaveLength(1);
+    expect(String(out)).toContain('Ambient rule "Incident sweep" created (id amb_1');
+    expect(String(out)).toContain("first run 2026-09-02T18:00:00.000Z");
+  });
+
+  it("the setup prompt tells the agent to create the rule itself, not point at a UI toggle", () => {
+    const p = buildSetupPrompt(agent);
+    expect(p).toContain("create_ambient_rule");
+    expect(p).toContain("there is no toggle for it in the setup UI");
+  });
+});

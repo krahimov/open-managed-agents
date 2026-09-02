@@ -776,6 +776,8 @@ const sessionRegistry = new SessionRegistry({
           }),
         findCredentialVault: (url) => findCredentialVaultForUrl(context.tenantId, url),
         attachVault: (vaultId) => attachVaultToAgent(context.tenantId, agent.id, vaultId),
+        createAmbientRule: (a) =>
+          createAmbientRuleFromSession(context.tenantId, agent.id, context.sessionId, a),
         env: { TAVILY_API_KEY: process.env.TAVILY_API_KEY },
       });
     }

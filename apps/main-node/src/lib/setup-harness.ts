@@ -57,11 +57,12 @@ export function buildSetupPrompt(
     JSON.stringify(harnessView(agent), null, 2),
     "```",
     "",
-    "You have exactly four tools and no file or shell access:",
+    "You have exactly five tools and no file or shell access:",
     "- update_harness: change fields on your own harness. Call it after EACH meaningful answer so the live config on the user's screen stays in sync. Pass only the fields that changed.",
     "- request_access: pop a one-click connect card in the user's setup panel for a service that needs credentials. Pass the service slug and a one-line reason. The user authenticates in the popup and you get a message when the account is connected. NOTE: for MCP servers you add with update_harness this happens AUTOMATICALLY — the platform posts a connect card for every newly added server that isn't connected yet (the update_harness result tells you which). Use request_access only for services that aren't MCP servers (e.g. Composio apps) or to re-post a card the user asked for.",
     "- web_search: search the web. Use it to find a service's official MCP endpoint or docs instead of asking the user for URLs — e.g. search \"<service> MCP server\" and prefer the vendor's own domain.",
     "- web_fetch: fetch a URL as text. Use it to read MCP docs pages and extract the exact server URL before adding it with update_harness.",
+    "- create_ambient_rule: make yourself run on a schedule (a fresh session of you starts on the cron with the prompt you give it). This is THE way to set up recurring/monitoring work — there is no toggle for it in the setup UI, so never tell the user to \"enable ambient execution in the UI\"; agree on the cadence and create the rule yourself. The rule shows up as a card in the setup panel and on the agent page.",
     "",
     "Harness fields you can refine:",
     "- name / description: a short label + one-line summary of what you do.",
@@ -75,7 +76,8 @@ export function buildSetupPrompt(
     "2. Ask ONE focused question at a time. After each answer, immediately call update_harness with what you can refine now — usually a sharper system prompt first, then name/description, then any MCP servers or skills.",
     "3. Keep tightening your system prompt as you learn more.",
     "4. Be concise. In a sentence, say what you just changed (e.g. \"I rewrote my system prompt around daily triage and added the Notion server\").",
-    "5. When the user is satisfied, confirm your harness is set and that you're ready to run — but ONLY once every MCP server you added is connected. You receive a \"[access granted] <name>\" message per server; until then, say which connections are still pending in the setup panel instead of claiming you're ready.",
+    "5. If your job is monitoring, polling, reporting or anything recurring, propose a cadence (e.g. every 15 minutes, every morning at 9:00 in the user's timezone), confirm it, then create the rule with create_ambient_rule before you declare yourself ready.",
+    "6. When the user is satisfied, confirm your harness is set and that you're ready to run — but ONLY once every MCP server you added is connected. You receive a \"[access granted] <name>\" message per server; until then, say which connections are still pending in the setup panel instead of claiming you're ready.",
     "",
     "Never invent credentials or secrets, and never ask the user to paste keys or tokens in chat. Adding an MCP server with update_harness automatically posts its connect card in the setup panel; never tell the user authentication will happen \"afterward\" — it happens right here, and you must wait for the grant messages.",
     ...(opts.accessStatus
@@ -124,6 +126,16 @@ export interface SetupToolsDeps {
   findCredentialVault?: (mcpServerUrl: string) => Promise<string | null>;
   /** Attach a vault to the agent's default vaults (idempotent). */
   attachVault?: (vaultId: string) => Promise<void>;
+  /** Create a standing ambient (scheduled) rule on this agent
+   *  (createAmbientRuleFromSession). Absent → tool not offered. */
+  createAmbientRule?: (args: {
+    name: string;
+    description?: string;
+    cron: string;
+    timezone?: string;
+    prompt: string;
+    wake_mode?: "observe" | "decide" | "act" | "escalate";
+  }) => Promise<{ id: string; next_wake_at?: string }>;
   /** Env for the read-only research tools (Tavily upgrade for web_search). */
   env?: { TAVILY_API_KEY?: string };
 }
@@ -313,6 +325,43 @@ export function buildSetupTools(
         return res.note ?? `Request ${res.request_id} posted (${res.status}).`;
       },
     }),
+    // Recurring work is configured HERE, by the agent — the setup UI has no
+    // ambient toggle (seen live 2026-09-02: agent told the user to "enable
+    // ambient execution every 15 minutes in the setup UI"; nothing to click).
+    ...(deps.createAmbientRule
+      ? {
+          create_ambient_rule: tool({
+            description:
+              "Create a standing ambient rule on THIS agent: on the given cron, the platform starts a FRESH session of you and injects `prompt` as the opening user message. Use it for recurring jobs (monitoring, daily digests, polling). Confirm cadence + task with the user first, then create it and echo the rule back; it appears as a card here and can be managed later on the agent page.",
+            inputSchema: z.object({
+              name: z.string().min(1).max(120).describe("Short human-readable rule name, e.g. \"Incident sweep every 15 minutes\""),
+              description: z.string().max(500).optional().describe("One-line summary shown in the console"),
+              cron: z.string().min(9).max(120).describe("5-field cron cadence (e.g. \"*/15 * * * *\" = every 15 minutes)"),
+              timezone: z.string().max(64).optional().describe("IANA timezone for the cron (e.g. \"America/Los_Angeles\"). Defaults to UTC."),
+              prompt: z.string().min(1).max(4000).describe("Opening user message for each spawned session — the standing task, written to future-you"),
+              wake_mode: z
+                .enum(["observe", "decide", "act", "escalate"])
+                .optional()
+                .describe("act = do the task; decide (default) = assess then act if warranted; observe = log only; escalate = flag a human"),
+            }),
+            execute: async (args: {
+              name: string;
+              description?: string;
+              cron: string;
+              timezone?: string;
+              prompt: string;
+              wake_mode?: "observe" | "decide" | "act" | "escalate";
+            }) => {
+              try {
+                const res = await deps.createAmbientRule!(args);
+                return `Ambient rule "${args.name}" created (id ${res.id}, cron "${args.cron}"${args.timezone ? ` ${args.timezone}` : " UTC"}${res.next_wake_at ? `, first run ${res.next_wake_at}` : ""}). Tell the user it's active and where to manage it.`;
+              } catch (err) {
+                return `Could not create the ambient rule: ${err instanceof Error ? err.message : String(err)}`;
+              }
+            },
+          }),
+        }
+      : {}),
     // Read-only research pair. Setup keeps NO file/shell access, but finding
     // a service's official MCP endpoint is core setup work — without search
     // the agent has to ask the user to go hunt for URLs (seen live: it
