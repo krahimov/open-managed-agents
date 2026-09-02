@@ -56,7 +56,7 @@ export function buildSetupPrompt(agent: AgentConfig): string {
     "",
     "You have exactly four tools and no file or shell access:",
     "- update_harness: change fields on your own harness. Call it after EACH meaningful answer so the live config on the user's screen stays in sync. Pass only the fields that changed.",
-    "- request_access: pop a one-click connect card in the user's setup panel for a service that needs credentials. Pass the service slug (for an MCP server you added, use its exact `name`) and a one-line reason. The user authenticates in the popup and you get a message when the account is connected.",
+    "- request_access: pop a one-click connect card in the user's setup panel for a service that needs credentials. Pass the service slug and a one-line reason. The user authenticates in the popup and you get a message when the account is connected. NOTE: for MCP servers you add with update_harness this happens AUTOMATICALLY — the platform posts a connect card for every newly added server that isn't connected yet (the update_harness result tells you which). Use request_access only for services that aren't MCP servers (e.g. Composio apps) or to re-post a card the user asked for.",
     "- web_search: search the web. Use it to find a service's official MCP endpoint or docs instead of asking the user for URLs — e.g. search \"<service> MCP server\" and prefer the vendor's own domain.",
     "- web_fetch: fetch a URL as text. Use it to read MCP docs pages and extract the exact server URL before adding it with update_harness.",
     "",
@@ -72,9 +72,9 @@ export function buildSetupPrompt(agent: AgentConfig): string {
     "2. Ask ONE focused question at a time. After each answer, immediately call update_harness with what you can refine now — usually a sharper system prompt first, then name/description, then any MCP servers or skills.",
     "3. Keep tightening your system prompt as you learn more.",
     "4. Be concise. In a sentence, say what you just changed (e.g. \"I rewrote my system prompt around daily triage and added the Notion server\").",
-    "5. When the user is satisfied, confirm your harness is set and that you're ready to run.",
+    "5. When the user is satisfied, confirm your harness is set and that you're ready to run — but ONLY once every MCP server you added is connected. You receive a \"[access granted] <name>\" message per server; until then, say which connections are still pending in the setup panel instead of claiming you're ready.",
     "",
-    "Never invent credentials or secrets, and never ask the user to paste keys or tokens in chat. For an MCP server that needs auth, add the server with update_harness, then call request_access for it (one call per server) so the user can authenticate right here — don't defer it to \"afterward\".",
+    "Never invent credentials or secrets, and never ask the user to paste keys or tokens in chat. Adding an MCP server with update_harness automatically posts its connect card in the setup panel; never tell the user authentication will happen \"afterward\" — it happens right here, and you must wait for the grant messages.",
   ].join("\n");
 }
 
@@ -99,8 +99,110 @@ export interface SetupToolsDeps {
     reason: string;
     mcp_server_url?: string;
   }) => Promise<{ request_id: string; status: string; note?: string }>;
+  /** Vault id holding an active credential for this MCP server URL, or
+   *  null. Lets update_harness skip the card and just attach the vault. */
+  findCredentialVault?: (mcpServerUrl: string) => Promise<string | null>;
+  /** Attach a vault to the agent's default vaults (idempotent). */
+  attachVault?: (vaultId: string) => Promise<void>;
   /** Env for the read-only research tools (Tavily upgrade for web_search). */
   env?: { TAVILY_API_KEY?: string };
+}
+
+type McpServerLike = { name?: string; type?: string; url?: string };
+
+function normalizeMcpUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    return `${u.origin}${u.pathname.replace(/\/+$/, "")}`.toLowerCase();
+  } catch {
+    return raw.trim().replace(/\/+$/, "").toLowerCase();
+  }
+}
+
+/** URL-type MCP servers in `after` that were not in `before` (by URL). */
+export function newlyAddedMcpServers(
+  before: unknown,
+  after: unknown,
+): Array<{ name: string; url: string }> {
+  const list = (v: unknown): McpServerLike[] => (Array.isArray(v) ? (v as McpServerLike[]) : []);
+  const seen = new Set(
+    list(before)
+      .filter((s) => s?.url && s.type !== "stdio")
+      .map((s) => normalizeMcpUrl(s.url!)),
+  );
+  const out: Array<{ name: string; url: string }> = [];
+  const emitted = new Set<string>();
+  for (const s of list(after)) {
+    if (!s?.url || s.type === "stdio") continue;
+    const key = normalizeMcpUrl(s.url);
+    if (seen.has(key) || emitted.has(key)) continue;
+    emitted.add(key);
+    out.push({ name: (s.name ?? new URL(s.url).hostname).trim().toLowerCase(), url: s.url });
+  }
+  return out;
+}
+
+export interface AutoAccessResult {
+  /** Servers a connect card was posted for. */
+  requested: Array<{ name: string; note?: string }>;
+  /** Servers already covered by a vault credential (vault attached). */
+  connected: string[];
+  /** Servers where posting the card itself failed. */
+  failed: string[];
+}
+
+/**
+ * Deterministic companion to update_harness: every NEW url-type MCP server
+ * either already has a credential in one of the tenant's vaults (→ attach
+ * that vault to the agent) or gets a connect card posted right now. This
+ * used to be a prompt instruction the model could — and did — skip
+ * (2026-09-02: four servers added, zero cards, agent said "ready to run").
+ */
+export async function autoRequestAccessForNewServers(
+  before: unknown,
+  after: unknown,
+  deps: Pick<SetupToolsDeps, "requestAccess" | "findCredentialVault" | "attachVault">,
+): Promise<AutoAccessResult> {
+  const result: AutoAccessResult = { requested: [], connected: [], failed: [] };
+  for (const server of newlyAddedMcpServers(before, after)) {
+    try {
+      const vaultId = deps.findCredentialVault ? await deps.findCredentialVault(server.url) : null;
+      if (vaultId) {
+        await deps.attachVault?.(vaultId);
+        result.connected.push(server.name);
+        continue;
+      }
+      const res = await deps.requestAccess({
+        service: server.name,
+        reason: `Connect ${server.name} so the agent can use the ${server.name} MCP server you just added.`,
+        mcp_server_url: server.url,
+      });
+      result.requested.push({ name: server.name, ...(res.note ? { note: res.note } : {}) });
+    } catch {
+      result.failed.push(server.name);
+    }
+  }
+  return result;
+}
+
+/** One-line summary appended to the update_harness tool result. */
+export function describeAutoAccess(r: AutoAccessResult): string {
+  const parts: string[] = [];
+  if (r.requested.length > 0) {
+    parts.push(
+      `Connect cards were posted automatically for: ${r.requested.map((x) => x.name).join(", ")} — the user authenticates in the setup panel; you'll receive an "[access granted] <name>" message per server. Do not tell the user you're ready until those arrive.`,
+    );
+    for (const x of r.requested) {
+      if (x.note && /one-time/i.test(x.note)) parts.push(`${x.name}: ${x.note}`);
+    }
+  }
+  if (r.connected.length > 0) {
+    parts.push(`Already connected via an existing vault credential (vault attached): ${r.connected.join(", ")}.`);
+  }
+  if (r.failed.length > 0) {
+    parts.push(`Could not post a connect card for: ${r.failed.join(", ")} — call request_access for these.`);
+  }
+  return parts.join(" ");
 }
 
 /**
@@ -166,7 +268,13 @@ export function buildSetupTools(
             changed,
           },
         } as SessionEvent);
-        return `Updated: ${changed.join(", ")}.`;
+        let summary = `Updated: ${changed.join(", ")}.`;
+        if (patch.mcp_servers !== undefined) {
+          const auto = await autoRequestAccessForNewServers(before.mcp_servers, after.mcp_servers, deps);
+          const line = describeAutoAccess(auto);
+          if (line) summary += ` ${line}`;
+        }
+        return summary;
       },
     }),
     request_access: tool({

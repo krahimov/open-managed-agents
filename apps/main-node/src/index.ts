@@ -768,6 +768,8 @@ const sessionRegistry = new SessionRegistry({
             ...a,
             mcp_server_url: a.mcp_server_url ?? matchAgentMcpServer(agent, a.service),
           }),
+        findCredentialVault: (url) => findCredentialVaultForUrl(context.tenantId, url),
+        attachVault: (vaultId) => attachVaultToAgent(context.tenantId, agent.id, vaultId),
         env: { TAVILY_API_KEY: process.env.TAVILY_API_KEY },
       });
     }
@@ -860,6 +862,8 @@ const sessionRegistry = new SessionRegistry({
       // pipeline as the DefaultHarness buildTools hooks.
       requestServiceAccess: (tenantId, sessionId, a) =>
         postAccessRequest(tenantId, sessionId, a),
+      findCredentialVault: findCredentialVaultForUrl,
+      attachVaultToAgent,
       createAmbientRule: (tenantId, sessionId, agentId, a) =>
         createAmbientRuleFromSession(tenantId, agentId, sessionId, a),
       findSkills: (tenantId, query) => findSkillsForTenant(tenantId, query),
@@ -1874,6 +1878,43 @@ v1.route(
   buildNodeOAuthRoutes({ services, env: process.env, onGranted: recordAccessGrant }),
 );
 
+/** Union `vaultId` into the agent's default_vault_ids (metadata merge). */
+async function attachVaultToAgent(tenantId: string, agentId: string, vaultId: string): Promise<void> {
+  const agent = await agentsService.get({ tenantId, agentId });
+  if (!agent) return;
+  const current = (agent.metadata as { default_vault_ids?: unknown } | undefined)?.default_vault_ids;
+  const ids = Array.isArray(current)
+    ? current.filter((id): id is string => typeof id === "string" && id.length > 0)
+    : [];
+  if (ids.includes(vaultId)) return;
+  await agentsService.update({
+    tenantId,
+    agentId,
+    input: { metadata: { default_vault_ids: [...ids, vaultId] } },
+  });
+}
+
+/** Vault id holding an ACTIVE credential bound to `mcpServerUrl` (any of the
+ *  tenant's vaults), or null. Setup uses it to skip the connect card for a
+ *  server the workspace already authorized (e.g. Sentry connected by an
+ *  earlier agent) and just attach that vault. */
+async function findCredentialVaultForUrl(tenantId: string, mcpServerUrl: string): Promise<string | null> {
+  const target = normalizeMcpUrlForMatch(mcpServerUrl);
+  if (!target) return null;
+  const vaults = await vaultService.list({ tenantId, includeArchived: false }).catch(() => []);
+  const vaultIds = vaults.map((v) => v.id);
+  if (vaultIds.length === 0) return null;
+  const grouped = await credentialService.listByVaults({ tenantId, vaultIds }).catch(() => []);
+  for (const group of grouped) {
+    for (const cred of group.credentials) {
+      if ((cred as { archived_at?: string | null }).archived_at) continue;
+      const url = (cred as { auth?: { mcp_server_url?: string } }).auth?.mcp_server_url;
+      if (url && normalizeMcpUrlForMatch(url) === target) return group.vault_id;
+    }
+  }
+  return null;
+}
+
 /**
  * Server-side half of a connect card: the OAuth callback persisted a vault
  * credential for a flow the card started from a session, so (1) record a
@@ -1902,19 +1943,7 @@ async function recordAccessGrant(grant: GrantNotification): Promise<void> {
 
   if (session.agent_id) {
     try {
-      const agent = await agentsService.get({ tenantId: grant.tenantId, agentId: session.agent_id });
-      const current = (agent?.metadata as { default_vault_ids?: unknown } | undefined)
-        ?.default_vault_ids;
-      const ids = Array.isArray(current)
-        ? current.filter((id): id is string => typeof id === "string" && id.length > 0)
-        : [];
-      if (agent && !ids.includes(grant.vaultId)) {
-        await agentsService.update({
-          tenantId: grant.tenantId,
-          agentId: session.agent_id,
-          input: { metadata: { default_vault_ids: [...ids, grant.vaultId] } },
-        });
-      }
+      await attachVaultToAgent(grant.tenantId, session.agent_id, grant.vaultId);
     } catch (err) {
       logger.warn(
         { err, op: "oauth.grant_vault_graft_failed", session_id: grant.sessionId },
