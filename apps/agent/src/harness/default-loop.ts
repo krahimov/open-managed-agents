@@ -318,6 +318,14 @@ export class DefaultHarness implements HarnessInterface {
     // provider exposes its own knobs via providerOptions. We branch on
     // model.provider here. To add OpenAI/Gemini cache support later, extend
     // the strategy table below; the harness loop above doesn't change.
+    // 2b. Turn-scoped reminders (memory push): append to the CURRENT user
+    // message's parts so they ride the uncached tail of the prompt, leaving
+    // the system block cache-stable. Not persisted; provenance lives in the
+    // event log (system.memory_pushed).
+    if (ctx.turnReminders && ctx.turnReminders.length > 0) {
+      appendTurnReminders(messages, ctx.turnReminders);
+    }
+
     const cached = applyProviderCacheStrategy(model, systemPrompt, tools, messages);
     // OpenAI hard-caps function names at 64 chars — in the tools array AND
     // in replayed history tool_calls. Long MCP names (Composio) 400 the
@@ -1021,6 +1029,29 @@ export class DefaultHarness implements HarnessInterface {
 function estimateMessageTokens(m: ModelMessage): number {
   const s = typeof m.content === "string" ? m.content : JSON.stringify(m.content);
   return Math.ceil(s.length / 4);
+}
+
+/** Append `<source>`-wrapped turn reminders to the last user message's
+ *  content (as a trailing text part). If the last message isn't a user
+ *  message (unexpected: history always ends with the triggering
+ *  user.message), a new user message is added instead so nothing is lost. */
+export function appendTurnReminders(
+  messages: ModelMessage[],
+  reminders: ReadonlyArray<{ source: string; text: string }>,
+): void {
+  const block = reminders
+    .map((r) => `<source name="${r.source}">\n${r.text}\n</source>`)
+    .join("\n\n");
+  const last = messages[messages.length - 1];
+  if (last && last.role === "user") {
+    const parts = typeof last.content === "string"
+      ? [{ type: "text" as const, text: last.content }]
+      : [...(last.content as Array<{ type: string }>)];
+    (parts as Array<{ type: string; text?: string }>).push({ type: "text", text: block });
+    (last as { content: unknown }).content = parts;
+    return;
+  }
+  messages.push({ role: "user", content: [{ type: "text", text: block }] } as ModelMessage);
 }
 
 function estimateMessagesTokens(messages: ModelMessage[]): number {

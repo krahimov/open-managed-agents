@@ -8,7 +8,14 @@ import { useApiQuery } from "../lib/useApiQuery";
 import { GitHubIcon, LinearIcon, SlackIcon } from "../components/icons";
 import { Page } from "../components/Page";
 import { Modal } from "../components/Modal";
+import { RunUntilDoneDialog } from "../components/RunUntilDoneDialog";
 import { Field } from "../components/Field";
+import {
+  MEMORY_MODE_LABELS,
+  MemoryModeControl,
+  parseMemoryMode,
+  type MemoryMode,
+} from "../components/MemoryModeControl";
 import { PageHeader } from "../components/PageHeader";
 import { CreateDeploymentDialog } from "../components/CreateDeploymentDialog";
 import { Button } from "@/components/ui/button";
@@ -65,6 +72,7 @@ export function AgentDetail() {
   const nav = useNavigate();
   const [editing, setEditing] = useState(false);
   const [showDeploy, setShowDeploy] = useState(false);
+  const [showRunDialog, setShowRunDialog] = useState(false);
 
   // Single-resource fetches via TQ. `enabled: !!id` defers until the route
   // param is available; the publication queries inherit the same gate.
@@ -165,6 +173,12 @@ export function AgentDetail() {
               <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
                 Edit
               </Button>
+              {(agent as { metadata?: { long_running?: boolean } }).metadata
+                ?.long_running === true && (
+                <Button size="sm" onClick={() => setShowRunDialog(true)}>
+                  Run until done
+                </Button>
+              )}
               <Button
                 variant="outline"
                 size="sm"
@@ -190,11 +204,18 @@ export function AgentDetail() {
         {editing && (
           <EditAgentModal agent={agent} onClose={() => setEditing(false)} />
         )}
+        <RunUntilDoneDialog
+          agentId={agent.id}
+          open={showRunDialog}
+          onClose={() => setShowRunDialog(false)}
+        />
         {/* Properties grid */}
         <div className="grid grid-cols-[140px_1fr] gap-x-4 gap-y-2 max-w-2xl text-sm">
           <span className="text-fg-muted">ID</span><span className="font-mono text-xs">{agent.id}</span>
           <span className="text-fg-muted">Model</span><span>{modelStr(agent.model)}</span>
           <span className="text-fg-muted">Harness</span><span>{agent._oma?.harness || "default"}</span>
+          <span className="text-fg-muted">Memory</span>
+          <span>{MEMORY_MODE_LABELS[parseMemoryMode(agent._oma?.memory)]}</span>
           {agent._oma?.default_environment_id && (
             <>
               <span className="text-fg-muted">Default Sandbox</span>
@@ -1034,6 +1055,9 @@ function EditAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void 
   const [model, setModel] = useState(initialModel);
   const [system, setSystem] = useState(agent.system ?? "");
   const [harness, setHarness] = useState(agent._oma?.harness ?? "default");
+  const [memoryMode, setMemoryMode] = useState<MemoryMode>(() =>
+    parseMemoryMode(agent._oma?.memory),
+  );
   const [skillIds, setSkillIds] = useState<Set<string>>(
     () =>
       new Set(
@@ -1065,7 +1089,19 @@ function EditAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void 
         mcp_servers: agent.mcp_servers,
         metadata: (agent as { metadata?: Record<string, unknown> }).metadata,
         skills: [...skillIds].map((skill_id) => ({ type: "custom", skill_id })),
-        _oma: { ...(agent._oma ?? {}), harness },
+        _oma: {
+          ...(agent._oma ?? {}),
+          harness,
+          // "off" clears via null (server drops the field, like
+          // reasoning_level); same mode keeps store_id/extract/push;
+          // a mode change resets to just { mode }.
+          memory:
+            memoryMode === "off"
+              ? null
+              : agent._oma?.memory?.mode === memoryMode
+                ? agent._oma.memory
+                : { mode: memoryMode },
+        },
       };
       for (const k of Object.keys(body)) {
         if (body[k] === undefined || body[k] === null) delete body[k];
@@ -1126,6 +1162,9 @@ function EditAgentModal({ agent, onClose }: { agent: Agent; onClose: () => void 
             <option value="claude-agent-sdk">claude-agent-sdk — local Claude Code, subscription billing</option>
             <option value="acp-proxy">acp-proxy — delegate to a registered local runtime</option>
           </select>
+        </Field>
+        <Field label="Memory">
+          <MemoryModeControl value={memoryMode} onChange={setMemoryMode} />
         </Field>
         <Field label="System prompt">
           <textarea

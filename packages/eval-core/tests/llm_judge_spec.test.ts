@@ -240,6 +240,62 @@ describe("SpecLlmJudgeVerifier", () => {
     expect(calls[0].user).toContain("still-reaches-the-judge");
   });
 
+  it("sweeps /mnt/session/outputs for bash-created artifacts the cwd sweep misses", async () => {
+    const execCalls: string[] = [];
+    const runExec = async (cmd: string) => {
+      execCalls.push(cmd);
+      if (cmd === "ls -la") return { exit_code: 0, output: "total 0" };
+      if (cmd.startsWith("find .")) return { exit_code: 0, output: "" };
+      if (cmd.startsWith("find /mnt/session/outputs")) {
+        return { exit_code: 0, output: "/mnt/session/outputs/report.md\n" };
+      }
+      return { exit_code: 0, output: "# Delivered report" };
+    };
+    const { fn, calls } = judgeReturning(JSON.stringify(goodVerdict));
+    const v = verifierForSpec({ type: "llm_judge", rubric: "r" }, ctxWith(fn, { runExec }));
+    await v.check(makeTrajectory(baseEvents));
+    expect(execCalls.some((c) => c.startsWith("find /mnt/session/outputs"))).toBe(true);
+    const user = calls[0].user;
+    expect(user).toContain("file:/mnt/session/outputs/report.md");
+    expect(user).toContain("# Delivered report");
+  });
+
+  it("system prompt teaches the outputs-directory platform convention", async () => {
+    const { fn, calls } = judgeReturning(JSON.stringify(goodVerdict));
+    await verifierForSpec({ type: "llm_judge", rubric: "r" }, ctxWith(fn))
+      .check(makeTrajectory(baseEvents));
+    expect(calls[0].system).toContain("/mnt/session/outputs/");
+    expect(calls[0].system).toContain("never as data leaving the workspace");
+  });
+
+  it("renders prior_episodes and memory_store sections when the trajectory carries them", async () => {
+    const { fn, calls } = judgeReturning(JSON.stringify(goodVerdict));
+    const v = verifierForSpec({ type: "llm_judge", rubric: "r" }, ctxWith(fn));
+    await v.check(makeTrajectory(baseEvents, {
+      prior_episodes: [{ index: 0, transcript: "User: remember I hate Mondays\nAgent: noted", trajectory_id: "tr-0" }],
+      memory_store: { store_id: "mem_1", files: [{ path: "prefs.md", content: "hates Mondays" }] },
+    }));
+    const user = calls[0].user;
+    expect(user).toContain("## Prior episodes");
+    expect(user).toContain("### Episode 1");
+    expect(user).toContain("remember I hate Mondays");
+    expect(user).toContain("NO shared chat history");
+    expect(user).toContain("## Memory store (final contents");
+    expect(user).toContain("file:memory/prefs.md");
+    expect(user).toContain("hates Mondays");
+  });
+
+  it("marks an empty memory store explicitly and omits sections when fields are absent", async () => {
+    const a = judgeReturning(JSON.stringify(goodVerdict));
+    await verifierForSpec({ type: "llm_judge", rubric: "r" }, ctxWith(a.fn))
+      .check(makeTrajectory(baseEvents, { memory_store: { store_id: "m", files: [] } }));
+    expect(a.calls[0].user).toContain("store is EMPTY");
+    const b = judgeReturning(JSON.stringify(goodVerdict));
+    await verifierForSpec({ type: "llm_judge", rubric: "r" }, ctxWith(b.fn)).check(makeTrajectory(baseEvents));
+    expect(b.calls[0].user).not.toContain("## Memory store");
+    expect(b.calls[0].user).not.toContain("## Prior episodes");
+  });
+
   it("survives runExec failure (workspace section skipped, verdict still produced)", async () => {
     const runExec = async () => { throw new Error("sandbox gone"); };
     const { fn } = judgeReturning(JSON.stringify(goodVerdict));
@@ -284,6 +340,70 @@ describe("parseJudgeVerdict tolerance", () => {
       JSON.stringify({ criteria: [{ id: "a", pass: true }], score: 3, pass: true, summary: "s" }),
     );
     expect(verdict.score).toBe(1);
+  });
+});
+
+describe("judge context + findings (simulations)", () => {
+  it("spec.context is prepended as ## Context before ## Task", async () => {
+    const { fn, calls } = judgeReturning(JSON.stringify(goodVerdict));
+    const v = verifierForSpec(
+      { type: "llm_judge", rubric: "r", context: "CONTEXT-MARKER: persona wants the March invoice" },
+      ctxWith(fn),
+    );
+    await v.check(makeTrajectory(baseEvents));
+    const user = calls[0].user;
+    expect(user).toContain("## Context\nCONTEXT-MARKER");
+    expect(user.indexOf("## Context")).toBeLessThan(user.indexOf("## Task"));
+  });
+
+  it("spec.findings:true adds the findings contract to the system prompt; absent otherwise", async () => {
+    const { fn, calls } = judgeReturning(JSON.stringify(goodVerdict));
+    await verifierForSpec({ type: "llm_judge", rubric: "r", findings: true }, ctxWith(fn))
+      .check(makeTrajectory(baseEvents));
+    expect(calls[0].system).toContain('"findings"');
+    expect(calls[0].system).toContain("OPERATOR");
+
+    const plain = judgeReturning(JSON.stringify(goodVerdict));
+    await verifierForSpec({ type: "llm_judge", rubric: "r" }, ctxWith(plain.fn))
+      .check(makeTrajectory(baseEvents));
+    expect(plain.calls[0].system).not.toContain('"findings"');
+  });
+
+  it("parses findings tolerantly: valid kept, invalid dropped, unknown enums defaulted", async () => {
+    const verdictWithFindings = {
+      ...goodVerdict,
+      findings: [
+        {
+          category: "tool_use",
+          severity: "major",
+          summary: "agent ran rm -rf on user data without confirmation",
+          evidence: ["sevt_x1"],
+          recommendation: "add a deny rule for destructive bash commands",
+        },
+        { category: "made-up", severity: "catastrophic", summary: "weird enums", evidence: [], recommendation: "" },
+        { severity: "minor" }, // no summary → dropped
+        "not an object",
+      ],
+    };
+    const { fn } = judgeReturning(JSON.stringify(verdictWithFindings));
+    const v = verifierForSpec({ type: "llm_judge", rubric: "r", findings: true }, ctxWith(fn));
+    const score = await v.check(makeTrajectory(baseEvents));
+    const findings = score.metadata.verdict.findings;
+    expect(findings).toHaveLength(2);
+    expect(findings[0]).toEqual({
+      category: "tool_use",
+      severity: "major",
+      summary: "agent ran rm -rf on user data without confirmation",
+      evidence: ["sevt_x1"],
+      recommendation: "add a deny rule for destructive bash commands",
+    });
+    expect(findings[1].category).toBe("task");
+    expect(findings[1].severity).toBe("info");
+  });
+
+  it("verdicts without findings still parse (old prompts / non-simulation specs)", () => {
+    const verdict = parseJudgeVerdict(JSON.stringify(goodVerdict));
+    expect(verdict.findings).toBeUndefined();
   });
 });
 

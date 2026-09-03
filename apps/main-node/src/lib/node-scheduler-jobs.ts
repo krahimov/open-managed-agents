@@ -40,10 +40,15 @@ export interface NodeSchedulerDeps {
   /** llm_judge resolver (lib/eval-judge.ts). Null/omitted degrades
    *  llm_judge reward specs to a 0 score with an "unavailable" reason. */
   evalJudgeResolver?: EvalRunnerContext["resolveJudge"] | null;
+  /** Memory port for memory-aware simulations (optional). */
+  evalMemory?: EvalRunnerContext["memory"] | null;
   memory: MemoryStoreService;
   /** Ambient rule dispatcher — sweeps due ambient_rules and starts agent
    *  sessions. Skip when null (feature dormant until rules exist anyway). */
   ambientDispatcher?: NodeAmbientDispatcher | null;
+  /** Mission supervisor — sweeps 'running' missions, verifies finished
+   *  iterations, and spawns the next ones. Skip when null. */
+  missionSupervisor?: { tick(): Promise<number> } | null;
   /** Optional integrations DB SqlClient. Pass null to skip the
    *  webhook-events retention sweep on Node. */
   integrationsSql?: SqlClient | null;
@@ -77,6 +82,7 @@ export function buildNodeScheduler(deps: NodeSchedulerDeps) {
     forEachShard: async (fn) => [await fn(deps.evalServices)],
     getServicesForTenant: async () => deps.evalServices,
     getSandboxBinding: async (): Promise<SandboxFetcher | null> => evalSandbox,
+    ...(deps.evalMemory ? { memory: deps.evalMemory } : {}),
     resolveJudge: deps.evalJudgeResolver ?? undefined,
   };
   scheduler.register({
@@ -156,6 +162,26 @@ export function buildNodeScheduler(deps: NodeSchedulerDeps) {
           }
         } catch (err) {
           log.warn({ err, op: "scheduler.ambient.failed" }, "ambient dispatch failed");
+        }
+      },
+    });
+  }
+
+  // Mission supervisor sweep — every 15s by default. An empty missions
+  // table costs one indexed miss per tick, same as ambient.
+  if (deps.missionSupervisor) {
+    const supervisor = deps.missionSupervisor;
+    scheduler.register({
+      name: "mission-supervisor",
+      cron: cron("MISSION_SUPERVISOR_CRON", "*/15 * * * * *"),
+      handler: async () => {
+        try {
+          const acted = await supervisor.tick();
+          if (acted > 0) {
+            log.info({ op: "scheduler.missions.acted", acted }, "missions advanced");
+          }
+        } catch (err) {
+          log.warn({ err, op: "scheduler.missions.failed" }, "mission supervisor tick failed");
         }
       },
     });

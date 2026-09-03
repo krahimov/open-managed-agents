@@ -138,13 +138,20 @@ export function NewEvalRunDialog({
       setError("Tasks must be a non-empty JSON array.");
       return;
     }
-    for (const t of tasks as Array<{ id?: unknown; messages?: unknown }>) {
+    for (const t of tasks as Array<{ id?: unknown; messages?: unknown; simulation?: unknown }>) {
       if (!t || typeof t !== "object" || typeof t.id !== "string" || !t.id) {
         setError("Every task needs a string id.");
         return;
       }
-      if (!Array.isArray(t.messages) || t.messages.length === 0) {
-        setError(`Task ${t.id} needs a non-empty messages array.`);
+      // Mirror the server rule: exactly one of `messages` / `simulation`.
+      const hasMessages = Array.isArray(t.messages) && t.messages.length > 0;
+      const hasSimulation =
+        t.simulation !== undefined && t.simulation !== null &&
+        typeof t.simulation === "object" && !Array.isArray(t.simulation);
+      if (hasMessages === hasSimulation) {
+        setError(
+          `Task ${t.id} needs exactly one of: a non-empty messages array, or a simulation object.`,
+        );
         return;
       }
     }

@@ -3,7 +3,7 @@ import { Link, useParams } from "react-router";
 import { useApi } from "../lib/api";
 import { useApiQuery } from "../lib/useApiQuery";
 import { shortenId } from "../lib/format";
-import type { Trajectory } from "../lib/trajectory";
+import type { JudgeFinding, Trajectory } from "../lib/trajectory";
 import { rewardHeadline } from "../lib/trajectory";
 
 interface EvalTrial {
@@ -21,13 +21,21 @@ interface EvalTrial {
   duration_seconds?: number;
   turns?: number;
   output_tail?: string;
+  /** Simulation trials only — persona-side counters stamped by the runner. */
+  persona_turns?: number;
+  sim_ended_by?: "persona" | "max_turns";
+  persona_model_id?: string;
+  persona_usage?: { input_tokens: number; output_tokens: number; calls: number };
+  findings?: JudgeFinding[];
 }
 
 interface EvalTask {
   id: string;
   spec: {
     id: string;
-    messages: string[];
+    /** Exactly one of `messages` / `simulation` is set (server-enforced). */
+    messages?: string[];
+    simulation?: { scenario: string };
     setup_files?: { path: string; content: string }[];
     setup_script?: string;
     timeout_ms?: number;
@@ -63,6 +71,12 @@ interface EvalRunDetail {
    *  POST /suites/:id/run (stamped into `results` at create). */
   suite_id?: string;
   suite_name?: string;
+  /** Aggregated judge findings across all graded trials (simulation runs). */
+  findings_report?: {
+    generated_at: string;
+    by_category: Record<string, Record<string, number>>;
+    top: Array<JudgeFinding & { task_id: string; trial_index: number }>;
+  };
   tasks: EvalTask[];
 }
 
@@ -72,6 +86,18 @@ function statusCls(s: string): string {
     case "failed":    return "bg-danger-subtle text-danger";
     case "running":   return "bg-info-subtle text-info";
     default:          return "bg-bg-surface text-fg-muted";
+  }
+}
+
+/** Severity display order + tones for the findings strip. Critical reads
+ *  as danger, major as warning; minor/info stay muted. */
+const FINDING_SEVERITY_ORDER = ["critical", "major", "minor", "info"] as const;
+
+function findingSeverityCls(sev: string): string {
+  switch (sev) {
+    case "critical": return "bg-danger-subtle text-danger";
+    case "major":    return "bg-warning-subtle text-warning";
+    default:         return "bg-bg-surface text-fg-muted";
   }
 }
 
@@ -301,6 +327,30 @@ export function EvalRunDetail() {
         </div>
       </div>
 
+      {/* Findings strip — one dense row of category × severity counts from
+          the run-level findings report (simulation runs). Same wireless
+          treatment as the metadata strip above: no card, just chips. */}
+      {run.findings_report && Object.keys(run.findings_report.by_category).length > 0 && (
+        <div
+          className="flex flex-wrap items-center gap-x-2 gap-y-1 text-sm text-fg-muted"
+          title={`Findings report generated ${new Date(run.findings_report.generated_at).toLocaleString()}`}
+        >
+          <span>Findings</span>
+          {Object.entries(run.findings_report.by_category).flatMap(([cat, sevs]) =>
+            FINDING_SEVERITY_ORDER
+              .filter(sev => (sevs[sev] ?? 0) > 0)
+              .map(sev => (
+                <span
+                  key={`${cat}-${sev}`}
+                  className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${findingSeverityCls(sev)}`}
+                >
+                  {cat}: {sevs[sev]} {sev}
+                </span>
+              )),
+          )}
+        </div>
+      )}
+
       {run.error && (
         <div className="bg-danger-subtle/40 rounded-lg p-3">
           <div className="text-sm font-semibold text-danger mb-1">Run-level error</div>
@@ -335,7 +385,19 @@ export function EvalRunDetail() {
                   onClick={() => toggleExpand(t.id)}
                 >
                   <td className="text-fg-subtle px-3 py-2 text-center rounded-l-lg">{isOpen ? "▾" : "▸"}</td>
-                  <td className="px-3 py-2 font-mono text-xs text-fg">{t.id}</td>
+                  <td className="px-3 py-2 font-mono text-xs text-fg">
+                    <span className="inline-flex items-center gap-1.5">
+                      {t.id}
+                      {t.spec.simulation && (
+                        <span
+                          className="font-sans text-[10px] px-1.5 py-0.5 rounded bg-brand/10 text-brand"
+                          title="Simulated-user task — a persona model plays the user"
+                        >
+                          simulation
+                        </span>
+                      )}
+                    </span>
+                  </td>
                   <td className="px-3 py-2">
                     <span className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${statusCls(t.status)}`}>
                       {t.status}
@@ -398,7 +460,14 @@ export function EvalRunDetail() {
                               </td>
                               <td className="py-1 pr-3 font-mono text-fg-muted">{tr.exit_code ?? "—"}</td>
                               <td className="py-1 pr-3 text-fg-muted">{durationStr(tr.started_at, tr.ended_at)}</td>
-                              <td className="py-1 pr-3 text-fg-muted">{tr.turns ?? "—"}</td>
+                              <td className="py-1 pr-3 text-fg-muted">
+                                {tr.turns ?? "—"}
+                                {tr.persona_turns !== undefined && (
+                                  <span className="text-fg-subtle" title="persona turns">
+                                    {" "}· {tr.persona_turns}p
+                                  </span>
+                                )}
+                              </td>
                               <td className="py-1 pr-3">
                                 {tr.session_id ? (
                                   <Link
@@ -495,10 +564,12 @@ export function EvalRunDetail() {
 
                       <details>
                         <summary className="cursor-pointer text-xs text-fg-subtle hover:text-fg">
-                          first message
+                          {t.spec.simulation ? "scenario" : "first message"}
                         </summary>
                         <pre className="mt-1 p-2 bg-bg-surface/60 rounded text-[11px] overflow-auto max-h-48 whitespace-pre-wrap text-fg">
-                          {t.spec.messages[0]}
+                          {t.spec.simulation
+                            ? t.spec.simulation.scenario
+                            : t.spec.messages?.[0] ?? "—"}
                         </pre>
                       </details>
                     </td>

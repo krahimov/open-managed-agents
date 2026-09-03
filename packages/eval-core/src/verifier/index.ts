@@ -11,6 +11,7 @@ export {
   LlmJudgeVerifier,
   createLlmJudgeVerifier,
   buildAgentTranscript,
+  parseEventData,
   type JudgeFn,
   type JudgeUsage,
   type LlmJudgeOpts,
@@ -20,4 +21,5 @@ export {
   parseJudgeVerdict,
   type JudgeVerdict,
   type JudgeCriterionVerdict,
+  type JudgeFinding,
 } from "./builtins/llm_judge_spec";

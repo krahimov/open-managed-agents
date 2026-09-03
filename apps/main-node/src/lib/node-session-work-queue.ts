@@ -1,6 +1,10 @@
 import { nanoid } from "nanoid";
 import type { SqlClient } from "@open-managed-agents/sql-client";
-import type { SessionEvent, UserMessageEvent } from "@open-managed-agents/shared";
+import type {
+  SessionEvent,
+  UserMessageEvent,
+  UserToolConfirmationEvent,
+} from "@open-managed-agents/shared";
 import { getLogger } from "@open-managed-agents/observability";
 
 const log = getLogger("node-session-work-queue");
@@ -11,7 +15,9 @@ export interface NodeSessionWorkItem {
   sessionId: string;
   agentId: string;
   eventId: string;
-  event: UserMessageEvent;
+  // user.message drives a fresh turn; user.tool_confirmation resumes a turn
+  // parked on an "ask" tool. The worker branches on event.type.
+  event: UserMessageEvent | UserToolConfirmationEvent;
   attempts: number;
 }
 

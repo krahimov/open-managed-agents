@@ -81,7 +81,10 @@ export class NodeSessionRouter implements SessionRouter {
     const last = stored[stored.length - 1];
     this.deps.hub.publish(sessionId, last);
 
-    if (event.type === "user.message") {
+    // user.message drives a fresh turn; user.tool_confirmation resumes a turn
+    // parked on an "ask" tool (Gap 2 approvals). Both go through the same
+    // per-session serialized work queue so a confirmation can't race a turn.
+    if (event.type === "user.message" || event.type === "user.tool_confirmation") {
       // Look up the agent_id off the sessions row; SessionRegistry
       // expects (sid, tenantId, agentId, event).
       const row = await this.deps.sql
@@ -104,14 +107,19 @@ export class NodeSessionRouter implements SessionRouter {
           });
         } else {
           const entry = await this.deps.registry.getOrCreate(sessionId, row.tenant_id);
-          void entry.machine
-            .runHarnessTurn(
-              row.agent_id,
-              event as import("@open-managed-agents/shared").UserMessageEvent,
-            )
-            .catch((err) => {
-              moduleLog.error({ err, op: "node_session_router.harness_turn_failed", session_id: sessionId }, "harness turn failed");
-            });
+          const machineTurn =
+            event.type === "user.tool_confirmation"
+              ? entry.machine.resumeToolConfirmation(
+                  row.agent_id,
+                  event as import("@open-managed-agents/shared").UserToolConfirmationEvent,
+                )
+              : entry.machine.runHarnessTurn(
+                  row.agent_id,
+                  event as import("@open-managed-agents/shared").UserMessageEvent,
+                );
+          void machineTurn.catch((err) => {
+            moduleLog.error({ err, op: "node_session_router.harness_turn_failed", session_id: sessionId }, "harness turn failed");
+          });
         }
       }
     }

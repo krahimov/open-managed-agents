@@ -24,11 +24,24 @@ export interface JudgeCriterionVerdict {
   reasoning: string;
 }
 
+/** One structured observation from the judge (simulation evals). Findings
+ *  are orthogonal to the pass/fail criteria — a trial can pass every
+ *  criterion and still carry a `critical` safety finding. */
+export interface JudgeFinding {
+  category: "task" | "safety" | "security" | "tool_use" | "communication";
+  severity: "info" | "minor" | "major" | "critical";
+  summary: string;
+  /** Event ids / artifact refs, same vocabulary as criterion evidence. */
+  evidence: string[];
+  recommendation: string;
+}
+
 export interface JudgeVerdict {
   criteria: JudgeCriterionVerdict[];
   pass: boolean;
   score: number;
   summary: string;
+  findings?: JudgeFinding[];
 }
 
 /** Score.metadata as persisted by the llm_judge verifier. All fields

@@ -21,7 +21,7 @@
 //      drop idx_memories_unsynced)
 //   packages/schema/src/index.ts applyMemoryPollerSchema()        (lease)
 
-import { index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { index, integer, primaryKey, real, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const memory_stores = sqliteTable(
   "memory_stores",
@@ -86,3 +86,42 @@ export const memory_blob_poller_lease = sqliteTable("memory_blob_poller_lease", 
   expires_at: integer("expires_at").notNull(),
   last_seen_ms: integer("last_seen_ms").notNull().default(0),
 });
+
+/**
+ * Indexed durable facts extracted from memory files / transcripts
+ * (docs/memory-facts-design.md §3). Files stay the source of truth for
+ * content; this is the queryable index behind memory_search / memory_get
+ * and the per-turn push. Search: SQLite uses an FTS5 external-content
+ * table (created in the migration, kept in sync by triggers); PG uses a
+ * generated tsvector column. Both are invisible to Drizzle here.
+ */
+export const memory_facts = sqliteTable(
+  "memory_facts",
+  {
+    id: text("id").primaryKey().notNull(),
+    tenant_id: text("tenant_id").notNull(),
+    store_id: text("store_id").notNull(),
+    agent_id: text("agent_id"),
+    /** preference | decision | rule | entity | note */
+    kind: text("kind").notNull(),
+    subject: text("subject").notNull(),
+    statement: text("statement").notNull(),
+    applies_when: text("applies_when"),
+    confidence: real("confidence").notNull().default(1),
+    /** active | superseded | retracted */
+    status: text("status").notNull().default("active"),
+    supersedes_id: text("supersedes_id"),
+    source_path: text("source_path"),
+    source_session_id: text("source_session_id"),
+    source_event_id: text("source_event_id"),
+    observed_at: integer("observed_at").notNull(),
+    created_at: integer("created_at").notNull(),
+    updated_at: integer("updated_at").notNull(),
+  },
+  (t) => [
+    index("idx_memory_facts_store_status").on(t.store_id, t.status, t.updated_at),
+    index("idx_memory_facts_subject").on(t.store_id, t.subject),
+    index("idx_memory_facts_source_session").on(t.source_session_id),
+  ],
+);
+

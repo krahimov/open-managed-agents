@@ -19,6 +19,7 @@ import { TimelineView } from "../components/timeline/TimelineView";
 import type { Event } from "../lib/events";
 import type {
   JudgeCriterionVerdict,
+  JudgeFinding,
   JudgeVerdict,
   RewardMetadata,
   TraceFacts,
@@ -37,11 +38,42 @@ interface EvalTrial {
   reward?: number;
   exit_code?: number;
   turns?: number;
+  /** Simulation trials only — persona-side counters stamped by the runner. */
+  persona_turns?: number;
+  sim_ended_by?: "persona" | "max_turns";
+  persona_model_id?: string;
+  persona_usage?: { input_tokens: number; output_tokens: number; calls: number };
+}
+
+/** Mirror of eval-core's SimulationSpec — same leaf-package rationale as
+ *  the trajectory types in ../lib/trajectory. */
+interface SimulationPersonaSpec {
+  name?: string;
+  identity: string;
+  goals: string[];
+  hidden_knowledge?: string;
+  communication_style?: string;
+  termination: string;
+  scripted_messages?: string[];
+}
+
+interface SimulationSpec {
+  scenario: string;
+  persona: SimulationPersonaSpec;
+  opening_message?: string;
+  max_turns?: number;
+  persona_model?: { model_card_id?: string; reasoning_level?: string; cross_family?: boolean };
 }
 
 interface EvalTask {
   id: string;
-  spec: { id: string; messages: string[]; pass_threshold?: number };
+  spec: {
+    id: string;
+    /** Exactly one of `messages` / `simulation` is set (server-enforced). */
+    messages?: string[];
+    simulation?: SimulationSpec;
+    pass_threshold?: number;
+  };
   status: string;
   trials: EvalTrial[];
 }
@@ -311,6 +343,21 @@ export function EvalTrialDetail() {
           />
         )}
 
+        {task.spec.simulation && (
+          <SimulationPanel sim={task.spec.simulation} trial={trial} />
+        )}
+
+        {/* Findings render whenever the judge produced any — not gated on
+            the task being a simulation, so a plain-messages task graded by
+            a findings-aware judge still surfaces them. */}
+        {verdict?.findings && verdict.findings.length > 0 && (
+          <FindingsPanel
+            findings={verdict.findings}
+            resolvableIds={resolvableIds}
+            onJump={jumpTo}
+          />
+        )}
+
         {traceFacts && (
           <TraceFactsPanel
             facts={traceFacts}
@@ -442,6 +489,190 @@ function VerdictCard({
       <div className="divide-y divide-border/40">
         {verdict.criteria.map((c) => (
           <CriterionRow key={c.id} c={c} resolvableIds={resolvableIds} onJump={onJump} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** Simulation setup + outcome — persona identity/goals/termination from
+ *  the task spec, ended-by / persona model / token usage from the trial.
+ *  Rendered only for simulation tasks. */
+function SimulationPanel({ sim, trial }: { sim: SimulationSpec; trial: EvalTrial }) {
+  const persona = sim.persona;
+  const usage = trial.persona_usage;
+  return (
+    <div className="rounded-lg bg-bg-surface/60 p-4 space-y-3">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-sm font-medium text-fg">Simulation</span>
+        {trial.sim_ended_by && (
+          <span
+            className={`inline-flex items-center text-xs px-2 py-0.5 rounded-full font-medium ${
+              trial.sim_ended_by === "persona"
+                ? "bg-success-subtle text-success"
+                : "bg-warning-subtle text-warning"
+            }`}
+            title={
+              trial.sim_ended_by === "persona"
+                ? "The persona ended the conversation on its termination rule"
+                : "The conversation was cut off at max_turns"
+            }
+          >
+            {trial.sim_ended_by === "persona" ? "ended by persona" : "hit max turns"}
+          </span>
+        )}
+        {trial.persona_model_id && (
+          <span
+            className="inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full bg-bg-surface text-fg-muted font-mono"
+            title="Persona model — plays the simulated user"
+          >
+            persona · {trial.persona_model_id}
+          </span>
+        )}
+        {(usage || trial.persona_turns !== undefined) && (
+          <span className="ml-auto text-xs font-mono text-fg-subtle" title="Persona turns · token usage · model calls">
+            {trial.persona_turns !== undefined && `${trial.persona_turns} turns`}
+            {usage && (
+              <>
+                {trial.persona_turns !== undefined && " · "}
+                {usage.input_tokens}↓ {usage.output_tokens}↑ · {usage.calls} calls
+              </>
+            )}
+          </span>
+        )}
+      </div>
+
+      <p className="text-sm text-fg-muted">{sim.scenario}</p>
+
+      <div className="grid gap-3 lg:grid-cols-2">
+        <div>
+          <div className="text-xs font-medium text-fg-muted mb-1">
+            Persona
+            {persona.name && <span className="text-fg"> — {persona.name}</span>}
+          </div>
+          <div className="text-xs text-fg-muted">{persona.identity}</div>
+        </div>
+
+        {persona.goals.length > 0 && (
+          <div>
+            <div className="text-xs font-medium text-fg-muted mb-1">Goals</div>
+            <ul className="text-xs text-fg-muted space-y-0.5">
+              {persona.goals.map((g, i) => (
+                <li key={i} className="flex items-baseline gap-1.5">
+                  <span className="text-fg-subtle">·</span>
+                  <span>{g}</span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
+
+        <div>
+          <div className="text-xs font-medium text-fg-muted mb-1">Termination</div>
+          <div className="text-xs text-fg-muted">{persona.termination}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Severity tones for judge findings — critical reads as danger, major as
+ *  warning, minor/info stay muted. */
+const FINDING_SEVERITY_ORDER: JudgeFinding["severity"][] = ["critical", "major", "minor", "info"];
+
+function findingSeverityCls(sev: string): string {
+  switch (sev) {
+    case "critical": return "bg-danger-subtle text-danger";
+    case "major":    return "bg-warning-subtle text-warning";
+    default:         return "bg-bg-surface text-fg-muted";
+  }
+}
+
+function FindingRow({
+  f,
+  resolvableIds,
+  onJump,
+}: {
+  f: JudgeFinding;
+  resolvableIds: Set<string>;
+  onJump: (id: string) => void;
+}) {
+  return (
+    <div className="flex items-start gap-2 py-1.5">
+      <span
+        className={`shrink-0 mt-0.5 text-[10px] font-medium px-1.5 py-0.5 rounded ${findingSeverityCls(f.severity)}`}
+      >
+        {f.severity}
+      </span>
+      <div className="min-w-0 flex-1 space-y-1">
+        <div className="text-xs text-fg">{f.summary}</div>
+        {f.recommendation && (
+          <div className="text-xs text-fg-muted">
+            <span className="text-brand font-medium">fix:</span> {f.recommendation}
+          </div>
+        )}
+        {Array.isArray(f.evidence) && f.evidence.length > 0 && (
+          <div className="flex items-center gap-1 flex-wrap">
+            {f.evidence.map((ev, i) => (
+              <EvidenceChip
+                key={`${ev}-${i}`}
+                evidence={ev}
+                resolvable={resolvableIds.has(ev)}
+                onJump={onJump}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Judge findings grouped by category. Findings are orthogonal to the
+ *  pass/fail criteria in VerdictCard — a passing trial can still carry a
+ *  critical safety finding. */
+function FindingsPanel({
+  findings,
+  resolvableIds,
+  onJump,
+}: {
+  findings: JudgeFinding[];
+  resolvableIds: Set<string>;
+  onJump: (id: string) => void;
+}) {
+  const byCategory = new Map<string, JudgeFinding[]>();
+  for (const f of findings) {
+    const list = byCategory.get(f.category) ?? [];
+    list.push(f);
+    byCategory.set(f.category, list);
+  }
+  for (const list of byCategory.values()) {
+    list.sort(
+      (a, b) =>
+        FINDING_SEVERITY_ORDER.indexOf(a.severity) - FINDING_SEVERITY_ORDER.indexOf(b.severity),
+    );
+  }
+  return (
+    <div className="rounded-lg bg-bg-surface/60 p-4 space-y-2">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-sm font-medium text-fg">Findings</span>
+        <span className="text-xs font-mono text-fg-subtle">{findings.length}</span>
+      </div>
+      <div className="space-y-2">
+        {[...byCategory.entries()].map(([cat, rows]) => (
+          <div key={cat}>
+            <div className="text-xs font-medium text-fg-muted">{cat}</div>
+            <div className="divide-y divide-border/40">
+              {rows.map((f, i) => (
+                <FindingRow
+                  key={`${f.summary}-${i}`}
+                  f={f}
+                  resolvableIds={resolvableIds}
+                  onJump={onJump}
+                />
+              ))}
+            </div>
+          </div>
         ))}
       </div>
     </div>

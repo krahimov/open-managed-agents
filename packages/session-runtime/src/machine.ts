@@ -33,6 +33,7 @@ import type {
   AgentConfig,
   SessionEvent,
   UserMessageEvent,
+  UserToolConfirmationEvent,
 } from "@open-managed-agents/shared";
 import type { LanguageModel } from "ai";
 import { recoverInterruptedState } from "./recovery";
@@ -179,6 +180,11 @@ export class SessionStateMachine {
 
     const threadId = (userMessage as { session_thread_id?: string }).session_thread_id;
     let failed = false;
+    // Tool-use ids the harness left pending because their policy is "ask".
+    // Read off ctx.runtime after harness.run; drives the requires_action
+    // stop_reason below so the session parks awaiting human confirmation
+    // instead of silently ending the turn (the dropped-checkpoint bug on Node).
+    let pendingConfirmations: string[] = [];
     try {
       await this.appendAndPublish({
         type: "session.status_running",
@@ -212,6 +218,9 @@ export class SessionStateMachine {
 
       const harness = this.deps.buildHarness();
       await harness.run(ctx);
+      const pending = (ctx as { runtime?: { pendingConfirmations?: string[] } })
+        .runtime?.pendingConfirmations;
+      if (pending?.length) pendingConfirmations = [...pending];
     } catch (err) {
       failed = true;
       await this.appendAndPublish({
@@ -228,12 +237,136 @@ export class SessionStateMachine {
     } finally {
       this.activeTurnId = null;
       await this.deps.adapter.endTurn(this.deps.sessionId, turnId, "idle");
+      // A turn that left tools pending "ask" parks in requires_action so the
+      // client (approval inbox) knows to resolve it; user.tool_confirmation
+      // then resumes via resumeToolConfirmation(). Otherwise end_turn.
+      const stopReason = failed
+        ? {}
+        : pendingConfirmations.length
+          ? {
+              stop_reason: {
+                type: "requires_action",
+                action_type: "tool_confirmation",
+                event_ids: pendingConfirmations,
+              },
+            }
+          : { stop_reason: { type: "end_turn" } };
       await this.appendAndPublish({
         type: "session.status_idle",
-        ...(failed ? {} : { stop_reason: { type: "end_turn" } }),
+        ...stopReason,
         ...(threadId ? { session_thread_id: threadId } : {}),
       } as SessionEvent);
     }
+  }
+
+  /**
+   * Resume a turn parked on an "ask" tool. Execute the confirmed tool (allow)
+   * or inject a denial (deny), append the agent.tool_result, then run a
+   * continuation turn so the model sees the result and proceeds. Port of the
+   * CF SessionDO.handleToolConfirmation onto the shared machine — the Node
+   * runtime had no consumer for user.tool_confirmation before this.
+   *
+   * Pending-call args are reconstructed from the durable event log (the
+   * agent.tool_use event carries name + input), so no separate pending store
+   * is needed and resume survives a process restart.
+   */
+  async resumeToolConfirmation(
+    agentId: string,
+    confirmation: UserToolConfirmationEvent,
+  ): Promise<void> {
+    const agent = await this.deps.loadAgent(agentId);
+    if (!agent) throw new Error(`agent ${agentId} not found`);
+
+    const events = await (
+      this.deps.adapter.eventLog as unknown as {
+        getEventsAsync(): Promise<SessionEvent[]>;
+      }
+    ).getEventsAsync();
+    const toolUse = events.find(
+      (e) =>
+        e.type === "agent.tool_use" &&
+        (e as { id?: string }).id === confirmation.tool_use_id,
+    ) as { id?: string; name?: string; input?: unknown } | undefined;
+    const alreadyResolved = events.some(
+      (e) =>
+        e.type === "agent.tool_result" &&
+        (e as { tool_use_id?: string }).tool_use_id === confirmation.tool_use_id,
+    );
+
+    // Guard: only a genuinely pending tool_use is resolvable. A confirmation
+    // for an unknown id (e.g. the model self-refused and never called the tool)
+    // or an already-answered one must NOT inject an orphan tool_result — that
+    // breaks the tool_use↔tool_result bijection and errors the next turn.
+    if (!toolUse?.name || alreadyResolved) {
+      this.deps.publish({
+        type: "session.warning",
+        source: "tool_confirmation",
+        message: `Ignored confirmation for ${confirmation.tool_use_id}: no pending tool call.`,
+      } as unknown as SessionEvent);
+      return;
+    }
+
+    if (confirmation.result === "allow") {
+      // Rebuild the toolset with execute intact — clearing effective_policy
+      // bypasses the "ask" strip (tools.ts) that removed execute in the
+      // original turn. Same trick CF uses (it rebuilds tools unrestricted).
+      const unrestricted = {
+        ...agent,
+        effective_policy: undefined,
+      } as AgentConfig;
+      const tools = (await this.deps.buildTools(
+        unrestricted,
+        this.deps.sandbox,
+      )) as Record<
+        string,
+        { execute?: (args: unknown, opts: unknown) => Promise<unknown> }
+      >;
+      const toolDef = tools[toolUse.name];
+      let content: string;
+      let isError = false;
+      if (toolDef?.execute) {
+        try {
+          const result = await toolDef.execute(toolUse.input, {
+            toolCallId: confirmation.tool_use_id,
+            messages: [],
+            abortSignal: undefined,
+          });
+          content = typeof result === "string" ? result : JSON.stringify(result);
+        } catch (e) {
+          content = `Error: ${e instanceof Error ? e.message : String(e)}`;
+          isError = true;
+        }
+      } else {
+        content = `Error: tool "${toolUse.name}" is not executable`;
+        isError = true;
+      }
+      await this.appendAndPublish({
+        type: "agent.tool_result",
+        tool_use_id: confirmation.tool_use_id,
+        content,
+        parent_event_id: confirmation.tool_use_id,
+        ...(isError ? { is_error: true } : {}),
+      } as unknown as SessionEvent);
+    } else {
+      const denyMsg =
+        confirmation.deny_message || "Tool execution was denied by the user.";
+      await this.appendAndPublish({
+        type: "agent.tool_result",
+        tool_use_id: confirmation.tool_use_id,
+        content: `Denied: ${denyMsg}`,
+        parent_event_id: confirmation.tool_use_id,
+        is_error: true,
+      } as unknown as SessionEvent);
+    }
+
+    // Continue the conversation. The synthetic trigger is NOT persisted
+    // (runHarnessTurn never persists its userMessage — history already has
+    // the tool_use + the tool_result we just appended), so the model simply
+    // resumes from the confirmed result.
+    await this.runHarnessTurn(agentId, {
+      type: "user.message",
+      content: [{ type: "text", text: "" }],
+    } as UserMessageEvent);
   }
 
   /**

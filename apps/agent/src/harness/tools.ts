@@ -24,7 +24,7 @@ import type { BrowserHarness, BrowserBillingHook } from "@open-managed-agents/br
 /** Tools enabled by default when an agent has no explicit tools config.
  *  Excludes opt-in tools that bias the LLM away from cheaper alternatives
  *  — see OPT_IN_TOOLS below. */
-export const DEFAULT_TOOLS = ["bash", "read", "write", "edit", "glob", "grep", "web_fetch", "web_search", "schedule", "cancel_schedule", "list_schedules", "create_ambient_rule", "list_ambient_rules", "delete_ambient_rule", "request_access", "find_skill", "request_skill"];
+export const DEFAULT_TOOLS = ["bash", "read", "write", "edit", "glob", "grep", "web_fetch", "web_search", "schedule", "cancel_schedule", "list_schedules", "create_ambient_rule", "list_ambient_rules", "delete_ambient_rule", "request_access", "find_skill", "request_skill", "memory_search", "memory_get", "memory_remember"];
 
 /** Tools recognised but NOT registered by default — agents must opt in
  *  via tools config (`{ name: "browser", enabled: true }`).
@@ -483,6 +483,45 @@ export async function buildTools(
     tenantId?: string;
     sessionId?: string;
     watchBackgroundTask?: (taskId: string, pid: string, outputFile: string, proc: ProcessHandle | null) => void;
+    /** Cross-session memory facts port (docs/memory-facts-design.md §5).
+     *  Present only when the session has ≥1 memory store attached and the
+     *  runtime has the facts index; the three memory_* tools register iff
+     *  it is set. `stores` lists the attached stores (id, name, access) so
+     *  memory_remember can target the writable one. */
+    memory?: {
+      stores: Array<{ id: string; name: string; access: "read_only" | "read_write" }>;
+      search: (args: {
+        query?: string;
+        kinds?: string[];
+        subject?: string;
+        include_history?: boolean;
+        limit?: number;
+      }) => Promise<
+        Array<{
+          id: string;
+          kind: string;
+          subject: string;
+          statement: string;
+          applies_when: string | null;
+          observed_at: number;
+          status: string;
+          source_path: string | null;
+          source_session_id: string | null;
+        }>
+      >;
+      get: (id: string) => Promise<{
+        fact: { id: string; kind: string; subject: string; statement: string; applies_when: string | null; observed_at: number; status: string; source_path: string | null; source_session_id: string | null };
+        chain: Array<{ id: string; statement: string; observed_at: number; status: string }>;
+        source_excerpt?: string;
+      } | null>;
+      remember: (args: {
+        kind: string;
+        subject: string;
+        statement: string;
+        applies_when?: string;
+        store_id?: string;
+      }) => Promise<{ id: string; superseded_id?: string | null; store_id: string }>;
+    };
     /** Browser tool factory. CF wires the @cloudflare/playwright adapter,
      *  Node self-host wires the playwright-core adapter (or CDP, or the
      *  throw-on-call Disabled adapter). */
@@ -1092,6 +1131,89 @@ export async function buildTools(
   // schedule a future user.message + drainEventQueue, backed by the agents
   // framework's durable scheduler on SessionDO. Reminder flows, follow-ups,
   // periodic monitors. Cron schedules recur until cancel_schedule.
+  // ---- Cross-session memory (memory-facts-design §5) ----------------------
+  // Registered only when the runtime hands us a facts port for this session
+  // (≥1 store attached). Search/get are read-only; remember writes a fact row
+  // AND appends to <store>/facts.md so the file substrate stays authoritative.
+  if (env?.memory && enabled.has("memory_search")) {
+    tools.memory_search = tool({
+      description:
+        "Search this agent's persistent cross-session memory for durable facts: standing rules, user preferences, past decisions, and known entities. " +
+        "Call this at the START of a task and before asking the user to repeat anything they may have told you before. " +
+        "Pass the task in plain words (e.g. \"draft a note to Acme about their contract\") — matching is full-text over subject/statement/applies_when. " +
+        "Returns ranked facts with ids; rules and preferences relevant to the task come first. Use memory_get for a fact's history/source.",
+      inputSchema: z.object({
+        query: z.string().min(1).max(500).describe("What you are about to do, or what you want to recall."),
+        kinds: z
+          .array(z.enum(["preference", "decision", "rule", "entity", "note"]))
+          .optional()
+          .describe("Restrict to these fact kinds."),
+        subject: z.string().max(120).optional().describe("Exact subject match, e.g. \"payroll vendor\"."),
+        include_history: z.boolean().optional().describe("Also return superseded facts (default false)."),
+        limit: z.number().int().min(1).max(20).optional().describe("Max results (default 5)."),
+      }),
+      execute: safe(async (args) => {
+        const rows = await env.memory!.search({ ...args, limit: args.limit ?? 5 });
+        if (rows.length === 0) return "No matching memory facts.";
+        return rows
+          .map(
+            (r) =>
+              `- [${r.kind}] ${r.subject}: ${r.statement}` +
+              (r.applies_when ? ` (applies when: ${r.applies_when})` : "") +
+              ` — id ${r.id}, observed ${new Date(r.observed_at).toISOString().slice(0, 10)}` +
+              (r.status !== "active" ? ` [${r.status}]` : ""),
+          )
+          .join("\n");
+      }),
+    });
+  }
+  if (env?.memory && enabled.has("memory_get")) {
+    tools.memory_get = tool({
+      description:
+        "Fetch one memory fact by id with its supersession history (what it replaced) and, when the fact came from a memory file, an excerpt of that file.",
+      inputSchema: z.object({ id: z.string().min(1).max(64) }),
+      execute: safe(async ({ id }) => {
+        const got = await env.memory!.get(id);
+        if (!got) return `No memory fact with id ${id}.`;
+        const f = got.fact;
+        const lines = [
+          `[${f.kind}] ${f.subject}: ${f.statement}`,
+          f.applies_when ? `applies when: ${f.applies_when}` : "",
+          `observed: ${new Date(f.observed_at).toISOString().slice(0, 10)} · status: ${f.status}` +
+            (f.source_session_id ? ` · from session ${f.source_session_id}` : "") +
+            (f.source_path ? ` · file ${f.source_path}` : ""),
+        ].filter(Boolean);
+        if (got.chain.length > 0) {
+          lines.push("history (newest first):");
+          for (const c of got.chain) {
+            lines.push(`  - ${c.statement} (observed ${new Date(c.observed_at).toISOString().slice(0, 10)}, ${c.status})`);
+          }
+        }
+        if (got.source_excerpt) lines.push("source excerpt:", got.source_excerpt);
+        return lines.join("\n");
+      }),
+    });
+  }
+  if (env?.memory && env.memory.stores.some((s) => s.access === "read_write") && enabled.has("memory_remember")) {
+    tools.memory_remember = tool({
+      description:
+        "Save a durable fact to persistent memory the moment the user states one: a standing rule (\"always CC legal@ on vendor contracts\"), a preference (\"no meetings before 10am\"), a decision (\"we chose Northwind as payroll vendor on July 22\"), or an entity fact. " +
+        "Write ONE self-contained sentence per fact. A new rule/preference/decision on the same subject supersedes the old one automatically. " +
+        "Do not save one-off task details, chatter, or things you merely inferred. Confirm to the user that you saved it.",
+      inputSchema: z.object({
+        kind: z.enum(["preference", "decision", "rule", "entity", "note"]),
+        subject: z.string().min(1).max(120).describe("Short noun phrase, e.g. \"vendor contracts\", \"payroll vendor\"."),
+        statement: z.string().min(1).max(1000).describe("One self-contained sentence."),
+        applies_when: z.string().max(300).optional().describe("For rules/preferences: when it applies, e.g. \"drafting or sending vendor contract emails\"."),
+        store_id: z.string().optional().describe("Target store when several are attached (default: the first writable one)."),
+      }),
+      execute: safe(async (args) => {
+        const res = await env.memory!.remember(args);
+        return `Saved to memory (id ${res.id}${res.superseded_id ? `, superseded ${res.superseded_id}` : ""}).`;
+      }),
+    });
+  }
+
   if (env?.scheduleWakeup && enabled.has("schedule")) {
     tools.schedule = tool({
       description:

@@ -32,10 +32,42 @@ import type { Actor, MemoryRow } from "../types";
  * methods are the queue consumer's entry points and must be idempotent
  * (R2 events deliver at-least-once).
  */
+export type MemoryFileWrittenListener = (info: {
+  storeId: string;
+  path: string;
+  actor: Actor;
+}) => void;
+
 export class SqlMemoryRepo implements MemoryRepo {
   private readonly db: OmaDbBuilder;
+  private readonly writeListeners: MemoryFileWrittenListener[] = [];
   constructor(db: OmaDb) {
     this.db = asBuilder(db);
+  }
+
+  /**
+   * Observe file writes that actually changed the index (memory-facts-design
+   * §4 trigger B). Every reflection path — REST writeByPath, chokidar
+   * watcher, CF queue consumer, S3 poller — converges on this repo, so one
+   * listener covers them all. Listeners are fire-and-forget; errors are
+   * swallowed so observability never blocks a write.
+   */
+  onFileWritten(listener: MemoryFileWrittenListener): () => void {
+    this.writeListeners.push(listener);
+    return () => {
+      const i = this.writeListeners.indexOf(listener);
+      if (i >= 0) this.writeListeners.splice(i, 1);
+    };
+  }
+
+  private notifyWritten(info: { storeId: string; path: string; actor: Actor }): void {
+    for (const l of this.writeListeners) {
+      try {
+        l(info);
+      } catch {
+        // observers never block writes
+      }
+    }
   }
 
   async createWithVersion(memory: NewMemoryRow, version: NewMemoryVersionInput): Promise<MemoryRow> {
@@ -54,6 +86,7 @@ export class SqlMemoryRepo implements MemoryRepo {
 
     const row = await this.findById(memory.storeId, memory.id);
     if (!row) throw new Error("memory vanished after createWithVersion");
+    this.notifyWritten({ storeId: version.storeId, path: version.path, actor: version.actor });
     return row;
   }
 
@@ -74,6 +107,7 @@ export class SqlMemoryRepo implements MemoryRepo {
 
     const row = await this.findById(version.storeId, memoryId);
     if (!row) throw new Error("memory vanished after updateWithVersion");
+    if (version.operation !== "deleted") this.notifyWritten({ storeId: version.storeId, path: version.path, actor: version.actor });
     return row;
   }
 
@@ -162,7 +196,8 @@ export class SqlMemoryRepo implements MemoryRepo {
           createdAt: input.nowMs,
         },
       );
-      return { wrote: true, row };
+      this.notifyWritten({ storeId: input.storeId, path: input.path, actor: input.actor });
+    return { wrote: true, row };
     }
 
     const memoryId = input.memoryId ?? generateMemoryId();
@@ -190,6 +225,7 @@ export class SqlMemoryRepo implements MemoryRepo {
         createdAt: input.nowMs,
       },
     );
+    this.notifyWritten({ storeId: input.storeId, path: input.path, actor: input.actor });
     return { wrote: true, row };
   }
 

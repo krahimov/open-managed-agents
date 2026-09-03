@@ -28,6 +28,16 @@ export const externalServiceGuidance =
 export const environmentProposalGuidance =
   "When the user asks you to configure or create a sandbox environment, propose it as a single fenced `yaml` block with top-level key `environment`. Include `name`, optional `description`, and `config`. For self-host cloud sandboxes, use `config.type: cloud` and include relevant `sandbox` fields (`provider`, `image`, `workdir`, `ephemeral`, `bootstrap_tools`, `bootstrap_apt_packages`, `max_file_bytes`), `resources.outputs`, `memory.stores`, `packages`, `networking`, or `dockerfile` when needed. The user can approve that YAML in the session UI; do not claim the environment exists until a tool/API call or user approval confirms it.";
 
+// Cross-session memory guidance (docs/memory-facts-design.md §7). NOT part
+// of `platformGuidance`: it is only relevant when a memory store is
+// attached, so runtimes prepend it as the first memory reminder instead of
+// paying its tokens on every memory-less agent turn. Both harnesses must
+// use this exact text — the DefaultHarness previously said only *where* the
+// mount was, and the memory simulation showed agents reading a standing
+// rule and then not applying it to the very next task.
+export const memoryGuidance =
+  "You have persistent memory that survives across sessions (the memory store(s) listed below). Use it deliberately: (1) At the START of a task — and before asking the user to repeat anything they may have told you before — check memory for relevant preferences, standing rules, and past decisions. (2) Standing rules and preferences found in memory APPLY to every task they govern: before drafting, sending, scheduling, or deciding, enumerate the memory rules relevant to that action and follow them without being reminded. (3) When the user states a durable preference, rule, or decision (\"always…\", \"never…\", \"we decided…\", \"remember that…\"), save it to memory in the same turn — a short, self-contained note with the date — and confirm you saved it. Do not save one-off task details or chatter.";
+
 export const platformGuidance =
   `${authenticatedCommandGuidance}\n\n${loopStopGuidance}\n\n${sessionOutputsGuidance}\n\n${externalServiceGuidance}\n\n${environmentProposalGuidance}`;
 

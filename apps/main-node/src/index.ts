@@ -79,7 +79,7 @@ import {
 } from "./lib/setup-harness.js";
 import { ALL_TOOLS, buildTools, getEnabledTools } from "@open-managed-agents/agent/harness/tools";
 import { resolveModel, type ApiCompat } from "@open-managed-agents/agent/harness/provider";
-import { composeSystemPrompt } from "@open-managed-agents/agent/harness/platform-guidance";
+import { composeSystemPrompt, memoryGuidance } from "@open-managed-agents/agent/harness/platform-guidance";
 import type { HarnessContext } from "@open-managed-agents/agent/harness/interface";
 import { nodeToMarkdown } from "@open-managed-agents/markdown/adapters/node";
 import { applyBetterAuthSchema } from "@open-managed-agents/schema";
@@ -122,6 +122,10 @@ import {
 import { OmaVaultResolver } from "@open-managed-agents/oma-cap-adapter";
 import { NodeSessionRouter } from "./lib/node-session-router.js";
 import { buildEvalSandboxFetcher } from "./lib/eval-sandbox-fetcher.js";
+import { buildNodeEvalMemoryPort } from "./lib/eval-memory-port.js";
+import { buildAttachAgentMemory } from "./lib/agent-memory-mode.js";
+import { createMemoryRuntime } from "./lib/memory-runtime.js";
+import { MemoryExtractionRunner } from "./lib/memory-extraction-runner.js";
 import {
   buildApprovalHistory,
   computeCapabilityStatement,
@@ -507,6 +511,13 @@ async function judgeAndMergeSkillReport(
   return applyJudgeVerdict(staticReport, judge);
 }
 
+// ─── Missions (long-running agent loops under an outer supervisor) ─────────
+const { MissionStore, newMissionId } = await import("./lib/missions.js");
+const { validateMissionInput } = await import("./lib/mission-decision.js");
+const missionStore = new MissionStore(sql);
+await missionStore.ensureSchema();
+const missionsRoot = process.env.MISSIONS_DIR ?? "./data/missions";
+
 let memoryBlobs: import("@open-managed-agents/memory-store").BlobStore;
 let memoryBlobDescription: string;
 let memoryBlobLocalDir: string | null = null;
@@ -551,8 +562,20 @@ if (
 const memoryService = createSqliteMemoryStoreService({
   db: drizzleDb,
   blobs: memoryBlobs,
+  // Facts index FTS idiom (memory-facts-design §3): FTS5 on SQLite,
+  // tsvector on Postgres.
+  dialect: usePostgres ? "pg" : "sqlite",
 });
-const memoryRepo = new SqlMemoryRepo(drizzleDb);
+// ONE SqlMemoryRepo instance shared by the service (REST writes) AND the
+// reflection paths (chokidar watcher / node queue / S3 poller). The
+// facts-extraction file trigger subscribes to this instance's write
+// observer — a second instance would silently miss every /mnt/memory edit.
+const memoryRepo = memoryService.repo as SqlMemoryRepo;
+
+// Memory fact extraction (memory-facts-design §4). The runner needs kv /
+// sessionRouter / sessionsService, which are constructed later — so the
+// registry tap and repo observer call through this late-bound holder.
+let memoryExtraction: import("./lib/memory-extraction-runner.js").MemoryExtractionRunner | null = null;
 // Memory blob watcher — wires chokidar fs events through
 // packages/queue's processMemoryEvent so CF + Node share one upsert
 // code path. PG mode uses the multi-replica-safe PG queue table; SQLite
@@ -721,11 +744,11 @@ async function buildSandbox(
 const sessionRegistry = new SessionRegistry({
   sql,
   hub,
-  onSessionEvent: webhookStore
-    ? (tenantId, sessionId, event) => {
-        void webhookStore.enqueueFor(tenantId, sessionId, event).catch(() => {});
-      }
-    : undefined,
+  onSessionEvent: (tenantId, sessionId, event) => {
+    if (webhookStore) void webhookStore.enqueueFor(tenantId, sessionId, event).catch(() => {});
+    // Memory fact extraction, trigger A (memory-facts-design §4).
+    memoryExtraction?.noteSessionEvent(tenantId, sessionId, (event as { type?: string }).type ?? "");
+  },
   agentsService,
   sessionsService,
   memoryService,
@@ -782,7 +805,15 @@ const sessionRegistry = new SessionRegistry({
       });
     }
     const creds = await resolveNodeModelCredentials(agent, context.tenantId);
-    return buildTools(agent, sandbox, {
+    // Cross-session memory tools (memory-facts-design §5): only when this
+    // session has ≥1 store attached and the facts index is available.
+    const memoryPort = await buildNodeMemoryToolsPort(context.tenantId, context.sessionId, agent.id);
+    // Simulation chaos injection: the eval runner stamps
+    // metadata.eval.chaos onto simulation sessions; wrap the finished tool
+    // dictionary so targeted tools fail deterministically per the rules
+    // (apps/agent/src/harness/chaos.ts). Non-eval sessions never carry it.
+    const chaosRules = (sessRow?.metadata as { eval?: { chaos?: unknown } } | null)?.eval?.chaos;
+    const built = await buildTools(agent, sandbox, {
       ANTHROPIC_API_KEY: creds.apiCompat.startsWith("ant") ? creds.apiKey : undefined,
       ANTHROPIC_BASE_URL: creds.apiCompat.startsWith("ant") ? creds.baseURL : undefined,
       // When set, the default web_search tool rides Tavily instead of the
@@ -848,6 +879,17 @@ const sessionRegistry = new SessionRegistry({
       findSkills: (query) => findSkillsForTenant(context.tenantId, query),
       requestSkill: (a) =>
         postSkillRequest(context.tenantId, agent.id, context.sessionId, a),
+      ...(memoryPort ? { memory: memoryPort } : {}),
+    });
+    if (!chaosRules) return built;
+    const { applyChaosRules } = await import("@open-managed-agents/agent/harness/chaos");
+    return applyChaosRules(built, chaosRules, {
+      sessionId: context.sessionId,
+      onInjected: (info: { tool: string; mode: string; call_index: number }) =>
+        logger.info(
+          { op: "sim.chaos.injected", session_id: context.sessionId, ...info },
+          "chaos: injected tool failure",
+        ),
     });
   },
   buildHarness: () => {
@@ -855,6 +897,69 @@ const sessionRegistry = new SessionRegistry({
     const sdk = new ClaudeAgentSdkHarness({
       resolveMcpTarget: resolveNodeMcpProxyTarget,
       resolveSkills: (tenantId, refs) => skillStore.resolveRefs(tenantId, refs),
+      // Memory stores — the SDK harness has no sandbox mount, so materialize
+      // the session's attached stores into its workdir and sync edits back.
+      // Without this, memory is invisible to every SDK-harness agent.
+      memory: {
+        resolve: async (tenantId, sessionId) => {
+          const rows = await sql
+            .prepare(
+              `SELECT store_id, access FROM session_memory_stores WHERE session_id = ?`,
+            )
+            .bind(sessionId)
+            .all<{ store_id: string; access: string }>();
+          const out: Array<{
+            storeId: string;
+            name: string;
+            access: "read_write" | "read_only";
+            memories: Array<{ path: string; content: string }>;
+          }> = [];
+          for (const r of rows.results ?? []) {
+            const store = await memoryService
+              .getStore({ tenantId, storeId: r.store_id })
+              .catch(() => null);
+            if (!store) continue;
+            const metas = await memoryService
+              .listMemories({ tenantId, storeId: r.store_id })
+              .catch(() => []);
+            const memories: Array<{ path: string; content: string }> = [];
+            for (const m of metas) {
+              const full = await memoryService
+                .readByPath({ tenantId, storeId: r.store_id, path: m.path })
+                .catch(() => null);
+              memories.push({ path: m.path, content: full?.content ?? "" });
+            }
+            out.push({
+              storeId: r.store_id,
+              name: store.name,
+              access: r.access === "read_only" ? "read_only" : "read_write",
+              memories,
+            });
+          }
+          return out;
+        },
+        write: async ({ tenantId, sessionId, storeId, path: memPath, content, baseSha256 }) => {
+          try {
+            await memoryService.writeByPath({
+              tenantId,
+              storeId,
+              path: memPath,
+              content,
+              precondition: baseSha256
+                ? { type: "content_sha256", content_sha256: baseSha256 }
+                : { type: "not_exists" },
+              actor: { type: "agent_session", id: sessionId },
+            });
+            return { ok: true };
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            const conflict =
+              (err as { name?: string })?.name === "MemoryPreconditionFailedError" ||
+              /precondition|sha256|exists/i.test(msg);
+            return { ok: false, conflict, error: msg };
+          }
+        },
+      },
       // Setup-session support: the in-process oma_setup MCP server stages the
       // agent's refined harness in session metadata and, on finish, applies it
       // to the agent it belongs to.
@@ -935,6 +1040,43 @@ const sessionRegistry = new SessionRegistry({
       ? buildSetupPrompt(input.agent, { accessStatus })
       : input.agent.system ?? "";
     const memoryContext = await buildNodeMemoryPromptContext(input.tenantId, input.sessionId);
+    // Turn-scoped reminders ride the user side of the prompt (cache-safe);
+    // system-prompt reminders (memoryContext.reminders) stay stable per session.
+    const turnReminders: Array<{ source: string; text: string }> = [];
+    // PUSH (memory-facts-design §5): before the model runs, match the
+    // incoming turn against the attached stores' active facts and inject
+    // the top-k as a per-turn reminder — so a standing rule is in context
+    // at the moment it governs, without relying on the model to search.
+    // Local FTS, no LLM, ≤ MEMORY_PUSH_MAX facts. Recorded on the session
+    // stream as memory_pushed so the judge / console can see it.
+    const pushEnabled = (input.agent as { memory?: { push?: boolean } }).memory?.push !== false;
+    if (!isSetup && pushEnabled && memoryContext.storeIds.length > 0 && memoryService.factsEnabled()) {
+      try {
+        const pushed = await buildMemoryPushReminder({
+          tenantId: input.tenantId,
+          // per_user: push only from the principal's own store (env-bound
+          // stores are shared across principals).
+          storeIds:
+            memoryContext.mode === "per_user" && memoryContext.primaryStoreId
+              ? [memoryContext.primaryStoreId]
+              : memoryContext.storeIds,
+          userMessage: input.userMessage as unknown as { content?: unknown },
+          isFirstTurn: await isFirstUserTurn(input.sessionId),
+        });
+        if (pushed) {
+          turnReminders.push({ source: "memory:relevant", text: pushed.text });
+          await sessionRouter
+            .appendEvent(input.sessionId, {
+              type: "system.memory_pushed",
+              fact_ids: pushed.factIds,
+              count: pushed.factIds.length,
+            } as SessionEvent)
+            .catch(() => {});
+        }
+      } catch (err) {
+        logger.warn({ op: "memory.push", err }, "memory push failed; turn continues without it");
+      }
+    }
     return {
       agent: input.agent,
       userMessage: input.userMessage,
@@ -949,6 +1091,7 @@ const sessionRegistry = new SessionRegistry({
         : composeSystemPrompt(rawSystemPrompt, memoryContext.reminders),
       rawSystemPrompt,
       platformReminders: isSetup ? [] : memoryContext.reminders,
+      turnReminders: isSetup ? [] : turnReminders,
       env: {
         ANTHROPIC_API_KEY: creds.apiKey,
         ANTHROPIC_BASE_URL: creds.apiCompat.startsWith("ant") ? creds.baseURL : undefined,
@@ -976,6 +1119,15 @@ const sessionWorkQueue = new NodeSessionWorkQueue({
   dialect,
   run: async (item) => {
     const entry = await sessionRegistry.getOrCreate(item.sessionId, item.tenantId);
+    // A parked "ask" tool resumes via resumeToolConfirmation; a normal
+    // user.message drives a fresh turn (and mirrors to Slack if applicable).
+    if (item.event.type === "user.tool_confirmation") {
+      await entry.machine.resumeToolConfirmation(
+        item.agentId,
+        item.event as import("@open-managed-agents/shared").UserToolConfirmationEvent,
+      );
+      return;
+    }
     await entry.machine.runHarnessTurn(item.agentId, item.event);
     // Best-effort, never throws — a Slack hiccup must not fail the turn.
     await slackReplyBridge?.mirrorTurnReply({
@@ -1840,12 +1992,118 @@ v1.post("/skills/acquire", async (c) => {
   }
 });
 
+// Memory fact extraction runner (memory-facts-design §4) — see the
+// late-bound holder above; the registry tap (trigger A) is already wired.
+memoryExtraction = new MemoryExtractionRunner({
+  memoryService,
+  kv,
+  listWritableStores: async (tenantId, sessionId) => {
+    const ctx = await buildNodeMemoryPromptContext(tenantId, sessionId);
+    const writable = ctx.storeIds.filter((id) => (ctx.access.get(id) ?? "read_write") === "read_write");
+    // Facts extracted from a session belong in the agent's OWN store when
+    // memory mode is on (per_user isolation; shared coherence). Put the
+    // primary first so the runner's stores[0] targets it; in per_user
+    // mode expose ONLY the primary.
+    if (ctx.primaryStoreId && writable.includes(ctx.primaryStoreId)) {
+      return ctx.mode === "per_user"
+        ? [ctx.primaryStoreId]
+        : [ctx.primaryStoreId, ...writable.filter((id) => id !== ctx.primaryStoreId)];
+    }
+    return ctx.mode === "per_user" ? [] : writable;
+  },
+  fetchEvents: async (sessionId, afterSeq) => {
+    const all = await newEventLog(sessionId).getEventsAsync(afterSeq);
+    return all as never;
+  },
+  sessionAgent: async (tenantId, sessionId) => {
+    const row = await sessionsService.get({ tenantId, sessionId });
+    if (!row?.agent_id) return null;
+    return { agentId: row.agent_id, auxModel: (row.agent_snapshot as { aux_model?: unknown } | null)?.aux_model };
+  },
+  resolveModel: async (tenantId, agentId) => {
+    const agent = await agentsService.get({ tenantId, agentId });
+    if (!agent) return null;
+    // Extractor rides the agent's aux_model when set (cheap tier by
+    // convention), else the agent's own model at low reasoning.
+    const target = agent.aux_model
+      ? { ...agent, model: agent.aux_model, reasoning_level: "low" as const }
+      : { ...agent, reasoning_level: "low" as const };
+    const creds = await resolveNodeModelCredentials(target as never, tenantId);
+    const model = resolveModel(creds.model, creds.apiKey, creds.baseURL, creds.apiCompat, creds.customHeaders, "low");
+    return { model, modelId: creds.model };
+  },
+  emitAuxCall: async (sessionId, ev) => {
+    await sessionRouter.appendEvent(sessionId, ev as never).catch(() => {});
+  },
+  shouldSkipSession: async (tenantId, sessionId) => {
+    // Eval / simulation sessions manage their own memory expectations;
+    // extraction there would leak scenario text into the agent's store.
+    const row = await sessionsService.get({ tenantId, sessionId });
+    if ((row?.metadata as { eval?: unknown } | null)?.eval) return true;
+    // Honor AgentMemoryConfig.extract (snapshotted on the session).
+    const snap = row?.agent_snapshot as { memory?: { extract?: boolean } } | null;
+    return snap?.memory?.extract === false;
+  },
+  log: (msg, ctx) => logger.info({ op: "memory.extract", ...ctx }, msg),
+});
+memoryService.repo.onFileWritten?.(({ storeId, path, actor }) => {
+  // Trigger B (memory-facts-design §4). The store row carries tenant_id, so
+  // resolve the tenant from it (multi-tenant safe). Agent-scoped stores are
+  // named agent-<id>-…; recover the agent id for extractor model
+  // resolution. Other stores skip file-trigger extraction for now.
+  void (async () => {
+    const store = await memoryStoreRowById(storeId);
+    if (!store) return;
+    const m = /^agent-(agent-[a-z0-9]+)-/.exec(store.name);
+    if (!m) return;
+    // Seeds planted by the eval runner + facts.md written by memory_remember
+    // are already indexed / not extraction inputs.
+    if (actor.type === "system" && actor.id === "eval-runner") return;
+    await memoryExtraction!.noteMemoryFileWrite(store.tenant_id, storeId, path, m[1]);
+  })().catch((err) => logger.warn({ op: "memory.extract.file_trigger", err }, "file trigger failed"));
+});
+
+/** Tenant-agnostic store lookup by id (the repo's rows carry tenant_id). */
+async function memoryStoreRowById(storeId: string): Promise<{ tenant_id: string; name: string } | null> {
+  const row = await sql
+    .prepare(`SELECT tenant_id, name FROM memory_stores WHERE id = ? LIMIT 1`)
+    .bind(storeId)
+    .first<{ tenant_id: string; name: string }>();
+  return row ?? null;
+}
+
 const sessionRoutesApp = buildSessionRoutes({
   services,
   router: sessionRouter,
   outputs: sessionOutputsBackend.adapter,
   lifecycle: {
     ...nodeSessionLifecycle({ files: filesService, filesBlob }),
+    // Agent-level cross-session memory (memory-facts-design §6): provision
+    // + attach the agent's own store per its `_oma.memory.mode` before the
+    // runtime inits, so /mnt/memory + the memory reminder are live on turn 1.
+    attachAgentMemory: buildAttachAgentMemory({
+      memoryService: memoryService as never,
+      attach: async ({ sessionId, storeId, access }) => {
+        await sql
+          .prepare(
+            `INSERT INTO session_memory_stores (session_id, store_id, access, created_at)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(session_id, store_id) DO UPDATE SET access = excluded.access`,
+          )
+          .bind(sessionId, storeId, access, Date.now())
+          .run();
+      },
+      pinAgentStore: async ({ tenantId, agentId, storeId }) => {
+        const row = await agentsService.get({ tenantId, agentId });
+        if (!row?.memory || row.memory.mode !== "shared" || row.memory.store_id) return;
+        await agentsService.update({
+          tenantId,
+          agentId,
+          input: { memory: { ...row.memory, store_id: storeId } },
+        });
+      },
+      log: (msg, ctx) => logger.info({ op: "memory.mode", ...ctx }, msg),
+    }),
     // Clerk Billing entitlement gate: free-plan tenants get a concurrent-
     // session cap (402), paid plans pass, non-Clerk tenants fail open.
     ...(clerkConfig && clerkStore && clerkConfig.billingEnforce
@@ -1880,6 +2138,44 @@ const sessionRoutesApp = buildSessionRoutes({
     } as unknown as import("@open-managed-agents/shared").EnvironmentConfig;
   },
 });
+// Session memory-store attach/list — MUST be registered before the
+// v1.route("/sessions", ...) mount below, or that sub-app's wildcard
+// swallows /sessions/:id/memory_stores and returns a generic 404.
+v1.post("/sessions/:id/memory_stores", async (c) => {
+  const sid = c.req.param("id");
+  const session = await sql
+    .prepare(`SELECT id FROM sessions WHERE tenant_id = ? AND id = ?`)
+    .bind(c.var.tenant_id, sid)
+    .first();
+  if (!session) return c.json({ error: "Session not found" }, 404);
+  const body = await c.req.json<{ store_id: string; access?: string }>();
+  if (!body.store_id) return c.json({ error: "store_id is required" }, 400);
+  const store = await memoryService.getStore({
+    tenantId: c.var.tenant_id,
+    storeId: body.store_id,
+  });
+  if (!store) return c.json({ error: "Memory store not found" }, 404);
+  const access = body.access === "read_only" ? "read_only" : "read_write";
+  await sql
+    .prepare(
+      `INSERT INTO session_memory_stores (session_id, store_id, access, created_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(session_id, store_id) DO UPDATE SET access = excluded.access`,
+    )
+    .bind(sid, body.store_id, access, Date.now())
+    .run();
+  return c.json({ session_id: sid, store_id: body.store_id, access }, 201);
+});
+v1.get("/sessions/:id/memory_stores", async (c) => {
+  const r = await sql
+    .prepare(
+      `SELECT store_id, access, created_at FROM session_memory_stores WHERE session_id = ?`,
+    )
+    .bind(c.req.param("id"))
+    .all<{ store_id: string; access: string; created_at: number }>();
+  return c.json({ data: r.results ?? [] });
+});
+
 v1.route("/sessions", sessionRoutesApp);
 v1.route("/deployments", buildDeploymentRoutes({ services }));
 v1.route("/vaults", buildVaultRoutes({
@@ -2448,6 +2744,138 @@ v1.post("/evals/draft_task_from_session", async (c) => {
   });
 });
 
+// ── Simulations: draft scenarios from the agent's config ────────────────
+// POST /v1/evals/draft_scenarios {agent_id, count?, focus?}
+// The tenant's cross-family judge model reads the agent's configuration
+// (system prompt, tools, MCP servers) and proposes N realistic simulation
+// scenarios — persona + rubric included — as EDITABLE drafts the console
+// lets the user revise before saving to a suite or launching. Same degrade
+// posture as draft_task_from_session: any LLM failure falls back to one
+// static template scenario; the endpoint never 500s because of the LLM.
+// Pure helpers live in lib/scenario-drafting.ts (unit-tested there).
+v1.post("/evals/draft_scenarios", async (c) => {
+  const {
+    SCENARIO_DRAFT_TIMEOUT_MS,
+    SCENARIO_COUNT_MAX,
+    scenarioDraftError,
+    scenarioDraftToTask,
+    staticScenarioTemplate,
+    buildScenarioAuthorPrompt,
+    parseScenarioDrafts,
+  } = await import("./lib/scenario-drafting.js");
+  type ScenarioDraft = import("./lib/scenario-drafting.js").ScenarioDraft;
+
+  const tenantId = c.var.tenant_id;
+  const body = await c.req
+    .json<{ agent_id?: string; count?: number; focus?: string }>()
+    .catch(() => null);
+  if (!body?.agent_id) return c.json({ error: "agent_id is required" }, 400);
+  const count = Math.max(1, Math.min(body.count ?? 3, SCENARIO_COUNT_MAX));
+
+  const agent = await agentsService.get({ tenantId, agentId: body.agent_id });
+  if (!agent) return c.json({ error: "Agent not found" }, 404);
+
+  const toolNames = (agent.tools ?? []).map((t) =>
+    "name" in t && typeof t.name === "string" ? t.name : (t as { type?: string }).type ?? "?",
+  );
+  const mcpNames = (agent.mcp_servers ?? []).map((m) => m.name);
+
+  let drafts: ScenarioDraft[] = [];
+  let draftedBy = "template";
+  try {
+    const { buildNodeJudgeResolver } = await import("./lib/eval-judge.js");
+    const resolver = buildNodeJudgeResolver({
+      modelCards: modelCardService,
+      agents: agentsService,
+    });
+    const resolved = await resolver(tenantId, body.agent_id, { type: "llm_judge", rubric: "" });
+    if (resolved) {
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), SCENARIO_DRAFT_TIMEOUT_MS);
+      try {
+        const res = await resolved.judge(
+          buildScenarioAuthorPrompt({
+            agent: { name: agent.name, system: agent.system },
+            toolNames,
+            mcpNames,
+            count,
+            focus: body.focus,
+          }),
+          ac.signal,
+        );
+        const parsed = parseScenarioDrafts(res.text || "");
+        drafts = parsed.filter((d) => scenarioDraftError(d) === null).slice(0, count);
+        if (drafts.length > 0) draftedBy = resolved.judgeModelId;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+  } catch {
+    // any resolution/generation failure falls back to the static template
+  }
+  if (drafts.length === 0) {
+    drafts = [staticScenarioTemplate(agent)];
+    draftedBy = "template";
+  }
+
+  // De-dup draft ids defensively — LLMs repeat slugs across scenarios.
+  const seen = new Set<string>();
+  const scenarios = drafts.map((d, i) => {
+    const task = scenarioDraftToTask(d, i);
+    let id = task.id as string;
+    while (seen.has(id)) id = `${id}-${i + 1}`;
+    seen.add(id);
+    return { ...task, id };
+  });
+
+  return c.json({ scenarios, drafted_by: draftedBy });
+});
+
+// ── Re-grade (evals-design §7): re-run verifiers on stored trajectories ──
+// POST /v1/evals/runs/:id/regrade {task_id?, trial_index?}
+// Conversations are NOT re-executed — only the judge/verifier runs again
+// against the persisted trajectory (workspace access best-effort). Lets
+// judge-side fixes and rubric edits correct verdicts for free. Node-only:
+// needs the in-process judge resolver.
+v1.post("/evals/runs/:id/regrade", async (c) => {
+  const { regradeRun } = await import("@open-managed-agents/evals-runner");
+  const { buildNodeJudgeResolver: buildResolver } = await import("./lib/eval-judge.js");
+  const tenantId = c.var.tenant_id;
+  const body = await c.req
+    .json<{ task_id?: string; trial_index?: number }>()
+    .catch(() => ({}) as { task_id?: string; trial_index?: number });
+
+  const evalCtxServices = {
+    agents: agentsService,
+    environments: environmentsService,
+    sessions: sessionsService,
+    evals: evalsService,
+    kv,
+  };
+  const sandbox = buildEvalSandboxFetcher(sessionRouter);
+  const result = await regradeRun(
+    {
+      forEachShard: async (fn) => [await fn(evalCtxServices as never)],
+      getServicesForTenant: async () => evalCtxServices as never,
+      getSandboxBinding: async () => sandbox,
+      resolveJudge: buildResolver({ modelCards: modelCardService, agents: agentsService }),
+      memory: buildNodeEvalMemoryPort({ memoryService: memoryService as never, sql }),
+    },
+    tenantId,
+    c.req.param("id"),
+    { taskId: body.task_id, trialIndex: body.trial_index },
+  );
+  if (!result) return c.json({ error: "Run not found" }, 404);
+  if ("error" in result) {
+    return c.json({ error: "run is still active; re-grade is only allowed on completed/failed runs" }, 400);
+  }
+  return c.json({
+    run_id: c.req.param("id"),
+    regraded: result.regraded,
+    skipped: result.skipped,
+  });
+});
+
 mountNodeModelCardRoutes(v1);
 mountNodeModelsRoutes(v1);
 mountNodeEnvironmentRoutes(v1);
@@ -2602,6 +3030,102 @@ v1.delete("/skills/:id", async (c) => {
   const ok = await skillStore.delete(c.get("tenant_id"), c.req.param("id"));
   return ok ? c.body(null, 204) : c.json({ error: "not found" }, 404);
 });
+
+// ── Missions — long-running agent loops (Phase 1) ──
+// POST creates the goal contract + workspace; the supervisor pump
+// (node-mission-supervisor.ts, registered with the scheduler below) does
+// all the spawning/verifying. Stop only flips status — the in-flight
+// iteration finishes its turn but is never verified or respawned.
+v1.post("/missions", async (c) => {
+  const body = await c.req
+    .json<{ agent_id?: string; goal?: string; verifiers?: unknown; budget?: unknown }>()
+    .catch(() => null);
+  if (!body?.agent_id) return c.json({ error: "agent_id required" }, 400);
+  const tenantId = c.get("tenant_id");
+  const agent = await agentsService.get({ tenantId, agentId: body.agent_id });
+  if (!agent || agent.archived_at) return c.json({ error: "agent not found" }, 404);
+  let validated: ReturnType<typeof validateMissionInput>;
+  try {
+    validated = validateMissionInput(body);
+  } catch (err) {
+    return c.json({ error: err instanceof Error ? err.message : "invalid mission" }, 400);
+  }
+  // Mint the id up front so the workspace (data/missions/<id> on the host)
+  // exists before the row does — the supervisor pump must never sweep a
+  // running mission whose workspace dir isn't there yet.
+  const missionId = newMissionId();
+  const workspace = resolve(missionsRoot, missionId);
+  mkdirSync(workspace, { recursive: true });
+  const mission = await missionStore.create({
+    id: missionId,
+    tenantId,
+    agentId: body.agent_id,
+    goal: validated.goal,
+    verifiers: validated.verifiers,
+    budget: validated.budget,
+    workspace,
+  });
+  // Spawn iteration 1 synchronously so the caller gets a session to land in
+  // (the console navigates straight there — missions have no page of their
+  // own). Failure is non-fatal: the pump retries on its next sweep.
+  let activeSessionId: string | null = null;
+  try {
+    activeSessionId = await missionSupervisor.kickoff(tenantId, missionId);
+  } catch {
+    // pump will pick it up
+  }
+  return c.json({ ...mission, active_session_id: activeSessionId }, 201);
+});
+v1.get("/missions", async (c) =>
+  c.json({ data: await missionStore.list(c.get("tenant_id")) }),
+);
+v1.get("/missions/:id", async (c) => {
+  const tenantId = c.get("tenant_id");
+  const mission = await missionStore.get(tenantId, c.req.param("id"));
+  if (!mission) return c.json({ error: "not found" }, 404);
+  // Iteration sessions carry metadata.mission_id (set at spawn time).
+  // Metadata is a JSON text column; the quoted-key LIKE narrows the scan,
+  // but mission ids contain nanoid `_` (a LIKE single-char wildcard), so
+  // the parsed value is the authoritative match.
+  const rows = await sql
+    .prepare(
+      `SELECT id, status, title, created_at, updated_at, metadata FROM sessions
+        WHERE tenant_id = ? AND metadata LIKE ? ORDER BY created_at ASC`,
+    )
+    .bind(tenantId, `%"mission_id":"${mission.id}"%`)
+    .all<{ id: string; status: string; title: string; created_at: number; updated_at: number | null; metadata: string | null }>();
+  const iterations = (rows.results ?? []).flatMap((r) => {
+    let meta: Record<string, unknown> = {};
+    try {
+      meta = r.metadata ? (JSON.parse(r.metadata) as Record<string, unknown>) : {};
+    } catch {
+      return [];
+    }
+    if (meta.mission_id !== mission.id) return [];
+    return [{
+      session_id: r.id,
+      status: r.status,
+      title: r.title,
+      iteration: typeof meta.mission_iteration === "number" ? meta.mission_iteration : null,
+      created_at: Number(r.created_at),
+      updated_at: r.updated_at === null ? null : Number(r.updated_at),
+    }];
+  });
+  return c.json({ ...mission, iterations });
+});
+v1.post("/missions/:id/stop", async (c) => {
+  const tenantId = c.get("tenant_id");
+  const mission = await missionStore.get(tenantId, c.req.param("id"));
+  if (!mission) return c.json({ error: "not found" }, 404);
+  if (mission.status !== "running") return c.json(mission);
+  const now = Date.now();
+  await missionStore.update(tenantId, mission.id, {
+    status: "stopped",
+    stopped_at: now,
+  });
+  return c.json({ ...mission, status: "stopped", stopped_at: now, updated_at: now });
+});
+
 v1.get("/integrations/github/credentials", (c) => c.json({ data: [] }));
 v1.get("/integrations/linear/credentials", (c) => c.json({ data: [] }));
 v1.get("/integrations/slack/credentials", (c) => c.json({ data: [] }));
@@ -2880,41 +3404,6 @@ const _capResolver = new OmaVaultResolver({
 void _capResolver;
 
 // ── Session ↔ memory_store binding (Node-specific; not in package yet) ──
-v1.post("/sessions/:id/memory_stores", async (c) => {
-  const sid = c.req.param("id");
-  const session = await sql
-    .prepare(`SELECT id FROM sessions WHERE tenant_id = ? AND id = ?`)
-    .bind(c.var.tenant_id, sid)
-    .first();
-  if (!session) return c.json({ error: "Session not found" }, 404);
-  const body = await c.req.json<{ store_id: string; access?: string }>();
-  if (!body.store_id) return c.json({ error: "store_id is required" }, 400);
-  const store = await memoryService.getStore({
-    tenantId: c.var.tenant_id,
-    storeId: body.store_id,
-  });
-  if (!store) return c.json({ error: "Memory store not found" }, 404);
-  const access = body.access === "read_only" ? "read_only" : "read_write";
-  await sql
-    .prepare(
-      `INSERT INTO session_memory_stores (session_id, store_id, access, created_at)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(session_id, store_id) DO UPDATE SET access = excluded.access`,
-    )
-    .bind(sid, body.store_id, access, Date.now())
-    .run();
-  return c.json({ session_id: sid, store_id: body.store_id, access }, 201);
-});
-v1.get("/sessions/:id/memory_stores", async (c) => {
-  const r = await sql
-    .prepare(
-      `SELECT store_id, access, created_at FROM session_memory_stores WHERE session_id = ?`,
-    )
-    .bind(c.req.param("id"))
-    .all<{ store_id: string; access: string; created_at: number }>();
-  return c.json({ data: r.results ?? [] });
-});
-
 // ── Console UI (optional) ──
 const consoleDir = process.env.CONSOLE_DIR;
 if (consoleDir) {
@@ -2948,6 +3437,46 @@ serve({ fetch: app.fetch, port, hostname: host }, (info) => {
 // applied) webhook-events retention. Linear dispatch is left un-wired here
 // because main-node doesn't construct a LinearProvider; pass `linearSweeper`
 // when an in-process gateway lands.
+// Vault credentials → MCP servers for server-spawned session snapshots.
+// Console sessions get the Composio tool-router entry injected client-side
+// at create time; ambient + mission sessions derive the same entry from the
+// vault's composio_mcp credential (its mcp_server_url IS the persistent
+// tool-router session URL). Name mirrors the console's convention:
+// composio_<toolkits-joined>, so resolveNodeMcpProxyTarget's URL match
+// finds the credential and injects the api key at call time.
+async function resolveVaultMcpServersForSpawn(
+  tenantId: string,
+  vaultIds: string[],
+): Promise<Array<{ name: string; type: "url"; url: string }>> {
+  const grouped = await credentialService
+    .listByVaults({ tenantId, vaultIds })
+    .catch(() => []);
+  const servers: Array<{ name: string; type: "url"; url: string }> = [];
+  const seenUrls = new Set<string>();
+  for (const group of grouped) {
+    for (const cred of group.credentials) {
+      const c = cred as {
+        archived_at?: string | null;
+        auth?: { type?: string; mcp_server_url?: string; composio_toolkits?: string[] };
+      };
+      if (c.archived_at) continue;
+      const auth = c.auth;
+      if (auth?.type !== "composio_mcp") continue;
+      const url = auth.mcp_server_url?.trim();
+      if (!url || seenUrls.has(url)) continue;
+      seenUrls.add(url);
+      const toolkits = Array.isArray(auth.composio_toolkits)
+        ? auth.composio_toolkits.filter((t): t is string => typeof t === "string" && !!t)
+        : [];
+      const base = toolkits.length > 0 ? `composio_${toolkits.join("_")}` : "composio";
+      let name = base;
+      for (let i = 2; servers.some((s) => s.name === name); i++) name = `${base}_${i}`;
+      servers.push({ name, type: "url", url });
+    }
+  }
+  return servers;
+}
+
 const ambientDispatcher = new NodeAmbientDispatcher({
   ambientRules: ambientRulesService,
   agents: agentsService,
@@ -2957,42 +3486,28 @@ const ambientDispatcher = new NodeAmbientDispatcher({
   appendUserEvent: async (sessionId, _tenantId, _agentId, event) => {
     await sessionRouter.appendEvent(sessionId, event);
   },
-  // Vault credentials → MCP servers for the spawned snapshot. Console
-  // sessions get the Composio tool-router entry injected client-side at
-  // create time; ambient sessions derive the same entry from the vault's
-  // composio_mcp credential (its mcp_server_url IS the persistent
-  // tool-router session URL). Name mirrors the console's convention:
-  // composio_<toolkits-joined>, so resolveNodeMcpProxyTarget's URL match
-  // finds the credential and injects the api key at call time.
-  resolveVaultMcpServers: async (tenantId, vaultIds) => {
-    const grouped = await credentialService
-      .listByVaults({ tenantId, vaultIds })
-      .catch(() => []);
-    const servers: Array<{ name: string; type: "url"; url: string }> = [];
-    const seenUrls = new Set<string>();
-    for (const group of grouped) {
-      for (const cred of group.credentials) {
-        const c = cred as {
-          archived_at?: string | null;
-          auth?: { type?: string; mcp_server_url?: string; composio_toolkits?: string[] };
-        };
-        if (c.archived_at) continue;
-        const auth = c.auth;
-        if (auth?.type !== "composio_mcp") continue;
-        const url = auth.mcp_server_url?.trim();
-        if (!url || seenUrls.has(url)) continue;
-        seenUrls.add(url);
-        const toolkits = Array.isArray(auth.composio_toolkits)
-          ? auth.composio_toolkits.filter((t): t is string => typeof t === "string" && !!t)
-          : [];
-        const base = toolkits.length > 0 ? `composio_${toolkits.join("_")}` : "composio";
-        let name = base;
-        for (let i = 2; servers.some((s) => s.name === name); i++) name = `${base}_${i}`;
-        servers.push({ name, type: "url", url });
-      }
-    }
-    return servers;
+  resolveVaultMcpServers: (tenantId, vaultIds) =>
+    resolveVaultMcpServersForSpawn(tenantId, vaultIds),
+});
+
+// Mission supervisor — the outer loop above the harness. Shares the ambient
+// dispatcher's spawn recipe (agent snapshot + local-runtime env + vault MCP
+// derivation) so mission iterations behave like any other server-spawned
+// session.
+const { NodeMissionSupervisor } = await import("./lib/node-mission-supervisor.js");
+const missionSupervisor = new NodeMissionSupervisor({
+  missions: missionStore,
+  agents: agentsService,
+  sessions: sessionsService,
+  sql,
+  appendUserEvent: async (sessionId, _tenantId, _agentId, event) => {
+    await sessionRouter.appendEvent(sessionId, event);
   },
+  appendSessionEvent: async (sessionId, event) => {
+    await sessionRouter.appendEvent(sessionId, event);
+  },
+  resolveVaultMcpServers: (tenantId, vaultIds) =>
+    resolveVaultMcpServersForSpawn(tenantId, vaultIds),
 });
 
 const { buildNodeJudgeResolver } = await import("./lib/eval-judge.js");
@@ -3009,8 +3524,10 @@ const scheduler = buildNodeScheduler({
     modelCards: modelCardService,
     agents: agentsService,
   }),
+  evalMemory: buildNodeEvalMemoryPort({ memoryService: memoryService as never, sql }),
   memory: memoryService,
   ambientDispatcher,
+  missionSupervisor,
   integrationsSql: platformRootSecret ? sql : null,
   wakeups: { pump: () => sessionWakeups.pump() },
 });
@@ -3552,123 +4069,20 @@ function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean 
   return fallback;
 }
 
-async function buildNodeMemoryPromptContext(
-  tenantId: string,
-  sessionId: string,
-): Promise<{
-  storeIds: string[];
-  reminders: Array<{ source: string; text: string }>;
-}> {
-  const attachments = new Map<string, {
-    storeId: string;
-    access: "read_only" | "read_write";
-    instructions?: string;
-  }>();
-
-  const session = await sessionsService.get({ tenantId, sessionId }).catch(() => null);
-  await addEnvironmentMemoryPromptBindings(attachments, tenantId, session?.environment_snapshot);
-
-  {
-    // Both dialects use the shared service (JSON `config` blob) since
-    // migration 0002 reconciled PG session_resources with the cf-auth shape.
-    const resources = await sessionsService
-      .listResourcesBySession({ sessionId })
-      .catch(() => []);
-    for (const row of resources) {
-      if (row.type !== "memory_store") continue;
-      const resource = row.resource as {
-        memory_store_id?: string;
-        store_id?: string;
-        access?: string;
-        instructions?: string;
-      };
-      const storeId = resource.memory_store_id ?? resource.store_id;
-      if (!storeId) continue;
-      attachments.set(storeId, {
-        storeId,
-        access: resource.access === "read_only" ? "read_only" : "read_write",
-        instructions:
-          typeof resource.instructions === "string"
-            ? resource.instructions.slice(0, 4096)
-            : undefined,
-      });
-    }
-  }
-
-  const legacyRows = await sql
-    .prepare(`SELECT store_id, access FROM session_memory_stores WHERE session_id = ?`)
-    .bind(sessionId)
-    .all<{ store_id: string; access: string }>()
-    .catch(() => ({ results: [] }));
-  for (const row of legacyRows.results ?? []) {
-    if (attachments.has(row.store_id)) continue;
-    attachments.set(row.store_id, {
-      storeId: row.store_id,
-      access: row.access === "read_only" ? "read_only" : "read_write",
-    });
-  }
-
-  const reminders: Array<{ source: string; text: string }> = [];
-  for (const attachment of attachments.values()) {
-    const store = await memoryService.getStore({
-      tenantId,
-      storeId: attachment.storeId,
-    });
-    if (!store) continue;
-    const accessLabel = attachment.access === "read_only" ? "read-only" : "read-write";
-    const lines = [
-      `## Memory store: ${store.name}`,
-      `Mounted at /mnt/memory/${store.name}/ (${accessLabel})`,
-    ];
-    if (store.description) lines.push(store.description);
-    if (attachment.instructions) lines.push(attachment.instructions);
-    if (attachment.access === "read_only") {
-      lines.push("(read-only mount - write attempts to this directory will fail)");
-    }
-    reminders.push({
-      source: `memory:${attachment.storeId}`,
-      text: lines.join("\n"),
-    });
-  }
-
-  return {
-    storeIds: [...attachments.keys()],
-    reminders,
-  };
-}
-
-async function addEnvironmentMemoryPromptBindings(
-  attachments: Map<string, {
-    storeId: string;
-    access: "read_only" | "read_write";
-    instructions?: string;
-  }>,
-  tenantId: string,
-  environment?: EnvironmentConfig | null,
-): Promise<void> {
-  const refs = environmentMemoryStoreRefs(environment);
-  if (refs.length === 0) return;
-
-  let storesByName: Map<string, string> | null = null;
-  for (const ref of refs) {
-    let storeId = ref.storeId;
-    if (!storeId && ref.name) {
-      storesByName ??= await loadNodeMemoryStoresByName(tenantId);
-      storeId = storesByName.get(ref.name);
-    }
-    if (!storeId) continue;
-    attachments.set(storeId, {
-      storeId,
-      access: ref.access,
-      ...(ref.instructions ? { instructions: ref.instructions } : {}),
-    });
-  }
-}
-
-async function loadNodeMemoryStoresByName(tenantId: string): Promise<Map<string, string>> {
-  const stores = await memoryService.listStores({ tenantId, status: "active" });
-  return new Map(stores.map((store) => [store.name, store.id]));
-}
+// Memory runtime (memory-facts-design §5–§7) — see lib/memory-runtime.ts.
+const memoryRuntime = createMemoryRuntime({
+  memoryService,
+  sessionsService,
+  sql,
+  newEventLog: (sessionId) => newEventLog(sessionId),
+  logger,
+});
+const {
+  buildNodeMemoryPromptContext,
+  buildNodeMemoryToolsPort,
+  buildMemoryPushReminder,
+  isFirstUserTurn,
+} = memoryRuntime;
 
 function mountNodeSandboxConfigRoutes(v1App: NodeV1App): void {
   v1App.get("/sandbox/config", (c) => {

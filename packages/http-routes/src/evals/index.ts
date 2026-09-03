@@ -27,11 +27,61 @@ interface Vars {
   Variables: { tenant_id: string };
 }
 
+/** Mirrors evals-runner SimulationPersonaSpec — deliberately duplicated,
+ *  same as EvalTaskSpec below. */
+export interface SimulationPersonaSpec {
+  name?: string;
+  identity: string;
+  goals: string[];
+  hidden_knowledge?: string;
+  communication_style?: string;
+  termination: string;
+  /** Deterministic mode for tests: bypasses the persona LLM. */
+  scripted_messages?: string[];
+}
+
+export interface SimulationSpec {
+  scenario: string;
+  persona: SimulationPersonaSpec;
+  opening_message?: string;
+  /** Max persona turns, 1..40 (default 10 at the runner). */
+  max_turns?: number;
+  persona_model?: { model_card_id?: string; reasoning_level?: string; cross_family?: boolean };
+  chaos?: {
+    rules: Array<{
+      tool: string;
+      failure_rate: number;
+      mode?: "error" | "timeout" | "empty";
+      error_text?: string;
+      seed?: number;
+      max_failures?: number;
+      timeout_ms?: number;
+    }>;
+  };
+  memory_store?: {
+    store_id?: string;
+    fresh?: boolean;
+    access?: "read_only" | "read_write";
+    instructions?: string;
+    seed_files?: Array<{ path: string; content: string }>;
+  };
+  episodes?: Array<{
+    gap_description?: string;
+    scenario?: string;
+    persona?: Partial<SimulationPersonaSpec>;
+    opening_message?: string;
+    max_turns?: number;
+  }>;
+}
+
 export interface EvalTaskSpec {
   id: string;
   setup_files?: { path: string; content: string }[];
   setup_script?: string;
-  messages: string[];
+  /** Scripted mode. Exactly one of messages | simulation must be set. */
+  messages?: string[];
+  /** Simulation mode — persona-driven multi-turn conversation. */
+  simulation?: SimulationSpec;
   timeout_ms?: number;
   trials?: number;
   reward?: RewardSpec;
@@ -82,8 +132,97 @@ function taskSpecError(task: EvalTaskSpec): string | null {
     return `task must be an object: ${JSON.stringify(task).slice(0, 100)}`;
   }
   if (!task.id) return `task missing id: ${JSON.stringify(task).slice(0, 100)}`;
-  if (!Array.isArray(task.messages) || task.messages.length === 0) {
-    return `task ${task.id} requires non-empty messages array`;
+  const hasMessages = Array.isArray(task.messages) && task.messages.length > 0;
+  const hasSim = task.simulation !== undefined && task.simulation !== null;
+  if (hasMessages === hasSim) {
+    return `task ${task.id} requires exactly one of messages | simulation`;
+  }
+  if (hasSim) {
+    const sim = task.simulation!;
+    if (typeof sim !== "object") return `task ${task.id} simulation must be an object`;
+    if (typeof sim.scenario !== "string" || !sim.scenario.trim()) {
+      return `task ${task.id} simulation.scenario is required`;
+    }
+    const p = sim.persona;
+    if (!p || typeof p !== "object") return `task ${task.id} simulation.persona is required`;
+    if (typeof p.identity !== "string" || !p.identity.trim()) {
+      return `task ${task.id} simulation.persona.identity is required`;
+    }
+    if (!Array.isArray(p.goals) || p.goals.length === 0) {
+      return `task ${task.id} simulation.persona.goals must be non-empty`;
+    }
+    if (typeof p.termination !== "string" || !p.termination.trim()) {
+      return `task ${task.id} simulation.persona.termination is required`;
+    }
+    if (
+      sim.max_turns !== undefined &&
+      (typeof sim.max_turns !== "number" || !Number.isFinite(sim.max_turns) ||
+        sim.max_turns < 1 || sim.max_turns > 40)
+    ) {
+      return `task ${task.id} simulation.max_turns must be 1..40`;
+    }
+    if (sim.chaos !== undefined) {
+      const rules = (sim.chaos as { rules?: unknown } | null)?.rules;
+      if (!Array.isArray(rules) || rules.length === 0) {
+        return `task ${task.id} simulation.chaos.rules must be a non-empty array`;
+      }
+      for (const r of rules as Array<Record<string, unknown>>) {
+        if (!r || typeof r.tool !== "string" || !r.tool.trim()) {
+          return `task ${task.id} simulation.chaos rule requires tool`;
+        }
+        if (typeof r.failure_rate !== "number" || !(r.failure_rate >= 0 && r.failure_rate <= 1)) {
+          return `task ${task.id} simulation.chaos rule ${r.tool} failure_rate must be 0..1`;
+        }
+        if (r.mode !== undefined && !["error", "timeout", "empty"].includes(r.mode as string)) {
+          return `task ${task.id} simulation.chaos rule ${r.tool} mode must be error|timeout|empty`;
+        }
+      }
+    }
+    if (sim.memory_store !== undefined) {
+      const m = sim.memory_store;
+      if (!m || typeof m !== "object") return `task ${task.id} simulation.memory_store must be an object`;
+      const hasId = typeof m.store_id === "string" && m.store_id.trim().length > 0;
+      if (hasId === (m.fresh === true)) {
+        return `task ${task.id} simulation.memory_store requires exactly one of store_id | fresh:true`;
+      }
+      if (m.access !== undefined && m.access !== "read_only" && m.access !== "read_write") {
+        return `task ${task.id} simulation.memory_store.access must be read_only|read_write`;
+      }
+      if (m.seed_files !== undefined) {
+        if (!Array.isArray(m.seed_files)) return `task ${task.id} simulation.memory_store.seed_files must be an array`;
+        if (m.fresh !== true && m.seed_files.length > 0) {
+          return `task ${task.id} simulation.memory_store.seed_files requires fresh:true (a shared store_id is not re-seeded per trial)`;
+        }
+        for (const f of m.seed_files) {
+          if (!f || typeof f.path !== "string" || !f.path.trim() || f.path.startsWith("/") || f.path.includes("..")) {
+            return `task ${task.id} simulation.memory_store.seed_files paths must be store-relative`;
+          }
+          if (typeof f.content !== "string") return `task ${task.id} simulation.memory_store.seed_files content must be a string`;
+        }
+      }
+    }
+    if (sim.episodes !== undefined) {
+      if (!Array.isArray(sim.episodes) || sim.episodes.length === 0) {
+        return `task ${task.id} simulation.episodes must be a non-empty array`;
+      }
+      if (sim.episodes.length > 5) return `task ${task.id} simulation.episodes supports at most 5 follow-up episodes`;
+      if (sim.memory_store === undefined) {
+        return `task ${task.id} simulation.episodes requires simulation.memory_store (episodes share memory, not conversation)`;
+      }
+      for (const ep of sim.episodes) {
+        if (!ep || typeof ep !== "object") return `task ${task.id} simulation.episodes entries must be objects`;
+        if (ep.max_turns !== undefined && (typeof ep.max_turns !== "number" || ep.max_turns < 1 || ep.max_turns > 40)) {
+          return `task ${task.id} simulation.episodes max_turns must be 1..40`;
+        }
+      }
+    }
+    if (
+      p.scripted_messages !== undefined &&
+      (!Array.isArray(p.scripted_messages) || p.scripted_messages.length === 0 ||
+        p.scripted_messages.some((m) => typeof m !== "string" || !m.trim()))
+    ) {
+      return `task ${task.id} simulation.persona.scripted_messages must be non-empty strings when set`;
+    }
   }
   if (
     task.pass_threshold !== undefined &&
@@ -441,6 +580,7 @@ function rowToApi(run: EvalRunRow) {
     tasks_pass_all_k?: number;
     suite_id?: string;
     suite_name?: string;
+    findings_report?: unknown;
   };
   return {
     id: run.id,
@@ -462,5 +602,7 @@ function rowToApi(run: EvalRunRow) {
     // §8 suite provenance — present only on runs launched via /suites/:id/run.
     ...(partial.suite_id !== undefined ? { suite_id: partial.suite_id } : {}),
     ...(partial.suite_name !== undefined ? { suite_name: partial.suite_name } : {}),
+    // Simulation rollup — present only on completed simulation runs.
+    ...(partial.findings_report !== undefined ? { findings_report: partial.findings_report } : {}),
   };
 }

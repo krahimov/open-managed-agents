@@ -11,6 +11,7 @@ import { RowActionsMenu } from "../components/RowActionsMenu";
 import { PopoverContent } from "@/components/ui/popover";
 import { Button } from "@/components/ui/button";
 import { NewEvalRunDialog } from "./evals/NewEvalRunDialog";
+import { NewSimulationDialog } from "./evals/NewSimulationDialog";
 import { SuitesSection } from "./evals/SuitesSection";
 
 interface EvalRunSummary {
@@ -85,6 +86,7 @@ export function EvalRunsList() {
   const nav = useNavigate();
   const { api } = useApi();
   const [showCreate, setShowCreate] = useState(false);
+  const [showSimCreate, setShowSimCreate] = useState(false);
 
   // Server-driven status filter. "any" → omit the param entirely so the
   // server returns all runs; anything else is whitelisted by the route's
@@ -253,8 +255,15 @@ export function EvalRunsList() {
   const statusDisplay =
     status === "any" ? undefined : STATUS_OPTIONS.find((o) => o.value === status)?.label;
 
+  // The DataTable toolbar has a single create slot; the simulation entry
+  // rides the `filters` node, which renders immediately after the create
+  // button in the same toolbar row.
   const filters = (
-    <FilterChip
+    <>
+      <Button variant="outline" onClick={() => setShowSimCreate(true)}>
+        + New simulation
+      </Button>
+      <FilterChip
       label="Status"
       active={status !== "any"}
       display={statusDisplay}
@@ -273,7 +282,8 @@ export function EvalRunsList() {
           searchPlaceholder="Status..."
         />
       </PopoverContent>
-    </FilterChip>
+      </FilterChip>
+    </>
   );
 
   return (
@@ -312,6 +322,7 @@ export function EvalRunsList() {
       }
     >
         <NewEvalRunDialog open={showCreate} onClose={() => setShowCreate(false)} />
+        <NewSimulationDialog open={showSimCreate} onClose={() => setShowSimCreate(false)} />
       </DataTable>
     </>
   );

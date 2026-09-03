@@ -1,6 +1,6 @@
 // Memory tables (Node-PG variant of cf-auth/memory).
 
-import { bigint, index, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
+import { bigint, doublePrecision, index, pgTable, text, uniqueIndex } from "drizzle-orm/pg-core";
 
 export const memory_stores = pgTable(
   "memory_stores",
@@ -64,3 +64,34 @@ export const memory_blob_poller_lease = pgTable("memory_blob_poller_lease", {
   expires_at: bigint("expires_at", { mode: "number" }).notNull(),
   last_seen_ms: bigint("last_seen_ms", { mode: "number" }).notNull().default(0),
 });
+
+/** Node-PG variant of cf-auth/memory memory_facts (memory-facts-design §3).
+ *  The `tsv` generated column + GIN index live in the SQL migration. */
+export const memory_facts = pgTable(
+  "memory_facts",
+  {
+    id: text("id").primaryKey().notNull(),
+    tenant_id: text("tenant_id").notNull(),
+    store_id: text("store_id").notNull(),
+    agent_id: text("agent_id"),
+    kind: text("kind").notNull(),
+    subject: text("subject").notNull(),
+    statement: text("statement").notNull(),
+    applies_when: text("applies_when"),
+    confidence: doublePrecision("confidence").notNull().default(1),
+    status: text("status").notNull().default("active"),
+    supersedes_id: text("supersedes_id"),
+    source_path: text("source_path"),
+    source_session_id: text("source_session_id"),
+    source_event_id: text("source_event_id"),
+    observed_at: bigint("observed_at", { mode: "number" }).notNull(),
+    created_at: bigint("created_at", { mode: "number" }).notNull(),
+    updated_at: bigint("updated_at", { mode: "number" }).notNull(),
+  },
+  (t) => [
+    index("idx_memory_facts_store_status").on(t.store_id, t.status, t.updated_at),
+    index("idx_memory_facts_subject").on(t.store_id, t.subject),
+    index("idx_memory_facts_source_session").on(t.source_session_id),
+  ],
+);
+

@@ -67,7 +67,11 @@ export interface NodeHarnessRuntimeOptions {
 export class NodeHarnessRuntime implements HarnessRuntime {
   history: SqlHistoryStore;
   sandbox: SandboxExecutor;
-  pendingConfirmations?: string[];
+  // Collected by DefaultHarness (default-loop.ts) when a tool evaluates to
+  // "ask" and its execute was stripped — the AI SDK then returns it as a
+  // pending call. Must be a live array (not undefined) or the harness's
+  // guarded push is dead and the confirmation checkpoint is silently dropped.
+  pendingConfirmations: string[] = [];
   /**
    * Per-runtime serial chain for SqlEventLog writes. The harness fires
    * many `broadcast()` calls in close succession (span_start, span_first_
