@@ -73,7 +73,12 @@ import { DefaultHarness } from "@open-managed-agents/agent/harness/default-loop"
 import { ClaudeAgentSdkHarness } from "./lib/claude-agent-sdk-harness.js";
 import { CodexSdkHarness } from "./lib/codex-sdk-harness.js";
 import type { SdkMemoryPort } from "./lib/sdk-harness-memory.js";
-import { buildSetupPrompt, buildSetupTools } from "./lib/setup-harness.js";
+import {
+  buildSetupPrompt,
+  buildSetupTools,
+  autoRequestAccessForNewServers,
+  describeSetupAccessStatus,
+} from "./lib/setup-harness.js";
 import { ALL_TOOLS, buildTools, getEnabledTools } from "@open-managed-agents/agent/harness/tools";
 import { resolveModel, type ApiCompat } from "@open-managed-agents/agent/harness/provider";
 import { composeSystemPrompt, memoryGuidance } from "@open-managed-agents/agent/harness/platform-guidance";
@@ -159,7 +164,16 @@ import {
   environmentMemoryStoreRefs,
   sandboxProviderFromEnvironment,
 } from "./lib/environment-runtime-config.js";
-import { buildNodeOAuthRoutes } from "./lib/node-oauth-routes.js";
+import {
+  buildNodeOAuthRoutes,
+  describeOAuthAppRequirement,
+  type GrantNotification,
+} from "./lib/node-oauth-routes.js";
+import {
+  forwardNodeMcpRequestWithRefresh,
+  verifyMcpCredential,
+  type NodeMcpProxyRefresh,
+} from "./lib/node-mcp-proxy.js";
 import { NodeSessionWorkQueue } from "./lib/node-session-work-queue.js";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
@@ -788,6 +802,10 @@ const sessionRegistry = new SessionRegistry({
             ...a,
             mcp_server_url: a.mcp_server_url ?? matchAgentMcpServer(agent, a.service),
           }),
+        findCredentialVault: (url) => findCredentialVaultForUrl(context.tenantId, url),
+        attachVault: (vaultId) => attachVaultToAgent(context.tenantId, agent.id, vaultId),
+        createAmbientRule: (a) =>
+          createAmbientRuleFromSession(context.tenantId, agent.id, context.sessionId, a),
         env: { TAVILY_API_KEY: process.env.TAVILY_API_KEY },
       });
     }
@@ -964,6 +982,9 @@ const sessionRegistry = new SessionRegistry({
       // pipeline as the DefaultHarness buildTools hooks.
       requestServiceAccess: (tenantId, sessionId, a) =>
         postAccessRequest(tenantId, sessionId, a),
+      findCredentialVault: findCredentialVaultForUrl,
+      attachVaultToAgent,
+      setupAccessStatus: ensureSetupAccessReconciled,
       createAmbientRule: (tenantId, sessionId, agentId, a) =>
         createAmbientRuleFromSession(tenantId, agentId, sessionId, a),
       findSkills: (tenantId, query) => findSkillsForTenant(tenantId, query),
@@ -1085,8 +1106,18 @@ const sessionRegistry = new SessionRegistry({
       sessionId: input.sessionId,
     });
     const isSetup = setupRow?.metadata?.oma_setup === true;
+    // Template-created agents arrive in setup with their MCP servers ALREADY
+    // on the harness, so update_harness never "adds" them and no card would
+    // be posted (seen live 2026-09-02: Incident commander template, four
+    // servers, zero cards). Reconcile every server once per setup session:
+    // verified/refreshed credential → vault attached; otherwise a connect
+    // card right now. The outcome rides in the preamble so the agent tells
+    // the user what's pending instead of inventing status.
+    const accessStatus = isSetup
+      ? await ensureSetupAccessReconciled(input.tenantId, input.sessionId, input.agent)
+      : undefined;
     const rawSystemPrompt = isSetup
-      ? buildSetupPrompt(input.agent)
+      ? buildSetupPrompt(input.agent, { accessStatus })
       : input.agent.system ?? "";
     const memoryContext = await buildNodeMemoryPromptContext(input.tenantId, input.sessionId);
     // Turn-scoped reminders ride the user side of the prompt (cache-safe);
@@ -1959,6 +1990,22 @@ async function postAccessRequest(
       : "composio";
   const key =
     authKind === "composio" ? await composioKeyForTenant(tenantId).catch(() => null) : null;
+  // Providers without Dynamic Client Registration (Slack, GitHub) need a
+  // one-time OAuth app before the popup can work — tell the card (guided
+  // setup) and the agent (so it sets the user's expectations) up front.
+  const oauthApp =
+    authKind === "mcp_oauth" && mcpServerUrl
+      ? await Promise.race([
+          describeOAuthAppRequirement({
+            deps: { services, env: process.env },
+            tenantId,
+            mcpServerUrl,
+            baseUrl: process.env.PUBLIC_BASE_URL ?? `http://localhost:${port}`,
+          }).catch(() => null),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 6000)),
+        ])
+      : null;
+  const needsAppSetup = !!oauthApp?.required && !oauthApp.configured;
   const requestId = `acreq-${generateEventId().replace(/^sevt-/, "")}`;
   await sessionRouter.appendEvent(sessionId, {
     type: "system.access_request",
@@ -1969,12 +2016,15 @@ async function postAccessRequest(
     auth_kind: authKind,
     ...(mcpServerUrl ? { mcp_server_url: mcpServerUrl } : {}),
     ...(authKind === "composio" ? { composio_configured: !!key } : {}),
+    ...(oauthApp?.required ? { oauth_app: oauthApp } : {}),
   } as SessionEvent);
   const note =
     authKind === "llm_provider"
       ? `"${service}" is a model provider, not a connectable app — its key belongs in Console → Model Cards, and the user has been pointed there. Don't wait on an OAuth grant; continue other work.`
       : authKind === "mcp_api_key"
         ? `"${service}" authenticates with an API key, not OAuth. The user is being asked to paste the key into the credential vault (it never enters this conversation) — you'll receive a message when it's saved.`
+        : needsAppSetup
+          ? `Connect card for "${service}" posted, but ${oauthApp?.label ?? service} requires a one-time OAuth app registration first (its MCP server has no automatic client registration). The card walks the user through creating the app and pasting its Client ID/Secret — tell the user it's a one-time setup step, then wait; you'll receive a message when access is granted.`
         : authKind === "mcp_oauth" || key
           ? `Connect card for "${service}" posted to the user's session view. You'll receive a message when access is granted — continue any work that doesn't need it, or end your turn and wait.`
           : `Request posted, but this workspace has no Composio account connected yet — the user is being guided to connect one (Console → Apps) before authorizing "${service}".`;
@@ -2370,7 +2420,201 @@ v1.route("/vaults", buildVaultRoutes({
       (await resolveTenantComposioKey(tenantId))?.apiKey ?? null,
   },
 }));
-v1.route("/oauth", buildNodeOAuthRoutes({ services, env: process.env }));
+v1.route(
+  "/oauth",
+  buildNodeOAuthRoutes({ services, env: process.env, onGranted: recordAccessGrant }),
+);
+
+type SetupAccessRecord = {
+  requested: Array<{ name: string; note?: string }>;
+  connected: string[];
+  failed: string[];
+  checked_at: number;
+};
+const setupAccessInFlight = new Map<string, Promise<string | undefined>>();
+
+/**
+ * Once per setup session: reconcile the MCP servers already on the agent
+ * (see the call site in buildHarness). Result persisted in session metadata
+ * (`setup_access`) so restarts and later turns reuse it instead of
+ * re-posting cards; servers added later are handled by update_harness.
+ */
+async function ensureSetupAccessReconciled(
+  tenantId: string,
+  sessionId: string,
+  agent: AgentConfig,
+): Promise<string | undefined> {
+  const format = (r: SetupAccessRecord) => {
+    const line = describeSetupAccessStatus(r);
+    return line.length > 0 ? line : undefined;
+  };
+  const row = await sessionsService.get({ tenantId, sessionId }).catch(() => null);
+  const stored = (row?.metadata as { setup_access?: SetupAccessRecord } | undefined)?.setup_access;
+  if (stored && Array.isArray(stored.connected)) return format(stored);
+
+  const inflight = setupAccessInFlight.get(sessionId);
+  if (inflight) return inflight;
+  const run = (async () => {
+    try {
+      const servers = (agent.mcp_servers ?? []).filter(
+        (srv) => srv?.type !== "stdio" && typeof srv?.url === "string" && !isComposioMcpUrl(srv.url),
+      );
+      if (servers.length === 0) return undefined;
+      const result = await autoRequestAccessForNewServers(undefined, servers, {
+        requestAccess: (a) => postAccessRequest(tenantId, sessionId, a),
+        findCredentialVault: (url) => findCredentialVaultForUrl(tenantId, url),
+        attachVault: (vaultId) => attachVaultToAgent(tenantId, agent.id, vaultId),
+      });
+      const record: SetupAccessRecord = { ...result, checked_at: Date.now() };
+      await sessionsService
+        .update({ tenantId, sessionId, metadata: { setup_access: record } })
+        .catch(() => {});
+      logger.info(
+        { op: "setup.access_reconciled", session_id: sessionId, agent_id: agent.id, ...result },
+        "setup access reconciled",
+      );
+      return format(record);
+    } catch (err) {
+      logger.warn({ err, op: "setup.access_reconcile_failed", session_id: sessionId }, "setup access reconcile failed");
+      return undefined;
+    } finally {
+      setupAccessInFlight.delete(sessionId);
+    }
+  })();
+  setupAccessInFlight.set(sessionId, run);
+  return run;
+}
+
+/** Union `vaultId` into the agent's default_vault_ids (metadata merge). */
+async function attachVaultToAgent(tenantId: string, agentId: string, vaultId: string): Promise<void> {
+  const agent = await agentsService.get({ tenantId, agentId });
+  if (!agent) return;
+  const current = (agent.metadata as { default_vault_ids?: unknown } | undefined)?.default_vault_ids;
+  const ids = Array.isArray(current)
+    ? current.filter((id): id is string => typeof id === "string" && id.length > 0)
+    : [];
+  if (ids.includes(vaultId)) return;
+  await agentsService.update({
+    tenantId,
+    agentId,
+    input: { metadata: { default_vault_ids: [...ids, vaultId] } },
+  });
+}
+
+/** Vault id holding a WORKING credential bound to `mcpServerUrl` (any of the
+ *  tenant's vaults), or null. Setup uses it to skip the connect card for a
+ *  server the workspace already authorized (e.g. Sentry connected by an
+ *  earlier agent) and just attach that vault. "Working" is verified live:
+ *  the token is probed, expired OAuth tokens are refreshed (and persisted)
+ *  first, and a credential the provider rejects does NOT count — the card
+ *  is posted instead and the OAuth callback upserts the row. */
+async function findCredentialVaultForUrl(tenantId: string, mcpServerUrl: string): Promise<string | null> {
+  const target = normalizeMcpUrlForMatch(mcpServerUrl);
+  if (!target) return null;
+  const vaults = await vaultService.list({ tenantId, includeArchived: false }).catch(() => []);
+  const vaultIds = vaults.map((v) => v.id);
+  if (vaultIds.length === 0) return null;
+  const grouped = await credentialService.listByVaults({ tenantId, vaultIds }).catch(() => []);
+  for (const group of grouped) {
+    for (const cred of group.credentials) {
+      if ((cred as { archived_at?: string | null }).archived_at) continue;
+      const auth = (cred as unknown as { auth?: Record<string, unknown> }).auth ?? {};
+      const url = auth.mcp_server_url;
+      if (typeof url !== "string" || normalizeMcpUrlForMatch(url) !== target) continue;
+      const token = [auth.bearer_token, auth.token, auth.access_token].find(
+        (t): t is string => typeof t === "string" && t.length > 0,
+      );
+      if (!token) {
+        // API-key / composio shapes: nothing to probe with a bearer — trust the row.
+        return group.vault_id;
+      }
+      const credentialId = (cred as { id: string }).id;
+      const vaultId = group.vault_id;
+      const refresh: NodeMcpProxyRefresh | undefined =
+        auth.type === "mcp_oauth" &&
+        typeof auth.refresh_token === "string" &&
+        typeof auth.token_endpoint === "string"
+          ? {
+              refreshToken: auth.refresh_token,
+              tokenEndpoint: auth.token_endpoint,
+              clientId: typeof auth.client_id === "string" ? auth.client_id : undefined,
+              clientSecret: typeof auth.client_secret === "string" ? auth.client_secret : undefined,
+              persist: async (t) => {
+                await credentialService.refreshAuth({
+                  tenantId,
+                  vaultId,
+                  credentialId,
+                  auth: {
+                    access_token: t.access_token,
+                    refresh_token: t.refresh_token,
+                    expires_at: t.expires_in
+                      ? new Date(Date.now() + t.expires_in * 1000).toISOString()
+                      : undefined,
+                  },
+                });
+              },
+            }
+          : undefined;
+      const check = await verifyMcpCredential({ url: mcpServerUrl, token, refresh });
+      logger.info(
+        { op: "setup.credential_check", mcp_server_url: mcpServerUrl, credential_id: credentialId, result: check },
+        "setup credential check",
+      );
+      if (check !== "invalid") return vaultId;
+      // rejected → keep looking (another vault may hold a live one)
+    }
+  }
+  return null;
+}
+
+/**
+ * Server-side half of a connect card: the OAuth callback persisted a vault
+ * credential for a flow the card started from a session, so (1) record a
+ * durable system.access_granted on that session, (2) nudge the agent with
+ * the same "[access granted]" user.message the card used to post from the
+ * browser, and (3) graft the vault onto the session's agent so its future
+ * sessions (scheduled ones included) actually carry the credential —
+ * setup-created agents otherwise ended up with NO default vault and every
+ * OAuth MCP server 401'd despite valid credentials in "Connected Apps".
+ */
+async function recordAccessGrant(grant: GrantNotification): Promise<void> {
+  const session = await sessionsService.get({
+    tenantId: grant.tenantId,
+    sessionId: grant.sessionId,
+  });
+  if (!session || session.archived_at) return;
+
+  await sessionRouter.appendEvent(grant.sessionId, {
+    type: "system.access_granted",
+    id: generateEventId(),
+    request_id: grant.requestId ?? "",
+    service: grant.service,
+    vault_id: grant.vaultId,
+    mcp_server_url: grant.mcpServerUrl,
+  } as SessionEvent);
+
+  if (session.agent_id) {
+    try {
+      await attachVaultToAgent(grant.tenantId, session.agent_id, grant.vaultId);
+    } catch (err) {
+      logger.warn(
+        { err, op: "oauth.grant_vault_graft_failed", session_id: grant.sessionId },
+        "credential stored but could not attach the vault to the agent",
+      );
+    }
+  }
+
+  await sessionRouter.appendEvent(grant.sessionId, {
+    type: "user.message",
+    id: generateEventId(),
+    content: [
+      {
+        type: "text",
+        text: `[access granted] ${grant.service} is now connected — continue where you left off.`,
+      },
+    ],
+  } as SessionEvent);
+}
 // ── Composio key resolution ────────────────────────────────────────────────
 // Managed-first: tenants paste their own Composio key in the console (stored
 // as a composio_mcp vault credential — same shape the MCP proxy already
@@ -3595,6 +3839,8 @@ type NodeMcpProxyTarget = {
   upstreamUrl: string;
   upstreamToken: string;
   upstreamAuthHeader?: { name: string; value: string };
+  /** mcp_oauth credentials: lets the proxy renew expired access tokens. */
+  refresh?: NodeMcpProxyRefresh;
 };
 
 const nodeMcpBinding = {
@@ -3619,7 +3865,16 @@ const nodeMcpBinding = {
     const body = ["GET", "HEAD"].includes(request.method)
       ? null
       : await request.arrayBuffer();
-    return forwardNodeMcpRequest(target, request.method, inboundHeaders, body);
+    // Renews expired mcp_oauth tokens (pre-emptively / on 401) — before this
+    // the Node proxy never refreshed, so one-hour tokens (Sentry) died
+    // mid-day and every call 401'd until the user reconnected.
+    return forwardNodeMcpRequestWithRefresh(
+      target,
+      undefined,
+      request.method,
+      inboundHeaders,
+      body,
+    );
   },
 };
 
@@ -3658,6 +3913,11 @@ async function resolveNodeMcpProxyTarget(
             access_token?: string;
             api_key?: string;
             api_key_env?: string;
+            refresh_token?: string;
+            token_endpoint?: string;
+            client_id?: string;
+            client_secret?: string;
+            expires_at?: string;
           }
         | undefined;
       if (!auth || !credentialMatchesMcpServerUrl(auth, server.url)) continue;
@@ -3675,7 +3935,33 @@ async function resolveNodeMcpProxyTarget(
 
       const token = auth.bearer_token ?? auth.token ?? auth.access_token;
       if (!token) continue;
-      return { upstreamUrl: server.url, upstreamToken: token };
+      const credentialId = (credential as { id: string }).id;
+      const vaultId = group.vault_id;
+      const refresh: NodeMcpProxyRefresh | undefined =
+        auth.type === "mcp_oauth" && auth.refresh_token && auth.token_endpoint
+          ? {
+              refreshToken: auth.refresh_token,
+              tokenEndpoint: auth.token_endpoint,
+              clientId: auth.client_id,
+              clientSecret: auth.client_secret,
+              expiresAtMs: auth.expires_at ? Date.parse(auth.expires_at) || undefined : undefined,
+              persist: async (t) => {
+                await credentialService.refreshAuth({
+                  tenantId,
+                  vaultId,
+                  credentialId,
+                  auth: {
+                    access_token: t.access_token,
+                    refresh_token: t.refresh_token,
+                    expires_at: t.expires_in
+                      ? new Date(Date.now() + t.expires_in * 1000).toISOString()
+                      : undefined,
+                  },
+                });
+              },
+            }
+          : undefined;
+      return { upstreamUrl: server.url, upstreamToken: token, ...(refresh ? { refresh } : {}) };
     }
   }
   // Composio credential selection: any tool-router URL matches any other

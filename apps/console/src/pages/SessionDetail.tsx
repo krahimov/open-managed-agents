@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from "react";
+import { useEffect, useState, useRef, useMemo } from "react";
 import { useParams, Link } from "react-router";
 import yaml from "js-yaml";
 import { OMA_SETUP_HARNESS } from "@open-managed-agents/api-types";
@@ -9,6 +9,7 @@ import { formatDuration, formatRelative, shortenId } from "../lib/format";
 import { Badge, StatusPill } from "../components/Badge";
 import { Modal } from "../components/Modal";
 import { AccessRequestCard } from "../components/AccessRequestCard";
+import { grantedRequestIdsOf } from "./agents/SessionChat";
 import { AmbientRuleCard } from "../components/AmbientRuleCard";
 import { SkillRequestCard } from "../components/SkillRequestCard";
 import { MissionBanner } from "../components/MissionBanner";
@@ -77,6 +78,9 @@ export function SessionDetail() {
   const { id } = useParams();
   const { api, streamEvents } = useApi();
   const [events, setEvents] = useState<Event[]>([]);
+  // Durable grants (system.access_granted) → matching connect cards render
+  // "Connected" even after a reload; see AccessRequestCard.
+  const grantedRequestIds = useMemo(() => grantedRequestIdsOf(events), [events]);
   /** In-flight assistant streams keyed by message_id. Each entry holds
    *  the deltas accumulated so far. Wiped on the matching agent.message
    *  (same message_id), which becomes the canonical render. */
@@ -1119,6 +1123,7 @@ export function SessionDetail() {
                   }
                   return (
                     <EventRender
+                      grantedRequestIds={grantedRequestIds}
                       key={stableKey}
                       event={e}
                       livePending={false}
@@ -1142,6 +1147,7 @@ export function SessionDetail() {
                   server-side rows so the UI is visually consistent. */}
               {localPending && activeThreadId === "sthr_primary" && (
                 <EventRender
+                      grantedRequestIds={grantedRequestIds}
                   key="local-pending"
                   event={{ type: "user.message", content: [{ type: "text", text: localPending }] } as Event}
                   livePending={true}
@@ -1159,6 +1165,7 @@ export function SessionDetail() {
                   .sort((a, b) => a.pending_seq - b.pending_seq);
                 return outbox.map((p) => (
                   <EventRender
+                      grantedRequestIds={grantedRequestIds}
                     key={`pending-${p.event_id}`}
                     event={p.event}
                     livePending={true}
@@ -1536,8 +1543,11 @@ function EventRender({
   pairedResult,
   modelErrorCause,
   onApproveEnvironmentYaml,
+  grantedRequestIds,
 }: {
   event: Event;
+  /** request_ids with a server-recorded system.access_granted. */
+  grantedRequestIds?: Set<string>;
   /**
    * Caller-derived "no agent.* event has followed this user.* event
    * yet on the same thread" hint. The wire-level processed_at_ms
@@ -1818,7 +1828,12 @@ function EventRender({
       );
 
     case "system.access_request":
-      return <AccessRequestCard event={event} />;
+      return (
+        <AccessRequestCard
+          event={event}
+          granted={grantedRequestIds?.has(String(event.request_id ?? "")) === true}
+        />
+      );
 
     case "system.ambient_rule_created":
       return <AmbientRuleCard event={event} />;

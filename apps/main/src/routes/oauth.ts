@@ -441,7 +441,7 @@ app.get("/authorize", async (c) => {
   // Operator workflow: visit https://api.slack.com/apps, create an app
   // with redirect URL ${baseUrl}/v1/oauth/callback, then set
   // SLACK_OAUTH_CLIENT_ID + SLACK_OAUTH_CLIENT_SECRET on the main worker.
-  if (!clientId && /^https:\/\/slack\.com\/?$/.test(meta.authServer.issuer)) {
+  if (!clientId && /^https:\/\/(mcp\.)?slack\.com\/?$/.test(meta.authServer.issuer)) {
     if (c.env.SLACK_OAUTH_CLIENT_ID && c.env.SLACK_OAUTH_CLIENT_SECRET) {
       clientId = c.env.SLACK_OAUTH_CLIENT_ID;
       clientSecret = c.env.SLACK_OAUTH_CLIENT_SECRET;

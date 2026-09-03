@@ -960,6 +960,42 @@ export interface SystemAccessRequestEvent extends EventBase {
    *  servers by name — the card then runs the vault MCP OAuth flow against
    *  this URL instead of the Composio connected-account flow. */
   mcp_server_url?: string;
+  /** For MCP OAuth servers WITHOUT Dynamic Client Registration (Slack,
+   *  GitHub…): the one-time OAuth-app registration the tenant must do
+   *  before the popup can work. `configured:false` → the console renders
+   *  the guided setup (steps, manifest, Client ID/Secret form) instead of
+   *  a Connect button that dead-ends. */
+  oauth_app?: OAuthAppRequirement;
+}
+
+export interface OAuthAppRequirement {
+  required: boolean;
+  configured: boolean;
+  source?: "tenant" | "env";
+  label: string;
+  issuer: string;
+  callback_uri: string;
+  env: { client_id: string; client_secret: string };
+  docs_url?: string;
+  setup_steps: string[];
+  manifest?: Record<string, unknown>;
+}
+
+// Server-recorded grant for a prior system.access_request. Emitted by the
+// vault MCP OAuth callback (when the connect card passed session_id +
+// request_id) right after the credential is persisted — durable proof that
+// the request was satisfied, independent of the browser popup → card
+// handoff. Consumers render the matching request card as "Connected" and
+// ignore it otherwise.
+export interface SystemAccessGrantedEvent extends EventBase {
+  type: "system.access_granted";
+  /** request_id of the system.access_request this satisfies. */
+  request_id: string;
+  /** Service slug from the original request (e.g. "sentry"). */
+  service: string;
+  /** Vault the credential landed in. */
+  vault_id?: string;
+  mcp_server_url?: string;
 }
 
 // Agent-created ambient rule. Emitted alongside the create_ambient_rule
@@ -1076,6 +1112,7 @@ export type SessionEvent =
   | SystemPolicyPinnedEvent
   | SystemPolicyDecisionEvent
   | SystemAccessRequestEvent
+  | SystemAccessGrantedEvent
   | SystemAmbientRuleCreatedEvent
   | SystemSkillRequestEvent
   | SystemMissionVerdictEvent

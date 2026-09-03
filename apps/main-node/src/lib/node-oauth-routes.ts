@@ -17,6 +17,15 @@ interface OAuthState {
   /** KV key of the cached dynamic client registration this flow used —
    *  deleted when token exchange reports invalid_client. */
   dcr_cache_key?: string;
+  /** Session + access-request the connect card is completing on behalf of.
+   *  When present the callback records the grant server-side (durable
+   *  system.access_granted + the "[access granted]" nudge) instead of
+   *  relying on the popup → card → POST /events browser handoff. */
+  session_id?: string;
+  request_id?: string;
+  /** Service slug from the access request (card-side name, e.g. "github"),
+   *  used for the grant text instead of the host-derived server name. */
+  service?: string;
 }
 
 interface ProtectedResourceMeta {
@@ -40,9 +49,42 @@ interface TokenResponse {
   token_type?: string;
 }
 
+export interface GrantNotification {
+  tenantId: string;
+  sessionId: string;
+  requestId?: string;
+  service: string;
+  vaultId: string;
+  mcpServerUrl: string;
+}
+
+/** What a connect flow needs from the operator/tenant BEFORE it can start:
+ *  providers without Dynamic Client Registration (Slack, GitHub, …) require
+ *  an OAuth app registered once per deployment. Surfaced on the access
+ *  request event and on the popup error so the console can walk the user
+ *  through it instead of showing a dead-end error. */
+export interface OAuthAppRequirement {
+  required: boolean;
+  /** An app is available (tenant-stored, env preset, or DCR). */
+  configured: boolean;
+  source?: "tenant" | "env";
+  label: string;
+  issuer: string;
+  callback_uri: string;
+  env: { client_id: string; client_secret: string };
+  docs_url?: string;
+  setup_steps: string[];
+  /** Provider app manifest (Slack) pre-filled with the callback URL. */
+  manifest?: Record<string, unknown>;
+}
+
 export interface NodeOAuthRoutesDeps {
   services: RouteServices;
   env?: Record<string, string | undefined>;
+  /** Called after a credential is persisted for a flow that carried a
+   *  session_id: records the grant on the session and wakes the agent.
+   *  Failures are swallowed — the credential is already stored. */
+  onGranted?: (grant: GrantNotification) => Promise<void>;
 }
 
 type NodeOAuthVars = {
@@ -57,6 +99,9 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     const vaultId = c.req.query("vault_id");
     const credentialId = c.req.query("credential_id");
     const clientRedirectUri = c.req.query("redirect_uri");
+    const sessionIdParam = c.req.query("session_id")?.trim() || undefined;
+    const requestIdParam = c.req.query("request_id")?.trim() || undefined;
+    const serviceParam = c.req.query("service")?.trim().toLowerCase() || undefined;
 
     if (!mcpServerUrl || !vaultId) {
       return c.json({ error: "mcp_server_url and vault_id are required" }, 400);
@@ -139,18 +184,26 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     if (!clientId) {
       const preset = presetForIssuer(meta.authServer.issuer);
       if (preset) {
-        const presetClientId = envValue(deps.env, preset.clientIdEnv);
-        const presetClientSecret = envValue(deps.env, preset.clientSecretEnv);
+        // Managed-first: a tenant-registered app (console) wins over the
+        // operator's env preset (self-host fallback).
+        const stored = await loadTenantOAuthApp(deps, tenantId, meta.authServer.issuer);
+        const presetClientId = stored?.client_id ?? envValue(deps.env, preset.clientIdEnv);
+        const presetClientSecret =
+          stored?.client_secret ?? envValue(deps.env, preset.clientSecretEnv);
         if (presetClientId && presetClientSecret) {
           clientId = presetClientId;
           clientSecret = presetClientSecret;
         } else {
+          const requirement = requirementFor(preset, meta.authServer.issuer, callbackUri, {
+            configured: false,
+          });
           return c.html(
             closeHtml(
-              `${preset.label} MCP OAuth needs a pre-registered app`,
+              `${preset.label} needs a one-time app setup`,
               htmlEscape(
-                `Create an OAuth app with callback ${callbackUri}, then set ${preset.clientIdEnv} and ${preset.clientSecretEnv} on the main-node server and retry.`,
+                `${preset.label}'s MCP server doesn't support automatic client registration. Create a ${preset.label} OAuth app with callback ${callbackUri} and enter its Client ID and Client Secret in the connect card (or set ${preset.clientIdEnv} / ${preset.clientSecretEnv} on the server).`,
               ),
+              { code: "oauth_app_required", provider: requirement },
             ),
             501,
           );
@@ -186,6 +239,9 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       redirect_uri: clientRedirectUri || `${baseUrl}/`,
       resource_uri: meta.resource.resource,
       dcr_cache_key: dcrCacheKey,
+      session_id: sessionIdParam,
+      request_id: requestIdParam,
+      service: serviceParam,
     };
 
     await deps.services.kv.put(`oauth_state:${state}`, JSON.stringify(oauthState), {
@@ -334,6 +390,30 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     await deps.services.kv.delete(stateKey);
     const probeResult = await probeMcpServer(oauthState.mcp_server_url, tokens.access_token);
 
+    // Record the grant server-side. Until now the ONLY thing telling the
+    // agent "access granted" was the console card, which had to be mounted,
+    // in its `connecting` state and listening on the BroadcastChannel at the
+    // exact moment this page loaded — a reload, navigation or re-render in
+    // between silently dropped the grant (seen live 2026-09-02: Sentry
+    // credential stored, agent still told "Sentry needs authorization").
+    const grantService = oauthState.service ?? serverName;
+    let grantRecorded = false;
+    if (oauthState.session_id && deps.onGranted) {
+      try {
+        await deps.onGranted({
+          tenantId: oauthState.tenant_id,
+          sessionId: oauthState.session_id,
+          requestId: oauthState.request_id,
+          service: grantService,
+          vaultId: oauthState.vault_id,
+          mcpServerUrl: oauthState.mcp_server_url,
+        });
+        grantRecorded = true;
+      } catch {
+        // The card falls back to posting the nudge itself.
+      }
+    }
+
     const redirectUrl = new URL(oauthState.redirect_uri);
     redirectUrl.searchParams.set("oauth", "success");
     redirectUrl.searchParams.set("service", serverName);
@@ -347,8 +427,14 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
         (function(){
           var msg = ${JSON.stringify({
             type: "oauth_complete",
-            service: serverName,
+            service: grantService,
+            server_name: serverName,
             vault_id: oauthState.vault_id,
+            request_id: oauthState.request_id ?? null,
+            session_id: oauthState.session_id ?? null,
+            // true → the server already appended the grant + nudge; the
+            // card must NOT post a second "[access granted]" message.
+            grant_recorded: grantRecorded,
             probe_ok: probeResult.ok,
             probe_message: probeResult.message ?? null,
           })};
@@ -371,6 +457,55 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       </script>
       </body></html>
     `);
+  });
+
+  // What does connecting this MCP server need from the user? Lets the
+  // console show the one-time app setup BEFORE the popup dead-ends.
+  app.get("/apps/requirement", async (c) => {
+    const mcpServerUrl = c.req.query("mcp_server_url");
+    if (!mcpServerUrl) return c.json({ error: "mcp_server_url is required" }, 400);
+    const requirement = await describeOAuthAppRequirement({
+      deps,
+      tenantId: c.get("tenant_id"),
+      mcpServerUrl,
+      baseUrl: getBaseUrl(c.req.url),
+    });
+    return c.json(requirement ?? { required: false, configured: true });
+  });
+
+  // Tenant-registered OAuth app for a provider issuer (client_id + secret),
+  // stored once and reused by every connect flow in this tenant.
+  app.put("/apps", async (c) => {
+    const body = await c.req
+      .json<{ mcp_server_url?: string; issuer?: string; client_id?: string; client_secret?: string }>()
+      .catch(() => ({}) as { mcp_server_url?: string; issuer?: string; client_id?: string; client_secret?: string });
+    const clientId = body.client_id?.trim();
+    const clientSecret = body.client_secret?.trim();
+    if (!clientId || !clientSecret) {
+      return c.json({ error: "client_id and client_secret are required" }, 400);
+    }
+    let issuer = body.issuer?.trim();
+    if (!issuer && body.mcp_server_url) {
+      try {
+        issuer = (await discoverOAuthMeta(body.mcp_server_url)).authServer.issuer;
+      } catch (err) {
+        return c.json({ error: `OAuth discovery failed: ${(err as Error).message}` }, 502);
+      }
+    }
+    if (!issuer) return c.json({ error: "issuer or mcp_server_url is required" }, 400);
+    const preset = presetForIssuer(issuer);
+    await deps.services.kv.put(
+      tenantOAuthAppKey(c.get("tenant_id"), issuer),
+      JSON.stringify({ client_id: clientId, client_secret: clientSecret, saved_at: Date.now() }),
+    );
+    return c.json({ ok: true, issuer, label: preset?.label ?? issuer, configured: true });
+  });
+
+  app.delete("/apps", async (c) => {
+    const issuer = c.req.query("issuer")?.trim();
+    if (!issuer) return c.json({ error: "issuer is required" }, 400);
+    await deps.services.kv.delete(tenantOAuthAppKey(c.get("tenant_id"), issuer));
+    return c.json({ ok: true });
   });
 
   app.post("/refresh", async (c) => {
@@ -550,26 +685,163 @@ async function dynamicClientRegistration(
   }
 }
 
-function presetForIssuer(issuer: string):
-  | { label: string; clientIdEnv: string; clientSecretEnv: string }
-  | null {
-  const presets: Array<{
-    label: string;
-    test: RegExp;
-    clientIdEnv: string;
-    clientSecretEnv: string;
-  }> = [
+interface OAuthPreset {
+  label: string;
+  test: RegExp;
+  clientIdEnv: string;
+  clientSecretEnv: string;
+  docsUrl?: string;
+  setupSteps?: (callbackUri: string) => string[];
+  manifest?: (callbackUri: string) => Record<string, unknown>;
+}
+
+/** Every user scope mcp.slack.com advertises — the authorize flow requests
+ *  the full scopes_supported list, and Slack rejects any scope the app
+ *  manifest doesn't declare (invalid_scope). */
+const SLACK_MCP_USER_SCOPES = [
+  "canvases:read", "canvases:write",
+  "channels:history", "channels:read", "channels:write",
+  "chat:write", "emoji:read",
+  "files:read", "files:write",
+  "groups:history", "groups:read", "groups:write",
+  "im:history", "im:read", "im:write",
+  "lists:read", "lists:write",
+  "mpim:history", "mpim:read", "mpim:write",
+  "reactions:read", "reactions:write",
+  "search:read.files", "search:read.im", "search:read.mpim",
+  "search:read.private", "search:read.public", "search:read.users",
+  "users:read", "users:read.email",
+];
+
+function tenantOAuthAppKey(tenantId: string, issuer: string): string {
+  return `oauth_app:${tenantId}:${issuer.replace(/\/+$/, "")}`;
+}
+
+async function loadTenantOAuthApp(
+  deps: NodeOAuthRoutesDeps,
+  tenantId: string,
+  issuer: string,
+): Promise<{ client_id: string; client_secret: string } | null> {
+  const raw = await deps.services.kv.get(tenantOAuthAppKey(tenantId, issuer)).catch(() => null);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as { client_id?: string; client_secret?: string };
+    return parsed.client_id && parsed.client_secret
+      ? { client_id: parsed.client_id, client_secret: parsed.client_secret }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function requirementFor(
+  preset: OAuthPreset,
+  issuer: string,
+  callbackUri: string,
+  state: { configured: boolean; source?: "tenant" | "env" },
+): OAuthAppRequirement {
+  return {
+    required: true,
+    configured: state.configured,
+    ...(state.source ? { source: state.source } : {}),
+    label: preset.label,
+    issuer,
+    callback_uri: callbackUri,
+    env: { client_id: preset.clientIdEnv, client_secret: preset.clientSecretEnv },
+    ...(preset.docsUrl ? { docs_url: preset.docsUrl } : {}),
+    setup_steps: preset.setupSteps?.(callbackUri) ?? [
+      `Create an OAuth app with ${preset.label} and set its redirect/callback URL to ${callbackUri}.`,
+      "Copy the app's Client ID and Client Secret and paste them below.",
+    ],
+    ...(preset.manifest ? { manifest: preset.manifest(callbackUri) } : {}),
+  };
+}
+
+/**
+ * Discover what connecting `mcpServerUrl` needs. Returns null when the
+ * server isn't OAuth at all (discovery fails) — callers treat that as
+ * "nothing to prepare". `required:false` when the provider supports
+ * Dynamic Client Registration.
+ */
+export async function describeOAuthAppRequirement(input: {
+  deps: NodeOAuthRoutesDeps;
+  tenantId: string;
+  mcpServerUrl: string;
+  baseUrl: string;
+}): Promise<OAuthAppRequirement | null> {
+  let meta: Awaited<ReturnType<typeof discoverOAuthMeta>>;
+  try {
+    meta = await discoverOAuthMeta(input.mcpServerUrl);
+  } catch {
+    return null;
+  }
+  const issuer = meta.authServer.issuer;
+  const callbackUri = `${input.baseUrl.replace(/\/+$/, "")}/v1/oauth/callback`;
+  const preset = presetForIssuer(issuer);
+  if (meta.authServer.registration_endpoint || !preset) {
+    return {
+      required: false,
+      configured: true,
+      label: preset?.label ?? new URL(issuer).hostname,
+      issuer,
+      callback_uri: callbackUri,
+      env: { client_id: preset?.clientIdEnv ?? "", client_secret: preset?.clientSecretEnv ?? "" },
+      setup_steps: [],
+    };
+  }
+  const stored = await loadTenantOAuthApp(input.deps, input.tenantId, issuer);
+  if (stored) return requirementFor(preset, issuer, callbackUri, { configured: true, source: "tenant" });
+  const envConfigured =
+    !!envValue(input.deps.env, preset.clientIdEnv) && !!envValue(input.deps.env, preset.clientSecretEnv);
+  return requirementFor(preset, issuer, callbackUri, {
+    configured: envConfigured,
+    ...(envConfigured ? { source: "env" as const } : {}),
+  });
+}
+
+function presetForIssuer(issuer: string): OAuthPreset | null {
+  const presets: OAuthPreset[] = [
     {
       label: "GitHub",
       test: /^https:\/\/github\.com\/login\/oauth\/?$/,
       clientIdEnv: "GITHUB_OAUTH_CLIENT_ID",
       clientSecretEnv: "GITHUB_OAUTH_CLIENT_SECRET",
+      docsUrl: "https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/creating-an-oauth-app",
+      setupSteps: (cb) => [
+        "Open github.com → Settings → Developer settings → OAuth Apps → New OAuth App.",
+        `Set the Authorization callback URL to ${cb}.`,
+        "Generate a client secret, then paste the Client ID and Client Secret below.",
+      ],
     },
     {
       label: "Slack",
-      test: /^https:\/\/slack\.com\/?$/,
+      test: /^https:\/\/(mcp\.)?slack\.com\/?$/,
       clientIdEnv: "SLACK_OAUTH_CLIENT_ID",
       clientSecretEnv: "SLACK_OAUTH_CLIENT_SECRET",
+      docsUrl: "https://docs.slack.dev/ai/mcp-server/",
+      setupSteps: (cb) => [
+        "Open api.slack.com/apps → Create New App → From a manifest, pick your workspace and paste the manifest below (it already contains the callback URL and every user scope Slack's MCP server advertises).",
+        "In the app: OAuth & Permissions → opt in to Proof Key for Code Exchange (PKCE).",
+        "In the app: Agents & AI Apps → toggle on Model Context Protocol.",
+        "Basic Information → App Credentials: copy the Client ID and Client Secret (not the bot/app tokens) and paste them below.",
+        `If you edit the redirect URL by hand it must be exactly ${cb}.`,
+      ],
+      manifest: (cb) => ({
+        display_information: {
+          name: "Orrery",
+          description: "Orrery agents connect to Slack through the Slack MCP server",
+        },
+        features: { bot_user: { display_name: "Orrery", always_online: false } },
+        oauth_config: {
+          redirect_urls: [cb],
+          scopes: { bot: ["users:read"], user: SLACK_MCP_USER_SCOPES },
+        },
+        settings: {
+          org_deploy_enabled: false,
+          socket_mode_enabled: false,
+          token_rotation_enabled: false,
+        },
+      }),
     },
     {
       label: "Asana",
@@ -657,10 +929,14 @@ async function probeMcpServer(
  *  connect cards/panels leave their "waiting" state and show the message,
  *  then stays open (readable) with the details — a silent window.close()
  *  buried every OAuth failure. */
-function closeHtml(title: string, body: string): string {
+function closeHtml(title: string, body: string, extra: Record<string, unknown> = {}): string {
   // body may carry markup for the page; the postMessage variant is plain text.
   const plain = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-  const msg = JSON.stringify({ type: "oauth_error", message: `${title}: ${plain}`.slice(0, 500) });
+  const msg = JSON.stringify({
+    type: "oauth_error",
+    message: `${title}: ${plain}`.slice(0, 500),
+    ...extra,
+  });
   return `<html><body style="font-family:system-ui;max-width:36rem;margin:3rem auto;line-height:1.5">
 <h2>${htmlEscape(title)}</h2><p>${body}</p>
 <p style="color:#888">You can close this window.</p>

@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { useApi } from "../lib/api";
 import { Button } from "@/components/ui/button";
 import type { Event } from "../lib/events";
+import { OAuthAppSetupPanel, type OAuthAppRequirement } from "./OAuthAppSetupPanel";
 
 /**
  * Agent-initiated credential request — rendered when the agent calls its
@@ -26,8 +27,14 @@ import type { Event } from "../lib/events";
 export function AccessRequestCard({
   event,
   sessionId: sessionIdProp,
+  granted = false,
 }: {
   event: Event;
+  /** True when the session's event log already holds a
+   *  system.access_granted for this request — the server recorded the
+   *  grant, so the card renders "Connected" regardless of popup state or
+   *  page reloads. */
+  granted?: boolean;
   /** Session to notify on completion. Defaults to the :id route param
    *  (SessionDetail); SessionChat must pass it explicitly — its route
    *  param is the AGENT id. */
@@ -46,6 +53,8 @@ export function AccessRequestCard({
      *  actually authenticates. Absent on events from older deploys —
      *  fall back to the pre-classification behavior then. */
     auth_kind?: "mcp_oauth" | "mcp_api_key" | "llm_provider" | "composio";
+    /** Server-side discovery: provider needs a one-time OAuth app first. */
+    oauth_app?: OAuthAppRequirement;
   };
   const service = (ev.service ?? "service").toLowerCase();
   const isMcpOauth =
@@ -55,21 +64,44 @@ export function AccessRequestCard({
   const isApiKeyMcp = ev.auth_kind === "mcp_api_key" && !!ev.mcp_server_url;
   const isLlmProvider = ev.auth_kind === "llm_provider";
   const [status, setStatus] = useState<"pending" | "connecting" | "connected" | "error">(
-    "pending",
+    granted ? "connected" : "pending",
   );
   const [error, setError] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState("");
-  const notifiedRef = useRef(false);
+  // One-time OAuth-app requirement (Slack, GitHub…). Seeded from the event
+  // (postAccessRequest discovers it up front); also learned late from the
+  // popup's `oauth_app_required` error for events from older deploys.
+  const [appReq, setAppReq] = useState<OAuthAppRequirement | null>(
+    ev.oauth_app && ev.oauth_app.required ? ev.oauth_app : null,
+  );
+  const [savingApp, setSavingApp] = useState(false);
+  const notifiedRef = useRef(granted);
   /** Vault the Composio account landed in — needed post-OAuth to graft the
    *  connection onto the session's agent (tool-router server + vault link). */
   const vaultIdRef = useRef<string | null>(null);
 
+  // Durable state wins over local popup bookkeeping: once the server has
+  // written system.access_granted for this request, flip to Connected even
+  // if this card never saw the popup finish (reload / re-render / other tab).
+  useEffect(() => {
+    if (!granted) return;
+    notifiedRef.current = true;
+    setStatus("connected");
+  }, [granted]);
+
   useEffect(() => {
     if (status !== "connecting") return;
-    const complete = async () => {
+    const complete = async (opts: { grantRecorded?: boolean } = {}) => {
       if (notifiedRef.current) return;
       notifiedRef.current = true;
       setStatus("connected");
+      if (opts.grantRecorded) {
+        // The OAuth callback already appended system.access_granted + the
+        // "[access granted]" nudge server-side — posting again would wake
+        // the agent twice with a duplicate message.
+        toast.success(`${service} connected.`);
+        return;
+      }
       // Graft the connection onto the session's AGENT (tool-router
       // mcp_server + vault link + toolkit list). Without this, an agent
       // created with no Composio wiring never sees the toolkit's tools —
@@ -131,15 +163,32 @@ export function AccessRequestCard({
         if (data.toolkit && data.toolkit.toLowerCase() !== service) return;
         void complete();
       } else if (data?.type === "oauth_complete") {
-        // MCP OAuth callback reports the provider's display name — accept any
-        // completion that lands while THIS card is the one connecting.
-        void complete();
+        // Only THIS request's completion. Older callback pages carry no
+        // request_id; accept those to stay compatible. Without this check
+        // every connecting card completed on ANY popup finishing (seen live:
+        // one GitHub popup → linear + github + github grants in one second).
+        const done = data as { request_id?: string | null; grant_recorded?: boolean };
+        if (done.request_id && ev.request_id && done.request_id !== ev.request_id) return;
+        void complete({ grantRecorded: done.grant_recorded === true });
       } else if (data?.type === "oauth_error") {
-        // Popup-side failure (discovery, missing preset app, token exchange,
-        // provider proxy state) — surface it on the card instead of leaving
-        // "Waiting for provider…" forever.
+        const err = data as {
+          message?: string;
+          code?: string;
+          provider?: OAuthAppRequirement;
+        };
+        if (err.code === "oauth_app_required" && err.provider) {
+          // Not a failure the user can retry — switch the card into the
+          // guided one-time app setup.
+          setAppReq(err.provider);
+          setError(null);
+          setStatus("pending");
+          return;
+        }
+        // Popup-side failure (discovery, token exchange, provider proxy
+        // state) — surface it on the card instead of leaving "Waiting for
+        // provider…" forever.
         setStatus("error");
-        setError((data as { message?: string }).message ?? "Provider authentication failed");
+        setError(err.message ?? "Provider authentication failed");
       }
     };
     window.addEventListener("message", handle);
@@ -232,7 +281,13 @@ export function AccessRequestCard({
           mcp_server_url: ev.mcp_server_url!,
           vault_id: vault.id,
           redirect_uri: window.location.href,
+          service,
         });
+        // Let the callback record the grant on the session itself (and
+        // graft the vault onto the agent) — the browser handoff below is
+        // then only cosmetic.
+        if (sessionId) params.set("session_id", sessionId);
+        if (ev.request_id) params.set("request_id", ev.request_id);
         window.open(
           `/v1/oauth/authorize?${params.toString()}`,
           `oauth-${service}`,
@@ -267,6 +322,27 @@ export function AccessRequestCard({
   };
 
   const composioUnavailable = !isMcpOauth && ev.composio_configured === false;
+  const needsAppSetup =
+    isMcpOauth && status !== "connected" && !!appReq?.required && !appReq.configured;
+
+  const saveOAuthApp = async (clientId: string, clientSecret: string) => {
+    if (!appReq) return;
+    setSavingApp(true);
+    setError(null);
+    try {
+      await api("/v1/oauth/apps", {
+        method: "PUT",
+        body: JSON.stringify({ issuer: appReq.issuer, client_id: clientId, client_secret: clientSecret }),
+      });
+      setAppReq({ ...appReq, configured: true, source: "tenant" });
+      toast.success(`${appReq.label} app saved — continuing to ${appReq.label}…`);
+      await connect();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : `Failed to save the ${appReq.label} app`);
+    } finally {
+      setSavingApp(false);
+    }
+  };
 
   return (
     <div className="max-w-2xl border border-border rounded-lg bg-bg-surface px-4 py-3">
@@ -287,6 +363,8 @@ export function AccessRequestCard({
           <Button asChild variant="outline" size="sm">
             <Link to="/integrations/apps">Connect Composio first</Link>
           </Button>
+        ) : needsAppSetup ? (
+          <span className="text-xs font-medium text-warning whitespace-nowrap">Setup required</span>
         ) : (
           <Button size="sm" onClick={connect} disabled={status === "connecting"}>
             {status === "connecting" ? "Waiting for provider…" : `Connect ${service}`}
@@ -313,6 +391,9 @@ export function AccessRequestCard({
             {status === "connecting" ? "Saving…" : "Save to vault"}
           </Button>
         </form>
+      )}
+      {needsAppSetup && appReq && (
+        <OAuthAppSetupPanel requirement={appReq} saving={savingApp} onSave={saveOAuthApp} />
       )}
       {error && <div className="mt-2 text-xs text-danger">{error}</div>}
       <div className="mt-2 text-[11px] text-fg-subtle">

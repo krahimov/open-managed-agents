@@ -41,7 +41,12 @@ import {
   evaluatePolicy,
   generateId,
 } from "@open-managed-agents/shared";
-import { buildSetupPrompt, harnessView } from "./setup-harness.js";
+import {
+  buildSetupPrompt,
+  harnessView,
+  autoRequestAccessForNewServers,
+  describeAutoAccess,
+} from "./setup-harness.js";
 import {
   materializeMemory,
   writeBackMemory,
@@ -158,6 +163,18 @@ export interface ClaudeAgentSdkHarnessDeps {
     sessionId: string,
     args: { service: string; reason: string; mcp_server_url?: string },
   ) => Promise<{ request_id: string; status: string; note?: string }>;
+  /** Vault holding an active credential for an MCP server URL (setup:
+   *  lets update_harness attach the vault instead of posting a card). */
+  findCredentialVault?: (tenantId: string, mcpServerUrl: string) => Promise<string | null>;
+  /** Attach a vault to an agent's default vaults (idempotent). */
+  attachVaultToAgent?: (tenantId: string, agentId: string, vaultId: string) => Promise<void>;
+  /** Setup sessions: reconcile the servers already on the harness (cards /
+   *  vault attach) once and return the status block for the preamble. */
+  setupAccessStatus?: (
+    tenantId: string,
+    sessionId: string,
+    agent: AgentConfig,
+  ) => Promise<string | undefined>;
   /**
    * Create a standing ambient rule on the session's agent (the
    * `create_ambient_rule` tool). Main-node wires this to the same
@@ -382,7 +399,24 @@ export class ClaudeAgentSdkHarness {
             changed,
           },
         } as SessionEvent);
-        return { content: [{ type: "text", text: `Updated: ${changed.join(", ")}.` }] };
+        let summary = `Updated: ${changed.join(", ")}.`;
+        // Newly added MCP servers get their connect cards posted right here —
+        // deterministic, not left to the model (see setup-harness.ts).
+        if (patch.mcp_servers !== undefined && this.#deps.requestServiceAccess) {
+          const sessionId = ctx.session_id ?? "";
+          const auto = await autoRequestAccessForNewServers(before.mcp_servers, after.mcp_servers, {
+            requestAccess: (a) => this.#deps.requestServiceAccess!(tenantId, sessionId, a),
+            findCredentialVault: this.#deps.findCredentialVault
+              ? (url) => this.#deps.findCredentialVault!(tenantId, url)
+              : undefined,
+            attachVault: this.#deps.attachVaultToAgent
+              ? (vaultId) => this.#deps.attachVaultToAgent!(tenantId, agentId, vaultId)
+              : undefined,
+          });
+          const line = describeAutoAccess(auto);
+          if (line) summary += ` ${line}`;
+        }
+        return { content: [{ type: "text", text: summary }] };
       },
     );
 
@@ -739,7 +773,15 @@ export class ClaudeAgentSdkHarness {
           ...reasoningOptions,
           mcpServers: mcpServersForTurn,
           systemPrompt: isSetup
-            ? buildSetupPrompt(ctx.agent)
+            ? buildSetupPrompt(ctx.agent, {
+                accessStatus: this.#deps.setupAccessStatus
+                  ? await this.#deps.setupAccessStatus(
+                      ctx.tenant_id ?? "default",
+                      ctx.session_id ?? "",
+                      ctx.agent,
+                    )
+                  : undefined,
+              })
             : {
                 type: "preset",
                 preset: "claude_code",
