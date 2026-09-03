@@ -16,28 +16,38 @@ import type { EventLogRepo, StreamRepo, StreamRow } from "../ports";
 export type SqlDialect = "sqlite" | "postgres";
 
 /**
- * Per-session append serialisation, shared across ALL SqlEventLog
- * instances in the process. Callers construct a fresh instance per
- * append (`newEventLog(sessionId)` factories), and a session has several
- * independent writers during a turn (harness broadcast chain, the session
- * machine's turn events, wakeup persistence, work-queue error paths), so
- * an instance-level chain serialises nothing. Entries are removed once
- * the tail settles, so the map only holds sessions with writes in flight.
+ * How many times {@link SqlEventLog.appendAsync} re-attempts the
+ * seq-minting INSERT when it loses the MAX(seq)+1 race. Each retry
+ * recomputes the subquery against committed rows, so a loser converges
+ * once the winner commits — but each round crowns only ONE winner among
+ * the concurrent colliders, so a writer can lose up to
+ * <concurrent-writers> times in a burst. postgres.js pools 10
+ * connections by default, bounding true concurrency at ~10; 20 attempts
+ * leaves headroom for retry-queue unfairness on top of that.
  */
-const appendChains = new Map<string, Promise<void>>();
+const MAX_APPEND_ATTEMPTS = 20;
 
 /**
- * The `seq` PRIMARY KEY collision an interleaved MAX(seq)+1 produces:
- * postgres.js surfaces SQLSTATE 23505, better-sqlite3 SQLITE_CONSTRAINT_*,
- * D1 a bare "UNIQUE constraint failed" message.
+ * Unique-violation detection across the drivers SqlClient wraps. The
+ * adapters propagate driver errors unwrapped, so the native shapes reach
+ * us directly:
+ *   - postgres.js: PostgresError with code "23505" and message
+ *     `duplicate key value violates unique constraint "..."`
+ *   - better-sqlite3: SqliteError with code "SQLITE_CONSTRAINT_PRIMARYKEY"
+ *     (or ..._UNIQUE) and message "UNIQUE constraint failed: ..."
+ *   - D1: plain Error whose message contains "UNIQUE constraint failed"
  */
 function isUniqueViolation(err: unknown): boolean {
-  const e = err as { code?: unknown; message?: unknown } | null;
-  if (!e || typeof e !== "object") return false;
-  if (e.code === "23505") return true;
-  if (typeof e.code === "string" && e.code.startsWith("SQLITE_CONSTRAINT")) return true;
-  const msg = typeof e.message === "string" ? e.message : "";
-  return /unique constraint|duplicate key/i.test(msg);
+  if (typeof err !== "object" || err === null) return false;
+  const code = (err as { code?: unknown }).code;
+  if (code === "23505") return true;
+  if (typeof code === "string" && code.startsWith("SQLITE_CONSTRAINT")) return true;
+  const msg = (err as { message?: unknown }).message;
+  return (
+    typeof msg === "string" &&
+    (msg.includes("UNIQUE constraint failed") ||
+      msg.includes("duplicate key value violates unique constraint"))
+  );
 }
 
 /**
@@ -48,14 +58,17 @@ function isUniqueViolation(err: unknown): boolean {
  * autoincrement, and the cross-session global counter that AUTOINCREMENT
  * would give us is not what we want (a session's seq should start at 1).
  *
- * The MAX(seq)+1 subquery is racy under concurrent writers: on Postgres
- * (pooled connections, snapshot reads) two in-flight inserts can mint the
- * same seq and collide on PRIMARY KEY (session_id, seq). better-sqlite3
- * never interleaves (one synchronous connection), which is why the race
- * only fires on PG deployments. Defense is two-layer: appendAsync
- * serialises per session through the module-scope {@link appendChains}
- * (fixes every same-process race), and the insert retries on unique
- * violation (covers a second process writing the same session).
+ * The subquery is racy under concurrent writers: on Postgres (READ
+ * COMMITTED, one pooled connection per writer) two inserts can read the
+ * same MAX(seq) and collide on the (session_id, seq) PRIMARY KEY. That
+ * happens in practice — SessionStateMachine, NodeHarnessRuntime's
+ * broadcast chain, and the HTTP session router each append through their
+ * own SqlEventLog instance/connection, so no single call-site chain can
+ * serialise them all. appendAsync therefore treats a unique violation as
+ * "lost the seq race" and retries; the re-run recomputes MAX(seq)+1.
+ * better-sqlite3 never hits this (sync writes serialise in-process), and
+ * cross-session writes never collide because they hit different
+ * (session_id) partitions of the PRIMARY KEY.
  */
 export class SqlEventLog implements EventLogRepo {
   constructor(
@@ -78,35 +91,6 @@ export class SqlEventLog implements EventLogRepo {
   }
 
   async appendAsync(event: SessionEvent): Promise<void> {
-    const key = this.sessionId;
-    const prev = appendChains.get(key) ?? Promise.resolve();
-    // A predecessor's failure must not block this append (its caller saw
-    // the rejection; ours starts fresh).
-    const run = prev.catch(() => {}).then(() => this.insertWithRetry(event));
-    const tail = run.catch(() => {});
-    appendChains.set(key, tail);
-    void tail.then(() => {
-      if (appendChains.get(key) === tail) appendChains.delete(key);
-    });
-    return run;
-  }
-
-  private async insertWithRetry(event: SessionEvent): Promise<void> {
-    let lastErr: unknown;
-    for (let attempt = 0; attempt < 5; attempt++) {
-      try {
-        return await this.insertOnce(event);
-      } catch (err) {
-        if (!isUniqueViolation(err)) throw err;
-        // seq collision with another process — the next attempt recomputes
-        // MAX(seq)+1 inside the statement and lands on the freed slot.
-        lastErr = err;
-      }
-    }
-    throw lastErr;
-  }
-
-  private async insertOnce(event: SessionEvent): Promise<void> {
     const ts = Date.now();
     // Mirror cf-do/index.ts: user.* are pending until drained;
     // everything else is "ingested" at write time. session_thread_id
@@ -120,22 +104,33 @@ export class SqlEventLog implements EventLogRepo {
     const threadId =
       (event as unknown as { session_thread_id?: string }).session_thread_id ??
       "sthr_primary";
-    await this.sql
-      .prepare(
-        `INSERT INTO session_events (session_id, seq, type, data, ts, processed_at, session_thread_id)
-         SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?
-           FROM session_events WHERE session_id = ?`,
-      )
-      .bind(
-        this.sessionId,
-        event.type,
-        JSON.stringify(event),
-        ts,
-        processedAt,
-        threadId,
-        this.sessionId,
-      )
-      .run();
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await this.sql
+          .prepare(
+            `INSERT INTO session_events (session_id, seq, type, data, ts, processed_at, session_thread_id)
+             SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?
+               FROM session_events WHERE session_id = ?`,
+          )
+          .bind(
+            this.sessionId,
+            event.type,
+            JSON.stringify(event),
+            ts,
+            processedAt,
+            threadId,
+            this.sessionId,
+          )
+          .run();
+        return;
+      } catch (err) {
+        if (!isUniqueViolation(err) || attempt >= MAX_APPEND_ATTEMPTS) throw err;
+        // Lost the MAX(seq)+1 race to a concurrent writer. Jittered
+        // linear backoff de-interleaves a burst of losers; the common
+        // case retries once, immediately after the winner's commit.
+        await new Promise((r) => setTimeout(r, Math.random() * 5 * attempt));
+      }
+    }
   }
 
   /**
