@@ -18,6 +18,17 @@
 
 ---
 
+## Choose your path
+
+| Goal | Start here |
+|---|---|
+| Evaluate the open-source project locally | **[Docker quickstart](#quick-start-docker-local-recommended)** — the primary path for this repository |
+| Use the managed product | [Hosted quickstart](#hosted-quickstart) |
+| Develop the platform | [Development](#development) |
+| Deploy on Cloudflare | [Cloudflare deployment](#cloudflare-deployment-advanced) |
+
+The product is managed-first, but the repository is optimized for an OSS evaluator's first success with Docker.
+
 ## What is this?
 
 Most agent frameworks give you a loop and leave the hard parts to you. Open Managed Agents (OMA) is the other half: the **platform** that runs agents in production. You define an agent (model, system prompt, tools, skills); OMA gives it everything it needs to actually operate:
@@ -63,86 +74,101 @@ Harnesses are registered by name and selected per agent via the `harness` field:
 | `claude-agent-sdk` | Runs each turn through the [Claude Agent SDK](https://docs.anthropic.com/en/api/agent-sdk/overview) (Claude Code as the loop), Node self-host only |
 | `acp-proxy` | Bridges external ACP-speaking agents into OMA sessions |
 
-## Quick start: self-host (Docker)
+## Quick start: Docker local (recommended)
+
+### Prerequisites
+
+- Git
+- Docker Engine or Docker Desktop with Docker Compose v2
+- `curl`, `jq`, and OpenSSL
+- An OpenAI or Anthropic API key. For evaluation, use a disposable key with a low spending limit and revoke it afterward.
 
 ```bash
 git clone https://github.com/krahimov/open-managed-agents.git
 cd open-managed-agents
 cp .env.example .env
 
-# Two secrets are required before first boot — both generated locally:
-#   BETTER_AUTH_SECRET   — signs Console sessions        (openssl rand -hex 32)
-#   PLATFORM_ROOT_SECRET — encrypts credentials at rest  (openssl rand -base64 32)
-#                          Back it up — losing it makes every encrypted row unreadable.
-$EDITOR .env
-
-# SQLite + local subprocess sandbox (default — fastest path)
-docker compose up -d
-
-# Or with Postgres:
-# docker compose -f docker-compose.postgres.yml up -d
-
-curl localhost:8787/health
-open http://localhost:8787        # Console UI on the same port
+# Generate both secrets locally and paste the values into .env.
+openssl rand -hex 32       # BETTER_AUTH_SECRET
+openssl rand -base64 32    # PLATFORM_ROOT_SECRET — back this up
 ```
 
-Setting `ANTHROPIC_API_KEY` in `.env` lets your first agent run immediately; for anything beyond a smoke test, add a **Model Card** from the Console instead — it's encrypted, per-tenant, and rotatable without a restart.
+For the shortest local-only smoke test, edit `.env` and set:
 
-## Quick start: Cloudflare
+```dotenv
+BETTER_AUTH_SECRET=<first generated value>
+PLATFORM_ROOT_SECRET=<second generated value>
+AUTH_DISABLED=1
 
-Requires a [Workers Paid plan](https://developers.cloudflare.com/workers/platform/pricing/) for Durable Objects and Containers.
+# Pick one provider. The commands below use OpenAI.
+OPENAI_API_KEY=<disposable OpenAI key>
+OPENAI_MODEL=gpt-5.4-mini
+# Or: ANTHROPIC_API_KEY=<key> and ANTHROPIC_MODEL=claude-sonnet-4-6
+```
+
+> [!WARNING]
+> `AUTH_DISABLED=1` makes every request the `default` tenant. Use it only for a local, single-user evaluation. For a shared or persistent deployment, leave it unset, sign in through the Console, and create a tenant API key.
+
+Start the SQLite stack and verify it:
 
 ```bash
-git clone https://github.com/krahimov/open-managed-agents.git
-cd open-managed-agents
-pnpm install
-
-# Local dev (no CF account needed — wrangler simulators)
-cp .dev.vars.example .dev.vars && $EDITOR .dev.vars
-pnpm dev              # API on http://localhost:8787
-pnpm dev:console      # Console on http://localhost:5173
-
-# Deploy
-npx wrangler login
-npx wrangler kv namespace create CONFIG_KV       # paste the id into wrangler.jsonc
-npx wrangler secret put BETTER_AUTH_SECRET
-npx wrangler secret put PLATFORM_ROOT_SECRET     # back this up
-npx wrangler secret put API_KEY                  # bootstrap key for the REST API
-npm run deploy
+docker compose up -d --build
+curl --fail --silent http://localhost:8787/health | jq
 ```
 
-This deploys the API worker (routes, auth, rate limiting), the agent worker (session runtime + harness + sandbox), a KV namespace for config, and an R2 bucket for workspace persistence.
+A successful response contains `"status": "ok"`, `"runtime": "node"`, and a SQLite database backend. Open <http://localhost:8787> for the Console.
 
-## Your first agent
+### Run your first agent
 
-Works against any deployment — Docker or Cloudflare:
+These commands assume the local-only `AUTH_DISABLED=1` setting above:
 
 ```bash
 BASE=http://localhost:8787
-KEY=dev-test-key                 # whatever you set as API_KEY
+MODEL=gpt-5.4-mini
 
-# 1. Create an agent
-AGENT=$(curl -s $BASE/v1/agents \
-  -H "x-api-key: $KEY" -H "content-type: application/json" \
-  -d '{
-    "name": "Coder",
-    "model": "claude-sonnet-4-6",
-    "system": "You are a helpful coding assistant.",
-    "tools": [{ "type": "agent_toolset_20260401" }]
-  }' | jq -r .id)
+AGENT=$(curl --fail --silent -X POST "$BASE/v1/agents" \
+  -H 'content-type: application/json' \
+  -d "{\"name\":\"hello-agent\",\"model\":\"$MODEL\",\"system\":\"Reply in one short sentence.\",\"tools\":[]}" \
+  | jq -r .id)
 
-# 2. Start a session
-SESSION=$(curl -s $BASE/v1/sessions \
-  -H "x-api-key: $KEY" -H "content-type: application/json" \
-  -d "{\"agent\":\"$AGENT\"}" | jq -r .id)
+test -n "$AGENT" && test "$AGENT" != null
 
-# 3. Send a message and stream the reply
-curl -N -X POST $BASE/v1/sessions/$SESSION/messages \
-  -H "x-api-key: $KEY" -H "content-type: application/json" \
-  -d '{"content":"Write a Python script that fetches HN top stories"}'
+SESSION=$(curl --fail --silent -X POST "$BASE/v1/sessions" \
+  -H 'content-type: application/json' \
+  -d "{\"agent\":\"$AGENT\",\"title\":\"quickstart\"}" \
+  | jq -r .id)
+
+test -n "$SESSION" && test "$SESSION" != null
+
+curl --fail-with-body -N -X POST "$BASE/v1/sessions/$SESSION/messages" \
+  -H 'content-type: application/json' \
+  -d '{"content":"Reply with exactly: openma is running"}'
 ```
 
-For long-lived sessions, `GET /v1/sessions/$SESSION/events/stream` replays history on connect and never closes. The `oma` CLI (`packages/cli`) wraps all of this: `oma models create`, `oma memory write`, `oma slack publish`, and more.
+The stream should end with a `session.status_idle` event. For long-lived sessions, `GET /v1/sessions/$SESSION/events/stream` replays history on connect and remains open.
+
+If you use Anthropic instead, set `MODEL=claude-sonnet-4-6`. When finished, run `docker compose down`; persisted data remains under `./data`. Revoke the disposable provider key after validation.
+
+### Common first-run failures
+
+| Symptom | Check |
+|---|---|
+| `401 Unauthorized` | Set `AUTH_DISABLED=1` for this local smoke test, or authenticate through the Console and send a real `x-api-key`. |
+| Turn fails with “No model card” or provider authentication error | Set one provider key and use the matching model ID. Recreate the container after changing `.env`: `docker compose up -d --force-recreate oma-server`. |
+| Port `8787` is already in use | Set `OMA_PORT` in `.env`, then use that port in `BASE`. |
+| Docker cannot start the stack | Confirm Docker is running and `docker compose version` reports Compose v2. |
+| Remote sandbox turns using memory stores stall or fail | Daytona, E2B, and BoxRun require shared `MEMORY_S3_*` storage for memory mounts; local subprocess mode uses `./data/memory-blobs`. |
+| Encrypted credentials become unreadable | Restore the original `PLATFORM_ROOT_SECRET`. Changing or losing it makes encrypted rows unrecoverable. |
+
+The default `subprocess` sandbox has **no isolation from the host process**. Use it only for trusted local evaluation; choose an isolated sandbox provider for untrusted agents.
+
+## Hosted quickstart
+
+The managed Console remains the main product surface. Go to [app.openma.dev](https://app.openma.dev), create an account and API key, then follow the [hosted tab in the full quickstart](https://docs.openma.dev/quickstart/).
+
+## Cloudflare deployment (advanced)
+
+Cloudflare deployment requires a Workers Paid plan for Durable Objects and Containers. It is an operator path, not the repository's first-run path. See the [Cloudflare deployment guide](https://docs.openma.dev/self-host/deploy/) and the repository's `scripts/deploy.sh`.
 
 ## Core concepts
 
@@ -217,8 +243,8 @@ The variables that gate boot and at-rest safety:
 |---|---|---|
 | `PLATFORM_ROOT_SECRET` | **Yes** | AES-GCM key for credentials, model-card keys, and integration tokens. **Back it up** — losing it makes every encrypted row unreadable. |
 | `BETTER_AUTH_SECRET` | **Yes** (prod) | Console session signing key. |
-| `API_KEY` | Yes | Bootstrap key for the REST API; mint per-tenant keys from the Console after first boot. |
-| `ANTHROPIC_API_KEY` | No | Fallback LLM credential when no Model Card is configured. Prefer Model Cards in production. |
+| `API_KEY` | Cloudflare bootstrap only | Bootstrap key for the Cloudflare REST API. Node self-host uses Console sessions or stored tenant API keys. |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | One provider or a Model Card | Fallback LLM credential when no Model Card is configured. Prefer Model Cards in production. |
 | `SANDBOX_PROVIDER` | No | `subprocess` (default), `litebox`, `daytona`, `e2b`, or `boxrun`. Use an isolated backend for untrusted agents. |
 | `TAVILY_API_KEY` | No | Backend for the `web_search` tool. |
 
@@ -228,13 +254,13 @@ Full reference: the annotated `.env.example` / `.dev.vars.example`.
 
 ```bash
 pnpm install
-npm test              # unit + integration suites
-npm run typecheck     # tsc across CF + Node targets
+pnpm test             # unit + integration suites
+pnpm run typecheck    # tsc across CF + Node targets
 pnpm dev              # CF workers locally (wrangler simulators)
 pnpm dev:console      # Console UI with hot reload
 ```
 
-Docs site: `pnpm dev:docs` (local preview), `pnpm deploy:docs` (publish).
+Docs site: `pnpm dev:docs` for local preview and `pnpm build:docs` for local HTML in the ignored `apps/docs/dist/` directory.
 
 ## Contributing
 
@@ -242,7 +268,7 @@ Contributions welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). The short vers
 
 1. Fork and create a feature branch (`git checkout -b feat/amazing-feature`)
 2. Make your change, with tests
-3. `npm test && npm run typecheck`
+3. `pnpm test && pnpm run typecheck`
 4. Open a pull request
 
 Security reports: see [SECURITY.md](SECURITY.md).
