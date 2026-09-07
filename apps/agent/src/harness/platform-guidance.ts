@@ -19,8 +19,22 @@ export const loopStopGuidance =
 // Files written here are listable via GET /v1/sessions/:id/outputs and
 // downloadable by the caller. Without this hint, agents historically wrote
 // final artefacts to /workspace/ where they vanish on container recycle.
-export const sessionOutputsGuidance =
-  "Files you write under `/mnt/session/outputs/` persist after the session ends and are downloadable by the user from the session's Files panel. Use this path for final artifacts the user should keep (reports, exports, generated docs, packaged code). Files written anywhere else (e.g. `/workspace/`) are scratch — they may be lost on container recycle and are not user-accessible. Treat the sandbox as ephemeral compute, not bulk storage: do not create large datasets, disk images, archives, package caches, or direct writes under `/mnt/_oma_storage`. For external service files, prefer the matching MCP tool or provider upload flow.";
+//
+// `sessionOutputsGuidanceFor(path)` exists for runtimes where the outputs
+// dir is NOT the legacy path — an agent-scoped Daytona machine shares one
+// box across sessions and mounts `/mnt/sessions/<sid>/outputs` instead
+// (`SandboxExecutor.sessionOutputsPath()`). Only the path is interpolated;
+// the surrounding text is identical so the default stays byte-for-byte
+// what CF SessionDO has always sent (prompt-cache prefix).
+export const DEFAULT_SESSION_OUTPUTS_PATH = "/mnt/session/outputs/";
+
+export function sessionOutputsGuidanceFor(
+  outputsPath: string = DEFAULT_SESSION_OUTPUTS_PATH,
+): string {
+  return `Files you write under \`${outputsPath}\` persist after the session ends and are downloadable by the user from the session's Files panel. Use this path for final artifacts the user should keep (reports, exports, generated docs, packaged code). Files written anywhere else (e.g. \`/workspace/\`) are scratch — they may be lost on container recycle and are not user-accessible. Treat the sandbox as ephemeral compute, not bulk storage: do not create large datasets, disk images, archives, package caches, or direct writes under \`/mnt/_oma_storage\`. For external service files, prefer the matching MCP tool or provider upload flow.`;
+}
+
+export const sessionOutputsGuidance = sessionOutputsGuidanceFor();
 
 export const externalServiceGuidance =
   "When a user asks about an OAuth-connected external service such as Google Drive, Gmail, Notion, Slack, GitHub, or Linear, use the available MCP tools for that service first. Do not expect provider CLIs, OAuth tokens, API keys, or credential files to exist in bash; those credentials are held by the platform and injected only through MCP/proxy calls. Before saying credentials are missing, check whether a matching MCP tool is available and use that tool.";
@@ -28,8 +42,25 @@ export const externalServiceGuidance =
 export const environmentProposalGuidance =
   "When the user asks you to configure or create a sandbox environment, propose it as a single fenced `yaml` block with top-level key `environment`. Include `name`, optional `description`, and `config`. For self-host cloud sandboxes, use `config.type: cloud` and include relevant `sandbox` fields (`provider`, `image`, `workdir`, `ephemeral`, `bootstrap_tools`, `bootstrap_apt_packages`, `max_file_bytes`), `resources.outputs`, `memory.stores`, `packages`, `networking`, or `dockerfile` when needed. The user can approve that YAML in the session UI; do not claim the environment exists until a tool/API call or user approval confirms it.";
 
-export const platformGuidance =
-  `${authenticatedCommandGuidance}\n\n${loopStopGuidance}\n\n${sessionOutputsGuidance}\n\n${externalServiceGuidance}\n\n${environmentProposalGuidance}`;
+/** Options accepted by `platformGuidanceFor` / `composeSystemPrompt`. */
+export interface PlatformGuidanceOptions {
+  /** Absolute outputs dir (with or without trailing slash) to name in the
+   *  session-outputs guidance. Omit for the default `/mnt/session/outputs/`. */
+  outputsPath?: string;
+}
+
+/**
+ * Platform guidance with the session-outputs path resolved. With no
+ * options (or `{}`) the result is exactly `platformGuidance`.
+ */
+export function platformGuidanceFor(opts?: PlatformGuidanceOptions): string {
+  const outputs = opts?.outputsPath
+    ? sessionOutputsGuidanceFor(opts.outputsPath)
+    : sessionOutputsGuidance;
+  return `${authenticatedCommandGuidance}\n\n${loopStopGuidance}\n\n${outputs}\n\n${externalServiceGuidance}\n\n${environmentProposalGuidance}`;
+}
+
+export const platformGuidance = platformGuidanceFor();
 
 /**
  * Compose agent.system + platform guidance + optional platform reminders
@@ -49,13 +80,19 @@ export const platformGuidance =
  *
  * If the agent has no system prompt of its own AND no reminders, the
  * guidance alone becomes the system prompt.
+ *
+ * `opts.outputsPath` swaps the outputs dir named in the guidance (agent-
+ * scoped sandboxes mount a per-session dir). Omitted ⇒ byte-identical to
+ * the two-argument form, so existing callers (CF SessionDO) are unaffected.
  */
 export function composeSystemPrompt(
   rawSystemPrompt: string | null | undefined,
   reminders?: ReadonlyArray<{ source: string; text: string }>,
+  opts?: PlatformGuidanceOptions,
 ): string {
   const raw = rawSystemPrompt ?? "";
-  const base = raw ? `${raw}\n\n${platformGuidance}` : platformGuidance;
+  const guidance = platformGuidanceFor(opts);
+  const base = raw ? `${raw}\n\n${guidance}` : guidance;
   if (!reminders?.length) return base;
   const blocks = reminders
     .map((r) => `<source name="${r.source}">\n${r.text}\n</source>`)

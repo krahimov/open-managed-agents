@@ -3,7 +3,7 @@
 // Three impls live in sibling files:
 //   - cf.ts      → wraps @cloudflare/playwright + the BROWSER binding
 //   - node.ts    → wraps playwright-core's chromium.launch() (lazy import)
-//   - cdp.ts     → wraps playwright-core's chromium.connect() to a remote
+//   - cdp.ts     → wraps playwright-core's chromium.connectOverCDP() to a remote
 //                  Browserless / k8s pool (BROWSERLESS_URL)
 //   - disabled.ts → throw-on-call placeholder when nothing else is wired
 //
@@ -247,7 +247,7 @@ export function buildBrowserTools(
   tools.browser_close = tool({
     description:
       "Close the browser session. Use only when you're truly done — subsequent " +
-      "browser_* calls will spin up a fresh session (loses cookies/state).",
+      "browser_* calls will reconnect. Agent computers preserve their shared tabs and cookies.",
     inputSchema: z.object({}),
     execute: async () => {
       if (!session || !session.isOpen()) return "No browser session to close.";

@@ -14,6 +14,7 @@ import { CreateDeploymentDialog } from "../components/CreateDeploymentDialog";
 import { Button } from "@/components/ui/button";
 import type { AgentRecord as Agent } from "../types/agent";
 import { AmbientTriggerControls } from "../components/AmbientTriggerControls";
+import { AgentComputerPanel } from "../components/AgentComputerPanel";
 import {
   COMPOSIO_MANAGED_AGENT_INTEGRATIONS,
   composioIntegrationIcon,
@@ -224,6 +225,8 @@ export function AgentDetail() {
           <span className="text-fg-muted">Updated</span><span>{new Date(agent.updated_at || agent.created_at).toLocaleString()}</span>
           {agent.archived_at && <><span className="text-fg-muted">Archived</span><span className="text-warning">{new Date(agent.archived_at).toLocaleString()}</span></>}
         </div>
+
+      <AgentComputerPanel key={agent.id} agentId={agent.id} />
 
       {/* Integrations — one fold per provider so adding a 4th / 5th doesn't
           push the rest of the page below the viewport. Default-open when
