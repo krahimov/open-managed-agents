@@ -92,6 +92,12 @@ export interface DaytonaSandboxInstance {
   labels?: Record<string, string>;
   autoStopInterval?: number;
   autoDeleteInterval?: number;
+  computerUse?: {
+    start(): Promise<unknown>;
+    screenshot: { takeFullScreen(showCursor?: boolean): Promise<{ screenshot?: string }> };
+    mouse: { click(x: number, y: number, button?: string, double?: boolean): Promise<unknown>; scroll(x: number, y: number, direction: string, amount?: number): Promise<unknown> };
+    keyboard: { type(text: string): Promise<unknown>; press(key: string, modifiers?: string[]): Promise<unknown> };
+  };
   process: DaytonaProcess;
   fs: DaytonaFileSystem;
   start(timeoutSec?: number): Promise<void>;
@@ -110,6 +116,7 @@ export interface DaytonaSandboxInstance {
  *  Declared as a type alias (not an interface) so it stays assignable to
  *  index-signature'd fakes. `resources` is only valid together with `image`. */
 export type DaytonaCreateParams = {
+  user?: string;
   public?: boolean;
   image?: string;
   snapshot?: string;

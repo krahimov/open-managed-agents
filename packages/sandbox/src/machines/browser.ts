@@ -56,10 +56,11 @@ server.listen(listenPort, '0.0.0.0');
 `;
 
 /** Exported for shell syntax checks and a real local Chromium smoke test. */
-export function buildAgentBrowserStartScript(): string {
+export function buildAgentBrowserStartScript(desktop = false): string {
   return [
     "#!/bin/sh",
     "set -eu",
+    ...(desktop ? ['display_socket="$(find /tmp/.X11-unix -name "X*" -type s | head -n 1)"', '[ -n "$display_socket" ] || { echo "Daytona desktop display is not ready" >&2; exit 1; }', 'export DISPLAY=":${display_socket##*/X}"'] : []),
     `mkdir -p ${quote(BROWSER_DIR)}`,
     // flock serializes concurrent sessions connecting after a stop/start.
     `exec 9>${quote(`${BROWSER_DIR}/start.lock`)}`,
@@ -67,7 +68,7 @@ export function buildAgentBrowserStartScript(): string {
     `if ! curl -fsS --max-time 2 http://127.0.0.1:${AGENT_BROWSER_PORT}/json/version >/dev/null 2>&1; then`,
     '  browser_bin="$(command -v chromium || command -v chromium-browser || command -v google-chrome || true)"',
     '  if [ -z "$browser_bin" ]; then echo "Chromium is not installed in the agent computer" >&2; exit 127; fi',
-    `  nohup "$browser_bin" --headless=new --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-renderer-backgrounding --remote-debugging-address=127.0.0.1 --remote-debugging-port=${AGENT_BROWSER_PORT} --user-data-dir=${quote(`${BROWSER_DIR}/profile`)} --restore-last-session about:blank >${quote(`${BROWSER_DIR}/chromium.log`)} 2>&1 </dev/null 9>&- &`,
+    `  nohup "$browser_bin" ${desktop ? "--start-maximized" : "--headless=new"} --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-renderer-backgrounding --remote-debugging-address=127.0.0.1 --remote-debugging-port=${AGENT_BROWSER_PORT} --user-data-dir=${quote(`${BROWSER_DIR}/profile`)} --restore-last-session about:blank >${quote(`${BROWSER_DIR}/chromium.log`)} 2>&1 </dev/null 9>&- &`,
     "fi",
     // The proxy can survive a Chromium crash; checking its upstream would
     // wrongly launch a duplicate proxy while Chromium is still starting.
@@ -100,6 +101,7 @@ export async function bootstrapAgentComputer(sb: DaytonaSandboxInstance, spec: A
   const packages = [...new Set([
     ...(spec.bootstrapTools ? spec.aptPackages : []),
     ...(spec.browser ? ["chromium", "nodejs", "curl", "ca-certificates", "util-linux", "fonts-liberation"] : []),
+    ...(spec.desktop ? ["xvfb", "xfce4", "xfce4-terminal", "x11vnc", "novnc", "dbus-x11", "xauth", "xdotool"] : []),
   ])];
   // The marker is outside /workspace, so workspace restores cannot falsely
   // mark tools as installed in a newly created machine.
@@ -117,11 +119,22 @@ export async function bootstrapAgentComputer(sb: DaytonaSandboxInstance, spec: A
       "fi",
     );
   }
-  await execute(sb, commands.join("\n"), 600);
+  // Native snapshots already contain desktop packages. Custom images install
+  // the documented dependencies before calling Daytona's process supervisor.
+  if (spec.snapshot && !spec.bootstrapTools) {
+    await execute(sb, `mkdir -p ${quote(spec.workdir)} /var/lib/oma`, 30);
+  } else {
+    await execute(sb, commands.join("\n"), 600);
+  }
+  if (spec.desktop) {
+    if (!sb.computerUse) throw new Error("Daytona SDK does not support desktop control");
+    console.info("[agent-computer] starting Daytona desktop", { sandboxId: sb.id });
+    await sb.computerUse.start();
+  }
   if (!spec.browser) return;
   await execute(sb, `mkdir -p ${quote(BROWSER_DIR)} ${quote(`${spec.workdir}/downloads`)}`, 30);
   await sb.fs.uploadFile(Buffer.from(AGENT_BROWSER_PROXY_SCRIPT), `${BROWSER_DIR}/proxy.cjs`);
-  await sb.fs.uploadFile(Buffer.from(buildAgentBrowserStartScript()), START_SCRIPT);
+  await sb.fs.uploadFile(Buffer.from(buildAgentBrowserStartScript(spec.desktop === true)), START_SCRIPT);
   await execute(sb, `sh ${quote(START_SCRIPT)}`, 90);
 }
 

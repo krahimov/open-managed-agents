@@ -526,6 +526,7 @@ export async function buildTools(
      *  Node self-host wires the playwright-core adapter (or CDP, or the
      *  throw-on-call Disabled adapter). */
     browser?: BrowserHarness;
+    computer?: import("@open-managed-agents/browser-harness").DesktopControl;
     /** Optional billing hook fired once on browser_close — CF sets this
      *  to attribute browser_active_seconds to the tenant/session. */
     browserBillingHook?: BrowserBillingHook | null;
@@ -633,6 +634,10 @@ export async function buildTools(
   if (env?.browser && enabled.has("browser")) {
     const { buildBrowserTools } = await import("@open-managed-agents/browser-harness");
     Object.assign(tools, buildBrowserTools(env.browser, env.browserBillingHook ?? null));
+    if (env.computer) {
+      const { buildComputerTools } = await import("@open-managed-agents/browser-harness");
+      Object.assign(tools, buildComputerTools(env.computer));
+    }
   }
 
   if (enabled.has("bash")) {

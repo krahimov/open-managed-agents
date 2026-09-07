@@ -10,9 +10,10 @@ interface MachineControl {
 export interface AgentComputerRouteDeps {
   machines: MachineControl;
   supported: boolean;
-  spec(): AgentMachineSpec;
+  spec(tenantId: string, agentId: string): AgentMachineSpec | Promise<AgentMachineSpec>;
   agentExists(tenantId: string, agentId: string): Promise<boolean>;
   screenshot(tenantId: string, agentId: string): Promise<Uint8Array>;
+  desktopTicket?(tenantId: string, agentId: string): string;
   logError?(error: unknown): void;
 }
 
@@ -22,6 +23,7 @@ export function publicMachine(row: AgentMachineRow | null) {
   return {
     id: row.id, state: row.state, desiredState: row.desiredState,
     provider: row.provider, image: row.image, workdir: row.workdir,
+    desktopEnabled: row.config.desktop === true,
     browserEnabled: row.browserEnabled, generation: row.generation,
     lastActiveAt: row.lastActiveAt, lastStartedAt: row.lastStartedAt,
     lastStoppedAt: row.lastStoppedAt, idleStopMinutes: row.idleStopMinutes,
@@ -55,7 +57,7 @@ export function buildAgentComputerRoutes(deps: AgentComputerRouteDeps) {
   app.post('/:id/machine/start', async c => {
     const existing = await deps.machines.get(c.get('tenant_id'), c.req.param('id'));
     if (!deps.supported && !existing) return c.json({ error: 'Agent computers are not enabled on this deployment.' }, 501);
-    const machine = await deps.machines.start(c.get('tenant_id'), c.req.param('id'), existing?.config ?? deps.spec());
+    const machine = await deps.machines.start(c.get('tenant_id'), c.req.param('id'), existing?.config ?? await deps.spec(c.get('tenant_id'), c.req.param('id')));
     return c.json({ machine: publicMachine(machine) });
   });
   app.post('/:id/machine/stop', async c => {
@@ -63,6 +65,11 @@ export function buildAgentComputerRoutes(deps: AgentComputerRouteDeps) {
     if (!deps.supported && !existing) return c.json({ error: 'Agent computers are not enabled on this deployment.' }, 501);
     const machine = await deps.machines.stop(c.get('tenant_id'), c.req.param('id'));
     return c.json({ machine: publicMachine(machine) });
+  });
+  app.post('/:id/machine/desktop-ticket', async c => {
+    const machine = await deps.machines.get(c.get('tenant_id'), c.req.param('id'));
+    if (!machine || machine.state !== 'running' || !machine.config.desktop || !deps.desktopTicket) return c.json({ error: 'Desktop is not running' }, 409);
+    return c.json({ url: deps.desktopTicket(c.get('tenant_id'), c.req.param('id')), expiresInSeconds: 30 }, 200, { 'Cache-Control': 'no-store' });
   });
   app.get('/:id/machine/screenshot', async c => {
     const machine = await deps.machines.get(c.get('tenant_id'), c.req.param('id'));

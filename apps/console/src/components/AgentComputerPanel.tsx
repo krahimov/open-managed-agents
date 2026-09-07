@@ -1,3 +1,4 @@
+import { DesktopViewer } from "./DesktopViewer";
 import { useEffect, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Monitor, RefreshCw } from "lucide-react";
@@ -12,6 +13,7 @@ interface AgentMachine {
   generation: number;
   workdir: string;
   browserEnabled: boolean;
+  desktopEnabled?: boolean;
   lastActiveAt: number | null;
   errorReason: string | null;
 }
@@ -84,7 +86,7 @@ function BrowserPreview({ agentId, machine }: { agentId: string; machine: AgentM
     <div className="mt-4 border-t border-border pt-4">
       <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
         <div>
-          <h3 className="text-sm font-medium">Browser preview</h3>
+          <h3 className="text-sm font-medium">{machine.desktopEnabled ? "Desktop screenshot" : "Browser preview"}</h3>
           <p className="text-xs text-fg-subtle">
             {screenshot.dataUpdatedAt
               ? `Captured ${new Date(screenshot.dataUpdatedAt).toLocaleTimeString()}. Updates every 15 seconds.`
@@ -110,7 +112,7 @@ function BrowserPreview({ agentId, machine }: { agentId: string; machine: AgentM
       {imageUrl ? (
         <img
           src={imageUrl}
-          alt="Current Chromium browser on the agent's cloud computer"
+          alt={machine.desktopEnabled ? "Current Linux desktop on the agent's cloud computer" : "Current Chromium browser on the agent's cloud computer"}
           className="w-full rounded-md border border-border bg-bg"
         />
       ) : (
@@ -240,7 +242,10 @@ export function AgentComputerPanel({ agentId }: { agentId: string }) {
           {machine?.errorReason && <p role="alert" className="mt-3 text-sm text-danger">{machine.errorReason}</p>}
           {control.error && <p role="alert" className="mt-3 text-sm text-danger">{control.error.message}</p>}
           {machine?.state === "running" && machine.browserEnabled && (
-            <BrowserPreview key={`${agentId}:${machine.id}:${machine.generation}`} agentId={agentId} machine={machine} />
+            <div key={`${agentId}:${machine.id}:${machine.generation}`}>
+              {machine.desktopEnabled && <DesktopViewer agentId={agentId} />}
+              <BrowserPreview agentId={agentId} machine={machine} />
+            </div>
           )}
         </>
       )}

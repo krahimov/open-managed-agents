@@ -23,6 +23,7 @@ export function buildSandboxEnvForEnvironment(
   setString(out, "SANDBOX_SCOPE", sandbox.scope);
   setString(out, "DAYTONA_SNAPSHOT", sandbox.snapshot);
   setBoolean(out, "MACHINE_BROWSER", sandbox.browser);
+  setBoolean(out, "MACHINE_DESKTOP", sandbox.desktop);
   setPositiveNumber(out, "MACHINE_IDLE_STOP_MINUTES", sandbox.idle_stop_minutes);
   setString(out, "MACHINE_SDK_MODE", sandbox.sdk_mode);
   setBoolean(out, "DAYTONA_EPHEMERAL", sandbox.ephemeral);

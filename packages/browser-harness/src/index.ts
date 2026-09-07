@@ -274,3 +274,5 @@ function bufferToBase64(buf: Uint8Array | { toString(enc: string): string }): st
   }
   return (buf as { toString: (enc: string) => string }).toString("base64");
 }
+
+export { buildComputerTools, type DesktopControl } from "./computer";
