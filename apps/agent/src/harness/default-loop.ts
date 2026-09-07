@@ -830,14 +830,16 @@ export class DefaultHarness implements HarnessInterface {
         );
       }
       // In-stream provider error that ended the stream (finish_reason=
-      // "error") with nothing shipped: streamText does NOT throw for these
+      // "error"): streamText does NOT throw for these
       // — onError fires, consumeStream completes, and without this check
       // the turn "succeeds" with no reply and no session.error. The user
       // sees a session that just goes idle (observed 2026-07-15/16:
       // OpenAI insufficient_quota — "the model does not answer"). Throw
       // with the captured diagnostic so the machine emits session.error
       // and the console renders its error card.
-      if (finishReason === "error" && turnShippedNothing) {
+      // Earlier successful tools do not make a later provider failure a
+      // successful turn. Keep their durable events and surface the failure.
+      if (finishReason === "error" || lastStreamErrorMessage) {
         if (currentMessageId) {
           await runtime.broadcastStreamEnd(currentMessageId, "aborted", "stream_error");
         }
