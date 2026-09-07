@@ -146,6 +146,11 @@ export function resolveModel(
       headers: customHeaders,
       fetch: observingFetch,
     });
+    // Astra requires Responses for function tools and supports low or higher
+    // reasoning. It cannot use the legacy chat/none fallback below.
+    if (effectiveCompat === "oai" && modelId === "gpt-6-astra") {
+      return openai.responses(modelId);
+    }
     // Default to the chat/completions endpoint, not the Responses API.
     // Reasons:
     //   - Third-party OpenAI-compat gateways (CF AI Gateway, Groq, DeepSeek,
@@ -338,7 +343,7 @@ export function reasoningProviderOptions(
   level: ReasoningLevel | undefined,
   hasTools: boolean,
 ):
-  | { openai: { reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh" } }
+  | { openai: { reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh"; forceReasoning?: boolean; store?: boolean } }
   | { anthropic: { thinking: { type: "enabled"; budgetTokens: number } } }
   | { anthropic: { thinking: { type: "adaptive" }; effort: "low" | "medium" | "high" | "max" } }
   | undefined {
@@ -353,6 +358,16 @@ export function reasoningProviderOptions(
   const bare = wireId.includes("/") ? wireId.split("/").slice(1).join("/") : wireId;
 
   if (isOpenAiCompatModel(model)) {
+    if (bare === "gpt-6-astra" && isOpenAiResponsesModel(model)) {
+      // The installed SDK predates Astra's capability table. Its supported
+      // override enables reasoning serialization. Replay full local history
+      // instead of depending on provider-side stored function-call items.
+      return { openai: {
+        reasoningEffort: effective === "instant" ? "low" : OPENAI_REASONING_EFFORT[effective],
+        forceReasoning: true,
+        store: false,
+      } };
+    }
     if (!OPENAI_REASONING_MODEL_RE.test(bare)) return undefined;
     if (effective !== "instant" && isOpenAiResponsesModel(model)) {
       return { openai: { reasoningEffort: OPENAI_REASONING_EFFORT[effective] } };

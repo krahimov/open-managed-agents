@@ -190,3 +190,18 @@ its random contents from `/workspace/downloads` using the shell.
 It saves JSON evidence, server error details, and a screenshot. It stops only
 its own idle test computer and retains the records for inspection.
 `OMA_SMOKE_MODEL` can override the test model.
+
+### OpenAI GPT-6 Astra
+
+Set `OPENAI_API_KEY` on the server and select `gpt-6-astra` on the agent.
+The default harness uses the Responses API for Astra's function tools,
+including browser and desktop actions. The default and `instant` reasoning
+settings use Astra's minimum supported effort, `low`; the existing `max`
+setting maps to `xhigh`. Responses are not stored at OpenAI; the harness
+replays its durable history, including encrypted reasoning when returned.
+Create a new session after changing the agent model because existing sessions
+retain the agent version they started with. Scheduled wakes use the latest
+agent version.
+
+A provider failure after successful tool calls now fails the turn visibly
+instead of reporting a successful completion with no final answer.
