@@ -85,6 +85,7 @@ export interface SessionRegistryDeps {
     sessionId: string,
     workdir: string,
     environment?: EnvironmentConfig | null,
+    owner?: { tenantId: string; agentId: string | null },
   ): Promise<SandboxExecutor>;
 
   /** Build the LanguageModel for the agent. Reads env, applies custom
@@ -302,7 +303,8 @@ export class SessionRegistry {
       environmentId: input.environmentId ?? undefined,
       memoryMounts,
       mountOutputs: environmentMountsSessionOutputs(input.environment),
-      backup: input.restoreWorkspace ? { restoreOnWarm: true } : undefined,
+      backup: input.restoreWorkspace && input.sandbox.sandboxCapabilities?.().scope !== "agent"
+        ? { restoreOnWarm: true } : undefined,
     });
     await this.mountSharedSessionResources(input.sessionId, input.tenantId, input.sandbox);
     await this.mountFileResources(input.sessionId, input.tenantId, input.sandbox);
@@ -528,7 +530,10 @@ export class SessionRegistry {
     const sandboxWorkdir = join(this.deps.sandboxWorkdirRoot, sessionId);
     const sessionRuntime = await this.loadSessionRuntimeContext(sessionId, tenantId);
     const environment = sessionRuntime.environmentSnapshot;
-    const sandbox = await this.deps.buildSandbox(sessionId, sandboxWorkdir, environment);
+    const sandbox = await this.deps.buildSandbox(sessionId, sandboxWorkdir, environment, {
+      tenantId,
+      agentId: sessionRuntime.agentId,
+    });
 
     try {
       await this.provisionSandboxResources({
@@ -710,13 +715,15 @@ export class SessionRegistry {
     environmentId: string | null;
     environmentSnapshot: EnvironmentConfig | null;
     agentSnapshot: AgentConfig | null;
+    agentId: string | null;
   }> {
     const row = await this.deps.sql
       .prepare(
-        `SELECT environment_id, environment_snapshot, agent_snapshot FROM sessions WHERE tenant_id = ? AND id = ?`,
+        `SELECT agent_id, environment_id, environment_snapshot, agent_snapshot FROM sessions WHERE tenant_id = ? AND id = ?`,
       )
       .bind(tenantId, sessionId)
       .first<{
+        agent_id: string | null;
         environment_id: string | null;
         environment_snapshot: string | null;
         agent_snapshot: string | null;
@@ -725,6 +732,7 @@ export class SessionRegistry {
       environmentId: row?.environment_id ?? null,
       environmentSnapshot: parseEnvironmentSnapshot(row?.environment_snapshot),
       agentSnapshot: parseAgentSnapshot(row?.agent_snapshot),
+      agentId: row?.agent_id ?? parseAgentSnapshot(row?.agent_snapshot)?.id ?? null,
     };
   }
 

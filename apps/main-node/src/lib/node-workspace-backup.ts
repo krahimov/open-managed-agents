@@ -17,6 +17,15 @@
 // Persistence: every snapshot inserts a `workspace_backups` row keyed by
 // session_id; restore picks the most recent unexpired row.
 //
+// Two key spaces share the table, both living in `source_session_id`:
+//   - session scope: `source_session_id = <sessionId>`, `environment_id =
+//     <sessionId>` (today's behaviour, unchanged);
+//   - agent-machine scope: `source_session_id = "machine:" + machineId`,
+//     `environment_id = machineId`. Session ids are `sess-…` so the two
+//     prefixes cannot collide. Machine snapshots additionally exclude
+//     `/workspace/.oma` (per-box bookkeeping that must never be
+//     resurrected on a fresh box) plus any caller-supplied excludes.
+//
 // Best-effort throughout: any provider where tar+exec fails returns
 // ok=false and the orchestrator proceeds with an empty workspace.
 
@@ -53,6 +62,43 @@ export interface NodeWorkspaceBackupServiceDeps {
 
 const DEFAULT_TTL_SEC = 7 * 24 * 3600;
 
+/** tar `--exclude` entries (relative to /workspace) applied to EVERY
+ *  snapshot. Order is preserved in the generated command. */
+const DEFAULT_TAR_EXCLUDES: readonly string[] = [
+  "node_modules",
+  ".cache",
+  "__pycache__",
+  ".next",
+];
+
+/** Extra excludes for machine snapshots only. */
+const MACHINE_TAR_EXCLUDES: readonly string[] = [".oma"];
+
+/** `source_session_id` prefix for machine-keyed rows. */
+export const MACHINE_BACKUP_SCOPE_PREFIX = "machine:";
+
+/** The `source_session_id` value used for an agent machine's rows. */
+export function machineBackupScopeKey(machineId: string): string {
+  return `${MACHINE_BACKUP_SCOPE_PREFIX}${machineId}`;
+}
+
+/** Internal: everything a snapshot needs beyond the sandbox. */
+interface SnapshotScope {
+  tenantId: string;
+  /** Value stored in `source_session_id`; also the `latest*` lookup key. */
+  scopeKey: string;
+  /** Value stored in `environment_id` (NOT NULL column). */
+  environmentId: string;
+  /** Path segment(s) under `workspace-backups/<tenant>/` for the blob. */
+  blobScope: string;
+  /** Extra blob customMetadata (tenant_id is always added). */
+  metadata: Record<string, string>;
+  /** Fully-resolved tar excludes, relative to /workspace. */
+  excludes: readonly string[];
+  /** Short label for the log line. */
+  label: string;
+}
+
 export class NodeWorkspaceBackupService implements WorkspaceBackupService {
   private readonly ttlSec: number;
   private readonly logger: NonNullable<NodeWorkspaceBackupServiceDeps["logger"]>;
@@ -74,15 +120,114 @@ export class NodeWorkspaceBackupService implements WorkspaceBackupService {
     tenantId: string;
     sandbox: SandboxExecutor;
   }): Promise<OrchestratorBackupHandle | null> {
-    const tarBytes = await this.tarWorkspace(input.sandbox);
+    return this.snapshotScope(input.sandbox, {
+      tenantId: input.tenantId,
+      scopeKey: input.sessionId,
+      // environment_id: Node sessions today are single-env; the backup
+      // is logically scoped by session, so use the session id as a
+      // synthetic env id when the caller doesn't supply one.
+      environmentId: input.sessionId,
+      blobScope: input.sessionId,
+      metadata: { session_id: input.sessionId },
+      excludes: DEFAULT_TAR_EXCLUDES,
+      label: `session=${input.sessionId.slice(0, 12)}`,
+    });
+  }
+
+  async restore(input: {
+    sessionId: string;
+    tenantId: string;
+    sandbox: SandboxExecutor;
+    handle: OrchestratorBackupHandle;
+  }): Promise<{ ok: boolean; error?: string }> {
+    return this.restoreFromHandle(input.sandbox, input.handle);
+  }
+
+  async latest(input: {
+    sessionId: string;
+    tenantId: string;
+  }): Promise<OrchestratorBackupHandle | null> {
+    return this.latestForScope({ tenantId: input.tenantId, scopeKey: input.sessionId });
+  }
+
+  // ── agent-machine scope ──────────────────────────────────────────────
+  //
+  // Same table, same blob store, different key: rows carry
+  // `source_session_id = "machine:<machineId>"` and `environment_id =
+  // <machineId>` so a recreated box (new Daytona sandbox, same machine
+  // row) can find and restore the last /workspace of its predecessor.
+
+  /** Snapshot an agent machine's /workspace. `excludes` are
+   *  /workspace-relative paths (or tar patterns) added on top of the
+   *  defaults and `.oma`. Best-effort: null when the workspace exceeds the
+   *  cap or tar/read fails. */
+  async snapshotMachine(input: {
+    tenantId: string;
+    machineId: string;
+    sandbox: SandboxExecutor;
+    excludes?: string[];
+  }): Promise<OrchestratorBackupHandle | null> {
+    return this.snapshotScope(input.sandbox, {
+      tenantId: input.tenantId,
+      scopeKey: machineBackupScopeKey(input.machineId),
+      environmentId: input.machineId,
+      blobScope: `machines/${input.machineId}`, // keep in sync with machineBlobPrefix()
+      metadata: { machine_id: input.machineId },
+      excludes: resolveTarExcludes([...MACHINE_TAR_EXCLUDES, ...(input.excludes ?? [])]),
+      label: `machine=${input.machineId.slice(0, 20)}`,
+    });
+  }
+
+  /** Most recent unexpired machine-keyed row, or null. Never returns
+   *  session-keyed rows (and `latest()` never returns machine rows). */
+  async latestForMachine(input: {
+    tenantId: string;
+    machineId: string;
+  }): Promise<OrchestratorBackupHandle | null> {
+    return this.latestForScope({
+      tenantId: input.tenantId,
+      scopeKey: machineBackupScopeKey(input.machineId),
+    });
+  }
+
+  /** Restore a machine backup into a (fresh) box's /workspace. The
+   *  handle must have been produced by `snapshotMachine` for the SAME
+   *  tenant + machine (its blob key carries both); anything else is
+   *  refused with ok=false so a caller bug can never pour another
+   *  tenant's (or another machine's) workspace into this box. */
+  async restoreMachine(input: {
+    tenantId: string;
+    machineId: string;
+    sandbox: SandboxExecutor;
+    handle: OrchestratorBackupHandle;
+  }): Promise<{ ok: boolean; error?: string }> {
+    const blobKey = input.handle.dir ?? "";
+    if (!blobKey) return { ok: false, error: "no blob_key on handle" };
+    const expectedPrefix = machineBlobPrefix(input.tenantId, input.machineId);
+    if (!blobKey.startsWith(expectedPrefix)) {
+      this.logger.warn(
+        `restoreMachine refused: handle ${blobKey.slice(0, 120)} does not belong to machine=${input.machineId} tenant=${input.tenantId}`,
+      );
+      return { ok: false, error: "handle does not belong to this machine" };
+    }
+    return this.restoreFromHandle(input.sandbox, input.handle);
+  }
+
+  // ── scope-parameterised bodies ───────────────────────────────────────
+
+  private async snapshotScope(
+    sandbox: SandboxExecutor,
+    scope: SnapshotScope,
+  ): Promise<OrchestratorBackupHandle | null> {
+    const tarBytes = await this.tarWorkspace(sandbox, scope.excludes);
     if (!tarBytes) return null;
     const id = `wsb_${randomBytes(8).toString("hex")}`;
-    const blobKey = `workspace-backups/${input.tenantId}/${input.sessionId}/${id}.tar`;
+    const blobKey = `workspace-backups/${scope.tenantId}/${scope.blobScope}/${id}.tar`;
     await this.deps.blobs.put(blobKey, tarBytes, {
       httpMetadata: { contentType: "application/x-tar" },
       customMetadata: {
-        tenant_id: input.tenantId,
-        session_id: input.sessionId,
+        tenant_id: scope.tenantId,
+        ...scope.metadata,
       },
     });
     const now = this.nowMs();
@@ -103,40 +248,33 @@ export class NodeWorkspaceBackupService implements WorkspaceBackupService {
          VALUES (?, ?, ?, ?, ?, ?)`,
       )
       .bind(
-        input.tenantId,
-        // environment_id: Node sessions today are single-env; the backup
-        // is logically scoped by session, so use the session id as a
-        // synthetic env id when the caller doesn't supply one.
-        input.sessionId,
+        scope.tenantId,
+        scope.environmentId,
         handleJson,
         now,
         now + this.ttlSec * 1000,
-        input.sessionId,
+        scope.scopeKey,
       )
       .run();
-    this.logger.log(
-      `snapshot session=${input.sessionId.slice(0, 12)} bytes=${tarBytes.byteLength}`,
-    );
+    this.logger.log(`snapshot ${scope.label} bytes=${tarBytes.byteLength}`);
     return { id, dir: blobKey };
   }
 
-  async restore(input: {
-    sessionId: string;
-    tenantId: string;
-    sandbox: SandboxExecutor;
-    handle: OrchestratorBackupHandle;
-  }): Promise<{ ok: boolean; error?: string }> {
-    const blobKey = input.handle.dir ?? "";
+  private async restoreFromHandle(
+    sandbox: SandboxExecutor,
+    handle: OrchestratorBackupHandle,
+  ): Promise<{ ok: boolean; error?: string }> {
+    const blobKey = handle.dir ?? "";
     if (!blobKey) return { ok: false, error: "no blob_key on handle" };
     const obj = await this.deps.blobs.get(blobKey);
     if (!obj) return { ok: false, error: "backup blob missing" };
     const bytes = await obj.bytes();
-    return this.untarIntoSandbox(input.sandbox, bytes);
+    return this.untarIntoSandbox(sandbox, bytes);
   }
 
-  async latest(input: {
-    sessionId: string;
+  private async latestForScope(input: {
     tenantId: string;
+    scopeKey: string;
   }): Promise<OrchestratorBackupHandle | null> {
     const now = this.nowMs();
     const row = await this.deps.sql
@@ -145,7 +283,7 @@ export class NodeWorkspaceBackupService implements WorkspaceBackupService {
          WHERE source_session_id = ? AND tenant_id = ? AND expires_at > ?
          ORDER BY created_at DESC LIMIT 1`,
       )
-      .bind(input.sessionId, input.tenantId, now)
+      .bind(input.scopeKey, input.tenantId, now)
       .first<{ id: string | number; backup_handle: string }>();
     if (!row) return null;
     try {
@@ -160,8 +298,11 @@ export class NodeWorkspaceBackupService implements WorkspaceBackupService {
 
   /** tar the sandbox's /workspace into bytes. Best-effort: returns null on
    *  any failure (caller treats as "no backup", proceeds). */
-  private async tarWorkspace(sandbox: SandboxExecutor): Promise<Uint8Array | null> {
-    const workspaceBytes = await this.estimateWorkspaceBytes(sandbox);
+  private async tarWorkspace(
+    sandbox: SandboxExecutor,
+    excludes: readonly string[],
+  ): Promise<Uint8Array | null> {
+    const workspaceBytes = await this.estimateWorkspaceBytes(sandbox, excludes);
     if (workspaceBytes !== null && workspaceBytes > this.maxBytes) {
       this.logger.warn(
         `tarWorkspace skipped: workspace size ${workspaceBytes} exceeds cap ${this.maxBytes}`,
@@ -169,8 +310,13 @@ export class NodeWorkspaceBackupService implements WorkspaceBackupService {
       return null;
     }
     const tmpInside = `/tmp/oma-ws-${randomBytes(6).toString("hex")}.tar`;
+    // Member names produced by `tar … .` are `./<path>`, so every exclude
+    // is anchored with `./` and single-quoted for the shell.
+    const excludeFlags = excludes
+      .map((e) => `--exclude=${shellQuote(`./${e}`)}`)
+      .join(" ");
     const out = await sandbox.exec(
-      `cd /workspace 2>/dev/null && tar -cf '${tmpInside}' --exclude='./node_modules' --exclude='./.cache' --exclude='./__pycache__' --exclude='./.next' . 2>&1 || echo '[exit 1]'`,
+      `cd /workspace 2>/dev/null && tar -cf '${tmpInside}' ${excludeFlags} . 2>&1 || echo '[exit 1]'`,
       120_000,
     );
     if (out.includes("[exit ")) {
@@ -192,10 +338,28 @@ export class NodeWorkspaceBackupService implements WorkspaceBackupService {
     }
   }
 
-  private async estimateWorkspaceBytes(sandbox: SandboxExecutor): Promise<number | null> {
+  /** Approximate size of what the tar will contain: sums `du -sk` over the
+   *  top-level entries of /workspace that are NOT excluded, so a large
+   *  `node_modules`/`.cache` (which tar skips anyway) cannot trip the cap
+   *  and silently drop the backup of a small source tree. Excludes that
+   *  contain a `/` (nested paths) cannot be expressed as a top-level
+   *  `-name` filter and are simply still counted — the estimate is an
+   *  upper bound on the tar payload, never an under-estimate. Uses only
+   *  POSIX `find -mindepth/-maxdepth/-name/-exec … +`, `du -sk` and `awk`
+   *  so it works on GNU, BSD and busybox userlands. Returns null when the
+   *  probe produced nothing usable (caller then skips the cap check, as
+   *  before). */
+  private async estimateWorkspaceBytes(
+    sandbox: SandboxExecutor,
+    excludes: readonly string[],
+  ): Promise<number | null> {
     try {
+      const nameFilters = excludes
+        .filter((e) => !e.includes("/"))
+        .map((e) => `! -name ${shellQuote(e)}`)
+        .join(" ");
       const raw = await sandbox.exec(
-        "du -sk /workspace 2>/dev/null | awk '{print $1}'",
+        `cd /workspace 2>/dev/null && find . -mindepth 1 -maxdepth 1 ${nameFilters} -exec du -sk {} + 2>/dev/null | awk '{ s += $1 } END { if (NR) print s }'`,
         10_000,
       );
       const match = raw.match(/^\s*(\d+)/);
@@ -232,6 +396,38 @@ export class NodeWorkspaceBackupService implements WorkspaceBackupService {
       void sandbox.exec(`rm -f '${tmpInside}'`, 5_000).catch(() => undefined);
     }
   }
+}
+
+/** Merge caller excludes onto the defaults: trim, strip any leading `./`
+ *  or `/` and trailing `/`, drop empties / `.` / `..` / entries with
+ *  control characters, de-duplicate while preserving order. */
+function resolveTarExcludes(extra: readonly string[]): string[] {
+  const out: string[] = [...DEFAULT_TAR_EXCLUDES];
+  const seen = new Set(out);
+  for (const raw of extra) {
+    if (typeof raw !== "string") continue;
+    const cleaned = raw
+      .trim()
+      .replace(/^(?:\.\/|\/)+/, "")
+      .replace(/\/+$/, "");
+    if (!cleaned || cleaned === "." || cleaned === "..") continue;
+    if (/[\0\r\n]/.test(cleaned)) continue;
+    if (seen.has(cleaned)) continue;
+    seen.add(cleaned);
+    out.push(cleaned);
+  }
+  return out;
+}
+
+/** Blob-key prefix every `snapshotMachine` blob for (tenant, machine)
+ *  lives under; `restoreMachine` refuses handles outside it. */
+function machineBlobPrefix(tenantId: string, machineId: string): string {
+  return `workspace-backups/${tenantId}/machines/${machineId}/`;
+}
+
+/** POSIX single-quote a string for `sh -c`. */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 function normalizeMaxBytes(value: number | undefined): number {

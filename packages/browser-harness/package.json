@@ -8,6 +8,7 @@
     "./cf": "./src/cf.ts",
     "./node": "./src/node.ts",
     "./cdp": "./src/cdp.ts",
+    "./sandbox": "./src/sandbox.ts",
     "./disabled": "./src/disabled.ts",
     "./select": "./src/select.ts"
   },
