@@ -89,29 +89,29 @@ async function fixture() {
     chat = 101,
     secret = deps.webhookSecret,
   ) =>
-    service
-      .webhookRoutes()
-      .request("/", {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "x-telegram-bot-api-secret-token": secret,
+    service.webhookRoutes().request("/", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-telegram-bot-api-secret-token": secret,
+      },
+      body: JSON.stringify({
+        update_id: id,
+        message: {
+          message_id: id,
+          text,
+          from: { id: chat },
+          chat: { id: chat, type: "private" },
         },
-        body: JSON.stringify({
-          update_id: id,
-          message: {
-            message_id: id,
-            text,
-            from: { id: chat },
-            chat: { id: chat, type: "private" },
-          },
-        }),
-      });
+      }),
+    });
   const link = async (user = "u", chat = 101) => {
     const r = await service.link(`tenant-${user}`, user);
     const token = new URL(r.url!).searchParams.get("start");
     await post(chat, `/start ${token}`, chat);
     await service.tick();
+    deps.router.appendEvent.mockClear();
+    deps.sessions.create.mockClear();
   };
   return { db, sql, service, deps, create, events, messages, post, link };
 }
@@ -138,6 +138,8 @@ describe("Telegram onboarding", () => {
     await f.post(2, `/start ${token}`, 202);
     await f.service.tick();
     expect(f.messages).toHaveLength(1);
+    await f.service.link("tenant-u", "u");
+    expect(f.deps.router.appendEvent).toHaveBeenCalledTimes(1);
   });
   it("rejects forged webhooks, expired links and revoked membership", async () => {
     const f = await fixture();
@@ -168,14 +170,12 @@ describe("Telegram onboarding", () => {
       },
       agentSnapshot: { harness: "codex-sdk", model: "gpt-6-astra" },
     });
-    const sid = [...f.events.keys()][0];
-    f.events
-      .get(sid)!
-      .push({
-        seq: 1,
-        type: "agent.message",
-        content: [{ type: "text", text: "QA complete" }],
-      });
+    const sid = [...f.events.keys()].at(-1)!;
+    f.events.get(sid)!.push({
+      seq: 1,
+      type: "agent.message",
+      content: [{ type: "text", text: "QA complete" }],
+    });
     await f.service.tick();
     await f.service.tick();
     expect(f.messages.filter((m) => m.text === "QA complete")).toHaveLength(1);
@@ -215,6 +215,6 @@ describe("Telegram onboarding", () => {
     f.db.exec("UPDATE telegram_outbox SET next_at=0");
     await f.service.tick();
     expect(f.messages.at(-1).text).toContain("running");
-    expect(f.deps.sessions.create).toHaveBeenCalledTimes(1);
+    expect(f.deps.sessions.create).toHaveBeenCalledTimes(0);
   });
 });

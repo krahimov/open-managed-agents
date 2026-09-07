@@ -145,7 +145,10 @@ export class TelegramOnboarding {
   }
   async link(tenant: string, user: string) {
     const a = await this.ensure(tenant, user);
-    if (a.chat_id) return { connected: true, agent_id: a.agent_id };
+    if (a.chat_id) {
+      await this.welcome(a);
+      return { connected: true, agent_id: a.agent_id };
+    }
     const token = randomBytes(24).toString("base64url");
     await this.d.sql
       .prepare(
@@ -308,12 +311,15 @@ export class TelegramOnboarding {
     }
     if (!a || !(await this.d.hasMembership(a.user_id, a.tenant_id))) return;
     const id = `update:${String(u.update_id).padStart(16, "0")}`;
-    if (text.startsWith("/start") || text === "/help")
-      return this.queue(
+    if (text.startsWith("/start")) {
+      await this.queue(
         a,
         id,
-        "Your agent is ready. Tell me what you want done.\n\n" + HELP,
+        "Your agent is ready. Starting your conversation.\n\n" + HELP,
       );
+      return this.welcome(a);
+    }
+    if (text === "/help") return this.queue(a, id, HELP);
     if (text === "/unlink") {
       await this.unlink(a.tenant_id, a.user_id);
       return;
@@ -412,6 +418,15 @@ export class TelegramOnboarding {
         "Please send a text message. Attachments are not supported yet.",
       );
     return this.message(a, id, text);
+  }
+  private async welcome(a: Account) {
+    // Stable event ID makes reconnection/retries safe and lets an existing
+    // connection resume onboarding after deployment without creating a second turn.
+    await this.message(
+      { ...a, active_agent_id: a.agent_id },
+      `telegram-welcome:${a.user_id}`,
+      "The user just connected their Telegram account. Briefly introduce yourself as their cloud agent and ask what they want to accomplish. Mention that /new followed by a task creates another agent. Do not perform unrelated work or ask them to use the web UI.",
+    );
   }
   private async message(a: Account, id: string, text: string) {
     const sid = await this.conversation(a);

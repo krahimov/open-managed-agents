@@ -5,7 +5,8 @@ console offers **Continue in Telegram**, opening a private bot chat. Telegram
 requires the user to press **Start** before a bot can contact them; a phone
 number alone cannot authorize bot messages.
 
-Once linked, the bot greets the user. Plain text goes to their active agent,
+Once linked, the platform starts a real agent conversation automatically and the
+agent introduces itself. Plain text goes to their active agent,
 which works in the cloud and replies through Telegram even after the browser
 closes. No API key needs to be pasted into Telegram.
 
