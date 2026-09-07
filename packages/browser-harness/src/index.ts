@@ -145,7 +145,7 @@ export function buildBrowserTools(
         const src = (output as unknown as { source: { data: string; media_type: string } }).source;
         return {
           type: "content" as const,
-          value: [{ type: "file-data" as const, data: src.data, mediaType: src.media_type }],
+          value: [{ type: "image-data" as const, data: src.data, mediaType: src.media_type }],
         };
       }
       return { type: "text" as const, value: typeof output === "string" ? output : JSON.stringify(output) };
