@@ -744,9 +744,8 @@ export async function buildTools(
         );
       }),
       // AI SDK 6 hook: convert tool execute output to the shape the model receives.
-      // For images/documents, emit a `content` array with `file-data` parts;
-      // the @ai-sdk/anthropic provider translates this into a tool_result with the
-      // appropriate image/document content block.
+      // Keep images distinct from document files: OpenAI rejects image MIME
+      // types in input_file parts, while both providers support image-data.
       toModelOutput: ({ output }) => {
         if (output && typeof output === "object" && "type" in output) {
           const t = (output as { type?: string }).type;
@@ -754,7 +753,7 @@ export async function buildTools(
             const src = (output as unknown as { source: { data: string; media_type: string } }).source;
             return {
               type: "content",
-              value: [{ type: "file-data", data: src.data, mediaType: src.media_type }],
+              value: [{ type: t === "image" ? "image-data" : "file-data", data: src.data, mediaType: src.media_type }],
             };
           }
         }

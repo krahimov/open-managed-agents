@@ -17,7 +17,7 @@ export function buildComputerTools(desktop: DesktopControl) {
       description: 'See the full Linux desktop, including browser chrome, terminals and other windows. Use the image coordinates for computer_click. Browser tools control the Chromium window on this same desktop.',
       inputSchema: z.object({}),
       execute: async () => ({ type: 'image' as const, source: { type: 'base64' as const, media_type: 'image/png', data: await desktop.screenshot() } }),
-      toModelOutput: ({ output }) => ({ type: 'content' as const, value: [{ type: 'file-data' as const, data: output.source.data, mediaType: 'image/png' }] }),
+      toModelOutput: ({ output }) => ({ type: 'content' as const, value: [{ type: 'image-data' as const, data: output.source.data, mediaType: 'image/png' }] }),
     }),
     computer_click: tool({
       description: 'Click a coordinate in the most recent full desktop screenshot.',
