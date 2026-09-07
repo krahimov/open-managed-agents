@@ -1,3 +1,4 @@
+import { TelegramOnboarding } from "./lib/telegram-onboarding.js";
 import { DesktopGateway } from "./lib/desktop-gateway.js";
 /**
  * apps/main-node — self-host Node entry for the Open Managed Agents API.
@@ -323,6 +324,12 @@ if (clerkOnly && !resolveClerkConfig()) {
   );
 }
 
+let telegram: TelegramOnboarding | null = null;
+async function provisionSignupUser(u: { id: string; name?: string | null; email?: string | null }) {
+  const tenant = await ensureTenantSqlite(sql, u.id, u.name, u.email);
+  if (telegram) await telegram.ensure(tenant, u.id);
+  return tenant;
+}
 let auth: ReturnType<typeof buildBetterAuth> | null = null;
 let authShutdown: (() => Promise<void>) | null = null;
 
@@ -345,7 +352,7 @@ if (!authDisabled && !clerkOnly) {
       betterAuthInfraKvUrl: process.env.BETTER_AUTH_KV_URL,
       requireEmailVerify: process.env.AUTH_REQUIRE_EMAIL_VERIFY === "1",
       cookieDomain: process.env.AUTH_COOKIE_DOMAIN,
-      ensureTenant: (u) => ensureTenantSqlite(sql, u.id, u.name, u.email),
+      ensureTenant: provisionSignupUser,
     });
     authShutdown = async () => {
       await pgPool.end();
@@ -374,7 +381,7 @@ if (!authDisabled && !clerkOnly) {
       betterAuthInfraKvUrl: process.env.BETTER_AUTH_KV_URL,
       requireEmailVerify: process.env.AUTH_REQUIRE_EMAIL_VERIFY === "1",
       cookieDomain: process.env.AUTH_COOKIE_DOMAIN,
-      ensureTenant: (u) => ensureTenantSqlite(sql, u.id, u.name, u.email),
+      ensureTenant: provisionSignupUser,
     });
     authShutdown = async () => {
       authDb.close();
@@ -2005,6 +2012,41 @@ const sessionRouter = new NodeSessionRouter({
   newEventLog,
   workQueue: sessionWorkQueue,
 });
+
+// Telegram's public webhook has its own secret-header authentication.
+// Linking and account management below remain behind normal tenant/user auth.
+if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_USERNAME && process.env.TELEGRAM_WEBHOOK_SECRET) {
+  telegram = new TelegramOnboarding({
+    sql, agents: agentsService, sessions: sessionsService, router: sessionRouter,
+    token: process.env.TELEGRAM_BOT_TOKEN,
+    username: process.env.TELEGRAM_BOT_USERNAME.replace(/^@/, ""),
+    webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET,
+    model: process.env.OMA_ONBOARDING_MODEL ?? "gpt-6-astra",
+    harness: process.env.OMA_ONBOARDING_HARNESS ?? "default",
+    environmentId: process.env.OMA_ONBOARDING_ENVIRONMENT_ID,
+    defaultEnvironment: async tenantId => {
+      const raw = process.env.OMA_ONBOARDING_ENVIRONMENT_CONFIG;
+      if (!raw) return undefined;
+      const config = JSON.parse(raw);
+      const existing = await environmentsService.listPage({ tenantId, status: "active", limit: 100 });
+      const found = existing.items.find(e => e.name === "Telegram computer");
+      if (found) return found.id;
+      const created = await environmentsService.create({ tenantId, name: "Telegram computer", config, status: "ready", sandboxWorkerName: config.sandbox?.provider ?? process.env.SANDBOX_PROVIDER ?? "subprocess" });
+      return created.id;
+    },
+    environment: async (tenantId, environmentId) => { const row = await environmentsService.get({ tenantId, environmentId }); return row ? toEnvironmentConfig(row) : null; },
+    hasMembership: async (userId, tenantId) => !!await sql.prepare("SELECT 1 AS one FROM membership WHERE user_id=? AND tenant_id=?").bind(userId,tenantId).first(),
+  });
+  app.route("/integrations/telegram/webhook", telegram.webhookRoutes());
+}
+const telegramTick = telegram ? setInterval(() => {
+  void telegram!.tick().catch(() => logger.warn({ op: "telegram.delivery_tick_failed" }, "Telegram delivery tick failed; will retry"));
+}, 2000) : null;
+telegramTick?.unref();
+
+if (telegram) v1.route("/telegram", telegram.routes());
+else v1.get("/telegram/status", c => c.json({ enabled: false, connected: false }));
+
 
 /**
  * Create a standing ambient rule from inside a session — the backend half of
@@ -3724,6 +3766,7 @@ logger.info({ op: "main-node.scheduler.started" }, "scheduler started");
 const shutdown = async (signal: string) => {
   logger.info({ op: "main-node.shutdown", signal }, `received ${signal}, shutting down`);
   clearInterval(machineTick);
+  if (telegramTick) clearInterval(telegramTick);
   await agentMachines.dispose();
   desktopGateway.close();
   try { await scheduler.stop(); } catch (err) { logger.warn({ err, op: "main-node.shutdown.scheduler_stop_failed" }, "scheduler stop failed"); }

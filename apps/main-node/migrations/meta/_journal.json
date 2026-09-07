@@ -50,6 +50,13 @@
    "when": 1786994288936,
    "tag": "0006_memory_facts",
    "breakpoints": true
+  },
+  {
+   "idx": 7,
+   "version": "7",
+   "when": 1788815340439,
+   "tag": "0007_telegram_onboarding",
+   "breakpoints": true
   }
  ]
 }

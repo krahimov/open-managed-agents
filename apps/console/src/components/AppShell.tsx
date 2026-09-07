@@ -35,6 +35,7 @@ import { AppSidebar } from "./AppSidebar";
 import { AppBreadcrumb } from "./AppBreadcrumb";
 import { BrandLoader } from "./BrandLoader";
 import { CommandPalette } from "./CommandPalette";
+import { TelegramOnboarding } from "./TelegramOnboarding";
 import { NavigationProgress } from "./NavigationProgress";
 
 /**
@@ -172,6 +173,7 @@ export function AppShell() {
                   scrolled ? "border-b border-border" : "border-b border-transparent",
                 ].join(" ")}
               />
+              <TelegramOnboarding />
               <main
                 ref={(el) => {
                   mainRef.current = el;
