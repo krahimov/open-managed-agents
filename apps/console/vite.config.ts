@@ -27,12 +27,14 @@ export default defineConfig({
     },
   },
   build: {
+    // noVNC probes WebCodecs with top-level await in its lazy desktop chunk.
+    target: "es2022",
     outDir: "dist",
     emptyOutDir: true,
   },
   server: {
     proxy: {
-      "/v1": proxyOpts,
+      "/v1": { ...proxyOpts, ws: true },
       "/auth": proxyOpts,
       "/auth-info": proxyOpts,
       "/health": proxyOpts,

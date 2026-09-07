@@ -202,10 +202,12 @@ export interface EnvironmentConfig {
        *  session of the agent. Node supports Daytona only and rejects
        *  other providers for agent scope. */
       scope?: "agent" | "session";
-      /** Run a headless Chromium inside the agent machine and expose it to
+      /** Run a Chromium inside the agent machine and expose it to
        *  the agent's browser tools + the console live view. Defaults to
        *  true in agent scope; ignored in session scope. */
       browser?: boolean;
+      /** Enable Daytona desktop, headed Chromium, and authenticated VNC. */
+      desktop?: boolean;
       /** Minutes of inactivity before the agent machine auto-stops
        *  (Daytona autoStopInterval). Default 30. */
       idle_stop_minutes?: number;

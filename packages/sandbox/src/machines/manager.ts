@@ -159,6 +159,7 @@ export class AgentMachineManager {
           sb = await client.create({
             ...(current.snapshot ? { snapshot: current.snapshot } : { image: current.image }),
             name: current.id,
+            ...(current.config.desktop ? { user: "root", envVars: { VNC_RESOLUTION: "1280x800" } } : {}),
             labels: { "oma-machine-id": current.id, "oma-tenant-id": current.tenantId, "oma-agent-id": current.agentId },
             public: false, ephemeral: false,
             autoDeleteInterval: -1, autoArchiveInterval: 0,
@@ -374,6 +375,7 @@ function canonicalSpec(spec: AgentMachineSpec): string {
     aptPackages: spec.bootstrapTools ? [...new Set(spec.aptPackages)].sort() : [],
     bootstrapTools: spec.bootstrapTools,
     browser: spec.browser,
+    desktop: spec.desktop === true,
     idleStopMinutes: spec.idleStopMinutes,
     maxFileBytes: spec.maxFileBytes ?? 512 * 1024 * 1024,
     sdkMode: spec.sdkMode,

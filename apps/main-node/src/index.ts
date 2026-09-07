@@ -1,3 +1,4 @@
+import { DesktopGateway } from "./lib/desktop-gateway.js";
 /**
  * apps/main-node — self-host Node entry for the Open Managed Agents API.
  *
@@ -682,6 +683,35 @@ const agentMachines = new AgentMachineManager({
     }
   },
 });
+// Full desktop connections stay inside the owning agent's machine.
+async function withDesktop<T>(tenantId: string, agentId: string, run: (desktop: NonNullable<NonNullable<Awaited<ReturnType<typeof agentMachines.getBox>>>["sb"]["computerUse"]>) => Promise<T>): Promise<T> {
+  const row = await agentMachines.get(tenantId, agentId);
+  if (!row?.config.desktop) throw new Error("Desktop is not enabled on this computer");
+  return agentMachines.withLock(row.id, async () => {
+    const box = await agentMachines.getBox(tenantId, agentId);
+    if (!box?.sb.computerUse) throw new Error("Desktop is not running");
+    await machineStore.update(row.id, { lastActiveAt: Date.now() }, Date.now());
+    return run(box.sb.computerUse);
+  });
+}
+const desktopGateway = new DesktopGateway(async (tenantId, agentId) => {
+  const row = await agentMachines.get(tenantId, agentId);
+  if (!row?.config.desktop) throw new Error("Desktop is not enabled");
+  return agentMachines.withLock(row.id, async () => {
+    const box = await agentMachines.getBox(tenantId, agentId);
+    if (!box) throw new Error("Desktop is not running");
+    const preview = await box.sb.getPreviewLink(6080);
+    const url = new URL('/websockify', preview.url);
+    if (url.protocol !== 'https:' || !preview.token || box.sb.public) throw new Error("Desktop requires a private HTTPS preview");
+    url.protocol = 'wss:';
+    const sessionId = `desktop_${crypto.randomUUID().replaceAll('-', '')}`;
+    await machineStore.upsertAttachment({ sessionId, machineId: row.id, tenantId, workerId: 'desktop-viewer', generation: row.generation, turnActive: false, bgProcesses: 0, viewers: 1, now: Date.now() });
+    const heartbeat = setInterval(() => { void machineStore.heartbeat(sessionId, Date.now()).catch(() => {}); }, 20_000);
+    heartbeat.unref();
+    return { url: url.href, headers: { 'x-daytona-preview-token': preview.token, 'X-Daytona-Skip-Preview-Warning': 'true' }, release: async () => { clearInterval(heartbeat); await machineStore.detach(sessionId); } };
+  });
+}, new URL(process.env.PUBLIC_BASE_URL ?? 'http://localhost:8787').origin);
+
 const machineTick = setInterval(() => {
   void agentMachines.tick().catch(err => logger.warn({ err, op: "agent_computer.tick_failed" }, "computer reconciliation failed"));
 }, 30_000);
@@ -856,6 +886,17 @@ const sessionRegistry = new SessionRegistry({
       TAVILY_API_KEY: process.env.TAVILY_API_KEY,
       toMarkdown: toMarkdownProvider,
       browser,
+      computer: browser && buildSandboxEnvForEnvironment(process.env, context.environment).MACHINE_DESKTOP === 'true' ? {
+        screenshot: () => withDesktop(context.tenantId, agent.id, async desktop => {
+          const shot = await desktop.screenshot.takeFullScreen();
+          if (!shot.screenshot) throw new Error('Daytona returned an empty desktop screenshot');
+          return shot.screenshot.replace(/^data:image\/png;base64,/, '');
+        }),
+        click: (x, y, button, double) => withDesktop(context.tenantId, agent.id, d => d.mouse.click(x, y, button, double)),
+        type: text => withDesktop(context.tenantId, agent.id, d => d.keyboard.type(text)),
+        press: (key, modifiers) => withDesktop(context.tenantId, agent.id, d => d.keyboard.press(key, modifiers)),
+        scroll: (x, y, direction, amount) => withDesktop(context.tenantId, agent.id, d => d.mouse.scroll(x, y, direction, amount)),
+      } : undefined,
       environmentConfig: context.environment?.config as never,
       mcpBinding: nodeMcpBinding,
       tenantId: context.tenantId,
@@ -1455,11 +1496,25 @@ v1.use("*", async (c, next) => {
 v1.route("/agents", buildAgentComputerRoutes({
   machines: agentMachines,
   supported: agentComputerEnabled(process.env),
-  spec: () => agentComputerSpec(process.env),
+  spec: async (tenantId, agentId) => {
+    const agent = await agentsService.get({ tenantId, agentId });
+    if (!agent) throw new Error('Agent not found');
+    const environmentId = agent.metadata?.default_environment_id;
+    const environment = typeof environmentId === 'string'
+      ? await environmentsService.get({ tenantId, environmentId }) : null;
+    if (typeof environmentId === 'string' && !environment) throw new Error('Agent environment not found');
+    return agentComputerSpec(buildSandboxEnvForEnvironment(process.env, environment ? toEnvironmentConfig(environment) : null));
+  },
   agentExists: async (tenantId, agentId) => !!await agentsService.get({ tenantId, agentId }).catch(() => null),
+  desktopTicket: (tenantId, agentId) => desktopGateway.issue(tenantId, agentId),
   screenshot: async (tenantId, agentId) => {
     const row = await agentMachines.get(tenantId, agentId);
     if (!row) throw new Error("Computer is not running");
+    if (row.config.desktop) return withDesktop(tenantId, agentId, async desktop => {
+      const shot = await desktop.screenshot.takeFullScreen();
+      if (!shot.screenshot) throw new Error('Daytona returned an empty desktop screenshot');
+      return Buffer.from(shot.screenshot.replace(/^data:image\/png;base64,/, ''), 'base64');
+    });
     return agentMachines.withLock(row.id, async () => {
     const box = await agentMachines.getBox(tenantId, agentId);
     if (!box) throw new Error("Computer is not running");
@@ -3075,18 +3130,24 @@ app.onError((err, c) => {
 
 const port = Number(process.env.PORT ?? 8787);
 const host = process.env.HOST ?? "0.0.0.0";
-serve({ fetch: app.fetch, port, hostname: host }, (info) => {
+const httpServer = serve({ fetch: app.fetch, port, hostname: host }, (info) => {
   logger.info(
     { op: "main-node.listening", address: info.address, port: info.port, db: backendDescription },
     `listening on http://${info.address}:${info.port}`,
   );
 });
 
+desktopGateway.attach(httpServer as import("node:http").Server);
+
 // Cron — eval-tick + memory retention sweep + (when integrations schema is
 // applied) webhook-events retention. Linear dispatch is left un-wired here
 // because main-node doesn't construct a LinearProvider; pass `linearSweeper`
 // when an in-process gateway lands.
 const ambientDispatcher = new NodeAmbientDispatcher({
+  resolveEnvironment: async (tenantId, environmentId) => {
+    const environment = await environmentsService.get({ tenantId, environmentId });
+    return environment ? toEnvironmentConfig(environment) : null;
+  },
   ambientRules: ambientRulesService,
   agents: agentsService,
   sessions: sessionsService,
@@ -3159,6 +3220,7 @@ const shutdown = async (signal: string) => {
   logger.info({ op: "main-node.shutdown", signal }, `received ${signal}, shutting down`);
   clearInterval(machineTick);
   await agentMachines.dispose();
+  desktopGateway.close();
   try { await scheduler.stop(); } catch (err) { logger.warn({ err, op: "main-node.shutdown.scheduler_stop_failed" }, "scheduler stop failed"); }
   try { await memoryWatcher.stop(); } catch (err) { logger.warn({ err, op: "main-node.shutdown.watcher_stop_failed" }, "memory watcher stop failed"); }
   if (s3Poller) {

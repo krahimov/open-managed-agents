@@ -8,6 +8,12 @@ vi.mock("../lib/clerk-auth", () => ({
   getClerkBearerToken: vi.fn(async () => "console-session-token"),
 }));
 
+const desktop = vi.hoisted(() => ({ connect: vi.fn(), disconnect: vi.fn() }));
+vi.mock('@novnc/novnc', () => ({ default: class extends EventTarget {
+  constructor(target: HTMLElement, url: string) { super(); desktop.connect(target, url); }
+  disconnect() { desktop.disconnect(); }
+} }));
+
 const machinePath = "/v1/agents/agent_test/machine";
 const runningMachine = {
   id: "machine_test",
@@ -146,4 +152,21 @@ describe("AgentComputerPanel", () => {
     expect(screen.queryByRole("img")).not.toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
+});
+
+it('opens the native desktop with an authenticated ticket and disconnects the viewer without stopping work', async () => {
+  desktop.connect.mockClear(); desktop.disconnect.mockClear();
+  fetchMock.mockImplementation(async input => {
+    if (input === `${machinePath}/desktop-ticket`) return Response.json({url: '/v1/computer-desktop/ws?ticket=one-use'});
+    if (input === `${machinePath}/screenshot`) return new Response(new Uint8Array([137,80,78,71]), {headers: {'content-type':'image/png'}});
+    return Response.json({machine: {...runningMachine, desktopEnabled: true}, supported: true});
+  });
+  const view = renderPanel();
+  fireEvent.click(await screen.findByRole('button', {name:'Open desktop'}));
+  await waitFor(() => expect(desktop.connect).toHaveBeenCalledOnce());
+  expect(desktop.connect.mock.calls[0][1]).toMatch(/^wss?:.*ticket=one-use$/);
+  fireEvent.click(screen.getByRole('button', {name:'Close desktop'}));
+  expect(desktop.disconnect).toHaveBeenCalledOnce();
+  expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/stop'))).toBe(false);
+  view.unmount();
 });

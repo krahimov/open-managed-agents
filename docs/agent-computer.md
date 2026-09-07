@@ -64,8 +64,8 @@ Enable browser tools on the agent:
 
 Start a session using that agent and environment. When the server default is
 agent scope, the agent's Computer section can provision a computer before the
-first session. With an environment opt-in, create the first session before
-using the Computer controls.
+first session. Set `metadata.default_environment_id` on the agent to make the
+Computer controls and scheduled ambient sessions use its chosen environment.
 
 ## Persistence and lifecycle
 
@@ -91,9 +91,52 @@ using the Computer controls.
   client disconnect continues normally; an API process crash is a different
   failure and may require retrying the interrupted model turn.
 
-Chromium uses a private Daytona preview endpoint. Preview credentials stay on
-the API server, and the console receives only an authenticated PNG response.
-This implementation provides a browser preview, not a streamed Linux desktop.
+## Full Linux desktop
+
+For Daytona's native desktop, set `sandbox.desktop: true` alongside
+`sandbox.browser: true`. A prebuilt Daytona snapshot avoids installing the
+operating system packages on every new computer:
+
+```json
+{
+  "provider": "daytona",
+  "scope": "agent",
+  "snapshot": "daytona-medium",
+  "workdir": "/workspace",
+  "bootstrap_tools": false,
+  "browser": true,
+  "desktop": true,
+  "idle_stop_minutes": 10
+}
+```
+
+A snapshot must include Chromium, Node.js, curl, util-linux, and Daytona's
+computer-use dependencies. Debian-based custom images can instead use
+`bootstrap_tools: true` to install them. Global equivalents include
+`DAYTONA_SNAPSHOT` and `MACHINE_DESKTOP=true`.
+
+Daytona supervises Xvfb, XFCE, VNC, and noVNC. Chromium runs visibly on that
+same desktop; existing browser tools still use CDP. Agents also receive
+`computer_screenshot`, `computer_click`, `computer_type`, `computer_press`, and
+`computer_scroll` when their browser tool configuration is enabled.
+
+The Console's **Open desktop** button streams the desktop and allows keyboard
+and mouse control. Viewing it keeps the machine awake; closing the viewer
+leaves active agent work running. The console requires a modern ES2022 browser.
+
+Chromium and VNC use private Daytona preview endpoints. Provider credentials
+remain on the API server. The browser receives a tenant-scoped, single-use
+WebSocket ticket that expires in 30 seconds; the gateway also verifies its
+Origin. Set `PUBLIC_BASE_URL` to the console's public origin and allow WebSocket
+upgrades through your reverse proxy.
+
+For standing incident monitoring, create an ambient schedule rule, for example
+`* * * * *` in UTC, and set the agent's `metadata.default_environment_id`.
+Every wake runs in a fresh session on the same persistent computer. The cloud
+API must remain running for schedules to fire. This schedules model turns;
+it does not keep an infinite model request open. Save checker state and incident
+history in `/workspace` so later wakes can detect changes.
+
 
 ## API
 
@@ -104,7 +147,8 @@ All endpoints require the owning tenant's authentication and an existing agent.
 | `GET /v1/agents/:id/machine` | Supported flag and public machine state |
 | `POST /v1/agents/:id/machine/start` | Create or resume the computer |
 | `POST /v1/agents/:id/machine/stop` | Preserve disk and stop when idle |
-| `GET /v1/agents/:id/machine/screenshot` | PNG preview of the current browser tab |
+| `GET /v1/agents/:id/machine/screenshot` | PNG of the desktop, or current browser tab in headless mode |
+| `POST /v1/agents/:id/machine/desktop-ticket` | Short-lived ticket for the live desktop WebSocket |
 
 The existing session outputs API lists and downloads generated files. Browser
 preview requests do not start a stopped computer. Listing or downloading session

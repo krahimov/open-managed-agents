@@ -51,6 +51,7 @@ export interface AmbientDispatcherDeps {
     tenantId: string,
     vaultIds: string[],
   ): Promise<Array<{ name: string; type: "url"; url: string }>>;
+  resolveEnvironment?(tenantId: string, environmentId: string): Promise<import("@open-managed-agents/shared").EnvironmentConfig | null>;
   now?(): number;
 }
 
@@ -114,7 +115,12 @@ export class NodeAmbientDispatcher {
     // synthesize a local-runtime env (main-node accepts any env id).
     const agentBase = { ...agent } as Record<string, unknown>;
     delete agentBase.tenant_id;
-    const environmentId = "env_local_runtime";
+    const configuredEnvironment = rule.trigger.config?.environment_id ?? agent.metadata?.default_environment_id;
+    const environmentId = typeof configuredEnvironment === 'string' && configuredEnvironment ? configuredEnvironment : 'env_local_runtime';
+    const environmentSnapshot = environmentId === 'env_local_runtime'
+      ? { id: environmentId, runtime: 'local', sandbox_template: null }
+      : await this.deps.resolveEnvironment?.(rule.tenant_id, environmentId);
+    if (!environmentSnapshot) throw new Error('Ambient environment is unavailable for this tenant');
     // Inherit the agent's default vaults — same fallback the sessions
     // route applies when vault_ids is omitted. Without this, ambient
     // sessions had no credentials and integration workflows (GitHub /
@@ -151,11 +157,7 @@ export class NodeAmbientDispatcher {
       title: `Ambient: ${rule.name}`,
       ...(vaultIds.length > 0 ? { vaultIds } : {}),
       agentSnapshot: agentBase as never,
-      environmentSnapshot: {
-        id: environmentId,
-        runtime: "local",
-        sandbox_template: null,
-      } as never,
+      environmentSnapshot: environmentSnapshot as never,
       metadata: { ambient: { rule_id: rule.id, wake_mode: rule.wake_mode } },
     });
 

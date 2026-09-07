@@ -56,6 +56,8 @@ export interface AgentMachineSpec {
   aptPackages: string[];
   bootstrapTools: boolean;
   browser: boolean;
+  /** Daytona desktop; omitted on existing headless computers. */
+  desktop?: boolean;
   idleStopMinutes: number;
   maxFileBytes?: number;
   sdkMode: AgentMachineSdkMode;

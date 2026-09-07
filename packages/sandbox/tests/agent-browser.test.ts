@@ -8,7 +8,7 @@ const spec: AgentMachineSpec = { image: "debian:12", workdir: "/workspace", aptP
 function fakeSandbox() {
   const executeCommand = vi.fn(async (command: string) => ({ exitCode: 0, result: command.startsWith("curl ") ? JSON.stringify({ webSocketDebuggerUrl: "ws://localhost:9222/devtools/browser/real-browser-id" }) : "" }));
   const getPreviewLink = vi.fn(async () => ({ url: "https://9223-box.proxy.daytona.work", token: "secret-preview-token" }));
-  const uploadFile = vi.fn(async () => {});
+  const uploadFile = vi.fn(async (_file: Buffer, _path: string) => {});
   const sb = { public: false, process: { executeCommand }, fs: { uploadFile }, getPreviewLink } as unknown as DaytonaSandboxInstance;
   return { sb, executeCommand, getPreviewLink, uploadFile };
 }
@@ -67,4 +67,17 @@ describe("agent computer browser bootstrap", () => {
     await expect(bootstrapAgentComputer(f.sb, spec)).rejects.toThrow("package install failed");
     expect(f.uploadFile).not.toHaveBeenCalled();
   });
+});
+
+it('uses the native Daytona desktop and starts headed Chromium on its display', async () => {
+  const f = fakeSandbox();
+  const start = vi.fn(async () => ({}));
+  Object.assign(f.sb, { computerUse: { start } });
+  await bootstrapAgentComputer(f.sb, { ...spec, desktop: true, snapshot: 'daytona-medium', bootstrapTools: false });
+  expect(start).toHaveBeenCalledOnce();
+  expect(f.executeCommand.mock.calls[0][0]).not.toContain('apt-get');
+  const script = f.uploadFile.mock.calls.map(args => args[0].toString()).find(value => value.includes('--start-maximized'))!;
+  expect(script).toContain('export DISPLAY');
+  expect(script).not.toContain('--headless');
+  expect(() => execFileSync('sh', ['-n'], { input: script })).not.toThrow();
 });
