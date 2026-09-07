@@ -11,9 +11,9 @@
  *
  * Creates one uniquely named agent/environment and three sessions. Uses a
  * real model + cloud computer, so normal provider charges apply. Disconnects
- * SSE during a sleep, checks the shared browser/filesystem and downloadable
- * artifacts, then verifies a second session and a stop/start cycle retain
- * the same computer. Stops the test computer when idle; records remain for
+ * SSE during a sleep, checks the shared browser/filesystem, localStorage,
+ * browser downloads and output artifacts, then verifies a second session
+ * and a stop/start cycle retain the same computer. Stops it when idle; records remain for
  * review. Never modifies or deletes pre-existing agents/environments.
  */
 import assert from 'node:assert/strict';
@@ -45,6 +45,11 @@ export function toolPairs(events) {
   }));
 }
 
+function sessionError(event) {
+  const detail = [...new Set([event.error, event.message, event.reason].map(contentText).filter(Boolean))].join(': ');
+  return (detail || contentText(event)).slice(0, 2000);
+}
+
 function evidenceEvent(event) {
   // Browser screenshots can contain megabytes of base64. Keep useful text
   // and image metadata; the screenshot endpoint is separately hash-checked.
@@ -72,11 +77,15 @@ export async function runSmoke(options) {
   const markerPath = `/workspace/${runId}.txt`;
   const htmlPath = `/workspace/${runId}.html`;
   const filename = 'computer-smoke-result.txt';
+  const storageKey = `${runId}-browser-state`;
+  const storageReadExpression = `localStorage.getItem(${JSON.stringify(storageKey)})`;
+  const storageWriteExpression = `(() => { const value = crypto.randomUUID(); localStorage.setItem(${JSON.stringify(storageKey)}, value); return value; })()`;
+  let storedBrowserToken;
   const record = {
     runId, startedAt: iso(), baseUrl, outputPath, status: 'running',
     resources: { agentId: null, environmentId: null, sessions: [] },
     settings: { model: options.model ?? 'claude-sonnet-4-6', idleMinutes, timeoutMs },
-    marker, markerPath, htmlPath, steps: [], requests: [], turns: [], checks: {},
+    marker, markerPath, htmlPath, storageKey, steps: [], requests: [], turns: [], checks: {},
     machineIdentity: { comparedFields: ['id', 'generation'], providerRef: 'Not exposed by the public API' },
     cleanup: { stopped: false, retainedRecords: true },
   };
@@ -142,7 +151,7 @@ export async function runSmoke(options) {
         if (event.type === 'session.status_running') seenRunning = true;
         turn.events.push(evidenceEvent(event));
         if (event.type === 'session.error' || event.type === 'session.status_terminated') {
-          throw new Error(`Session ${sessionId} failed: ${contentText(event.error ?? event.reason ?? event).slice(0, 2000)}`);
+          throw new Error(`Session ${sessionId} failed: ${sessionError(event)}`);
         }
         if (seenRunning && event.type === 'session.status_idle') {
           assert(!event.stop_reason || event.stop_reason.type === 'end_turn', `Turn stopped before completion: ${JSON.stringify(event.stop_reason)}`);
@@ -159,7 +168,7 @@ export async function runSmoke(options) {
     throw new Error(`Session ${sessionId} did not complete within ${timeoutMs} ms`);
   }
 
-  async function disconnectDuringSleep(sessionId, turn) {
+  async function disconnectDuringSleep(sessionId, turn, sendMessage) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(new Error('Timed out waiting for the sleep command')), Math.min(timeoutMs, 720_000));
     let reader;
@@ -168,6 +177,10 @@ export async function runSmoke(options) {
       assert(response.headers.get('content-type')?.includes('text/event-stream'), 'Expected an SSE response');
       assert(response.body, 'SSE response had no body');
       reader = response.body.getReader();
+      // The Node route reads replay before subscribing to live events.
+      // Wait for its response so both steps finish before starting work.
+      await step('sse_connected_before_message', { sessionId });
+      await sendMessage();
       const decoder = new TextDecoder();
       let buffered = '';
       let seenRunning = false;
@@ -182,8 +195,15 @@ export async function runSmoke(options) {
           const data = frame.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).trimStart()).join('\n');
           if (!data) continue;
           const event = normalizeEvent(JSON.parse(data));
+          // Keep persisted SSE events separately from polling history, so
+          // a failure before reconnecting still leaves its real diagnostic.
+          if (Number.isFinite(event.seq) || event.type === 'session.error' || event.type === 'session.status_terminated') {
+            turn.sseEvents.push(evidenceEvent(event));
+          }
           if (event.type === 'session.status_running') seenRunning = true;
-          if (event.type === 'session.error') throw new Error(`Session error before disconnect: ${contentText(event.error)}`);
+          if (event.type === 'session.error' || event.type === 'session.status_terminated') {
+            throw new Error(`Session ${sessionId} failed before disconnect: ${sessionError(event)}`);
+          }
           if (API_TOOL_TYPES.has(event.type) && event.name === 'bash' && /\bsleep\s+15\b/.test(JSON.stringify(event.input))) {
             turn.disconnectedAt = iso();
             turn.disconnectedAfterSeq = event.seq;
@@ -212,14 +232,21 @@ export async function runSmoke(options) {
   }
 
   async function sendTurn(sessionId, prompt, disconnect = false) {
-    const turn = { sessionId, sentAt: iso(), prompt, events: [] };
+    const turn = { sessionId, sentAt: null, prompt, events: [], sseEvents: [] };
     record.turns.push(turn);
-    await post(`${sessionPath(sessionId)}/events`, { events: [{ type: 'user.message', content: [{ type: 'text', text: prompt }] }] });
-    await step('message_accepted', { sessionId });
-    if (disconnect) await disconnectDuringSleep(sessionId, turn);
+    const sendMessage = async () => {
+      turn.sentAt = iso();
+      await post(`${sessionPath(sessionId)}/events`, { events: [{ type: 'user.message', content: [{ type: 'text', text: prompt }] }] });
+      await step('message_accepted', { sessionId });
+    };
+    if (disconnect) await disconnectDuringSleep(sessionId, turn, sendMessage);
+    else await sendMessage();
     const events = await pollTurn(sessionId, turn);
     const pairs = toolPairs(events);
-    const successful = name => pairs.filter(pair => pair.use.name === name && pair.result && !pair.result.is_error);
+    // Browser tools catch exceptions and return "Eval error: ..." etc.
+    // Such responses do not necessarily set the event's is_error flag.
+    const successful = name => pairs.filter(pair => pair.use.name === name && pair.result && !pair.result.is_error &&
+      !/^(?:Navigate|Screenshot|Click|Type|Get text|Eval) error:/.test(contentText(pair.result.content)));
     assert(successful('bash').length > 0, 'The agent did not complete a real bash tool call');
     assert(successful('browser_navigate').some(pair => JSON.stringify(pair.use.input).includes(`file://${htmlPath}`)), 'The browser did not navigate to the HTML file inside this computer');
     assert(successful('browser_get_text').some(pair => contentText(pair.result.content).includes(marker)), 'The browser did not read the marker from the local HTML file');
@@ -232,6 +259,25 @@ export async function runSmoke(options) {
     } else {
       assert(successful('bash').some(pair => contentText(pair.result.content).includes(marker)), 'The second session could not read the persisted workspace marker');
     }
+    const tokenResult = (expression, label) => {
+      const pair = successful('browser_eval').find(pair => pair.use.input?.expression?.trim() === expression);
+      assert(pair, `The agent did not run the exact ${label} browser expression successfully`);
+      let token;
+      try { token = JSON.parse(contentText(pair.result.content)); } catch { /* assertion below explains the failure */ }
+      assert(typeof token === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(token), `${label} did not return a browser-generated UUID`);
+      return { pair, token };
+    };
+    const browserState = tokenResult(disconnect ? storageWriteExpression : storageReadExpression, 'localStorage');
+    if (disconnect) storedBrowserToken = browserState.token;
+    else assert.equal(browserState.token, storedBrowserToken, 'The browser lost its retained localStorage value');
+    turn.browserState = { key: storageKey, token: browserState.token, retained: !disconnect };
+    const browserDownload = downloadCheck(sessionId);
+    const downloadedToken = tokenResult(browserDownload.expression, 'download');
+    const diskRead = successful('bash').find(pair => pair.use.input?.command?.trim() === browserDownload.command &&
+      pair.use.seq > downloadedToken.pair.result.seq && contentText(pair.result.content).includes(downloadedToken.token));
+    assert(diskRead, 'The shell could not read the browser-created download from the shared downloads directory');
+    turn.browserDownload = { path: browserDownload.path, token: downloadedToken.token, verified: true };
+    record.checks.browserDownloadsVerified = true;
     const listing = await json(`${sessionPath(sessionId)}/outputs`);
     assert(listing.data?.some(file => file.filename === filename), `Output ${filename} is missing from the Files API`);
     const downloaded = await (await request(`${sessionPath(sessionId)}/outputs/${filename}`)).text();
@@ -241,7 +287,22 @@ export async function runSmoke(options) {
     return turn;
   }
 
-  const readPrompt = sessionId => `Use the real tools to verify the retained computer. First use bash to run cat ${markerPath}; do not recreate or overwrite that file or ${htmlPath}. Then use browser_navigate to open file://${htmlPath} and browser_get_text to read the page. Copy the exact marker read from that file into /mnt/sessions/${sessionId}/outputs/${filename} using bash or write. Report completion briefly. The existing marker must be read from disk, not inferred.`;
+  function downloadCheck(sessionId) {
+    const filename = `${runId}-${sessionId}-browser.txt`;
+    const path = `/workspace/downloads/${filename}`;
+    return {
+      path,
+      expression: `(() => { const value = crypto.randomUUID(); const link = document.createElement("a"); link.href = URL.createObjectURL(new Blob([value], { type: "text/plain" })); link.download = ${JSON.stringify(filename)}; document.body.append(link); link.click(); link.remove(); return value; })()`,
+      command: `for attempt in $(seq 1 30); do if [ -f '${path}' ]; then cat '${path}'; exit 0; fi; sleep 1; done; exit 1`,
+    };
+  }
+
+  const browserChecksPrompt = (sessionId, first = false) => {
+    const download = downloadCheck(sessionId);
+    return `Use browser_eval with exactly this expression to ${first ? 'initialize a random value in' : 'read the retained value from'} localStorage: ${first ? storageWriteExpression : storageReadExpression}\n${first ? '' : 'Do not call localStorage.setItem or change the browser profile.\n'}Then use browser_eval with exactly this expression to trigger a real browser download: ${download.expression}\nAfter that returns, use bash with exactly this command to read the downloaded file: ${download.command}\nDo not create or overwrite that download with shell or file tools. Its random value must come from the browser.`;
+  };
+
+  const readPrompt = sessionId => `Use the real tools to verify the retained computer. First use bash to run cat ${markerPath}; do not recreate or overwrite that file or ${htmlPath}. Then use browser_navigate to open file://${htmlPath} and browser_get_text to read the page. ${browserChecksPrompt(sessionId)}\nCopy the exact marker read from the original HTML page into /mnt/sessions/${sessionId}/outputs/${filename} using bash or write. Report completion briefly. The existing marker must be read from disk, not inferred.`;
 
   try {
     await step('smoke_started');
@@ -270,7 +331,7 @@ export async function runSmoke(options) {
     const first = await createSession('disconnected browser task');
     const html = `<!doctype html><html><head><title>${runId}</title></head><body><h1>${marker}</h1><p>Shared Linux filesystem and Chromium verified.</p></body></html>`;
     const command = `sleep 15; printf '%s\\n' '${marker}' > '${markerPath}'; printf '%s' '${html}' > '${htmlPath}'; cat '${markerPath}'`;
-    await sendTurn(first, `This is a live disconnect test. Your FIRST tool call must be bash with exactly this command: ${command}\nAfter it finishes, use browser_navigate to open file://${htmlPath}, then browser_get_text to read the page. Write the exact marker seen in the page to /mnt/sessions/${first}/outputs/${filename} using bash or write. Finish with one sentence. Keep working if the client disconnects.`, true);
+    await sendTurn(first, `This is a live disconnect test. Your FIRST tool call must be bash with exactly this command: ${command}\nAfter it finishes, use browser_navigate to open file://${htmlPath}, then browser_get_text to read the page. ${browserChecksPrompt(first, true)}\nWrite the exact marker seen in the original HTML page to /mnt/sessions/${first}/outputs/${filename} using bash or write. Finish with one sentence. Keep working if the client disconnects.`, true);
     const originalMachine = await machine();
     assert(originalMachine?.state === 'running' && originalMachine.browserEnabled, 'Expected a running computer with its browser enabled');
     record.machineIdentity.first = originalMachine;
@@ -285,6 +346,7 @@ export async function runSmoke(options) {
     assert.equal(record.machineIdentity.second.id, originalMachine.id, 'Second session received a different computer');
     assert.equal(record.machineIdentity.second.generation, originalMachine.generation, 'Second session recreated the computer');
     record.checks.sharedAcrossSessions = true;
+    record.checks.localStorageSharedAcrossSessions = true;
     const stopped = await post(`${agentPath()}/machine/stop`);
     assert.equal(stopped.machine?.state, 'stopped', 'Computer did not stop');
     record.machineIdentity.stopped = stopped.machine;
@@ -297,6 +359,7 @@ export async function runSmoke(options) {
     const third = await createSession('files after stop and start');
     await sendTurn(third, readPrompt(third));
     record.checks.persistedAfterStopStart = true;
+    record.checks.localStoragePersistedAfterStopStart = true;
     record.status = 'passed';
     await step('all_checks_passed');
   } catch (error) {
