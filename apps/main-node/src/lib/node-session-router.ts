@@ -173,8 +173,16 @@ export class NodeSessionRouter implements SessionRouter {
     } = {},
   ): Promise<SessionStreamHandle> {
     const buf: SessionStreamFrame[] = [];
+    // Replay frames form a prefix of buf until consumed. They must not use
+    // up the separate allowance for live events arriving during that drain.
+    let bufferedReplay = 0;
     let waker: ((v: IteratorResult<SessionStreamFrame>) => void) | null = null;
     let closed = false;
+    const needsReplay = opts.replay || opts.lastEventId !== undefined;
+    let replaying = needsReplay;
+    type StreamEvent = SessionEvent & { seq?: number };
+    const pendingLive: StreamEvent[] = [];
+    let replayedThrough = opts.lastEventId ?? -1;
 
     // Spec-vs-extension filter. When `include` doesn't contain "chunks",
     // only Anthropic-spec event types pass through (defaults to spec-only,
@@ -191,46 +199,46 @@ export class NodeSessionRouter implements SessionRouter {
       }
     };
 
-    const enqueue = (raw: string) => {
+    const enqueue = (ev: StreamEvent, replayFrame = false) => {
       if (closed) return;
+      const tid =
+        (ev as { session_thread_id?: string }).session_thread_id ??
+        "sthr_primary";
+      if (opts.threadId && tid !== opts.threadId) return;
+      const raw = JSON.stringify(ev);
       if (!passes(raw)) return;
       const frame: SessionStreamFrame = { data: raw };
       if (waker) {
         const w = waker;
         waker = null;
         w({ value: frame, done: false });
-      } else if (buf.length < 1024) {
+      } else if (replayFrame || buf.length - bufferedReplay < 1024) {
         buf.push(frame);
+        if (replayFrame) bufferedReplay++;
       }
     };
 
-    // Replay history > lastEventId before subscribing — gated by `replay`
-    // OR `lastEventId` (Last-Event-ID = SSE-native resume contract: client
-    // sent it, they want history > N regardless of opt-in flag).
-    if (opts.replay || opts.lastEventId !== undefined) {
-      const log = this.deps.newEventLog(sessionId);
-      const history = await log.getEventsAsync(opts.lastEventId ?? undefined);
-      for (const ev of history) {
-        const tid =
-          (ev as { session_thread_id?: string }).session_thread_id ??
-          "sthr_primary";
-        if (opts.threadId && tid !== opts.threadId) continue;
-        enqueue(JSON.stringify(ev));
-      }
-    }
+    const enqueueLive = (ev: StreamEvent, replayFrame = false) => {
+      // A durable event can appear in both the SQL snapshot and a hub
+      // callback, including a delayed callback after replay has finished.
+      // Keep this watermark tied to the snapshot, not live arrival order:
+      // a late event absent from history must still reach the client.
+      if (ev.seq !== undefined && ev.seq <= replayedThrough) return;
+      enqueue(ev, replayFrame);
+    };
 
     const writer = {
       closed: false,
-      write(ev: unknown) {
-        const tid =
-          (ev as { session_thread_id?: string }).session_thread_id ??
-          "sthr_primary";
-        if (opts.threadId && tid !== opts.threadId) return;
-        enqueue(JSON.stringify(ev));
+      write(ev: StreamEvent) {
+        if (closed) return;
+        if (replaying) pendingLive.push(ev);
+        else enqueueLive(ev);
       },
       close() {
         if (closed) return;
         closed = true;
+        this.closed = true;
+        pendingLive.length = 0;
         if (waker) {
           const w = waker;
           waker = null;
@@ -238,13 +246,36 @@ export class NodeSessionRouter implements SessionRouter {
         }
       },
     };
+    // Subscribe BEFORE awaiting the SQL snapshot. Events committed after
+    // that snapshot are buffered, then delivered after history, so neither
+    // side of the replay/live handoff can lose them.
     const detach = this.deps.hub.attach(sessionId, writer);
+    try {
+      if (needsReplay) {
+        const history = await this.deps.newEventLog(sessionId)
+          .getEventsAsync(opts.lastEventId ?? undefined);
+        for (const ev of history as StreamEvent[]) {
+          if (ev.seq !== undefined) replayedThrough = Math.max(replayedThrough, ev.seq);
+          // History is already fetched in full; the live backlog limit must
+          // not silently truncate it before the caller can start reading.
+          enqueue(ev, true);
+        }
+        for (const ev of pendingLive) enqueueLive(ev, true);
+        pendingLive.length = 0;
+      }
+      replaying = false;
+    } catch (error) {
+      writer.close();
+      detach();
+      throw error;
+    }
 
     return {
       [Symbol.asyncIterator]() {
         return {
           next() {
             if (buf.length > 0) {
+              if (bufferedReplay > 0) bufferedReplay--;
               return Promise.resolve({ value: buf.shift()!, done: false });
             }
             if (closed) {

@@ -137,7 +137,12 @@ Set `OMA_BASE_URL` and `OMA_API_KEY` for an isolated deployment, then run:
 node scripts/agent-computer-smoke.mjs /tmp/computer-evidence.json
 ```
 
-The script creates test records, disconnects during active work, checks the
-shared browser and files, resumes a stopped machine, and saves JSON evidence
-and a screenshot. It stops only its own idle test computer and retains the
-records for inspection. `OMA_SMOKE_MODEL` can override the test model.
+The script subscribes before submitting work, disconnects during the first
+shell command, and checks the shared browser and files. It verifies that a
+random value written to browser localStorage survives a new session and a
+machine stop/start. Each session also triggers a browser download and reads
+its random contents from `/workspace/downloads` using the shell.
+
+It saves JSON evidence, server error details, and a screenshot. It stops only
+its own idle test computer and retains the records for inspection.
+`OMA_SMOKE_MODEL` can override the test model.
