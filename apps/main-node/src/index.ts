@@ -1158,8 +1158,8 @@ const sessionRegistry = new SessionRegistry({
   buildHarnessContext: async (input) => {
     const harness = input.agent.harness ?? process.env.OMA_DEFAULT_HARNESS;
     if (input.sandbox.sandboxCapabilities?.().scope === "agent" &&
-        (harness === "claude-agent-sdk" || harness === "codex-sdk")) {
-      throw new Error("Agent computers require the default harness. SDK harnesses execute host tools and cannot use an agent computer yet.");
+        harness === "claude-agent-sdk") {
+      throw new Error("Agent computers support default and codex-sdk harnesses. Claude SDK host tools cannot use an agent computer yet.");
     }
     const creds = await resolveNodeModelCredentials(input.agent, input.tenantId);
     const runtime = new NodeHarnessRuntime({

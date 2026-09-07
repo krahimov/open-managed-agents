@@ -18,7 +18,10 @@
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { randomBytes } from "node:crypto";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { CallToolRequestSchema, ListToolsRequestSchema, type ContentBlock } from "@modelcontextprotocol/sdk/types.js";
+import { asSchema } from "ai";
+import { z } from "zod";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 export interface BridgeTool {
@@ -27,7 +30,9 @@ export interface BridgeTool {
   /** zod raw shape ({ field: z.string()... }) — cast internally so the
    *  workspace zod and the MCP SDK's bundled zod don't fight nominally. */
   inputSchema: Record<string, unknown>;
-  handler: (args: Record<string, unknown>) => Promise<{ text: string; isError?: boolean }>;
+  /** Already converted JSON Schema, for platform-prepared AI SDK tools. */
+  jsonSchema?: Record<string, unknown>;
+  handler: (args: Record<string, unknown>) => Promise<{ text?: string; content?: ContentBlock[]; isError?: boolean }>;
 }
 
 export interface McpHttpBridge {
@@ -43,32 +48,29 @@ export async function startMcpHttpBridge(
 ): Promise<McpHttpBridge> {
   const token = randomBytes(24).toString("hex");
 
+  const definitions = await Promise.all(tools.map(async t => ({
+    ...t,
+    schema: t.jsonSchema ?? await asSchema(z.object(t.inputSchema as z.ZodRawShape)).jsonSchema,
+  })));
   const buildServer = () => {
-    const server = new McpServer({ name: serverName, version: "1.0.0" });
-    for (const t of tools) {
-      server.registerTool(
-        t.name,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        { description: t.description, inputSchema: t.inputSchema as any },
-        (async (args: Record<string, unknown>) => {
-          try {
-            const r = await t.handler(args ?? {});
-            return {
-              content: [{ type: "text" as const, text: r.text }],
-              ...(r.isError ? { isError: true } : {}),
-            };
-          } catch (err) {
-            return {
-              content: [
-                { type: "text" as const, text: err instanceof Error ? err.message : String(err) },
-              ],
-              isError: true,
-            };
-          }
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        }) as any,
-      );
-    }
+    const server = new Server({ name: serverName, version: "1.0.0" }, { capabilities: { tools: {} } });
+    server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: definitions.map(t => ({ name: t.name, description: t.description, inputSchema: t.schema as { type: "object" } })),
+    }));
+    server.setRequestHandler(CallToolRequestSchema, async request => {
+      try {
+        const t = definitions.find(t => t.name === request.params.name);
+        if (!t) throw new Error("Unknown tool");
+        const args = request.params.arguments ?? {};
+        // JSON-schema tools validate with the original AI SDK schema in their handler.
+        const parsed = t.jsonSchema ? args : z.object(t.inputSchema as z.ZodRawShape).parse(args);
+        const r = await t.handler(parsed);
+        return { content: r.content ?? [{ type: "text" as const, text: r.text ?? "" }],
+          ...(r.isError ? { isError: true } : {}) };
+      } catch (err) {
+        return { content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }], isError: true };
+      }
+    });
     return server;
   };
 

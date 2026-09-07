@@ -36,7 +36,7 @@
  * attached skills are materialized under <cwd>/skills/ and referenced there.
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, chmod } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { Codex } from "@openai/codex-sdk";
@@ -59,6 +59,7 @@ import type { AgentConfig } from "@open-managed-agents/shared";
 import { generateId } from "@open-managed-agents/shared";
 import type { HarnessPatch, McpTarget } from "./claude-agent-sdk-harness.js";
 import { startMcpHttpBridge, type BridgeTool, type McpHttpBridge } from "./mcp-http-bridge.js";
+import { codexComputerTools, computerCodexEnv, COMPUTER_CODEX_FEATURES } from "./codex-computer-tools.js";
 import { buildSetupPrompt, harnessView } from "./setup-harness.js";
 import {
   materializeMemory,
@@ -539,6 +540,7 @@ export class CodexSdkHarness {
     const runtime = ctx.runtime;
     const sessionId = ctx.session_id ?? "unknown-session";
     const tenantId = ctx.tenant_id ?? "default";
+    const computer = ctx.runtime.sandbox?.sandboxCapabilities?.().scope === "agent";
     const cwd = workdirFor(sessionId);
     await mkdir(cwd, { recursive: true });
 
@@ -569,7 +571,7 @@ export class CodexSdkHarness {
     // index them from AGENTS.md. Idempotent per turn (overwrite) so skill
     // edits apply on the next turn.
     const skillNames: string[] = [];
-    if (!isSetup && this.#deps.resolveSkills && ctx.tenant_id) {
+    if (!computer && !isSetup && this.#deps.resolveSkills && ctx.tenant_id) {
       try {
         const skills = await this.#deps.resolveSkills(ctx.tenant_id, ctx.agent.skills);
         for (const s of skills) {
@@ -590,7 +592,7 @@ export class CodexSdkHarness {
       storeByName: new Map(),
       guidance: "",
     };
-    if (!isSetup && this.#deps.memory && ctx.tenant_id) {
+    if (!computer && !isSetup && this.#deps.memory && ctx.tenant_id) {
       try {
         materializedMemory = await materializeMemory(this.#deps.memory, ctx.tenant_id, sessionId, cwd);
       } catch (err) {
@@ -635,17 +637,20 @@ export class CodexSdkHarness {
     // process (the codex child calls back over HTTP with a per-turn bearer
     // token), so they can append session events, update the agent row, and
     // schedule wakeups exactly like the claude-agent-sdk in-process servers.
-    const bridgeTools = this.#bridgeToolsFor(ctx, runtime, sessionId, isSetup);
+    const bridgeTools = computer && !isSetup
+      ? await codexComputerTools(ctx)
+      : this.#bridgeToolsFor(ctx, runtime, sessionId, isSetup);
     const bridge: McpHttpBridge | null =
       bridgeTools.length > 0 ? await startMcpHttpBridge("oma_platform", bridgeTools) : null;
 
+    try {
     // Setup: the bridge is the ONLY MCP surface (mirrors strictMcpConfig on
     // the claude harness); working sessions get the agent's servers too.
     // default_tools_approval_mode "approve" (verified against codex 0.149 —
     // "auto" is not accepted): with approvalPolicy "never" any tool codex
     // classifies as approval-needing would otherwise auto-FAIL with
     // "MCP tool call requires approval, but approval policy is never".
-    const agentMcpServers = isSetup ? undefined : await this.#mcpConfigFor(ctx, sessionId);
+    const agentMcpServers = (isSetup || computer) ? undefined : await this.#mcpConfigFor(ctx, sessionId);
     const omaServers = Object.fromEntries(
       Object.entries({
         ...(agentMcpServers ?? {}),
@@ -659,7 +664,7 @@ export class CodexSdkHarness {
     // sessions run unattended, so that's off by default; set
     // OMA_CODEX_INHERIT_HOST_MCP=1 to opt back in.
     const hostServerNames =
-      process.env.OMA_CODEX_INHERIT_HOST_MCP === "1" ? [] : await hostCodexMcpServerNames();
+      (computer || process.env.OMA_CODEX_INHERIT_HOST_MCP === "1") ? [] : await hostCodexMcpServerNames();
     const mcpServers: Record<string, Record<string, string | boolean | Record<string, string>>> = {
       ...Object.fromEntries(
         hostServerNames
@@ -668,8 +673,19 @@ export class CodexSdkHarness {
       ),
       ...omaServers,
     };
+    // A private, persistent auth cache; seed once so CLI token refresh survives deploys.
+    // Operators opt in to subscription auth. Never copy these credentials into Daytona.
+    const authHome = path.resolve(process.env.OMA_CODEX_HOME ?? path.join(process.env.SANDBOX_WORKDIR ?? "./data/sandboxes", "codex-auth"));
+    if (computer) {
+      await mkdir(authHome, { recursive: true, mode: 0o700 });
+      await chmod(authHome, 0o700);
+      if (process.env.OMA_CODEX_AUTH_JSON) {
+        try { await writeFile(path.join(authHome, "auth.json"), process.env.OMA_CODEX_AUTH_JSON, { mode: 0o600, flag: "wx" }); }
+        catch (err) { if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err; }
+      }
+    }
     const codexOptions: CodexOptions = {
-      env: curatedCodexEnv(),
+      env: computer ? computerCodexEnv(process.env, authHome) : curatedCodexEnv(),
       // Escape hatch when the vendored @openai/codex platform binary is
       // unavailable (e.g. its optional dependency failed to download).
       ...(process.env.OMA_CODEX_PATH ? { codexPathOverride: process.env.OMA_CODEX_PATH } : {}),
@@ -678,6 +694,11 @@ export class CodexSdkHarness {
         // agent sessions (see the platformNotes rationale above). OMA skills
         // are unaffected — they ride <cwd>/skills + AGENTS.md.
         skills: { enabled: false },
+        ...(computer ? {
+          features: COMPUTER_CODEX_FEATURES,
+          forced_login_method: "chatgpt",
+          developer_instructions: "All files, shell commands, browser actions and desktop actions use the oma_platform MCP tools. They run on your persistent cloud Linux computer. Local shell and image tools are disabled; the local process has a read-only sandbox. Do not use local apply_patch. Your workspace is /workspace on the remote computer. " + ctx.systemPrompt,
+        } : {}),
         ...(Object.keys(mcpServers).length > 0 ? { mcp_servers: mcpServers } : {}),
       },
     };
@@ -696,15 +717,16 @@ export class CodexSdkHarness {
       // scoped to a per-session workdir by the CLI's own sandbox. Setup is a
       // pure config conversation — no file/shell writes by design.
       approvalPolicy: "never",
-      sandboxMode: isSetup ? "read-only" : sandboxModeFromEnv(),
+      sandboxMode: (isSetup || computer) ? "read-only" : sandboxModeFromEnv(),
       networkAccessEnabled: true,
       // Codex's default web search runs against a cached index — freshly
       // deployed pages come back "not indexed" (observed live with a
       // days-old vercel.app site) and the agent has to hand-fetch via the
       // JS repl. Live mode searches the actual web.
-      webSearchMode: "live",
+      webSearchMode: computer ? "disabled" : "live",
     };
-    const priorThreadId = codexThreads.get(sessionId);
+    const threadIdPath = path.join(cwd, ".codex-thread-id");
+    const priorThreadId = codexThreads.get(sessionId) ?? (computer ? await readFile(threadIdPath, "utf8").catch(() => undefined) : undefined);
     const thread = priorThreadId
       ? codex.resumeThread(priorThreadId, threadOptions)
       : codex.startThread(threadOptions);
@@ -811,7 +833,6 @@ export class CodexSdkHarness {
       }
     };
 
-    try {
       const { events } = await thread.runStreamed(textOfUserMessage(ctx), {
         signal: runtime.abortSignal,
       });
@@ -819,6 +840,7 @@ export class CodexSdkHarness {
         switch (event.type) {
           case "thread.started":
             codexThreads.set(sessionId, event.thread_id);
+            if (computer) await writeFile(threadIdPath, event.thread_id, { mode: 0o600 });
             break;
           case "item.started":
             handleItem("started", event.item);
@@ -867,7 +889,7 @@ export class CodexSdkHarness {
     // Turn finished cleanly (the catch above re-throws) — sync any memory
     // edits back to their stores. Best-effort: a write-back failure must not
     // fail the turn the agent already completed.
-    if (!isSetup && this.#deps.memory && ctx.tenant_id) {
+    if (!computer && !isSetup && this.#deps.memory && ctx.tenant_id) {
       await writeBackMemory(this.#deps.memory, ctx.tenant_id, sessionId, cwd, materializedMemory)
         .then(({ saved, conflicts }) => {
           if (saved > 0 || conflicts.length > 0) {

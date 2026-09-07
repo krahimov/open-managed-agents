@@ -40,11 +40,13 @@ function makeCtx(overrides: Record<string, unknown> = {}) {
     agent: { id: "agent-1", model: "gpt-5.2", ...((overrides.agent as object) ?? {}) },
     session_id: (overrides.session_id as string) ?? `sess-${Math.random().toString(36).slice(2)}`,
     tenant_id: "default",
+    tools: overrides.tools ?? {},
     systemPrompt: "You are a test agent.",
     userMessage: { content: [{ type: "text", text: "hello" }] },
     runtime: {
       broadcast: (e: Record<string, unknown>) => broadcasts.push(e),
       abortSignal: undefined,
+      ...((overrides.runtime as object) ?? {}),
     },
   };
   return { ctx: ctx as never, broadcasts };
@@ -83,6 +85,22 @@ describe("curatedCodexEnv", () => {
 });
 
 describe("CodexSdkHarness.run", () => {
+  it("isolates agent computers from native host tools and forces subscription auth", async () => {
+    const calls = { started: [] as unknown[], resumed: [] as Array<{ id: string; options: unknown }> };
+    let options: any;
+    const h = new CodexSdkHarness({ createCodex: o => { options = o; return fakeCodex([], calls); } });
+    const { ctx } = makeCtx({ runtime: { sandbox: { sandboxCapabilities: () => ({ scope: "agent" }) } } });
+    await h.run(ctx);
+    expect(options.config.features.shell_tool).toBe(false);
+    expect(options.config.features.view_image).toBe(false);
+    expect(options.config.features.plugins).toBe(false);
+    expect(options.config.forced_login_method).toBe("chatgpt");
+    expect(options.env).not.toHaveProperty("OPENAI_API_KEY");
+    expect(options.env).not.toHaveProperty("SANDBOX_WORKDIR");
+    expect((calls.started[0] as any).sandboxMode).toBe("read-only");
+    expect((calls.started[0] as any).webSearchMode).toBe("disabled");
+  });
+
   it("translates the codex event stream into OMA session events", async () => {
     const events: ThreadEvent[] = [
       { type: "thread.started", thread_id: "thr-1" },
