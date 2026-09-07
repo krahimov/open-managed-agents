@@ -76,6 +76,10 @@ it('uses the native Daytona desktop and starts headed Chromium on its display', 
   await bootstrapAgentComputer(f.sb, { ...spec, desktop: true, snapshot: 'daytona-medium', bootstrapTools: false });
   expect(start).toHaveBeenCalledOnce();
   expect(f.executeCommand.mock.calls[0][0]).not.toContain('apt-get');
+  expect(f.executeCommand.mock.calls[0][0]).toContain('sudo -n');
+  expect(f.executeCommand.mock.calls[0][0]).toContain('as_root chown');
+  expect(f.executeCommand.mock.calls[0][0]).toContain('/mnt/sessions');
+  expect(() => execFileSync('sh', ['-n'], { input: f.executeCommand.mock.calls[0][0] })).not.toThrow();
   const script = f.uploadFile.mock.calls.map(args => args[0].toString()).find(value => value.includes('--start-maximized'))!;
   expect(script).toContain('export DISPLAY');
   expect(script).not.toContain('--headless');

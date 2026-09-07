@@ -107,14 +107,22 @@ export async function bootstrapAgentComputer(sb: DaytonaSandboxInstance, spec: A
   // mark tools as installed in a newly created machine.
   const hash = createHash("sha256").update(JSON.stringify(packages)).digest("hex").slice(0, 16);
   const marker = `/var/lib/oma/tools-${hash}`;
-  const commands = ["set -eu", `mkdir -p ${quote(spec.workdir)} /var/lib/oma`];
+  // Native snapshots execute toolbox commands as `daytona`, even when the
+  // sandbox API reports user=root. Give that user the app-owned directories.
+  const directories = [spec.workdir, '/var/lib/oma', '/mnt/sessions', '/mnt/memory', '/mnt/session'].map(quote).join(' ');
+  const prepare = [
+    'set -eu',
+    'as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }',
+    `as_root mkdir -p ${directories}`,
+    `as_root chown "$(id -u):$(id -g)" ${directories}`,
+  ];
+  const commands = [...prepare];
   if (packages.length) {
     commands.push(
       `if [ ! -f ${quote(marker)} ]; then`,
       '  command -v apt-get >/dev/null || { echo "Agent computer bootstrap requires a Debian-compatible image or a prebuilt snapshot" >&2; exit 127; }',
-      "  export DEBIAN_FRONTEND=noninteractive",
-      "  apt-get update -qq",
-      `  apt-get install -y -qq --no-install-recommends ${packages.map(quote).join(" ")}`,
+      "  as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq",
+      `  as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ${packages.map(quote).join(" ")}`,
       `  touch ${quote(marker)}`,
       "fi",
     );
@@ -122,7 +130,7 @@ export async function bootstrapAgentComputer(sb: DaytonaSandboxInstance, spec: A
   // Native snapshots already contain desktop packages. Custom images install
   // the documented dependencies before calling Daytona's process supervisor.
   if (spec.snapshot && !spec.bootstrapTools) {
-    await execute(sb, `mkdir -p ${quote(spec.workdir)} /var/lib/oma`, 30);
+    await execute(sb, prepare.join('\n'), 30);
   } else {
     await execute(sb, commands.join("\n"), 600);
   }
