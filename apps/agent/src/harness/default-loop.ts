@@ -9,6 +9,8 @@ import type { CompactionStrategy } from "./compaction";
 import { ALL_TOOLS } from "./tools";
 import { llmLoggingMiddleware, llmLogKey } from "./llm-logging-middleware";
 import { isOpenAiCompatModel, sanitizeOpenAiToolNames, reasoningProviderOptions } from "./provider";
+import type { ToolSet } from "ai";
+import { OPENAI_MAX_TOOLS, SEARCH_TOOL_NAME, CALL_TOOL_NAME, applyToolBudget } from "./tool-budget";
 
 // Single source of truth lives in ./tools.ts (ALL_TOOLS). Importing here so
 // adding a new toolset entry can't drift the event-classification list — the
@@ -329,6 +331,25 @@ export class DefaultHarness implements HarnessInterface {
     // in replayed history tool_calls. Long MCP names (Composio) 400 the
     // whole turn otherwise. Deterministic mangle; no-op for other providers.
     if (isOpenAiCompatModel(model)) {
+      // …and the tools array at 128 entries. Keep built-ins + whole MCP
+      // servers in harness order while they fit; the rest stay reachable
+      // via search_mcp_tools / call_mcp_tool (see tool-budget.ts). Seen
+      // live: 6 servers → 224 tools → 400 on every turn.
+      if (cached.tools && Object.keys(cached.tools).length > OPENAI_MAX_TOOLS) {
+        const budget = applyToolBudget(cached.tools as ToolSet, {
+          maxTools: OPENAI_MAX_TOOLS,
+          serverOrder: (agent.mcp_servers ?? []).map((srv) => srv.name).filter(Boolean) as string[],
+        });
+        cached.tools = budget.tools as typeof cached.tools;
+        runtime.broadcast({
+          type: "session.warning",
+          source: "tool_budget",
+          message:
+            `Model accepts at most ${OPENAI_MAX_TOOLS} tools; deferred ${budget.deferred.size} MCP tools from ` +
+            `${Object.entries(budget.deferredByServer).map(([srv, n]) => `${srv} (${n})`).join(", ")} — ` +
+            `reachable via ${SEARCH_TOOL_NAME} / ${CALL_TOOL_NAME}.`,
+        } as SessionEvent);
+      }
       const safe = sanitizeOpenAiToolNames({ tools: cached.tools, messages: cached.messages });
       if (safe.tools) cached.tools = safe.tools as typeof cached.tools;
       if (safe.messages) cached.messages = safe.messages as typeof cached.messages;

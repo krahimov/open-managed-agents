@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import {
   OMA_SETUP_HARNESS,
   OMA_SETUP_KIND_HARNESS_UPDATED,
@@ -80,9 +80,23 @@ function isRenderable(ev: Event): boolean {
   // setup this is how the agent hands the user the OAuth popups for the
   // servers it just added to its own harness.
   if (ev.type === "system.access_request") return true;
+  // Not drawn itself, but kept in state so the matching request card can
+  // read the durable grant (grantedRequestIdsOf).
+  if (ev.type === "system.access_granted") return true;
   if (ev.type === "system.ambient_rule_created") return true;
   if (ev.type === "system.skill_request") return true;
   return false;
+}
+
+/** request_ids the server has durably marked granted (system.access_granted). */
+export function grantedRequestIdsOf(events: Event[]): Set<string> {
+  const out = new Set<string>();
+  for (const ev of events) {
+    if (ev.type !== "system.access_granted") continue;
+    const rid = (ev as { request_id?: unknown }).request_id;
+    if (typeof rid === "string" && rid) out.add(rid);
+  }
+  return out;
 }
 
 export function SessionChat({
@@ -221,6 +235,7 @@ export function SessionChat({
   );
 
   const isEmpty = events.length === 0 && !pending;
+  const grantedRequestIds = useMemo(() => grantedRequestIdsOf(events), [events]);
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -253,8 +268,16 @@ export function SessionChat({
                 </Message>
               );
             }
+            if (ev.type === "system.access_granted") return null;
             if (ev.type === "system.access_request") {
-              return <AccessRequestCard key={key} event={ev} sessionId={sessionId} />;
+              return (
+                <AccessRequestCard
+                  key={key}
+                  event={ev}
+                  sessionId={sessionId}
+                  granted={grantedRequestIds.has(String(ev.request_id ?? ""))}
+                />
+              );
             }
             if (ev.type === "system.ambient_rule_created") {
               return <AmbientRuleCard key={key} event={ev} />;

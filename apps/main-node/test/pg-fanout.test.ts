@@ -63,6 +63,32 @@ d("SqlEventLog on Postgres", () => {
     expect((events[1] as { seq?: number }).seq).toBe(2);
   });
 
+  it("concurrent appendAsync from independent instances mints distinct seq", async () => {
+    // Regression: seq is minted via `SELECT COALESCE(MAX(seq), 0) + 1`,
+    // which races under READ COMMITTED — before appendAsync retried on
+    // unique violations, this scenario intermittently failed a turn with
+    // `duplicate key value violates unique constraint "session_events_pkey"`.
+    // Production has several uncoordinated writers per session (machine,
+    // harness broadcast chain, HTTP router), modelled here as independent
+    // SqlEventLog instances appending concurrently over pooled connections.
+    const sid = uniqSid("evlog-race");
+    sessions.push(sid);
+    const logs = Array.from({ length: 5 }, () => new SqlEventLog(sql, sid, () => {}));
+    const total = 25;
+    await Promise.all(
+      Array.from({ length: total }, (_, i) =>
+        logs[i % logs.length].appendAsync({
+          type: "agent.message",
+          content: [{ type: "text", text: `race-${i}` }],
+        } as SessionEvent),
+      ),
+    );
+    const events = await logs[0].getEventsAsync();
+    const seqs = events.map((e) => (e as { seq?: number }).seq);
+    // Every append landed, and seq is gapless + duplicate-free 1..N.
+    expect(seqs).toEqual(Array.from({ length: total }, (_, i) => i + 1));
+  });
+
   it("getEventsAsync(afterSeq) filters", async () => {
     const sid = uniqSid("evlog-after");
     sessions.push(sid);
