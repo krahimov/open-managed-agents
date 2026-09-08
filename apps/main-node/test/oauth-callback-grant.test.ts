@@ -124,3 +124,26 @@ describe("oauth callback grant recording", () => {
     expect(await res.text()).toContain('"grant_recorded":false');
   });
 });
+
+describe("Telegram MCP OAuth completion receipts", () => {
+  it("writes a receipt only after credentials are stored, and does not accept a query-supplied key", async () => {
+    stubUpstreams();
+    const f = fakeServices({ ...baseState, completion_key: "telegram_oauth:trusted-flow" });
+    const app = new Hono().route("/v1/oauth", buildNodeOAuthRoutes({ services: f.services as never }));
+    const response = await app.request("https://api.example/v1/oauth/callback?code=abc&state=st1&completion_key=telegram_oauth:forged");
+    expect(response.status).toBe(200);
+    expect(f.created).toHaveLength(1);
+    expect(f.kv.get("telegram_oauth:trusted-flow")).toBe("complete");
+    expect(f.kv.has("telegram_oauth:forged")).toBe(false);
+    expect(f.kv.has("oauth_state:st1")).toBe(false);
+  });
+  it("never issues a receipt if credential storage fails", async () => {
+    stubUpstreams();
+    const f = fakeServices({ ...baseState, completion_key: "telegram_oauth:trusted-flow" });
+    f.services.credentials.create = async () => { throw new Error("storage unavailable"); };
+    const app = new Hono().route("/v1/oauth", buildNodeOAuthRoutes({ services: f.services as never }));
+    const response = await app.request("https://api.example/v1/oauth/callback?code=abc&state=st1");
+    expect(response.status).toBe(500);
+    expect(f.kv.has("telegram_oauth:trusted-flow")).toBe(false);
+  });
+});

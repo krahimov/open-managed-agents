@@ -1,4 +1,4 @@
-import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import type { SqlClient } from "@open-managed-agents/sql-client";
@@ -52,6 +52,26 @@ export interface TelegramDeps {
   fetch?: typeof fetch;
 }
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
+/** Only signed Mini App launch data authenticates the linked Telegram user. */
+export function verifyTelegramInitData(raw: string, token: string, now = Date.now()): string | null {
+  if (!raw || raw.length > 16384) return null;
+  const data = new URLSearchParams(raw);
+  const keys = [...data.keys()];
+  if (new Set(keys).size !== keys.length) return null;
+  const signature = data.get("hash") ?? "";
+  if (!/^[a-f0-9]{64}$/.test(signature)) return null;
+  data.delete("hash");
+  const check = [...data.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([k, v]) => `${k}=${v}`).join("\n");
+  const secret = createHmac("sha256", "WebAppData").update(token).digest();
+  const expected = createHmac("sha256", secret).update(check).digest();
+  if (!timingSafeEqual(expected, Buffer.from(signature, "hex"))) return null;
+  const date = Number(data.get("auth_date"));
+  if (!data.has("auth_date") || !Number.isSafeInteger(date) || date <= 0 || date * 1000 > now + 30000 || now - date * 1000 > 900000) return null;
+  try {
+    const user = JSON.parse(data.get("user") ?? "null");
+    return user && Number.isSafeInteger(user.id) && user.id > 0 && !user.is_bot ? String(user.id) : null;
+  } catch { return null; }
+}
 const HELP =
   "Send a message to work with your agent.\n/new [task] — set up another agent\n/run — start work with the saved setup\n/connect <app> — connect an app\n/agents — list your agents\n/use <agent ID> — switch agents\n/status — check progress\n/stop — interrupt the current agent\n/unlink — disconnect Telegram";
 
@@ -251,6 +271,19 @@ export class TelegramOnboarding {
     });
     return app;
   }
+  async miniAppConnection(initData: string, sid: string, requestId: string) {
+    const telegramId = verifyTelegramInitData(initData, this.d.token);
+    if (!telegramId) return null;
+    const account = await this.d.sql.prepare("SELECT a.* FROM telegram_accounts a JOIN telegram_conversations c ON c.tenant_id=a.tenant_id AND c.user_id=a.user_id WHERE c.session_id=? AND a.telegram_user_id=? AND a.chat_id=?").bind(sid, telegramId, telegramId).first<Account>();
+    if (!account || !await this.ownedConversation(account.tenant_id, account.user_id, sid)) return null;
+    const events = await this.d.router.getEvents(sid, { limit: 10000 });
+    const event = events.data.find(e => e.type === "system.access_request" && (e as unknown as { request_id?: string }).request_id === requestId);
+    if (!event) return null;
+    const binding = await this.ownedConversation(account.tenant_id, account.user_id, sid);
+    const agent = binding && await this.d.agents.get({ tenantId: account.tenant_id, agentId: binding.agent_id });
+    if (!agent || agent.archived_at) return null;
+    return { tenantId: account.tenant_id, userId: account.user_id, agent, event };
+  }
   private async ownedConversation(tenant: string, user: string | undefined, sid: string) {
     if (!user || !await this.d.hasMembership(user, tenant)) return null;
     return this.d.sql.prepare("SELECT c.session_id,c.agent_id FROM telegram_conversations c JOIN telegram_accounts a ON a.tenant_id=c.tenant_id AND a.user_id=c.user_id WHERE c.tenant_id=? AND c.user_id=? AND c.session_id=? AND a.chat_id IS NOT NULL").bind(tenant, user, sid).first<{ session_id: string; agent_id: string }>();
@@ -263,7 +296,7 @@ export class TelegramOnboarding {
       .bind(tenant, user)
       .run();
   }
-  private async queue(a: Account, id: string, text: string, button?: { text: string; url: string }) {
+  private async queue(a: Account, id: string, text: string, button?: { text: string; web_app: { url: string } }) {
     if (!a.chat_id) return;
     const parts = text.match(/[\s\S]{1,3800}/gu) ?? [""];
     await this.d.sql.batch(
@@ -535,7 +568,7 @@ export class TelegramOnboarding {
           if (event.type === "system.access_request" && this.d.publicBaseUrl) {
             const request = e as unknown as { request_id: string; service: string; reason?: string };
             const url = new URL(`/telegram/connect/${encodeURIComponent(c.session_id)}/${encodeURIComponent(request.request_id)}`, this.d.publicBaseUrl).toString();
-            await this.queue(c, `event:${c.session_id}:${String(event.seq).padStart(16, "0")}`, `Connect ${request.service}${request.reason ? `: ${request.reason}` : ""}. Choose your vault and authorize in the secure page. Then return here.`, { text: `Connect ${request.service}`, url });
+            await this.queue(c, `event:${c.session_id}:${String(event.seq).padStart(16, "0")}`, `Connect ${request.service}${request.reason ? `: ${request.reason}` : ""}. Choose your vault and authorize in the secure page. Then return here.`, { text: `Connect ${request.service}`, web_app: { url } });
           } else if (event.type === "agent.message") {
             const text = Array.isArray(event.content)
               ? event.content

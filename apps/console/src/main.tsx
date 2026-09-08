@@ -79,10 +79,6 @@ import { consolePlugins } from "./plugins/registry";
  */
 
 const protectedRoutes: RouteObject[] = [
-  { path: "telegram/connect/:sessionId/:requestId", lazy: async () => {
-    const { TelegramConnect } = await import("./pages/TelegramConnect");
-    return { Component: TelegramConnect };
-  }, handle: { crumb: "Connect agent app" } },
   { index: true, element: <Dashboard />, handle: { crumb: "Dashboard" } },
   // Nested route groups so detail pages publish a proper hierarchy
   // through `useMatches()` — `/agents/:id` resolves to
@@ -290,6 +286,10 @@ const router = createBrowserRouter([
   { path: "login", element: <Login /> },
   { path: "cli/login", element: <CliLogin /> },
   { path: "connect-runtime", element: <ConnectRuntime /> },
+  { path: "telegram/connect/:sessionId/:requestId", lazy: async () => {
+    const { TelegramConnect } = await import("./pages/TelegramConnect");
+    return { Component: TelegramConnect };
+  }, handle: { crumb: "Connect agent app" } },
   { path: "composio/callback", element: <ComposioCallback /> },
   {
     element: <AppShell />,

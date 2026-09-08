@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import Database from "better-sqlite3";
+import { createHmac } from "node:crypto";
 import { Hono } from "hono";
 import { readFileSync } from "node:fs";
 import { BetterSqlite3SqlClient } from "../../../packages/sql-client/src/adapters/better-sqlite3";
@@ -254,7 +255,7 @@ describe("Telegram onboarding", () => {
     const f = await fixture(); await f.link();
     await f.post(601, "/connect linear"); await f.service.tick();
     const button = f.messages.find(m => m.reply_markup)?.reply_markup.inline_keyboard[0][0];
-    expect(button).toEqual({ text:"Connect linear", url:"https://test.example/telegram/connect/sess-1/acreq-telegram-601" });
+    expect(button).toEqual({ text:"Connect linear", web_app: { url:"https://test.example/telegram/connect/sess-1/acreq-telegram-601" } });
     expect(JSON.stringify(button)).not.toContain("test-token");
     const app = (user: string) => {
       const h = new Hono<any>(); h.use("*", async (c,next) => { c.set("user_id",user);c.set("tenant_id", "tenant-u"); await next(); });
@@ -272,4 +273,26 @@ describe("Telegram onboarding", () => {
     expect((await app("u").request("/conversations/sess-1/access/acreq-telegram-601")).status).toBe(404);
   });
 
+});
+
+function signedLaunch(userId: number) {
+  const fields = new URLSearchParams({ auth_date: String(Math.floor(Date.now()/1000)), user: JSON.stringify({ id: userId }) });
+  const key = createHmac("sha256", "WebAppData").update("test-token").digest();
+  fields.set("hash", createHmac("sha256", key).update([...fields.entries()].sort().map(([k,v]) => `${k}=${v}`).join("\n")).digest("hex"));
+  return fields.toString();
+}
+it("binds signed Mini App identity to the exact owned request and rechecks membership and unlink", async () => {
+  const f = await fixture(); await f.link();
+  await f.post(700, "/connect linear"); await f.service.tick();
+  const proof = signedLaunch(101);
+  const verify = () => f.service.miniAppConnection(proof, "sess-1", "acreq-telegram-700");
+  expect(await verify()).toMatchObject({ tenantId: "tenant-u", userId: "u", agent: { id: "agent-1" } });
+  expect(await f.service.miniAppConnection(signedLaunch(102), "sess-1", "acreq-telegram-700")).toBeNull();
+  expect(await f.service.miniAppConnection(proof, "sess-other", "acreq-telegram-700")).toBeNull();
+  expect(await f.service.miniAppConnection(proof, "sess-1", "request-other")).toBeNull();
+  f.deps.hasMembership.mockResolvedValue(false);
+  expect(await verify()).toBeNull();
+  f.deps.hasMembership.mockResolvedValue(true);
+  await f.post(701, "/unlink"); await f.service.tick();
+  expect(await verify()).toBeNull();
 });

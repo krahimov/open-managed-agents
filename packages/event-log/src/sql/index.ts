@@ -26,6 +26,7 @@ export type SqlDialect = "sqlite" | "postgres";
  */
 const appendChains = new Map<string, Promise<void>>();
 
+/**
  * How many times {@link SqlEventLog.appendAsync} re-attempts the
  * seq-minting INSERT when it loses the MAX(seq)+1 race. Each retry
  * recomputes the subquery against committed rows, so a loser converges

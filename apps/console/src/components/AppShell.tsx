@@ -74,7 +74,7 @@ export interface AppOutletContext {
 
 export function AppShell() {
   const { isAuthenticated, isLoading } = useAuth();
-  const { pathname } = useLocation();
+  const { pathname, search, hash } = useLocation();
   const navigate = useNavigate();
   const [pageHeaderSlot, setPageHeaderSlot] = useState<HTMLDivElement | null>(null);
 
@@ -115,7 +115,7 @@ export function AppShell() {
   }
 
   if (!isAuthenticated) {
-    return <Navigate to="/login" replace />;
+    return <Navigate to={`/login?next=${encodeURIComponent(pathname + search + hash)}`} replace />;
   }
 
   return (
