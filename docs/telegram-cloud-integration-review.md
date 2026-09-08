@@ -62,10 +62,40 @@ Commands were run against the isolated merge checkout, not the user's working
 checkout or either original feature checkout. See the final verification results
 below. No live third-party consent, Telegram messages, provider credential
 changes, or new Daytona computer provisioning were performed in this review.
-The new Mini App flow has not been deployed, so existing bot buttons retain the
-old behavior until deployment and a fresh `/connect <app>` request.
+The new Mini App flow is deployed to the existing isolated test service. Old bot
+buttons still retain the ordinary-link behavior; request a fresh `/connect <app>`
+button to launch the Mini App. Production and main were not changed.
 
 The live cloud smoke script remains available for an isolated test
 service with credentials and sufficient Daytona capacity. Its deterministic
 checks and the local real-Chromium test passed, but they do not establish that
 the new merged code has run against Daytona in the cloud.
+
+| Check | Result |
+| --- | --- |
+| Node server suite | 314 passed, 14 skipped without external test configuration |
+| Sandbox lifecycle | 96 passed |
+| Session runtime | 36 passed |
+| Browser suite, real Chrome enabled | 26 passed |
+| Console suite | 32 passed |
+| Cloud smoke script self-tests | 7 passed |
+| Repository-wide TypeScript | passed |
+| Console TypeScript and production build | passed |
+
+Total: 511 passing tests across these suites, 14 skipped. Root Cloudflare worker
+integration tests and live Postgres/S3 suites were not run. The final server suite
+includes the corrected actual-process SIGKILL tests. No orphaned servers from
+this checkout remained after the final run.
+
+Review PR: https://github.com/krahimov/open-managed-agents/pull/21
+
+## Isolated deployment verification
+
+Railway deployment `d5fe2950-3763-4858-b6f5-6bb604f76b1d` reached `SUCCESS`.
+It deployed code commit `af105d353` to the existing `agent-computer-test` service
+and environment. `/health` returned `status: ok` after the new process started.
+The new connection endpoint returned 401 for absent and tampered launch data,
+and 403 for a cross-origin request. No user messages were submitted by this
+review. Provider consent and the full in-Telegram launch remain manual checks.
+
+Telegram identity verification follows the [official Mini App validation protocol](https://core.telegram.org/bots/webapps#validating-data-received-via-the-mini-app).
