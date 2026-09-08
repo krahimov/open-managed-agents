@@ -26,12 +26,15 @@ import type { Event } from "../lib/events";
 export function AccessRequestCard({
   event,
   sessionId: sessionIdProp,
+  vaultId,
 }: {
   event: Event;
   /** Session to notify on completion. Defaults to the :id route param
    *  (SessionDetail); SessionChat must pass it explicitly — its route
    *  param is the AGENT id. */
   sessionId?: string;
+  /** Explicitly selected by the signed-in user on the Telegram connection page. */
+  vaultId?: string;
 }) {
   const { api } = useApi();
   const { id: routeId } = useParams();
@@ -69,7 +72,6 @@ export function AccessRequestCard({
     const complete = async () => {
       if (notifiedRef.current) return;
       notifiedRef.current = true;
-      setStatus("connected");
       // Graft the connection onto the session's AGENT (tool-router
       // mcp_server + vault link + toolkit list). Without this, an agent
       // created with no Composio wiring never sees the toolkit's tools —
@@ -87,10 +89,14 @@ export function AccessRequestCard({
             },
           );
           attachedServer = graft.attached_server === true;
-        } catch {
-          // agent stays unwired; the message below falls back to the nudge
+        } catch (err) {
+          notifiedRef.current = false;
+          setStatus("error");
+          setError(err instanceof Error ? err.message : "Connection could not be verified. Please retry.");
+          return;
         }
       }
+      setStatus("connected");
       // Tell the agent — a plain user.message wakes the turn loop the same
       // way a typed reply would, so it picks the task back up.
       void api(`/v1/sessions/${sessionId}/events`, {
@@ -124,11 +130,14 @@ export function AccessRequestCard({
       toast.success(`${service} connected.`);
     };
     const handle = (e: MessageEvent) => {
+      if (e.origin && e.origin !== window.location.origin) return;
       const data = (
         e as MessageEvent<{ type?: string; toolkit?: string; service?: string }>
       ).data;
       if (data?.type === "composio_auth_complete") {
         if (data.toolkit && data.toolkit.toLowerCase() !== service) return;
+        const providerError = (data as { error?: string }).error;
+        if (providerError) { setStatus("error"); setError(providerError); return; }
         void complete();
       } else if (data?.type === "oauth_complete") {
         // MCP OAuth callback reports the provider's display name — accept any
@@ -157,9 +166,10 @@ export function AccessRequestCard({
         bc.close();
       }
     };
-  }, [status, service, sessionId, api]);
+  }, [status, service, sessionId, api, isMcpOauth]);
 
   const ensureVault = async (): Promise<{ id: string }> => {
+    if (vaultId) return { id: vaultId };
     const vaultsRes = await api<{
       data: Array<{ id: string; name: string; archived_at?: string | null }>;
     }>("/v1/vaults?status=active&limit=100");

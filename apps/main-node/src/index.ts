@@ -1868,6 +1868,9 @@ v1.post("/sessions/:id/composio/graft", async (c) => {
       connectedAccounts[slug] = acct.id;
     }
   }
+  if (!connectedAccounts[toolkit]) {
+    return c.json({ error: `No active ${toolkit} account was found in this vault. Complete provider authorization and retry.` }, 409);
+  }
   const routerSession = await createComposioToolRouterSession(
     { apiKey: key.apiKey },
     {
@@ -2021,6 +2024,9 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_USERNAME && proce
     token: process.env.TELEGRAM_BOT_TOKEN,
     username: process.env.TELEGRAM_BOT_USERNAME.replace(/^@/, ""),
     webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET,
+    publicBaseUrl: process.env.PUBLIC_BASE_URL,
+    requestAccess: (tenantId, sessionId, service, requestId) => postAccessRequest(tenantId, sessionId, { service, reason: `Connect ${service} to this Telegram agent.` }, requestId),
+    hasVault: async (tenantId, vaultId) => (await vaultService.list({ tenantId, includeArchived: false })).some(v => v.id === vaultId),
     model: process.env.OMA_ONBOARDING_MODEL ?? "gpt-6-astra",
     harness: process.env.OMA_ONBOARDING_HARNESS ?? "default",
     environmentId: process.env.OMA_ONBOARDING_ENVIRONMENT_ID,
@@ -2157,6 +2163,7 @@ async function postAccessRequest(
   tenantId: string,
   sessionId: string,
   args: { service: string; reason: string; mcp_server_url?: string },
+  suppliedRequestId?: string,
 ): Promise<{ request_id: string; status: string; note?: string }> {
   const service = args.service.trim().toLowerCase();
   const mcpServerUrl = args.mcp_server_url?.trim() || undefined;
@@ -2168,7 +2175,7 @@ async function postAccessRequest(
       : "composio";
   const key =
     authKind === "composio" ? await composioKeyForTenant(tenantId).catch(() => null) : null;
-  const requestId = `acreq-${generateEventId().replace(/^sevt-/, "")}`;
+  const requestId = suppliedRequestId ?? `acreq-${generateEventId().replace(/^sevt-/, "")}`;
   await sessionRouter.appendEvent(sessionId, {
     type: "system.access_request",
     id: generateEventId(),

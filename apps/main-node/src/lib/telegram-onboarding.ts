@@ -46,11 +46,14 @@ export interface TelegramDeps {
     id: string,
   ) => Promise<EnvironmentConfig | null>;
   hasMembership: (userId: string, tenantId: string) => Promise<boolean>;
+  publicBaseUrl?: string;
+  requestAccess?: (tenantId: string, sessionId: string, service: string, requestId: string) => Promise<unknown>;
+  hasVault?: (tenantId: string, vaultId: string) => Promise<boolean>;
   fetch?: typeof fetch;
 }
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
 const HELP =
-  "Send a message to work with your agent.\n/new <task> — create and start another agent\n/agents — list your agents\n/use <agent ID> — switch agents\n/status — check progress\n/stop — interrupt the current agent\n/unlink — disconnect Telegram";
+  "Send a message to work with your agent.\n/new [task] — set up another agent\n/run — start work with the saved setup\n/connect <app> — connect an app\n/agents — list your agents\n/use <agent ID> — switch agents\n/status — check progress\n/stop — interrupt the current agent\n/unlink — disconnect Telegram";
 
 /** A durable inbox/outbox keeps Telegram delivery independent of browser connections. */
 export class TelegramOnboarding {
@@ -226,7 +229,31 @@ export class TelegramOnboarding {
       await this.unlink(c.var.tenant_id, c.var.user_id);
       return c.json({ connected: false });
     });
+    app.get("/conversations/:sid/access/:request", async c => {
+      const binding = await this.ownedConversation(c.var.tenant_id, c.var.user_id, c.req.param("sid"));
+      if (!binding) return c.json({ error: "Connection request not found" }, 404);
+      const events = await this.d.router.getEvents(binding.session_id, { limit: 10000 });
+      const event = events.data.find(e => e.type === "system.access_request" && (e as unknown as { request_id?: string }).request_id === c.req.param("request"));
+      if (!event) return c.json({ error: "Connection request not found" }, 404);
+      const agent = await this.d.agents.get({ tenantId: c.var.tenant_id, agentId: binding.agent_id });
+      return c.json({ event, agent_id: binding.agent_id, vault_ids: agent?.metadata?.default_vault_ids ?? [] });
+    });
+    app.post("/conversations/:sid/vault", async c => {
+      const binding = await this.ownedConversation(c.var.tenant_id, c.var.user_id, c.req.param("sid"));
+      if (!binding) return c.json({ error: "Conversation not found" }, 404);
+      const body = await c.req.json<{ vault_id?: string }>().catch(() => ({} as { vault_id?: string }));
+      if (!body.vault_id || !await this.d.hasVault?.(c.var.tenant_id, body.vault_id)) return c.json({ error: "Vault not found" }, 404);
+      const agent = await this.d.agents.get({ tenantId: c.var.tenant_id, agentId: binding.agent_id });
+      if (!agent) return c.json({ error: "Agent not found" }, 404);
+      const old = Array.isArray(agent.metadata?.default_vault_ids) ? agent.metadata.default_vault_ids as string[] : [];
+      await this.d.agents.update({ tenantId: c.var.tenant_id, agentId: agent.id, input: { metadata: { default_vault_ids: [...new Set([...old, body.vault_id])] } } });
+      return c.json({ attached: true });
+    });
     return app;
+  }
+  private async ownedConversation(tenant: string, user: string | undefined, sid: string) {
+    if (!user || !await this.d.hasMembership(user, tenant)) return null;
+    return this.d.sql.prepare("SELECT c.session_id,c.agent_id FROM telegram_conversations c JOIN telegram_accounts a ON a.tenant_id=c.tenant_id AND a.user_id=c.user_id WHERE c.tenant_id=? AND c.user_id=? AND c.session_id=? AND a.chat_id IS NOT NULL").bind(tenant, user, sid).first<{ session_id: string; agent_id: string }>();
   }
   private async unlink(tenant: string, user: string) {
     await this.d.sql
@@ -236,28 +263,28 @@ export class TelegramOnboarding {
       .bind(tenant, user)
       .run();
   }
-  private async queue(a: Account, id: string, text: string) {
+  private async queue(a: Account, id: string, text: string, button?: { text: string; url: string }) {
     if (!a.chat_id) return;
     const parts = text.match(/[\s\S]{1,3800}/gu) ?? [""];
     await this.d.sql.batch(
       parts.map((text, i) =>
         this.d.sql
           .prepare(
-            "INSERT INTO telegram_outbox (id,tenant_id,user_id,chat_id,text) VALUES (?,?,?,?,?) ON CONFLICT (id) DO NOTHING",
+            "INSERT INTO telegram_outbox (id,tenant_id,user_id,chat_id,text,reply_markup) VALUES (?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING",
           )
-          .bind(`${id}:${i}`, a.tenant_id, a.user_id, a.chat_id, text),
+          .bind(`${id}:${i}`, a.tenant_id, a.user_id, a.chat_id, text, i === 0 && button ? JSON.stringify({ inline_keyboard: [[button]] }) : null),
       ),
     );
   }
-  private async conversation(a: Account) {
+  private async conversation(a: Account, mode: "setup" | "work" = "work", transitionId?: string) {
     const agentId = a.active_agent_id!;
     const existing = await this.d.sql
       .prepare(
-        "SELECT session_id FROM telegram_conversations WHERE tenant_id=? AND user_id=? AND agent_id=?",
+        "SELECT session_id,transition_id FROM telegram_conversations WHERE tenant_id=? AND user_id=? AND agent_id=?",
       )
       .bind(a.tenant_id, a.user_id, agentId)
-      .first<{ session_id: string }>();
-    if (existing) return existing.session_id;
+      .first<{ session_id: string; transition_id: string | null }>();
+    if (existing && (!transitionId || existing.transition_id === transitionId)) return existing.session_id;
     const agent = await this.d.agents.get({ tenantId: a.tenant_id, agentId });
     if (!agent) throw new Error("Agent unavailable");
     const envId = String(agent.metadata?.default_environment_id ?? "");
@@ -270,18 +297,19 @@ export class TelegramOnboarding {
       title: `Telegram · ${agent.name}`,
       agentSnapshot: agent,
       ...(env ? { environmentSnapshot: env } : {}),
-      metadata: { telegram_user: a.user_id },
+      vaultIds: Array.isArray(agent.metadata?.default_vault_ids) ? agent.metadata.default_vault_ids as string[] : [],
+      metadata: { telegram_user: a.user_id, ...(mode === "setup" ? { oma_setup: true } : {}) },
     });
     await this.d.sql
       .prepare(
-        "INSERT INTO telegram_conversations (session_id,tenant_id,user_id,agent_id) VALUES (?,?,?,?) ON CONFLICT (tenant_id,user_id,agent_id) DO NOTHING",
+        "INSERT INTO telegram_conversations (session_id,tenant_id,user_id,agent_id,mode,transition_id) VALUES (?,?,?,?,?,?) ON CONFLICT (tenant_id,user_id,agent_id) DO UPDATE SET session_id=excluded.session_id,mode=excluded.mode,transition_id=excluded.transition_id,last_seq=-1",
       )
-      .bind(session.id, a.tenant_id, a.user_id, agentId)
+      .bind(session.id, a.tenant_id, a.user_id, agentId, mode, transitionId ?? null)
       .run();
     return session.id;
   }
   private async process(u: Update) {
-    const text = u.message.text?.trim() ?? "";
+    const text = (u.message.text?.trim() ?? "").replace(new RegExp(`^(/\\w+)@${this.d.username}(?=\\s|$)`, "i"), "$1");
     const chat = String(u.message.chat.id),
       user = String(u.message.from.id);
     let a = await this.d.sql
@@ -345,18 +373,12 @@ export class TelegramOnboarding {
           .join("\n"),
       );
     }
-    if (text.startsWith("/new ")) {
-      const task = text.slice(5).trim();
-      if (!task)
-        return this.queue(
-          a,
-          id,
-          "Use /new followed by what the agent should do.",
-        );
+    if (/^\/new(?:\s|$)/.test(text)) {
+      const task = text.slice(4).trim();
       const agent = await this.createAgent(
         a,
-        task.slice(0, 70),
-        task,
+        task.slice(0, 70) || "New agent",
+        task || "Help the user define this agent’s purpose during setup.",
         `${a.user_id}:${u.update_id}`,
       );
       await this.d.sql
@@ -366,8 +388,32 @@ export class TelegramOnboarding {
         .bind(agent.id, a.tenant_id, a.user_id)
         .run();
       a = { ...a, active_agent_id: agent.id };
-      await this.queue(a, id, `Created ${agent.name}. Starting it now.`);
-      return this.message(a, id, `Begin this task: ${task}`);
+      await this.conversation(a, "setup");
+      await this.queue(a, id, `Created ${agent.name}. Let's set it up. Describe what it should do; use /run when the configuration is ready.`);
+      return this.message(a, id, `We are setting up this agent through Telegram. ${task ? `My initial task is: ${task}.` : "Ask me what I want this agent to do."} Use the same setup tools as Orrery to refine your saved configuration. Ask one focused question at a time. Use request_access for integrations; the platform sends a connection button. Never ask for credentials in chat. Explain /run when ready; do not begin the actual work during setup.`);
+    }
+    if (text === "/run") {
+      const current = await this.conversation(a);
+      const transition = await this.d.sql.prepare("SELECT transition_id FROM telegram_conversations WHERE session_id=?").bind(current).first<{ transition_id: string | null }>();
+      const startText = "Begin the task in your saved instructions. If essential information or authorization is missing, ask before proceeding.";
+      if (transition?.transition_id === id) return this.message(a, id, startText);
+      const row = await this.d.sessions.get({ tenantId: a.tenant_id, sessionId: current });
+      if (row?.status === "running" || row?.status === "rescheduling") return this.queue(a, id, "The agent is still replying. Wait for it to finish, then send /run.");
+      await this.conversation(a, "work", id);
+      await this.queue(a, id, "Starting work with your saved configuration and selected vaults.");
+      return this.message(a, id, startText);
+    }
+    if (/^\/connect(?:\s|$)/.test(text)) {
+      const service = text.slice(8).trim().toLowerCase();
+      if (!/^[a-z0-9_-]{1,80}$/.test(service)) return this.queue(a, id, "Use /connect followed by an app, for example /connect linear or /connect gmail.");
+      if (!this.d.requestAccess) return this.queue(a, id, "App connections are not configured on this deployment.");
+      const sid = await this.conversation(a);
+      const prior = await this.d.router.getEvents(sid, { limit: 10000 });
+      const requestId = `acreq-telegram-${u.update_id}`;
+      if (!prior.data.some(e => (e as unknown as { request_id?: string }).request_id === requestId)) {
+        await this.d.requestAccess(a.tenant_id, sid, service, requestId);
+      }
+      return;
     }
     if (text.startsWith("/use ")) {
       const agent = await this.d.agents
@@ -425,7 +471,7 @@ export class TelegramOnboarding {
     await this.message(
       { ...a, active_agent_id: a.agent_id },
       `telegram-welcome:${a.user_id}`,
-      "The user just connected their Telegram account. Briefly introduce yourself as their cloud agent and ask what they want to accomplish. Mention that /new followed by a task creates another agent. Do not perform unrelated work or ask them to use the web UI.",
+      "The user just connected their Telegram account. Briefly introduce yourself as their cloud agent and ask what they want to accomplish. Mention that /new starts a guided agent setup and /run starts work after setup. Do not perform unrelated work or ask them to use the web UI.",
     );
   }
   private async message(a: Account, id: string, text: string) {
@@ -485,7 +531,11 @@ export class TelegramOnboarding {
             content?: Array<{ type: string; text?: string }>;
             error?: string;
           };
-          if (event.type === "agent.message") {
+          if (event.type === "system.access_request" && this.d.publicBaseUrl) {
+            const request = e as unknown as { request_id: string; service: string; reason?: string };
+            const url = new URL(`/telegram/connect/${encodeURIComponent(c.session_id)}/${encodeURIComponent(request.request_id)}`, this.d.publicBaseUrl).toString();
+            await this.queue(c, `event:${c.session_id}:${String(event.seq).padStart(16, "0")}`, `Connect ${request.service}${request.reason ? `: ${request.reason}` : ""}. Choose your vault and authorize in the secure page. Then return here.`, { text: `Connect ${request.service}`, url });
+          } else if (event.type === "agent.message") {
             const text = Array.isArray(event.content)
               ? event.content
                   .filter((b) => b.type === "text")
@@ -523,6 +573,7 @@ export class TelegramOnboarding {
           user_id: string;
           chat_id: string;
           text: string;
+          reply_markup: string | null;
         }>();
       for (const row of outbox.results ?? []) {
         const a = await this.account(row.tenant_id, row.user_id);
@@ -531,7 +582,7 @@ export class TelegramOnboarding {
           !(await this.d.hasMembership(row.user_id, row.tenant_id))
         ) {
           await this.d.sql
-            .prepare("UPDATE telegram_outbox SET sent=1,text='' WHERE id=?")
+            .prepare("UPDATE telegram_outbox SET sent=1,text='',reply_markup=NULL WHERE id=?")
             .bind(row.id)
             .run();
           continue;
@@ -542,7 +593,7 @@ export class TelegramOnboarding {
             {
               method: "POST",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify({ chat_id: row.chat_id, text: row.text }),
+              body: JSON.stringify({ chat_id: row.chat_id, text: row.text, ...(row.reply_markup ? { reply_markup: JSON.parse(row.reply_markup) } : {}) }),
               signal: AbortSignal.timeout(15000),
             },
           );
@@ -557,7 +608,7 @@ export class TelegramOnboarding {
             throw new Error("Telegram delivery failed");
           }
           await this.d.sql
-            .prepare("UPDATE telegram_outbox SET sent=1,text='' WHERE id=?")
+            .prepare("UPDATE telegram_outbox SET sent=1,text='',reply_markup=NULL WHERE id=?")
             .bind(row.id)
             .run();
         } catch {

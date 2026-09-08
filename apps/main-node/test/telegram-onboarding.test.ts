@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach, vi } from "vitest";
 import Database from "better-sqlite3";
+import { Hono } from "hono";
 import { readFileSync } from "node:fs";
 import { BetterSqlite3SqlClient } from "../../../packages/sql-client/src/adapters/better-sqlite3";
 import { TelegramOnboarding } from "../src/lib/telegram-onboarding.js";
@@ -19,6 +20,7 @@ async function fixture() {
       "utf8",
     ),
   );
+  db.exec(readFileSync(new URL("../migrations-sqlite/0005_telegram_setup.sql", import.meta.url), "utf8"));
   db.exec(
     "CREATE TABLE agents (id TEXT,tenant_id TEXT,config TEXT,archived_at INTEGER)",
   );
@@ -44,6 +46,12 @@ async function fixture() {
     sql,
     agents: {
       create,
+      update: vi.fn(async ({ tenantId, agentId, input }: any) => {
+        const a = saved.find(a => a.id === agentId && a.tenant_id === tenantId);
+        Object.assign(a, { ...input, metadata: { ...a.metadata, ...input.metadata } });
+        db.prepare("UPDATE agents SET config=? WHERE id=?").run(JSON.stringify(a), agentId);
+        return a;
+      }),
       get: async ({ tenantId, agentId }: any) =>
         saved.find((a) => a.id === agentId && a.tenant_id === tenantId) ?? null,
     },
@@ -66,6 +74,11 @@ async function fixture() {
         return { status: 202 };
       }),
     },
+    publicBaseUrl: "https://test.example",
+    hasVault: vi.fn(async (tenant: string, id: string) => tenant === "tenant-u" && id === "vault-u"),
+    requestAccess: vi.fn(async (_tenant: string, sid: string, service: string, requestId: string) => {
+      await deps.router.appendEvent(sid, { type: "system.access_request", request_id: requestId, service });
+    }),
     token: "test-token",
     username: "test_bot",
     webhookSecret: "test-webhook-secret",
@@ -169,6 +182,7 @@ describe("Telegram onboarding", () => {
         config: { sandbox: { scope: "agent", desktop: true } },
       },
       agentSnapshot: { harness: "codex-sdk", model: "gpt-6-astra" },
+      metadata: { oma_setup: true },
     });
     const sid = [...f.events.keys()].at(-1)!;
     f.events.get(sid)!.push({
@@ -217,4 +231,45 @@ describe("Telegram onboarding", () => {
     expect(f.messages.at(-1).text).toContain("running");
     expect(f.deps.sessions.create).toHaveBeenCalledTimes(0);
   });
+  it("bare /new starts setup, accepts a bot suffix, then /run snapshots the saved configuration and vault", async () => {
+    const f = await fixture(); await f.link();
+    await f.post(501, "/new@test_bot"); await f.service.tick();
+    expect(f.create).toHaveBeenCalledTimes(2);
+    expect(f.deps.sessions.create.mock.calls[0][0].metadata.oma_setup).toBe(true);
+    const input = f.deps.router.appendEvent.mock.calls[0][1].content[0].text;
+    expect(input).toContain("Ask me what I want");
+    await f.deps.agents.update({ tenantId: "tenant-u", agentId: "agent-2", input: { system: "Daily QA", metadata: { default_vault_ids: ["vault-u"] } } });
+    f.deps.sessions.get = async () => ({ status: "idle" });
+    await f.post(502, "/run"); await f.service.tick();
+    const work = f.deps.sessions.create.mock.calls.at(-1)[0];
+    expect(work.metadata.oma_setup).toBeUndefined();
+    expect(work.agentSnapshot.system).toBe("Daily QA");
+    expect(work.vaultIds).toEqual(["vault-u"]);
+    // Recover after replacing the session but before the webhook is acknowledged.
+    f.db.prepare("UPDATE telegram_inbox SET done=0,payload=? WHERE update_id='502'").run(JSON.stringify({ update_id:502, message:{ text:"/run", from:{id:101}, chat:{id:101,type:"private"} } }));
+    await new TelegramOnboarding(f.deps).tick();
+    expect(f.deps.sessions.create).toHaveBeenCalledTimes(2);
+  });
+  it("sends durable connect buttons, restricts the page to its owner, and validates vault ownership", async () => {
+    const f = await fixture(); await f.link();
+    await f.post(601, "/connect linear"); await f.service.tick();
+    const button = f.messages.find(m => m.reply_markup)?.reply_markup.inline_keyboard[0][0];
+    expect(button).toEqual({ text:"Connect linear", url:"https://test.example/telegram/connect/sess-1/acreq-telegram-601" });
+    expect(JSON.stringify(button)).not.toContain("test-token");
+    const app = (user: string) => {
+      const h = new Hono<any>(); h.use("*", async (c,next) => { c.set("user_id",user);c.set("tenant_id", "tenant-u"); await next(); });
+      h.route("/",f.service.routes());return h;
+    };
+    expect((await app("u").request("/conversations/sess-1/access/acreq-telegram-601")).status).toBe(200);
+    expect((await app("v").request("/conversations/sess-1/access/acreq-telegram-601")).status).toBe(404);
+    const attach = (id: string) => app("u").request("/conversations/sess-1/vault",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({vault_id:id})});
+    expect((await attach("vault-other")).status).toBe(404);
+    expect((await attach("vault-u")).status).toBe(200);
+    expect(f.deps.agents.update).toHaveBeenCalledWith(expect.objectContaining({input:{metadata:{default_vault_ids:["vault-u"]}}}));
+    await f.post(601, "/connect linear"); await f.service.tick();
+    expect(f.deps.requestAccess).toHaveBeenCalledTimes(1);
+    await f.post(602, "/unlink");await f.service.tick();
+    expect((await app("u").request("/conversations/sess-1/access/acreq-telegram-601")).status).toBe(404);
+  });
+
 });
