@@ -12,7 +12,10 @@ closes. No API key needs to be pasted into Telegram.
 
 Commands:
 
-- `/new <task>` creates and starts an agent for that task.
+- `/new` starts the same guided setup session as the Orrery console. Describe the task in the next message, or include it after `/new`.
+- Setup uses `update_harness` and `request_access` to save the agent configuration and request connections. It does not begin the actual work.
+- `/run` creates a working session from the latest saved configuration, including selected vaults and connected tools.
+- `/connect <app>` sends a connection button, for example `/connect linear` or `/connect gmail`. Agents can also request a connection during setup.
 - `/agents` lists the user's Telegram agents.
 - `/use <agent ID>` switches the conversation to another of those agents.
 - `/status` reports the active agent's session status.
@@ -66,6 +69,22 @@ no send-message idempotency key, so a crash after Telegram accepts a reply but
 before our acknowledgement is stored can repeat that reply. Deploy one Node
 replica for this first version; queue processing/provisioning is serialized in
 that process.
+
+Connection buttons open a focused Orrery page under normal login. The endpoint
+checks that the signed-in user owns the linked Telegram conversation. Select an
+existing vault, or create Connected Apps when none exists, and authorize through
+the same Composio/MCP connection card used by the console. Selecting a vault
+grants this agent access to it in future work sessions. Secrets never enter the
+Telegram message or connection URL. The page sends completion into the linked
+conversation; `/run` picks up newly attached tools and vaults in a fresh session.
+Composio requires a workspace Composio key or operator `COMPOSIO_API_KEY`.
+Individual provider sign-in/consent remains a user action. Google services use
+individual toolkit slugs, such as `gmail` and `googledrive`.
+
+The page may ask for Orrery sign-in in a browser that is not already signed in.
+This is not a Telegram Mini App or a replacement for provider consent. Only one
+active conversation per Telegram agent is routed to the bot; older setup
+sessions remain in Orrery history. Complete connection requests before `/run`.
 
 This version supports text and explicit creation commands. Attachments, voice,
 Telegram group workspaces, iMessage and natural-language agent configuration

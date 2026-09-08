@@ -27,6 +27,7 @@ import { OAuthAppSetupPanel, type OAuthAppRequirement } from "./OAuthAppSetupPan
 export function AccessRequestCard({
   event,
   sessionId: sessionIdProp,
+  vaultId,
   granted = false,
 }: {
   event: Event;
@@ -39,6 +40,8 @@ export function AccessRequestCard({
    *  (SessionDetail); SessionChat must pass it explicitly — its route
    *  param is the AGENT id. */
   sessionId?: string;
+  /** Explicitly selected by the signed-in user on the Telegram connection page. */
+  vaultId?: string;
 }) {
   const { api } = useApi();
   const { id: routeId } = useParams();
@@ -76,6 +79,7 @@ export function AccessRequestCard({
   );
   const [savingApp, setSavingApp] = useState(false);
   const notifiedRef = useRef(granted);
+  const vaultIdRef = useRef<string | null>(null);
 
   // Durable state wins over local popup bookkeeping: once the server has
   // written system.access_granted for this request, flip to Connected even
@@ -88,9 +92,33 @@ export function AccessRequestCard({
 
   useEffect(() => {
     if (status !== "connecting") return;
-    const complete = (opts: { grantRecorded?: boolean } = {}) => {
+    const complete = async (opts: { grantRecorded?: boolean } = {}) => {
       if (notifiedRef.current) return;
       notifiedRef.current = true;
+      // Graft the connection onto the session's AGENT (tool-router
+      // mcp_server + vault link + toolkit list). Without this, an agent
+      // created with no Composio wiring never sees the toolkit's tools —
+      // in this session or any future one, scheduled sessions included.
+      // Best-effort: the OAuth grant itself already succeeded.
+      let attachedServer = false;
+      if (!isMcpOauth && vaultIdRef.current) {
+        try {
+          const graft = await api<{ attached_server?: boolean }>(
+            `/v1/sessions/${sessionId}/composio/graft`,
+            {
+              method: "POST",
+              body: JSON.stringify({ toolkit: service, vault_id: vaultIdRef.current }),
+              silentErrors: true,
+            },
+          );
+          attachedServer = graft.attached_server === true;
+        } catch (err) {
+          notifiedRef.current = false;
+          setStatus("error");
+          setError(err instanceof Error ? err.message : "Connection could not be verified. Please retry.");
+          return;
+        }
+      }
       setStatus("connected");
       if (opts.grantRecorded) {
         // The OAuth callback already appended system.access_granted + the
@@ -118,7 +146,9 @@ export function AccessRequestCard({
                   // for a Drive upload instead of re-querying Composio).
                   text: isMcpOauth
                     ? `[access granted] ${service} is now connected — continue where you left off.`
-                    : `[access granted] ${service} is now connected. Your available actions have changed: re-run COMPOSIO_SEARCH_TOOLS for ${service} to discover its tools (do not assume earlier "no tools found" results still hold), then continue where you left off.`,
+                    : attachedServer
+                      ? `[access granted] ${service} is now connected and its toolkit was attached to this agent. This running session may not expose the new tools yet — NEW sessions of this agent (including scheduled ones) will have them. Re-run COMPOSIO_SEARCH_TOOLS for ${service} to check what's visible here, then continue where you left off.`
+                      : `[access granted] ${service} is now connected. Your available actions have changed: re-run COMPOSIO_SEARCH_TOOLS for ${service} to discover its tools (do not assume earlier "no tools found" results still hold), then continue where you left off.`,
                 },
               ],
             },
@@ -130,12 +160,15 @@ export function AccessRequestCard({
       toast.success(`${service} connected.`);
     };
     const handle = (e: MessageEvent) => {
+      if (e.origin && e.origin !== window.location.origin) return;
       const data = (
         e as MessageEvent<{ type?: string; toolkit?: string; service?: string }>
       ).data;
       if (data?.type === "composio_auth_complete") {
         if (data.toolkit && data.toolkit.toLowerCase() !== service) return;
-        complete();
+        const providerError = (data as { error?: string }).error;
+        if (providerError) { setStatus("error"); setError(providerError); return; }
+        void complete();
       } else if (data?.type === "oauth_complete") {
         // Only THIS request's completion. Older callback pages carry no
         // request_id; accept those to stay compatible. Without this check
@@ -143,7 +176,7 @@ export function AccessRequestCard({
         // one GitHub popup → linear + github + github grants in one second).
         const done = data as { request_id?: string | null; grant_recorded?: boolean };
         if (done.request_id && ev.request_id && done.request_id !== ev.request_id) return;
-        complete({ grantRecorded: done.grant_recorded === true });
+        void complete({ grantRecorded: done.grant_recorded === true });
       } else if (data?.type === "oauth_error") {
         const err = data as {
           message?: string;
@@ -180,9 +213,10 @@ export function AccessRequestCard({
         bc.close();
       }
     };
-  }, [status, service, sessionId, api]);
+  }, [status, service, sessionId, api, isMcpOauth]);
 
   const ensureVault = async (): Promise<{ id: string }> => {
+    if (vaultId) return { id: vaultId };
     const vaultsRes = await api<{
       data: Array<{ id: string; name: string; archived_at?: string | null }>;
     }>("/v1/vaults?status=active&limit=100");
@@ -274,6 +308,7 @@ export function AccessRequestCard({
       const popup = window.open("", `composio-${service}`, "width=600,height=720,popup=yes");
       try {
         const vault = await ensureVault();
+        vaultIdRef.current = vault.id;
         const callbackUrl = `${window.location.origin}/composio/callback?toolkit=${encodeURIComponent(service)}`;
         const link = await api<{ redirect_url: string }>(
           `/v1/vaults/${vault.id}/credentials/composio_accounts/link`,

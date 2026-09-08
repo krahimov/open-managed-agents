@@ -29,6 +29,13 @@
    "when": 1788815340438,
    "tag": "0004_telegram_onboarding",
    "breakpoints": true
+  },
+  {
+   "idx": 4,
+   "version": "6",
+   "when": 1788820062357,
+   "tag": "0005_telegram_setup",
+   "breakpoints": true
   }
  ]
 }
