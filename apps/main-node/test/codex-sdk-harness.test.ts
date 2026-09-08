@@ -1,7 +1,7 @@
 // CodexSdkHarness — event translation and fail-closed guards, exercised
 // through the createCodex test seam (no codex binary spawned).
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -55,6 +55,8 @@ function makeCtx(overrides: Record<string, unknown> = {}) {
 beforeEach(() => {
   process.env.SANDBOX_WORKDIR = mkdtempSync(path.join(tmpdir(), "codex-harness-test-"));
 });
+
+afterEach(() => vi.unstubAllEnvs());
 
 describe("codexModelFor", () => {
   it("passes bare OpenAI ids through and drops everything else", () => {
@@ -205,6 +207,8 @@ describe("CodexSdkHarness.run", () => {
   });
 
   it("runs setup sessions over the MCP bridge (read-only sandbox, oma_platform server)", async () => {
+    vi.stubEnv("OMA_CODEX_HOME", path.join(process.env.SANDBOX_WORKDIR!, "setup-auth"));
+    vi.stubEnv("OMA_CODEX_AUTH_JSON", "");
     const events: ThreadEvent[] = [
       { type: "thread.started", thread_id: "thr-setup" },
       { type: "item.completed", item: { id: "item_0", type: "agent_message", text: "let's configure you" } },
@@ -228,6 +232,9 @@ describe("CodexSdkHarness.run", () => {
     const config = codexOptionsSeen[0]?.config as
       | { mcp_servers?: Record<string, { url: string; http_headers: Record<string, string> }> }
       | undefined;
+    expect(codexOptionsSeen[0]?.env).toHaveProperty("CODEX_HOME");
+    expect(codexOptionsSeen[0]?.config).toMatchObject({ forced_login_method: "chatgpt", features: { shell_tool: false, view_image: false } });
+    expect((calls.started[0] as any).webSearchMode).toBe("disabled");
     const bridgeEntry = config?.mcp_servers?.oma_platform;
     expect(bridgeEntry?.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
     expect(bridgeEntry?.http_headers.Authorization).toMatch(/^Bearer /);

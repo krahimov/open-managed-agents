@@ -555,6 +555,10 @@ export class CodexSdkHarness {
     // in-process transport.
     const sessionMeta = await this.#deps.readSessionMetadata?.(tenantId, sessionId);
     const isSetup = sessionMeta?.["oma_setup"] === true && !!this.#deps.updateAgent;
+    // Hosted setup uses the operator-configured private cache even though
+    // its planning-only runtime has no computer. Keep local CLI login behavior
+    // when a self-hosted operator has not configured a separate auth cache.
+    const isolated = computer || (isSetup && Boolean(process.env.OMA_CODEX_HOME || process.env.OMA_CODEX_AUTH_JSON));
 
     // No per-tool permission callback in the Codex SDK, so a pinned access
     // policy cannot be enforced on this path. Fail closed instead of running
@@ -664,7 +668,7 @@ export class CodexSdkHarness {
     // sessions run unattended, so that's off by default; set
     // OMA_CODEX_INHERIT_HOST_MCP=1 to opt back in.
     const hostServerNames =
-      (computer || process.env.OMA_CODEX_INHERIT_HOST_MCP === "1") ? [] : await hostCodexMcpServerNames();
+      (isolated || process.env.OMA_CODEX_INHERIT_HOST_MCP === "1") ? [] : await hostCodexMcpServerNames();
     const mcpServers: Record<string, Record<string, string | boolean | Record<string, string>>> = {
       ...Object.fromEntries(
         hostServerNames
@@ -676,7 +680,7 @@ export class CodexSdkHarness {
     // A private, persistent auth cache; seed once so CLI token refresh survives deploys.
     // Operators opt in to subscription auth. Never copy these credentials into Daytona.
     const authHome = path.resolve(process.env.OMA_CODEX_HOME ?? path.join(process.env.SANDBOX_WORKDIR ?? "./data/sandboxes", "codex-auth"));
-    if (computer) {
+    if (isolated) {
       await mkdir(authHome, { recursive: true, mode: 0o700 });
       await chmod(authHome, 0o700);
       if (process.env.OMA_CODEX_AUTH_JSON) {
@@ -685,7 +689,7 @@ export class CodexSdkHarness {
       }
     }
     const codexOptions: CodexOptions = {
-      env: computer ? computerCodexEnv(process.env, authHome) : curatedCodexEnv(),
+      env: isolated ? computerCodexEnv(process.env, authHome) : curatedCodexEnv(),
       // Escape hatch when the vendored @openai/codex platform binary is
       // unavailable (e.g. its optional dependency failed to download).
       ...(process.env.OMA_CODEX_PATH ? { codexPathOverride: process.env.OMA_CODEX_PATH } : {}),
@@ -694,10 +698,10 @@ export class CodexSdkHarness {
         // agent sessions (see the platformNotes rationale above). OMA skills
         // are unaffected — they ride <cwd>/skills + AGENTS.md.
         skills: { enabled: false },
-        ...(computer ? {
+        ...(isolated ? {
           features: COMPUTER_CODEX_FEATURES,
           forced_login_method: "chatgpt",
-          developer_instructions: "All files, shell commands, browser actions and desktop actions use the oma_platform MCP tools. They run on your persistent cloud Linux computer. Local shell and image tools are disabled; the local process has a read-only sandbox. Do not use local apply_patch. Your workspace is /workspace on the remote computer. " + ctx.systemPrompt,
+          developer_instructions: isSetup ? buildSetupPrompt(ctx.agent) : "All files, shell commands, browser actions and desktop actions use the oma_platform MCP tools. They run on your persistent cloud Linux computer. Local shell and image tools are disabled; the local process has a read-only sandbox. Do not use local apply_patch. Your workspace is /workspace on the remote computer. " + ctx.systemPrompt,
         } : {}),
         ...(Object.keys(mcpServers).length > 0 ? { mcp_servers: mcpServers } : {}),
       },
@@ -723,10 +727,10 @@ export class CodexSdkHarness {
       // deployed pages come back "not indexed" (observed live with a
       // days-old vercel.app site) and the agent has to hand-fetch via the
       // JS repl. Live mode searches the actual web.
-      webSearchMode: computer ? "disabled" : "live",
+      webSearchMode: isolated ? "disabled" : "live",
     };
     const threadIdPath = path.join(cwd, ".codex-thread-id");
-    const priorThreadId = codexThreads.get(sessionId) ?? (computer ? await readFile(threadIdPath, "utf8").catch(() => undefined) : undefined);
+    const priorThreadId = codexThreads.get(sessionId) ?? (isolated ? await readFile(threadIdPath, "utf8").catch(() => undefined) : undefined);
     const thread = priorThreadId
       ? codex.resumeThread(priorThreadId, threadOptions)
       : codex.startThread(threadOptions);
@@ -840,7 +844,7 @@ export class CodexSdkHarness {
         switch (event.type) {
           case "thread.started":
             codexThreads.set(sessionId, event.thread_id);
-            if (computer) await writeFile(threadIdPath, event.thread_id, { mode: 0o600 });
+            if (isolated) await writeFile(threadIdPath, event.thread_id, { mode: 0o600 });
             break;
           case "item.started":
             handleItem("started", event.item);

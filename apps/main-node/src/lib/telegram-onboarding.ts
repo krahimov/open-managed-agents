@@ -530,6 +530,7 @@ export class TelegramOnboarding {
             seq: number;
             content?: Array<{ type: string; text?: string }>;
             error?: string;
+            message?: string;
           };
           if (event.type === "system.access_request" && this.d.publicBaseUrl) {
             const request = e as unknown as { request_id: string; service: string; reason?: string };
@@ -552,7 +553,9 @@ export class TelegramOnboarding {
             await this.queue(
               c,
               `event:${c.session_id}:${String(event.seq).padStart(16, "0")}`,
-              "The agent encountered an error. Check /status or retry your request.",
+              /total disk limit exceeded/i.test(event.message ?? event.error ?? "")
+                ? "Cloud storage is full, so the computer could not start. Your agent configuration is saved. Free or archive an unused computer, or increase the Daytona storage limit, then retry /run."
+                : "The agent encountered an error. Check /status or retry your request.",
             );
           await this.d.sql
             .prepare(
