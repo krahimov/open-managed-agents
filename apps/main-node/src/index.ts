@@ -1,3 +1,4 @@
+import { buildTelegramConnectRoutes } from "./lib/telegram-connect-routes.js";
 import { TelegramOnboarding } from "./lib/telegram-onboarding.js";
 import { DesktopGateway } from "./lib/desktop-gateway.js";
 /**
@@ -101,6 +102,8 @@ import {
   buildAgentRoutes,
   buildVaultRoutes,
   listComposioToolkits,
+  createComposioToolRouterSession,
+  listComposioConnectedAccounts,
   buildSessionRoutes,
   buildDeploymentRoutes,
   buildPublicGatewayRoutes,
@@ -1683,7 +1686,8 @@ v1.get("/agents/:id/evidence/capability", async (c) => {
 // succeeded but every session, including scheduled ones, had zero LinkedIn
 // actions. Ensures a tool-router credential covering the toolkit exists in
 // the vault, adds the composio mcp_server to the agent, and links the vault.
-v1.post("/sessions/:id/composio/graft", async (c) => {
+const composioGraftRoutes = new Hono<{ Variables: { tenant_id: string; user_id?: string } }>();
+composioGraftRoutes.post("/:id/composio/graft", async (c) => {
   const tenantId = c.var.tenant_id;
   const sessionId = c.req.param("id");
   const body = await c.req
@@ -1816,6 +1820,8 @@ v1.post("/sessions/:id/composio/graft", async (c) => {
   });
 });
 
+v1.route("/sessions", composioGraftRoutes);
+
 // GET /v1/agents/:id/evidence/approvals — grant version lineage with
 // per-version rule diffs (who approved which change, when).
 v1.get("/agents/:id/evidence/approvals", async (c) => {
@@ -1925,6 +1931,11 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_USERNAME && proce
     hasMembership: async (userId, tenantId) => !!await sql.prepare("SELECT 1 AS one FROM membership WHERE user_id=? AND tenant_id=?").bind(userId,tenantId).first(),
   });
   app.route("/integrations/telegram/webhook", telegram.webhookRoutes());
+  app.route("/integrations/telegram/connect", buildTelegramConnectRoutes({
+    telegram, services, router: sessionRouter, graftRoutes: composioGraftRoutes,
+    baseUrl: process.env.PUBLIC_BASE_URL!,
+    composio: { apiKey: process.env.COMPOSIO_API_KEY, resolveApiKey: async tenantId => (await resolveTenantComposioKey(tenantId))?.apiKey ?? null },
+  }));
 }
 const telegramTick = telegram ? setInterval(() => {
   void telegram!.tick().catch(() => logger.warn({ op: "telegram.delivery_tick_failed" }, "Telegram delivery tick failed; will retry"));

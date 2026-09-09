@@ -99,7 +99,7 @@ export function AccessRequestCard({
       // mcp_server + vault link + toolkit list). Without this, an agent
       // created with no Composio wiring never sees the toolkit's tools —
       // in this session or any future one, scheduled sessions included.
-      // Best-effort: the OAuth grant itself already succeeded.
+      // Verify the active provider account before reporting the connection.
       let attachedServer = false;
       if (!isMcpOauth && vaultIdRef.current) {
         try {

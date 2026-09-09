@@ -1,7 +1,8 @@
 # Telegram signup and agent control
 
 The Node deployment can create a user's first agent when they sign up. The
-console offers **Continue in Telegram**, opening a private bot chat. Telegram
+console offers **Continue in Telegram**, opening a private bot chat.
+The initial account link requires signing in to this same deployment. Telegram
 requires the user to press **Start** before a bot can contact them; a phone
 number alone cannot authorize bot messages.
 
@@ -70,23 +71,32 @@ before our acknowledgement is stored can repeat that reply. Deploy one Node
 replica for this first version; queue processing/provisioning is serialized in
 that process.
 
-Connection buttons open a focused Orrery page under normal login. The endpoint
-checks that the signed-in user owns the linked Telegram conversation. Select an
-existing vault, or create Connected Apps when none exists, and authorize through
-the same Composio/MCP connection card used by the console. Selecting a vault
-grants this agent access to it in future work sessions. Secrets never enter the
-Telegram message or connection URL. The page sends completion into the linked
-conversation; `/run` picks up newly attached tools and vaults in a fresh session.
-Composio requires a workspace Composio key or operator `COMPOSIO_API_KEY`.
-Individual provider sign-in/consent remains a user action. Google services use
-individual toolkit slugs, such as `gmail` and `googledrive`.
+Connection buttons open a Telegram Mini App. The server verifies Telegram's signed
+launch data, its age, the linked account, current tenant membership, and ownership
+of the exact session and connection request. No Orrery browser login is needed.
+Signed launch data expires after 15 minutes and is never stored in browser storage
+or passed in an authorization URL. Reopen the bot's button if it expires.
 
-The page may ask for Orrery sign-in in a browser that is not already signed in.
-This is not a Telegram Mini App or a replacement for provider consent. Only one
-active conversation per Telegram agent is routed to the bot; older setup
-sessions remain in Orrery history. Complete connection requests before `/run`.
+Choose a vault, prepare authorization, then open the provider's consent screen.
+Return to the Mini App and press **I've authorized the app**. The server checks
+that MCP OAuth stored a credential, or that Composio has an active account for
+the requested toolkit and vault, before attaching it and notifying the agent.
+Failed or incomplete consent cannot mark the request connected. `/run` starts a
+new session with the saved tools and vaults. Complete connections before `/run`.
+
+Old ordinary browser links cannot supply Telegram identity. Send `/connect <app>`
+again to receive a Mini App button. Provider sign-in and consent still happen at
+the provider. API-key integrations require adding the key in Orrery's vault.
+Composio needs a workspace key or operator `COMPOSIO_API_KEY`; the Mini App shows
+an explicit configuration error if neither is available. Google services use
+individual toolkit slugs such as `gmail` and `googledrive`.
+
+The normal Orrery login independently shows GitHub only when both
+`GITHUB_AUTH_CLIENT_ID` and `GITHUB_AUTH_CLIENT_SECRET` are configured. These are
+per deployment: a separate Telegram test service does not inherit production's
+GitHub login, accounts, cookies, or provider configuration. `/auth-info` reports
+the providers enabled on the service being opened.
 
 This version supports text and explicit creation commands. Attachments, voice,
-Telegram group workspaces, iMessage and natural-language agent configuration
-are not implemented. Existing Clerk accounts can link from the console; automatic
+Telegram group workspaces and iMessage are not implemented. Existing Clerk accounts can link from the console; automatic
 creation at signup currently uses the Better Auth signup hook.

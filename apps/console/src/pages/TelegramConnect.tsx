@@ -1,56 +1,89 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router";
-import { useApi } from "../lib/api";
-import type { Event } from "../lib/events";
-import { AccessRequestCard } from "../components/AccessRequestCard";
 import { Button } from "@/components/ui/button";
+import { loadTelegramMiniApp, type TelegramMiniApp } from "../lib/telegram-mini-app";
 
-/** Reuses Orrery's authenticated provider flow. The Telegram URL contains no credential. */
+type View = { service: string; reason?: string; vaults: Array<{ id: string; name: string }>; vault_ids: string[] };
+type Flow = { url: string; flow_id: string };
+
+/** Telegram proves the linked identity; the provider still asks for consent. */
 export function TelegramConnect() {
   const { sessionId, requestId } = useParams();
-  const { api } = useApi();
-  const [event, setEvent] = useState<Event | null>(null);
-  const [vaults, setVaults] = useState<Array<{ id: string; name: string }>>([]);
+  const [app, setApp] = useState<TelegramMiniApp>();
+  const [view, setView] = useState<View>();
   const [selected, setSelected] = useState("");
-  const [attached, setAttached] = useState("");
+  const [flow, setFlow] = useState<Flow>();
+  const [opened, setOpened] = useState(false);
+  const [connected, setConnected] = useState(false);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const base = `/integrations/telegram/connect/${encodeURIComponent(sessionId ?? "")}/${encodeURIComponent(requestId ?? "")}`;
+
+  async function request<T>(telegram: TelegramMiniApp, action: string, body = {}): Promise<T> {
+    const response = await fetch(`${base}/${action}`, {
+      method: "POST", credentials: "omit", cache: "no-store",
+      headers: { "content-type": "application/json", "x-telegram-init-data": telegram.initData },
+      body: JSON.stringify(body),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || "Connection failed. Please try again.");
+    return result as T;
+  }
+
   useEffect(() => {
     let disposed = false;
-    void Promise.all([
-      api<{ event: Event; vault_ids: string[] }>(`/v1/telegram/conversations/${sessionId}/access/${requestId}`),
-      api<{ data: Array<{ id: string; name: string; archived_at?: string | null }> }>("/v1/vaults?status=active&limit=100"),
-    ]).then(([request, list]) => {
+    setView(undefined); setFlow(undefined); setConnected(false); setOpened(false); setError("");
+    void loadTelegramMiniApp().then(async telegram => {
+      telegram.ready();
+      if (!telegram.initData) throw new Error("Open this page using a fresh Connect button in your linked Telegram chat. Send /connect followed by the app name to get one.");
+      const result = await request<View>(telegram, "view");
       if (disposed) return;
-      const available = list.data.filter(v => !v.archived_at);
-      setEvent(request.event);
-      setVaults(available);
-      setSelected(available.find(v => request.vault_ids.includes(v.id))?.id ?? available.find(v => v.name === "Connected Apps")?.id ?? available[0]?.id ?? "");
+      setApp(telegram); setView(result);
+      setSelected(result.vaults.find(v => result.vault_ids.includes(v.id))?.id ?? result.vaults.find(v => v.name === "Connected Apps")?.id ?? result.vaults[0]?.id ?? "");
     }).catch(e => { if (!disposed) setError(e.message); });
     return () => { disposed = true; };
-  }, [api, sessionId, requestId]);
-  const chooseVault = async () => {
+  }, [base]);
+
+  const authorize = async () => {
+    if (!app) return;
     setBusy(true); setError("");
     try {
-      const id = selected || (await api<{ id: string }>("/v1/vaults", { method: "POST", body: JSON.stringify({ name: "Connected Apps" }) })).id;
-      await api(`/v1/telegram/conversations/${sessionId}/vault`, { method: "POST", body: JSON.stringify({ vault_id: id }) });
-      setAttached(id);
-    } catch (e) { setError(e instanceof Error ? e.message : "Could not select the vault."); }
+      const result = await request<Flow>(app, "authorize", { vault_id: selected || undefined });
+      if (new URL(result.url).protocol !== "https:") throw new Error("The provider returned an invalid authorization link.");
+      setFlow(result);
+    } catch (e) { setError(e instanceof Error ? e.message : "Could not start authorization."); }
+    finally { setBusy(false); }
+  };
+  const complete = async () => {
+    if (!app || !flow) return;
+    setBusy(true); setError("");
+    try {
+      await request(app, "complete", { flow_id: flow.flow_id });
+      setConnected(true);
+    } catch (e) { setError(e instanceof Error ? e.message : "Could not verify authorization."); }
     finally { setBusy(false); }
   };
   return <main className="mx-auto w-full max-w-2xl space-y-5 p-6">
-    <h1 className="text-xl font-semibold">Connect your Telegram agent</h1>
-    <p className="text-sm text-fg-subtle">Choose a vault, then authorize the app. Return to Telegram after connecting. Send /run when setup is ready to start work with the saved connections.</p>
+    <h1 className="text-xl font-semibold">{view ? `Connect ${view.service}` : "Connect your Telegram agent"}</h1>
     {error && <p role="alert" className="text-sm text-danger">{error}</p>}
-    {!event && !error && <p>Loading connection request…</p>}
-    {event && !attached && <div className="space-y-3 rounded-lg border border-border p-4">
-      <label className="block text-sm" htmlFor="telegram-vault">Credential vault</label>
-      {vaults.length > 0 && <select id="telegram-vault" className="w-full rounded border border-border bg-bg p-2" value={selected} onChange={e => setSelected(e.target.value)}>
-        {vaults.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
-      </select>}
-      <p className="text-xs text-fg-subtle">This grants the agent access to the selected vault in future work sessions. Credentials stay in the vault.</p>
-      <Button onClick={() => void chooseVault()} disabled={busy}>{busy ? "Saving…" : vaults.length ? "Use this vault" : "Create Connected Apps vault"}</Button>
-    </div>}
-    {event && attached && <AccessRequestCard event={event} sessionId={sessionId} vaultId={attached} />}
+    {!view && !error && <p>Verifying your Telegram account…</p>}
+    {view && !connected && <>
+      <p className="text-sm text-fg-subtle">{view.reason || "Authorize the app, then return here to finish connecting your agent."}</p>
+      {!flow ? <div className="space-y-3 rounded-lg border border-border p-4">
+        {view.vaults.length > 0 && <>
+          <label className="block text-sm" htmlFor="telegram-vault">Credential vault</label>
+          <select id="telegram-vault" className="w-full rounded border border-border bg-bg p-2" value={selected} onChange={e => setSelected(e.target.value)}>
+            {view.vaults.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+          </select>
+        </>}
+        <p className="text-sm text-fg-subtle">{view.vaults.length ? "This gives your agent access to the selected vault in future work sessions." : "A Connected Apps vault will store this connection for your agent."} Credentials stay out of Telegram.</p>
+        <Button onClick={() => void authorize()} disabled={busy}>{busy ? "Preparing…" : "Continue to authorization"}</Button>
+      </div> : <div className="space-y-3">
+        <p>Open the provider, complete its consent screen, then return to this page.</p>
+        <Button onClick={() => { app!.openLink(flow.url); setOpened(true); }}>{opened ? "Reopen provider" : `Authorize ${view.service}`}</Button>
+        {opened && <Button onClick={() => void complete()} disabled={busy}>{busy ? "Checking…" : "I've authorized the app"}</Button>}
+      </div>}
+    </>}
+    {connected && <p role="status">Connected. Return to Telegram to continue setup. Send /run when you are ready to start work.</p>}
   </main>;
 }
