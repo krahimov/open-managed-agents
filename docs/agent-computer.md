@@ -221,6 +221,12 @@ server seeds the cache only if absent, preserving subsequent CLI token refreshes
 Credentials stay on the API host and are never mounted in Daytona. Keep this
 opt-in harness limited to a trusted single-operator deployment.
 
+For a restricted acceptance run, set `OMA_CODEX_ALLOWED_AGENTS` to a comma-separated
+list of `tenant_id/agent_id` pairs. Only those agents can use Codex, and they must
+have an agent-scoped cloud computer. An empty value denies every agent. Omitting
+the variable preserves the single-operator behavior described above. The global
+`OMA_ENABLE_CODEX_SDK=1` opt-in is still required.
+
 For agent-scoped computers the Codex process has native shell/image/browser tools
 and host plugins disabled, a read-only local sandbox, and an allowlisted process
 environment. Its authenticated MCP bridge exposes the session's prepared OMA
