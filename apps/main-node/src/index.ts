@@ -80,6 +80,8 @@ import type { AgentConfig, CredentialConfig, EnvironmentConfig, SessionEvent, Tr
 import { generateEventId, extractTextFromContent, extractTraceFacts } from "@open-managed-agents/shared";
 import type { TraceFacts } from "@open-managed-agents/shared";
 import { DefaultHarness } from "@open-managed-agents/agent/harness/default-loop";
+import { CodexSdkHarness } from "./lib/codex-sdk-harness.js";
+import type { SdkMemoryPort } from "./lib/sdk-harness-memory.js";
 import { ClaudeAgentSdkHarness } from "./lib/claude-agent-sdk-harness.js";
 import {
   buildSetupPrompt,
@@ -960,6 +962,66 @@ const sessionRegistry = new SessionRegistry({
   },
   buildHarness: () => {
     const def = new DefaultHarness();
+    const sdkMemoryPort: SdkMemoryPort = {
+      resolve: async (tenantId, sessionId) => {
+        const rows = await sql
+          .prepare(
+            `SELECT store_id, access FROM session_memory_stores WHERE session_id = ?`,
+          )
+          .bind(sessionId)
+          .all<{ store_id: string; access: string }>();
+        const out: Array<{
+          storeId: string;
+          name: string;
+          access: "read_write" | "read_only";
+          memories: Array<{ path: string; content: string }>;
+        }> = [];
+        for (const r of rows.results ?? []) {
+          const store = await memoryService
+            .getStore({ tenantId, storeId: r.store_id })
+            .catch(() => null);
+          if (!store) continue;
+          const metas = await memoryService
+            .listMemories({ tenantId, storeId: r.store_id })
+            .catch(() => []);
+          const memories: Array<{ path: string; content: string }> = [];
+          for (const m of metas) {
+            const full = await memoryService
+              .readByPath({ tenantId, storeId: r.store_id, path: m.path })
+              .catch(() => null);
+            memories.push({ path: m.path, content: full?.content ?? "" });
+          }
+          out.push({
+            storeId: r.store_id,
+            name: store.name,
+            access: r.access === "read_only" ? "read_only" : "read_write",
+            memories,
+          });
+        }
+        return out;
+      },
+      write: async ({ tenantId, sessionId, storeId, path: memPath, content, baseSha256 }) => {
+        try {
+          await memoryService.writeByPath({
+            tenantId,
+            storeId,
+            path: memPath,
+            content,
+            precondition: baseSha256
+              ? { type: "content_sha256", content_sha256: baseSha256 }
+              : { type: "not_exists" },
+            actor: { type: "agent_session", id: sessionId },
+          });
+          return { ok: true };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          const conflict =
+            (err as { name?: string })?.name === "MemoryPreconditionFailedError" ||
+            /precondition|sha256|exists/i.test(msg);
+          return { ok: false, conflict, error: msg };
+        }
+      },
+    };
     const sdk = new ClaudeAgentSdkHarness({
       resolveMcpTarget: resolveNodeMcpProxyTarget,
       resolveSkills: (tenantId, refs) => skillStore.resolveRefs(tenantId, refs),
@@ -987,6 +1049,27 @@ const sessionRegistry = new SessionRegistry({
       requestSkill: (tenantId, agentId, sessionId, a) =>
         postSkillRequest(tenantId, agentId, sessionId, a),
     });
+    const codexSdk = new CodexSdkHarness({
+      resolveMcpTarget: resolveNodeMcpProxyTarget,
+      resolveSkills: (tenantId, refs) => skillStore.resolveRefs(tenantId, refs),
+      memory: sdkMemoryPort,
+      readSessionMetadata: async (tenantId, sessionId) =>
+        (await sessionsService.get({ tenantId, sessionId }))?.metadata ?? null,
+      updateAgent: async (tenantId, agentId, patch) => {
+        return await agentsService.update({ tenantId, agentId, input: patch });
+      },
+      requestServiceAccess: (tenantId, sessionId, a) =>
+        postAccessRequest(tenantId, sessionId, a),
+      createAmbientRule: (tenantId, sessionId, agentId, a) =>
+        createAmbientRuleFromSession(tenantId, agentId, sessionId, a),
+      findSkills: (tenantId, query) => findSkillsForTenant(tenantId, query),
+      requestSkill: (tenantId, agentId, sessionId, a) =>
+        postSkillRequest(tenantId, agentId, sessionId, a),
+      scheduleWakeup: (tenantId, sessionId, agentId, a) =>
+        sessionWakeups.schedule({ tenantId, sessionId, agentId, ...a }),
+      cancelWakeup: (sessionId, id) => sessionWakeups.cancel(sessionId, id),
+      listWakeups: (sessionId) => sessionWakeups.list(sessionId),
+    });
     return {
       run: (ctx: unknown) => {
         const c = ctx as HarnessContext;
@@ -1008,6 +1091,19 @@ const sessionRegistry = new SessionRegistry({
           }
           return sdk.run(c);
         }
+        if (harness === "codex-sdk") {
+          // Same hard gate as claude-agent-sdk: runs the Codex CLI ON THE
+          // HOST with approvals disabled — single-operator/self-host only.
+          if (process.env.OMA_ENABLE_CODEX_SDK !== "1") {
+            const msg =
+              "codex-sdk harness is disabled on this deployment — it runs the " +
+              "OpenAI Codex CLI on the host and is intended for " +
+              "single-operator self-hosting. Set OMA_ENABLE_CODEX_SDK=1 to enable.";
+            c.runtime.broadcast({ type: "session.error", error: msg } as SessionEvent);
+            return Promise.reject(new Error(msg));
+          }
+          return codexSdk.run(c);
+        }
         return def.run(c);
       },
     };
@@ -1015,8 +1111,8 @@ const sessionRegistry = new SessionRegistry({
   buildHarnessContext: async (input) => {
     const harness = input.agent.harness ?? process.env.OMA_DEFAULT_HARNESS;
     if (input.sandbox.sandboxCapabilities?.().scope === "agent" &&
-        (harness === "claude-agent-sdk" || harness === "codex-sdk")) {
-      throw new Error("Agent computers require the default harness. SDK harnesses execute host tools and cannot use an agent computer yet.");
+        harness === "claude-agent-sdk") {
+      throw new Error("Agent computers support default and codex-sdk harnesses. Claude SDK host tools cannot use an agent computer yet.");
     }
     const creds = await resolveNodeModelCredentials(input.agent, input.tenantId);
     const runtime = new NodeHarnessRuntime({

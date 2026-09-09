@@ -452,7 +452,7 @@ describe("Built-in tool execution", () => {
     });
     expect(modelOutput.type).toBe("content");
     expect(modelOutput.value).toHaveLength(1);
-    expect(modelOutput.value[0].type).toBe("file-data");
+    expect(modelOutput.value[0].type).toBe("image-data");
     expect(modelOutput.value[0].mediaType).toBe("image/jpeg");
     expect(modelOutput.value[0].data).toBe(fakeBase64);
   });

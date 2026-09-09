@@ -30,9 +30,9 @@ OMA_DEFAULT_HARNESS=default
 ```
 
 Keep authentication enabled for a public deployment. Set an API model credential
-or create a model card through the console. Use the default OMA harness; the
-Claude Code and Codex SDK harnesses still run their native tools on the API host
-and are rejected for agent computers.
+or create a model card through the console. Use the default OMA harness for API
+billing, or the opt-in Codex subscription path below for single-operator testing.
+The Claude Code SDK harness runs tools on the API host and is rejected for agent computers.
 
 An environment can opt in instead of setting `SANDBOX_SCOPE` globally:
 
@@ -205,3 +205,27 @@ agent version.
 
 A provider failure after successful tool calls now fails the turn visibly
 instead of reporting a successful completion with no final answer.
+
+
+### Codex subscription testing (single operator)
+
+Agent computers can also use `harness: "codex-sdk"` when the operator explicitly
+sets `OMA_ENABLE_CODEX_SDK=1`. This path uses the official Codex SDK and the
+operator's ChatGPT sign-in, including `gpt-6-astra`. It does not use an OpenAI API
+key. Subscription usage limits still apply.
+
+Set `OMA_CODEX_HOME` to a private persistent directory, with an authenticated
+`auth.json` from `codex login` (directory mode 700, file mode 600). Alternatively,
+set the deployment secret `OMA_CODEX_AUTH_JSON` to that file's contents; the
+server seeds the cache only if absent, preserving subsequent CLI token refreshes.
+Credentials stay on the API host and are never mounted in Daytona. Keep this
+opt-in harness limited to a trusted single-operator deployment.
+
+For agent-scoped computers the Codex process has native shell/image/browser tools
+and host plugins disabled, a read-only local sandbox, and an allowlisted process
+environment. Its authenticated MCP bridge exposes the session's prepared OMA
+tools; `bash`, file tools, browser and desktop actions execute on Daytona.
+Screenshots are returned as MCP image blocks. Native `apply_patch` cannot write
+in the read-only local sandbox; use OMA `write` / `edit` / `bash` on the computer.
+Tools awaiting approval are omitted, and pinned access policies are rejected.
+The Codex thread ID and auth cache persist across API-server restarts.

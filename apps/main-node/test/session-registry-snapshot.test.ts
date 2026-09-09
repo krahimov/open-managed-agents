@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { generateEventId } from "@open-managed-agents/shared";
 import type { AgentConfig, SessionEvent, UserMessageEvent } from "@open-managed-agents/shared";
 import { SqlEventLog, ensureSchema as ensureEventLogSchema } from "@open-managed-agents/event-log/sql";
@@ -13,7 +13,7 @@ import { bootstrapTestDb } from "./_helpers/bootstrap-test-db";
 const TENANT = "tn_registry_snapshot";
 
 describe("SessionRegistry", () => {
-  it("runs turns with the immutable session agent snapshot", async () => {
+  it.each([false, true])("runs snapshot turns with setup=%s and reserves computers only for work", async (isSetup) => {
     const { sql, db, cleanup } = await bootstrapTestDb();
     try {
       await sql
@@ -48,6 +48,7 @@ describe("SessionRegistry", () => {
         agentId: agent.id,
         environmentId: "env-local-runtime",
         title: "snapshot test",
+        metadata: { oma_setup: isSetup },
         vaultIds: [],
         agentSnapshot: snapshot,
         environmentSnapshot: {
@@ -58,18 +59,21 @@ describe("SessionRegistry", () => {
       });
 
       let toolsAgent: AgentConfig | null = null;
+      const buildSandbox = vi.fn(async () => noopSandbox);
+      if (!isSetup) buildSandbox.mockRejectedValueOnce(new Error("Total disk limit exceeded"));
+      const provision = vi.fn(async () => {});
       const registry = new SessionRegistry({
         sql,
         hub: { attach: () => () => {}, publish: () => {}, closeSession: () => {} },
         agentsService: agents,
         memoryService: memory,
-        sandboxOrchestrator: noopOrchestrator,
+        sandboxOrchestrator: { ...noopOrchestrator, provision },
         newEventLog: (sessionId) =>
           new SqlEventLog(sql, sessionId, (event: SessionEvent) => {
             (event as { id?: string }).id ??= generateEventId();
             (event as { processed_at?: string }).processed_at ??= new Date().toISOString();
           }),
-        buildSandbox: async () => noopSandbox,
+        buildSandbox,
         sandboxWorkdirRoot: "/tmp/oma-registry-test",
         buildModel: async () => ({}) as never,
         buildTools: async (turnAgent) => {
@@ -80,6 +84,9 @@ describe("SessionRegistry", () => {
         buildHarnessContext: async (input) => input,
       });
 
+      if (!isSetup) {
+        await expect(registry.getOrCreate(session.id, TENANT)).rejects.toThrow("Total disk limit exceeded");
+      }
       await registry.getOrCreate(session.id, TENANT).then((entry) =>
         entry.machine.runHarnessTurn(agent.id, {
           type: "user.message",
@@ -88,6 +95,18 @@ describe("SessionRegistry", () => {
       );
 
       expect(toolsAgent?.mcp_servers).toEqual(snapshot.mcp_servers);
+      if (isSetup) {
+        expect(buildSandbox).not.toHaveBeenCalled();
+        expect(provision).not.toHaveBeenCalled();
+        const entry = await registry.getOrCreate(session.id, TENANT);
+        await expect(entry.sandbox.exec("hostname")).rejects.toThrow("unavailable during setup");
+        await expect(entry.sandbox.readFile("/private")).rejects.toThrow("unavailable during setup");
+        await registry.refreshResources(session.id, TENANT);
+        expect(provision).not.toHaveBeenCalled();
+      } else {
+        expect(buildSandbox).toHaveBeenCalledTimes(2);
+        expect(provision).toHaveBeenCalledOnce();
+      }
     } finally {
       cleanup();
     }

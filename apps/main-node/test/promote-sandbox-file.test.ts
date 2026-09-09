@@ -13,6 +13,8 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 
 interface ProcessHandle {
   child: ChildProcess;
@@ -23,22 +25,20 @@ interface ProcessHandle {
 
 const REPO_ROOT = resolve(__dirname, "../../..");
 const MAIN_NODE_ENTRY = join(REPO_ROOT, "apps/main-node/src/index.ts");
-const TSX_BIN = join(REPO_ROOT, "apps/main-node/node_modules/.bin/tsx");
+const TSX_LOADER = pathToFileURL(createRequire(import.meta.url).resolve("tsx/esm")).href;
 
 async function startMainNode(opts: { dataDir: string }): Promise<ProcessHandle> {
   const port = await pickPort();
-  const child = spawn(TSX_BIN, [MAIN_NODE_ENTRY], {
+  const child = spawn(process.execPath, ["--import", TSX_LOADER, MAIN_NODE_ENTRY], {
     cwd: REPO_ROOT,
     env: {
       ...process.env,
-      DATABASE_URL: "",
       PORT: String(port),
       // Hermetic: main-node self-loads .env/.env.local (loadDotenvDefaults)
       // for any key the child env leaves undefined — an empty string blocks
       // the file value. Without these pins the test runs against the
       // operator's real DATABASE_URL (shared Neon!) and sandbox provider.
       DATABASE_URL: "",
-      SANDBOX_PROVIDER: "subprocess",
       // validateNodeModel accepts a bare model string only when a model
       // card exists or a provider key is set.
       ANTHROPIC_API_KEY: "test-key-not-real",
@@ -76,7 +76,7 @@ async function startMainNode(opts: { dataDir: string }): Promise<ProcessHandle> 
 
 function killHard(handle: ProcessHandle): Promise<void> {
   return new Promise((res) => {
-    if (handle.child.exitCode !== null) return res();
+    if (handle.child.exitCode !== null || handle.child.signalCode !== null) return res();
     handle.child.once("exit", () => res());
     handle.child.kill("SIGKILL");
   });

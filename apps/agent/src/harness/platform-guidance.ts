@@ -99,3 +99,6 @@ export function composeSystemPrompt(
     .join("\n\n");
   return `${base}\n\n${blocks}`;
 }
+
+export const memoryGuidance =
+  "You have persistent memory that survives across sessions (the memory store(s) listed below). Use it deliberately: (1) At the START of a task — and before asking the user to repeat anything they may have told you before — check memory for relevant preferences, standing rules, and past decisions. (2) Standing rules and preferences found in memory APPLY to every task they govern: before drafting, sending, scheduling, or deciding, enumerate the memory rules relevant to that action and follow them without being reminded. (3) When the user states a durable preference, rule, or decision (\"always…\", \"never…\", \"we decided…\", \"remember that…\"), save it to memory in the same turn — a short, self-contained note with the date — and confirm you saved it. Do not save one-off task details or chatter.";
