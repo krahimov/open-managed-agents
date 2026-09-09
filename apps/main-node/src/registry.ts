@@ -85,6 +85,7 @@ export interface SessionRegistryDeps {
     sessionId: string,
     workdir: string,
     environment?: EnvironmentConfig | null,
+    owner?: { tenantId: string; agentId: string | null },
   ): Promise<SandboxExecutor>;
 
   /** Build the LanguageModel for the agent. Reads env, applies custom
@@ -162,6 +163,10 @@ export class SessionRegistry {
     if (!p) {
       p = this.build(sessionId, tenantId);
       this.map.set(sessionId, p);
+      const pending = p;
+      void pending.catch(() => {
+        if (this.map.get(sessionId) === pending) this.map.delete(sessionId);
+      });
     }
     return p;
   }
@@ -245,6 +250,7 @@ export class SessionRegistry {
     if (!p) return false;
     const entry = await p;
     const sessionRuntime = await this.loadSessionRuntimeContext(sessionId, tenantId);
+    if (sessionRuntime.isSetup) return true;
     await this.provisionSandboxResources({
       sessionId,
       tenantId,
@@ -302,7 +308,8 @@ export class SessionRegistry {
       environmentId: input.environmentId ?? undefined,
       memoryMounts,
       mountOutputs: environmentMountsSessionOutputs(input.environment),
-      backup: input.restoreWorkspace ? { restoreOnWarm: true } : undefined,
+      backup: input.restoreWorkspace && input.sandbox.sandboxCapabilities?.().scope !== "agent"
+        ? { restoreOnWarm: true } : undefined,
     });
     await this.mountSharedSessionResources(input.sessionId, input.tenantId, input.sandbox);
     await this.mountFileResources(input.sessionId, input.tenantId, input.sandbox);
@@ -528,10 +535,19 @@ export class SessionRegistry {
     const sandboxWorkdir = join(this.deps.sandboxWorkdirRoot, sessionId);
     const sessionRuntime = await this.loadSessionRuntimeContext(sessionId, tenantId);
     const environment = sessionRuntime.environmentSnapshot;
-    const sandbox = await this.deps.buildSandbox(sessionId, sandboxWorkdir, environment);
+    // Config interviews use platform setup tools only. Never reserve a machine,
+    // mount credentials/resources, or offer host file execution for setup.
+    const unavailable = async (): Promise<never> => { throw new Error("Computer tools are unavailable during setup. Start a work session to use them."); };
+    const sandbox: SandboxExecutor = sessionRuntime.isSetup
+      ? { exec: unavailable, readFile: unavailable, writeFile: unavailable }
+      : await this.deps.buildSandbox(sessionId, sandboxWorkdir, environment, {
+      tenantId,
+      agentId: sessionRuntime.agentId,
+    });
 
     try {
-      await this.provisionSandboxResources({
+      if (sessionRuntime.isSetup) log.info({ op: "session_registry.setup_without_computer", session_id: sessionId }, "Starting setup without provisioning a computer");
+      if (!sessionRuntime.isSetup) await this.provisionSandboxResources({
         sessionId,
         tenantId,
         sandbox,
@@ -710,21 +726,28 @@ export class SessionRegistry {
     environmentId: string | null;
     environmentSnapshot: EnvironmentConfig | null;
     agentSnapshot: AgentConfig | null;
+    agentId: string | null;
+    isSetup: boolean;
   }> {
     const row = await this.deps.sql
       .prepare(
-        `SELECT environment_id, environment_snapshot, agent_snapshot FROM sessions WHERE tenant_id = ? AND id = ?`,
+        `SELECT agent_id, environment_id, environment_snapshot, agent_snapshot, metadata FROM sessions WHERE tenant_id = ? AND id = ?`,
       )
       .bind(tenantId, sessionId)
       .first<{
+        agent_id: string | null;
         environment_id: string | null;
         environment_snapshot: string | null;
         agent_snapshot: string | null;
+        metadata: string | Record<string, unknown> | null;
       }>();
+    const metadata = typeof row?.metadata === "string" ? JSON.parse(row.metadata) : row?.metadata;
     return {
+      isSetup: metadata?.oma_setup === true,
       environmentId: row?.environment_id ?? null,
       environmentSnapshot: parseEnvironmentSnapshot(row?.environment_snapshot),
       agentSnapshot: parseAgentSnapshot(row?.agent_snapshot),
+      agentId: row?.agent_id ?? parseAgentSnapshot(row?.agent_snapshot)?.id ?? null,
     };
   }
 

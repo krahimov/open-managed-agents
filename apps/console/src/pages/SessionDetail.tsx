@@ -23,6 +23,7 @@ import {
 import { TimelineView } from "../components/timeline/TimelineView";
 import { SaveAsEvalDialog } from "./evals/SaveAsEvalDialog";
 import type { Event } from "../lib/events";
+import { eventKey } from "../lib/event-key";
 import type { Trajectory, TrajectoryOutcome } from "../lib/trajectory";
 import { rewardHeadline, outcomeToStatusTone } from "../lib/trajectory";
 // ai-elements primitives — used to render the chat surface (messages,
@@ -165,18 +166,6 @@ export function SessionDetail() {
   const [showTrajectory, setShowTrajectory] = useState(false);
   const seenKeys = useRef(new Set<string>());
   const abortRef = useRef<AbortController | null>(null);
-
-  // Dedup key for SSE re-delivery + initial-fetch overlap. `id` is stamped
-  // on every event by the server (sevt-* for tool_results / stream events;
-  // toolCallId for tool_use overrides) so it's a uniqueness guarantee
-  // across the wire. The previous content-based key dropped legitimate
-  // distinct events whose payloads happened to be byte-identical (two
-  // back-to-back `gh repo list` calls both timing out with the same
-  // 401 stderr was the repro). Fallback only kicks in for legacy events
-  // that pre-date stamping.
-  const eventKey = (e: Event) =>
-    (e as { id?: string }).id
-    ?? `${e.type}:${JSON.stringify(e.content || e.tool_use_id || e.error || "").slice(0, 120)}`;
 
   const addEvent = (e: Record<string, unknown>) => {
     const ev = e as Event;

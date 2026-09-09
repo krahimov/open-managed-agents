@@ -117,6 +117,79 @@ export interface SandboxExecutor {
    * via this. No-op on impls that don't auto-sleep.
    */
   renewActivityTimeout?(): Promise<void>;
+  /** Mark a turn active while the model or tools are running remotely. */
+  setTurnActive?(active: boolean): Promise<void>;
+  /**
+   * Absolute directory the platform guidance names as "the session outputs
+   * dir" for THIS session. Session-scoped adapters return the legacy
+   * `/mnt/session/outputs`; agent-scoped adapters (one box shared by every
+   * session of an agent) return a per-session dir such as
+   * `/mnt/sessions/<sid>/outputs`. Absent ⇒ callers assume the default
+   * (`DEFAULT_SESSION_OUTPUTS_DIR`) and the system prompt text is unchanged.
+   */
+  sessionOutputsPath?(): string;
+  /**
+   * Resolve a CDP endpoint for a browser running INSIDE the sandbox (agent
+   * machines run Chromium behind an in-box proxy). `null` when the sandbox
+   * has no browser (browser disabled, or the adapter cannot host one).
+   * The returned `headers` carry the provider's preview auth token — they
+   * must never be forwarded to clients; main-node connects on their behalf.
+   */
+  getBrowserEndpoint?(): Promise<SandboxBrowserEndpoint | null>;
+  /**
+   * Enumerate background processes started through `startProcess` that this
+   * executor still tracks (both scopes). Used by the machine routes'
+   * `GET …/machine/processes` and by keep-alive bookkeeping.
+   */
+  listProcesses?(): Promise<SandboxProcessInfo[]>;
+  /**
+   * Static capability flags of this executor. Named `sandboxCapabilities`
+   * (not `capabilities`) so it cannot be confused with
+   * `SandboxOrchestrator.capabilities(sandbox)`, which introspects the
+   * optional-method surface instead.
+   */
+  sandboxCapabilities?(): SandboxExecutorCapabilities;
+}
+
+/** Default mount point for per-session outputs (session scope, and the
+ *  path the platform guidance names when an executor does not override
+ *  `sessionOutputsPath()`). */
+export const DEFAULT_SESSION_OUTPUTS_DIR = "/mnt/session/outputs";
+
+/**
+ * CDP endpoint of a browser hosted inside a sandbox. `wsUrl` is the
+ * browser-level DevTools websocket (`…/devtools/browser/<id>`), `httpUrl`
+ * the matching `http(s)://` base for `/json/*` calls, `headers` the auth
+ * headers required by the provider's preview proxy, `generation` the box
+ * generation the endpoint was resolved against (a recreated box invalidates
+ * cached endpoints).
+ */
+export interface SandboxBrowserEndpoint {
+  wsUrl: string;
+  httpUrl: string;
+  headers: Record<string, string>;
+  generation: number;
+  /** Absolute download directory inside the computer, shared with file tools. */
+  downloadsPath?: string;
+}
+
+/** One tracked background process, as reported by `listProcesses()`. */
+export interface SandboxProcessInfo {
+  id: string;
+  pid: number;
+  status: string;
+  /** ms epoch */
+  startedAt: number;
+  command?: string;
+}
+
+/** Static capability flags reported by `SandboxExecutor.sandboxCapabilities()`. */
+export interface SandboxExecutorCapabilities {
+  /** `session`: one box per session (today's default). `agent`: one
+   *  persistent box shared by every session of the agent. */
+  scope: "session" | "agent";
+  /** Whether `getBrowserEndpoint()` can return a live in-box browser. */
+  browser: boolean;
 }
 
 // ─── Factory contract ──────────────────────────────────────────────────
@@ -147,6 +220,31 @@ export interface SandboxFactoryContext {
    *  per-(tenant, session) dirs under here when mountSessionOutputs
    *  is called; remote adapters that don't host-mount can ignore it. */
   outputsRoot?: string;
+  /** Owning tenant. Optional so existing hosts/tests that build a context
+   *  with only the per-session fields keep compiling; agent-scoped
+   *  adapters require it (together with `agentId` and `machines`). */
+  tenantId?: string;
+  /** Owning agent, when the session has one. `null`/absent ⇒ no agent
+   *  machine can be bound and adapters fall back to session scope. */
+  agentId?: string | null;
+  /** Agent-machine binding handed in by the host when it runs an
+   *  `AgentMachineManager`. Absent ⇒ session scope regardless of env. */
+  machines?: AgentMachineBinding;
+}
+
+/**
+ * Host → adapter handle for the per-agent persistent machine manager.
+ * `manager` is typed `unknown` here because the concrete
+ * `AgentMachineManager` port lives in `./machines/ports` (later slice);
+ * adapters narrow it themselves. Kept in the factory context (not env) so
+ * the manager instance — which owns DB rows, locks and SDK handles — is
+ * passed by reference, never re-created per session.
+ */
+export interface AgentMachineBinding {
+  tenantId: string;
+  agentId: string;
+  manager: unknown;
+  spec?: import("./machines/ports").AgentMachineSpec;
 }
 
 /** Read-only view of process env handed to the factory. Whole `process.env`

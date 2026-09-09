@@ -15,11 +15,11 @@ import {
 
 const T0 = Date.parse("2026-07-02T09:00:00.000Z");
 
-function build(opts?: { agentMissing?: boolean; agentMetadata?: Record<string, unknown> }) {
+function build(opts?: { agentMissing?: boolean; agentMetadata?: Record<string, unknown>; environment?: Record<string, unknown> }) {
   const { service: ambientRules } = createInMemoryAmbientRuleService({
     clock: { nowMs: () => T0 },
   });
-  const created: Array<{ agentId: string; title?: string; metadata?: unknown; vaultIds?: string[] }> = [];
+  const created: Array<{ agentId: string; title?: string; metadata?: unknown; vaultIds?: string[]; environmentId?: string; environmentSnapshot?: unknown }> = [];
   const appended: Array<{ sessionId: string; text: string }> = [];
   let now = T0;
 
@@ -47,6 +47,7 @@ function build(opts?: { agentMissing?: boolean; agentMetadata?: Record<string, u
       const content = (event as { content: Array<{ text: string }> }).content;
       appended.push({ sessionId, text: content[0]?.text ?? "" });
     },
+    resolveEnvironment: async (tenantId, id) => { expect(tenantId).toBe(TENANT); expect(id).toBe("env_desktop"); return opts?.environment as never ?? null; },
     now: () => now,
   });
 
@@ -315,4 +316,20 @@ describe("vault MCP injection", () => {
     const snap = created[0].agentSnapshot as { mcp_servers: Array<{ name: string; url: string }> };
     expect(snap.mcp_servers.map((s) => s.name)).toEqual(["custom", "composio_gmail_notion"]);
   });
+});
+
+
+it("ambient sessions retain the agent's tenant-scoped desktop environment", async () => {
+  const environment = { id: 'env_desktop', config: { type: 'cloud', sandbox: { scope: 'agent', desktop: true, snapshot: 'daytona-medium' } } };
+  const t = build({ agentMetadata: { default_environment_id: 'env_desktop' }, environment });
+  await t.ambientRules.create({ tenantId: TENANT, agentId: AGENT, input: { name: 'Monitor', trigger: { source: 'schedule', config: { cron: '* * * * *' } }, wake_mode: 'act', next_wake_at: new Date(T0).toISOString() } });
+  await t.dispatcher.dispatchDue();
+  expect(t.created[0].environmentId).toBe('env_desktop');
+  expect(t.created[0].environmentSnapshot).toEqual(environment);
+});
+it("ambient sessions do not fall back to the host when their environment is missing", async () => {
+  const t = build({ agentMetadata: { default_environment_id: 'env_desktop' } });
+  await t.ambientRules.create({ tenantId: TENANT, agentId: AGENT, input: { name: 'Monitor', trigger: { source: 'schedule', config: { cron: '* * * * *' } }, wake_mode: 'act', next_wake_at: new Date(T0).toISOString() } });
+  await t.dispatcher.dispatchDue();
+  expect(t.created).toHaveLength(0);
 });

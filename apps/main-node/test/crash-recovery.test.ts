@@ -26,6 +26,8 @@ import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:net";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 
 interface ProcessHandle {
@@ -41,12 +43,8 @@ const DEBUG = process.env.DEBUG_CRASH_RECOVERY === "1";
 
 const REPO_ROOT = resolve(__dirname, "../../..");
 const MAIN_NODE_ENTRY = join(REPO_ROOT, "apps/main-node/src/index.ts");
-// Resolve tsx binary directly — `node --import tsx/esm` requires tsx to
-// be resolvable from CWD's node_modules, which fails when the spawned
-// child runs with `cwd: REPO_ROOT` but tsx is hoisted to a different
-// node_modules layout. Pointing at the binary by absolute path is the
-// most portable fix.
-const TSX_BIN = join(REPO_ROOT, "apps/main-node/node_modules/.bin/tsx");
+// Spawn the actual server process so SIGKILL cannot leave a tsx child running.
+const TSX_LOADER = pathToFileURL(createRequire(import.meta.url).resolve("tsx/esm")).href;
 
 async function startMainNode(opts: { dataDir: string }): Promise<ProcessHandle> {
   // Run the real binary via tsx (same toolchain `pnpm start` uses).
@@ -59,13 +57,12 @@ async function startMainNode(opts: { dataDir: string }): Promise<ProcessHandle> 
   // in sqlite, not the listener.
   const port = await pickPort();
   const child = spawn(
-    TSX_BIN,
-    [MAIN_NODE_ENTRY],
+    process.execPath,
+    ["--import", TSX_LOADER, MAIN_NODE_ENTRY],
     {
       cwd: REPO_ROOT,
       env: {
         ...process.env,
-        DATABASE_URL: "",
         PORT: String(port),
         // Hermetic: block main-node's .env self-load from routing this
         // child at the operator's real DATABASE_URL (shared Neon).
@@ -128,7 +125,7 @@ async function startMainNode(opts: { dataDir: string }): Promise<ProcessHandle> 
 
 function killHard(handle: ProcessHandle): Promise<void> {
   return new Promise((res) => {
-    if (handle.child.exitCode !== null) return res();
+    if (handle.child.exitCode !== null || handle.child.signalCode !== null) return res();
     handle.child.once("exit", () => res());
     handle.child.kill("SIGKILL");
   });

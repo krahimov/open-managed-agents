@@ -197,6 +197,26 @@ export interface EnvironmentConfig {
       bootstrap_tools?: boolean;
       bootstrap_apt_packages?: string[];
       max_file_bytes?: number;
+      /** `session` (default): one sandbox per session, discarded at the
+       *  end. `agent`: one persistent "agent machine" shared by every
+       *  session of the agent. Node supports Daytona only and rejects
+       *  other providers for agent scope. */
+      scope?: "agent" | "session";
+      /** Run a Chromium inside the agent machine and expose it to
+       *  the agent's browser tools + the console live view. Defaults to
+       *  true in agent scope; ignored in session scope. */
+      browser?: boolean;
+      /** Enable Daytona desktop, headed Chromium, and authenticated VNC. */
+      desktop?: boolean;
+      /** Minutes of inactivity before the agent machine auto-stops
+       *  (Daytona autoStopInterval). Default 30. */
+      idle_stop_minutes?: number;
+      /** Named Daytona snapshot to boot the machine from instead of
+       *  `image`. When set, `image`/resources are not sent to Daytona. */
+      snapshot?: string;
+      /** Reserved for SDK harness integration. Agent computers currently
+       *  require the default harness; SDK harnesses are rejected. */
+      sdk_mode?: "tools" | "tools_only" | "off";
     };
     /** Default memory stores mounted whenever a session uses this
      *  environment. Session-level resources can still add or override

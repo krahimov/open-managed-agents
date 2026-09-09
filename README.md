@@ -250,3 +250,9 @@ Security reports: see [SECURITY.md](SECURITY.md).
 ## License
 
 [Apache 2.0](LICENSE)
+
+### Persistent cloud computers
+
+Agents can share a persistent Daytona Linux computer across sessions, with a
+workspace, coding tools, and Chromium. The cloud server continues accepted work
+when the console disconnects. See [setup and validation](docs/agent-computer.md).

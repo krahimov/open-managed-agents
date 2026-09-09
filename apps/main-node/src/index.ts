@@ -1,3 +1,4 @@
+import { DesktopGateway } from "./lib/desktop-gateway.js";
 /**
  * apps/main-node — self-host Node entry for the Open Managed Agents API.
  *
@@ -8,6 +9,15 @@
  */
 
 import { randomBytes } from "node:crypto";
+import { AgentMachineManager } from "@open-managed-agents/sandbox/machines/manager";
+import { bootstrapAgentComputer, resolveAgentComputerBrowser } from "@open-managed-agents/sandbox/machines/browser";
+import { createSandboxBrowserHarness } from "@open-managed-agents/browser-harness/sandbox";
+import { NodeAgentMachineStore } from "./lib/agent-machine-store.js";
+import { agentComputerOutputsAdapter } from "./lib/agent-computer-outputs.js";
+import { computerBackupExecutor } from "./lib/agent-computer-backup.js";
+import { agentComputerSpec, agentComputerEnabled } from "./lib/agent-computer-config.js";
+import { buildAgentComputerRoutes } from "./lib/agent-computer-routes.js";
+
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
@@ -70,6 +80,8 @@ import type { AgentConfig, CredentialConfig, EnvironmentConfig, SessionEvent, Tr
 import { generateEventId, extractTextFromContent, extractTraceFacts } from "@open-managed-agents/shared";
 import type { TraceFacts } from "@open-managed-agents/shared";
 import { DefaultHarness } from "@open-managed-agents/agent/harness/default-loop";
+import { CodexSdkHarness } from "./lib/codex-sdk-harness.js";
+import type { SdkMemoryPort } from "./lib/sdk-harness-memory.js";
 import { ClaudeAgentSdkHarness } from "./lib/claude-agent-sdk-harness.js";
 import {
   buildSetupPrompt,
@@ -648,6 +660,65 @@ const workspaceBackups = new NodeWorkspaceBackupService({
   maxBytes: parsePositiveIntEnv(process.env.WORKSPACE_BACKUP_MAX_BYTES),
 });
 
+const machineStore = new NodeAgentMachineStore({ sql, dialect });
+await machineStore.ensureSchema();
+const agentMachines = new AgentMachineManager({
+  store: machineStore,
+  tickIntervalMs: 0,
+  apiKey: process.env.DAYTONA_API_KEY,
+  apiUrl: process.env.DAYTONA_API_URL,
+  bootstrap: bootstrapAgentComputer,
+  browserEndpoint: resolveAgentComputerBrowser,
+  snapshot: async (row, sb) => {
+    const backup = await workspaceBackups.snapshotMachine({
+      tenantId: row.tenantId, machineId: row.id, sandbox: computerBackupExecutor(sb),
+    });
+    if (backup) await machineStore.update(row.id, { lastBackupAt: Date.now() }, Date.now());
+  },
+  restore: async (row, sb) => {
+    const handle = await workspaceBackups.latestForMachine({ tenantId: row.tenantId, machineId: row.id });
+    if (handle) {
+      const result = await workspaceBackups.restoreMachine({
+        tenantId: row.tenantId, machineId: row.id, sandbox: computerBackupExecutor(sb), handle,
+      });
+      if (!result.ok) throw new Error(result.error ?? "Computer workspace restore failed");
+    }
+  },
+});
+// Full desktop connections stay inside the owning agent's machine.
+async function withDesktop<T>(tenantId: string, agentId: string, run: (desktop: NonNullable<NonNullable<Awaited<ReturnType<typeof agentMachines.getBox>>>["sb"]["computerUse"]>) => Promise<T>): Promise<T> {
+  const row = await agentMachines.get(tenantId, agentId);
+  if (!row?.config.desktop) throw new Error("Desktop is not enabled on this computer");
+  return agentMachines.withLock(row.id, async () => {
+    const box = await agentMachines.getBox(tenantId, agentId);
+    if (!box?.sb.computerUse) throw new Error("Desktop is not running");
+    await machineStore.update(row.id, { lastActiveAt: Date.now() }, Date.now());
+    return run(box.sb.computerUse);
+  });
+}
+const desktopGateway = new DesktopGateway(async (tenantId, agentId) => {
+  const row = await agentMachines.get(tenantId, agentId);
+  if (!row?.config.desktop) throw new Error("Desktop is not enabled");
+  return agentMachines.withLock(row.id, async () => {
+    const box = await agentMachines.getBox(tenantId, agentId);
+    if (!box) throw new Error("Desktop is not running");
+    const preview = await box.sb.getPreviewLink(6080);
+    const url = new URL('/websockify', preview.url);
+    if (url.protocol !== 'https:' || !preview.token || box.sb.public) throw new Error("Desktop requires a private HTTPS preview");
+    url.protocol = 'wss:';
+    const sessionId = `desktop_${crypto.randomUUID().replaceAll('-', '')}`;
+    await machineStore.upsertAttachment({ sessionId, machineId: row.id, tenantId, workerId: 'desktop-viewer', generation: row.generation, turnActive: false, bgProcesses: 0, viewers: 1, now: Date.now() });
+    const heartbeat = setInterval(() => { void machineStore.heartbeat(sessionId, Date.now()).catch(() => {}); }, 20_000);
+    heartbeat.unref();
+    return { url: url.href, headers: { 'x-daytona-preview-token': preview.token, 'X-Daytona-Skip-Preview-Warning': 'true' }, release: async () => { clearInterval(heartbeat); await machineStore.detach(sessionId); } };
+  });
+}, new URL(process.env.PUBLIC_BASE_URL ?? 'http://localhost:8787').origin);
+
+const machineTick = setInterval(() => {
+  void agentMachines.tick().catch(err => logger.warn({ err, op: "agent_computer.tick_failed" }, "computer reconciliation failed"));
+}, 30_000);
+machineTick.unref();
+
 const sandboxOrchestrator = new DefaultSandboxOrchestrator({
   backups: workspaceBackups,
 });
@@ -693,9 +764,13 @@ async function buildSandbox(
   sessionId: string,
   workdir: string,
   environment?: EnvironmentConfig | null,
+  owner?: { tenantId: string; agentId: string | null },
 ): Promise<import("@open-managed-agents/sandbox").SandboxExecutor> {
   const sandboxEnv = buildSandboxEnvForEnvironment(process.env, environment);
   const provider = sandboxProviderFromEnvironment(process.env, environment);
+  if (sandboxEnv.SANDBOX_SCOPE === "agent" && provider !== "daytona") {
+    throw new Error("Agent computer scope requires the Daytona provider.");
+  }
   const path = SANDBOX_PROVIDER_PATHS[provider];
   if (!path) {
     throw new Error(
@@ -711,12 +786,32 @@ async function buildSandbox(
       workdir,
       memoryRoot: memoryBlobLocalDir ?? "",
       outputsRoot,
+      ...(owner ?? {}),
+      ...(sandboxEnv.SANDBOX_SCOPE === "agent" && owner?.agentId ? {
+        machines: { ...owner, agentId: owner.agentId, manager: agentMachines, spec: agentComputerSpec(sandboxEnv) },
+      } : {}),
     },
     sandboxEnv,
   );
 }
 
+/**
+ * Outputs dir to name in the platform guidance for this session's sandbox.
+ * Session-scoped adapters either omit `sessionOutputsPath` or return the
+ * legacy `/mnt/session/outputs`; agent-scoped ones return a per-session dir.
+ * `undefined` keeps `composeSystemPrompt`'s default text byte-identical.
+ * Normalised to a single trailing slash to match the guidance wording.
+ */
+function outputsPathFor(
+  sb: import("@open-managed-agents/sandbox").SandboxExecutor | null | undefined,
+): string | undefined {
+  const path = sb?.sessionOutputsPath?.();
+  return path ? path.replace(/\/?$/, "/") : undefined;
+}
+
 // ─── Session registry ───────────────────────────────────────────────────
+
+const sessionBrowsers = new Map<string, ReturnType<typeof createSandboxBrowserHarness>>();
 
 const sessionRegistry = new SessionRegistry({
   sql,
@@ -782,6 +877,9 @@ const sessionRegistry = new SessionRegistry({
       });
     }
     const creds = await resolveNodeModelCredentials(agent, context.tenantId);
+    const browser = sandbox.sandboxCapabilities?.().scope === "agent"
+      ? createSandboxBrowserHarness(sandbox) : undefined;
+    if (browser) sessionBrowsers.set(context.sessionId, browser);
     return buildTools(agent, sandbox, {
       ANTHROPIC_API_KEY: creds.apiCompat.startsWith("ant") ? creds.apiKey : undefined,
       ANTHROPIC_BASE_URL: creds.apiCompat.startsWith("ant") ? creds.baseURL : undefined,
@@ -789,6 +887,18 @@ const sessionRegistry = new SessionRegistry({
       // rate-limit-prone DuckDuckGo scrape (see tools.ts web search block).
       TAVILY_API_KEY: process.env.TAVILY_API_KEY,
       toMarkdown: toMarkdownProvider,
+      browser,
+      computer: browser && buildSandboxEnvForEnvironment(process.env, context.environment).MACHINE_DESKTOP === 'true' ? {
+        screenshot: () => withDesktop(context.tenantId, agent.id, async desktop => {
+          const shot = await desktop.screenshot.takeFullScreen();
+          if (!shot.screenshot) throw new Error('Daytona returned an empty desktop screenshot');
+          return shot.screenshot.replace(/^data:image\/png;base64,/, '');
+        }),
+        click: (x, y, button, double) => withDesktop(context.tenantId, agent.id, d => d.mouse.click(x, y, button, double)),
+        type: text => withDesktop(context.tenantId, agent.id, d => d.keyboard.type(text)),
+        press: (key, modifiers) => withDesktop(context.tenantId, agent.id, d => d.keyboard.press(key, modifiers)),
+        scroll: (x, y, direction, amount) => withDesktop(context.tenantId, agent.id, d => d.mouse.scroll(x, y, direction, amount)),
+      } : undefined,
       environmentConfig: context.environment?.config as never,
       mcpBinding: nodeMcpBinding,
       tenantId: context.tenantId,
@@ -852,6 +962,66 @@ const sessionRegistry = new SessionRegistry({
   },
   buildHarness: () => {
     const def = new DefaultHarness();
+    const sdkMemoryPort: SdkMemoryPort = {
+      resolve: async (tenantId, sessionId) => {
+        const rows = await sql
+          .prepare(
+            `SELECT store_id, access FROM session_memory_stores WHERE session_id = ?`,
+          )
+          .bind(sessionId)
+          .all<{ store_id: string; access: string }>();
+        const out: Array<{
+          storeId: string;
+          name: string;
+          access: "read_write" | "read_only";
+          memories: Array<{ path: string; content: string }>;
+        }> = [];
+        for (const r of rows.results ?? []) {
+          const store = await memoryService
+            .getStore({ tenantId, storeId: r.store_id })
+            .catch(() => null);
+          if (!store) continue;
+          const metas = await memoryService
+            .listMemories({ tenantId, storeId: r.store_id })
+            .catch(() => []);
+          const memories: Array<{ path: string; content: string }> = [];
+          for (const m of metas) {
+            const full = await memoryService
+              .readByPath({ tenantId, storeId: r.store_id, path: m.path })
+              .catch(() => null);
+            memories.push({ path: m.path, content: full?.content ?? "" });
+          }
+          out.push({
+            storeId: r.store_id,
+            name: store.name,
+            access: r.access === "read_only" ? "read_only" : "read_write",
+            memories,
+          });
+        }
+        return out;
+      },
+      write: async ({ tenantId, sessionId, storeId, path: memPath, content, baseSha256 }) => {
+        try {
+          await memoryService.writeByPath({
+            tenantId,
+            storeId,
+            path: memPath,
+            content,
+            precondition: baseSha256
+              ? { type: "content_sha256", content_sha256: baseSha256 }
+              : { type: "not_exists" },
+            actor: { type: "agent_session", id: sessionId },
+          });
+          return { ok: true };
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          const conflict =
+            (err as { name?: string })?.name === "MemoryPreconditionFailedError" ||
+            /precondition|sha256|exists/i.test(msg);
+          return { ok: false, conflict, error: msg };
+        }
+      },
+    };
     const sdk = new ClaudeAgentSdkHarness({
       resolveMcpTarget: resolveNodeMcpProxyTarget,
       resolveSkills: (tenantId, refs) => skillStore.resolveRefs(tenantId, refs),
@@ -879,6 +1049,27 @@ const sessionRegistry = new SessionRegistry({
       requestSkill: (tenantId, agentId, sessionId, a) =>
         postSkillRequest(tenantId, agentId, sessionId, a),
     });
+    const codexSdk = new CodexSdkHarness({
+      resolveMcpTarget: resolveNodeMcpProxyTarget,
+      resolveSkills: (tenantId, refs) => skillStore.resolveRefs(tenantId, refs),
+      memory: sdkMemoryPort,
+      readSessionMetadata: async (tenantId, sessionId) =>
+        (await sessionsService.get({ tenantId, sessionId }))?.metadata ?? null,
+      updateAgent: async (tenantId, agentId, patch) => {
+        return await agentsService.update({ tenantId, agentId, input: patch });
+      },
+      requestServiceAccess: (tenantId, sessionId, a) =>
+        postAccessRequest(tenantId, sessionId, a),
+      createAmbientRule: (tenantId, sessionId, agentId, a) =>
+        createAmbientRuleFromSession(tenantId, agentId, sessionId, a),
+      findSkills: (tenantId, query) => findSkillsForTenant(tenantId, query),
+      requestSkill: (tenantId, agentId, sessionId, a) =>
+        postSkillRequest(tenantId, agentId, sessionId, a),
+      scheduleWakeup: (tenantId, sessionId, agentId, a) =>
+        sessionWakeups.schedule({ tenantId, sessionId, agentId, ...a }),
+      cancelWakeup: (sessionId, id) => sessionWakeups.cancel(sessionId, id),
+      listWakeups: (sessionId) => sessionWakeups.list(sessionId),
+    });
     return {
       run: (ctx: unknown) => {
         const c = ctx as HarnessContext;
@@ -900,11 +1091,29 @@ const sessionRegistry = new SessionRegistry({
           }
           return sdk.run(c);
         }
+        if (harness === "codex-sdk") {
+          // Same hard gate as claude-agent-sdk: runs the Codex CLI ON THE
+          // HOST with approvals disabled — single-operator/self-host only.
+          if (process.env.OMA_ENABLE_CODEX_SDK !== "1") {
+            const msg =
+              "codex-sdk harness is disabled on this deployment — it runs the " +
+              "OpenAI Codex CLI on the host and is intended for " +
+              "single-operator self-hosting. Set OMA_ENABLE_CODEX_SDK=1 to enable.";
+            c.runtime.broadcast({ type: "session.error", error: msg } as SessionEvent);
+            return Promise.reject(new Error(msg));
+          }
+          return codexSdk.run(c);
+        }
         return def.run(c);
       },
     };
   },
   buildHarnessContext: async (input) => {
+    const harness = input.agent.harness ?? process.env.OMA_DEFAULT_HARNESS;
+    if (input.sandbox.sandboxCapabilities?.().scope === "agent" &&
+        harness === "claude-agent-sdk") {
+      throw new Error("Agent computers support default and codex-sdk harnesses. Claude SDK host tools cannot use an agent computer yet.");
+    }
     const creds = await resolveNodeModelCredentials(input.agent, input.tenantId);
     const runtime = new NodeHarnessRuntime({
       sessionId: input.sessionId,
@@ -946,7 +1155,9 @@ const sessionRegistry = new SessionRegistry({
       // (written for the working toolset) and no memory reminders.
       systemPrompt: isSetup
         ? rawSystemPrompt
-        : composeSystemPrompt(rawSystemPrompt, memoryContext.reminders),
+        : composeSystemPrompt(rawSystemPrompt, memoryContext.reminders, {
+            outputsPath: outputsPathFor(input.sandbox),
+          }),
       rawSystemPrompt,
       platformReminders: isSetup ? [] : memoryContext.reminders,
       env: {
@@ -976,7 +1187,18 @@ const sessionWorkQueue = new NodeSessionWorkQueue({
   dialect,
   run: async (item) => {
     const entry = await sessionRegistry.getOrCreate(item.sessionId, item.tenantId);
+    await entry.sandbox.setTurnActive?.(true);
+    try {
     await entry.machine.runHarnessTurn(item.agentId, item.event);
+    } finally {
+      const browser = sessionBrowsers.get(item.sessionId);
+      sessionBrowsers.delete(item.sessionId);
+      try {
+        await browser?.dispose();
+      } finally {
+        await entry.sandbox.setTurnActive?.(false);
+      }
+    }
     // Best-effort, never throws — a Slack hiccup must not fail the turn.
     await slackReplyBridge?.mirrorTurnReply({
       tenantId: item.tenantId,
@@ -1366,6 +1588,47 @@ v1.use("*", async (c, next) => {
   await ensureTenantDefaults(c.var.tenant_id);
   await next();
 });
+
+v1.route("/agents", buildAgentComputerRoutes({
+  machines: agentMachines,
+  supported: agentComputerEnabled(process.env),
+  spec: async (tenantId, agentId) => {
+    const agent = await agentsService.get({ tenantId, agentId });
+    if (!agent) throw new Error('Agent not found');
+    const environmentId = agent.metadata?.default_environment_id;
+    const environment = typeof environmentId === 'string'
+      ? await environmentsService.get({ tenantId, environmentId }) : null;
+    if (typeof environmentId === 'string' && !environment) throw new Error('Agent environment not found');
+    return agentComputerSpec(buildSandboxEnvForEnvironment(process.env, environment ? toEnvironmentConfig(environment) : null));
+  },
+  agentExists: async (tenantId, agentId) => !!await agentsService.get({ tenantId, agentId }).catch(() => null),
+  desktopTicket: (tenantId, agentId) => desktopGateway.issue(tenantId, agentId),
+  screenshot: async (tenantId, agentId) => {
+    const row = await agentMachines.get(tenantId, agentId);
+    if (!row) throw new Error("Computer is not running");
+    if (row.config.desktop) return withDesktop(tenantId, agentId, async desktop => {
+      const shot = await desktop.screenshot.takeFullScreen();
+      if (!shot.screenshot) throw new Error('Daytona returned an empty desktop screenshot');
+      return Buffer.from(shot.screenshot.replace(/^data:image\/png;base64,/, ''), 'base64');
+    });
+    return agentMachines.withLock(row.id, async () => {
+    const box = await agentMachines.getBox(tenantId, agentId);
+    if (!box) throw new Error("Computer is not running");
+    await machineStore.update(row.id, { lastActiveAt: Date.now() }, Date.now());
+    const browser = createSandboxBrowserHarness({
+      getBrowserEndpoint: () => resolveAgentComputerBrowser(box.sb, box.generation),
+    });
+    const session = await browser.launch();
+    try {
+      const image = await (await session.page()).screenshot({ type: "png" });
+      return image instanceof Uint8Array ? image : Buffer.from(image.toString("base64"), "base64");
+    } finally {
+      await session.close();
+    }
+    });
+  },
+  logError: err => logger.warn({ err, op: "agent_computer.request_failed" }, "computer request failed"),
+}));
 
 // ── Evidence export — read-only audit projections (authority record) ──
 // Capability statement, approval history, activity log. Registered before
@@ -1843,7 +2106,33 @@ v1.post("/skills/acquire", async (c) => {
 const sessionRoutesApp = buildSessionRoutes({
   services,
   router: sessionRouter,
-  outputs: sessionOutputsBackend.adapter,
+  outputs: agentComputerOutputsAdapter({
+    fallback: sessionOutputsBackend.adapter,
+    resolve: async (tenantId, sessionId) => {
+      const session = await sessionsService.get({ tenantId, sessionId });
+      if (!session?.agent_id) return null;
+      const env = buildSandboxEnvForEnvironment(process.env, session.environment_snapshot);
+      if (!agentComputerEnabled(env)) return null;
+      const row = await agentMachines.get(tenantId, session.agent_id);
+      if (!row) return null;
+      let box = await agentMachines.getBox(tenantId, session.agent_id);
+      if (!box) {
+        await agentMachines.start(tenantId, session.agent_id, row.config);
+        box = await agentMachines.getBox(tenantId, session.agent_id);
+      }
+      if (!box) throw new Error("Computer files are temporarily unavailable");
+      const executor = computerBackupExecutor(box.sb);
+      const exec = executor.exec.bind(executor);
+      executor.exec = (command, timeout) => agentMachines.withLock(row.id, async () => {
+        await machineStore.update(row.id, { lastActiveAt: Date.now() }, Date.now());
+        return exec(command, timeout);
+      });
+      return {
+        sandbox: executor,
+        outputsPath: `/mnt/sessions/${sessionId}/outputs`,
+      };
+    },
+  }),
   lifecycle: {
     ...nodeSessionLifecycle({ files: filesService, filesBlob }),
     // Clerk Billing entitlement gate: free-plan tenants get a concurrent-
@@ -2937,18 +3226,24 @@ app.onError((err, c) => {
 
 const port = Number(process.env.PORT ?? 8787);
 const host = process.env.HOST ?? "0.0.0.0";
-serve({ fetch: app.fetch, port, hostname: host }, (info) => {
+const httpServer = serve({ fetch: app.fetch, port, hostname: host }, (info) => {
   logger.info(
     { op: "main-node.listening", address: info.address, port: info.port, db: backendDescription },
     `listening on http://${info.address}:${info.port}`,
   );
 });
 
+desktopGateway.attach(httpServer as import("node:http").Server);
+
 // Cron — eval-tick + memory retention sweep + (when integrations schema is
 // applied) webhook-events retention. Linear dispatch is left un-wired here
 // because main-node doesn't construct a LinearProvider; pass `linearSweeper`
 // when an in-process gateway lands.
 const ambientDispatcher = new NodeAmbientDispatcher({
+  resolveEnvironment: async (tenantId, environmentId) => {
+    const environment = await environmentsService.get({ tenantId, environmentId });
+    return environment ? toEnvironmentConfig(environment) : null;
+  },
   ambientRules: ambientRulesService,
   agents: agentsService,
   sessions: sessionsService,
@@ -3019,6 +3314,9 @@ logger.info({ op: "main-node.scheduler.started" }, "scheduler started");
 
 const shutdown = async (signal: string) => {
   logger.info({ op: "main-node.shutdown", signal }, `received ${signal}, shutting down`);
+  clearInterval(machineTick);
+  await agentMachines.dispose();
+  desktopGateway.close();
   try { await scheduler.stop(); } catch (err) { logger.warn({ err, op: "main-node.shutdown.scheduler_stop_failed" }, "scheduler stop failed"); }
   try { await memoryWatcher.stop(); } catch (err) { logger.warn({ err, op: "main-node.shutdown.watcher_stop_failed" }, "memory watcher stop failed"); }
   if (s3Poller) {

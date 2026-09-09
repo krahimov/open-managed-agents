@@ -24,6 +24,10 @@ export const generatePermissionGrantId = () => `grant-${nanoid()}`;
 // events can name which outcome they pertain to (sessions can chain
 // outcomes sequentially; same session, different outcome ids).
 export const generateOutcomeId = () => `outc_${nanoid()}`;
+// Agent machine (per-agent persistent sandbox, see packages/sandbox/src/
+// machines/ports.ts) and its lifecycle-event rows.
+export const generateAgentMachineId = () => `amch-${nanoid()}`;
+export const generateAgentMachineEventId = () => `amev-${nanoid()}`;
 
 /**
  * Sentinel environment_id for sessions whose agent runs on a user-registered

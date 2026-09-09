@@ -3,7 +3,7 @@
 // Three impls live in sibling files:
 //   - cf.ts      → wraps @cloudflare/playwright + the BROWSER binding
 //   - node.ts    → wraps playwright-core's chromium.launch() (lazy import)
-//   - cdp.ts     → wraps playwright-core's chromium.connect() to a remote
+//   - cdp.ts     → wraps playwright-core's chromium.connectOverCDP() to a remote
 //                  Browserless / k8s pool (BROWSERLESS_URL)
 //   - disabled.ts → throw-on-call placeholder when nothing else is wired
 //
@@ -145,7 +145,7 @@ export function buildBrowserTools(
         const src = (output as unknown as { source: { data: string; media_type: string } }).source;
         return {
           type: "content" as const,
-          value: [{ type: "file-data" as const, data: src.data, mediaType: src.media_type }],
+          value: [{ type: "image-data" as const, data: src.data, mediaType: src.media_type }],
         };
       }
       return { type: "text" as const, value: typeof output === "string" ? output : JSON.stringify(output) };
@@ -247,7 +247,7 @@ export function buildBrowserTools(
   tools.browser_close = tool({
     description:
       "Close the browser session. Use only when you're truly done — subsequent " +
-      "browser_* calls will spin up a fresh session (loses cookies/state).",
+      "browser_* calls will reconnect. Agent computers preserve their shared tabs and cookies.",
     inputSchema: z.object({}),
     execute: async () => {
       if (!session || !session.isOpen()) return "No browser session to close.";
@@ -274,3 +274,5 @@ function bufferToBase64(buf: Uint8Array | { toString(enc: string): string }): st
   }
   return (buf as { toString: (enc: string) => string }).toString("base64");
 }
+
+export { buildComputerTools, type DesktopControl } from "./computer";
