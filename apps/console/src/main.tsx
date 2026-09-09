@@ -278,6 +278,10 @@ const router = createBrowserRouter([
   { path: "login", element: <Login /> },
   { path: "cli/login", element: <CliLogin /> },
   { path: "connect-runtime", element: <ConnectRuntime /> },
+  { path: "telegram/connect/:sessionId/:requestId", lazy: async () => {
+    const { TelegramConnect } = await import("./pages/TelegramConnect");
+    return { Component: TelegramConnect };
+  }, handle: { crumb: "Connect agent app" } },
   { path: "composio/callback", element: <ComposioCallback /> },
   {
     element: <AppShell />,

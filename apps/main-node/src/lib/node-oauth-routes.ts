@@ -3,6 +3,7 @@ import type { CredentialAuth } from "@open-managed-agents/shared";
 import type { RouteServices } from "@open-managed-agents/http-routes";
 
 interface OAuthState {
+  completion_key?: string;
   tenant_id: string;
   vault_id: string;
   credential_id?: string;
@@ -79,6 +80,8 @@ export interface OAuthAppRequirement {
 }
 
 export interface NodeOAuthRoutesDeps {
+  /** Internal completion receipt for a scoped Telegram connection. Never accepted from query input. */
+  completionKey?: string;
   services: RouteServices;
   env?: Record<string, string | undefined>;
   /** Called after a credential is persisted for a flow that carried a
@@ -227,6 +230,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     const codeChallenge = await sha256Base64url(codeVerifier);
     const state = randomString(32);
     const oauthState: OAuthState = {
+      completion_key: deps.completionKey,
       tenant_id: tenantId,
       vault_id: vaultId,
       credential_id: credentialId,
@@ -388,6 +392,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     }
 
     await deps.services.kv.delete(stateKey);
+    if (oauthState.completion_key) await deps.services.kv.put(oauthState.completion_key, "complete", { expirationTtl: 900 });
     const probeResult = await probeMcpServer(oauthState.mcp_server_url, tokens.access_token);
 
     // Record the grant server-side. Until now the ONLY thing telling the

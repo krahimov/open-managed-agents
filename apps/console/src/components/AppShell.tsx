@@ -35,6 +35,7 @@ import { AppSidebar } from "./AppSidebar";
 import { AppBreadcrumb } from "./AppBreadcrumb";
 import { BrandLoader } from "./BrandLoader";
 import { CommandPalette } from "./CommandPalette";
+import { TelegramOnboarding } from "./TelegramOnboarding";
 import { NavigationProgress } from "./NavigationProgress";
 
 /**
@@ -73,7 +74,7 @@ export interface AppOutletContext {
 
 export function AppShell() {
   const { isAuthenticated, isLoading } = useAuth();
-  const { pathname } = useLocation();
+  const { pathname, search, hash } = useLocation();
   const navigate = useNavigate();
   const [pageHeaderSlot, setPageHeaderSlot] = useState<HTMLDivElement | null>(null);
 
@@ -114,7 +115,7 @@ export function AppShell() {
   }
 
   if (!isAuthenticated) {
-    return <Navigate to="/login" replace />;
+    return <Navigate to={`/login?next=${encodeURIComponent(pathname + search + hash)}`} replace />;
   }
 
   return (
@@ -172,6 +173,7 @@ export function AppShell() {
                   scrolled ? "border-b border-border" : "border-b border-transparent",
                 ].join(" ")}
               />
+              <TelegramOnboarding />
               <main
                 ref={(el) => {
                   mainRef.current = el;

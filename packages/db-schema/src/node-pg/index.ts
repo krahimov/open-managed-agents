@@ -26,3 +26,5 @@ export * from "./cf-router-sharding";
 export * from "./cf-integrations-linear";
 export * from "./cf-integrations-github";
 export * from "./cf-integrations-slack";
+
+export * from "./telegram";
