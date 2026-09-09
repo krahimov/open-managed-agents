@@ -549,6 +549,16 @@ export class CodexSdkHarness {
       throw new Error(message);
     };
 
+    // Optional operator restriction for subscription-backed acceptance runs.
+    // Bind both tenant and agent, and require the isolated computer path.
+    const allowedAgents = process.env.OMA_CODEX_ALLOWED_AGENTS;
+    if (allowedAgents !== undefined) {
+      const allowed = new Set(allowedAgents.split(",").map(value => value.trim()).filter(Boolean));
+      if (!ctx.tenant_id || !ctx.agent.id || !allowed.has(`${ctx.tenant_id}/${ctx.agent.id}`) || !computer) {
+        fail("Codex subscription access is restricted to operator-approved agents with a cloud computer.");
+      }
+    }
+
     // Setup sessions (the agent's first session, refining its own harness)
     // run the focused config-designer conversation. The oma_setup toolset is
     // served over the loopback MCP bridge since the Codex SDK has no

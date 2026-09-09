@@ -87,7 +87,25 @@ describe("curatedCodexEnv", () => {
 });
 
 describe("CodexSdkHarness.run", () => {
+  it.each(["", "default/agent-other", "other-tenant/agent-1"])("rejects agents outside the operator allowlist %j before starting Codex", async allowed => {
+    vi.stubEnv("OMA_CODEX_ALLOWED_AGENTS", allowed);
+    const createCodex = vi.fn();
+    const h = new CodexSdkHarness({ createCodex });
+    const { ctx } = makeCtx({ runtime: { sandbox: { sandboxCapabilities: () => ({ scope: "agent" }) } } });
+    await expect(h.run(ctx)).rejects.toThrow("restricted to operator-approved agents");
+    expect(createCodex).not.toHaveBeenCalled();
+  });
+
+  it("requires an isolated computer even for an allowlisted agent", async () => {
+    vi.stubEnv("OMA_CODEX_ALLOWED_AGENTS", "default/agent-1");
+    const createCodex = vi.fn();
+    const h = new CodexSdkHarness({ createCodex });
+    await expect(h.run(makeCtx().ctx)).rejects.toThrow("restricted to operator-approved agents");
+    expect(createCodex).not.toHaveBeenCalled();
+  });
+
   it("isolates agent computers from native host tools and forces subscription auth", async () => {
+    vi.stubEnv("OMA_CODEX_ALLOWED_AGENTS", "default/agent-other, default/agent-1 ");
     const calls = { started: [] as unknown[], resumed: [] as Array<{ id: string; options: unknown }> };
     let options: any;
     const h = new CodexSdkHarness({ createCodex: o => { options = o; return fakeCodex([], calls); } });
