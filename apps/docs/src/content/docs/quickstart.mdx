@@ -1,100 +1,192 @@
 ---
 title: Quickstart
-description: Sign up, get an API key, and run your first agent session in under five minutes.
+description: Run your first openma agent locally with Docker, or use the hosted Console.
 ---
 
 import { Steps, Tabs, TabItem, Aside, LinkCard } from '@astrojs/starlight/components';
 
-This walks you through the **hosted path** — fastest way from zero to a running agent. If you want to self-host instead, jump to [Self-host → Overview](/self-host/overview/).
+The managed Console is openma's main product surface. For this open-source repository, however, the most reliable evaluation path is a local Docker stack. Choose either path below; both end with a streamed agent turn.
+
+<Tabs syncKey="quickstart-path">
+  <TabItem label="Docker local (recommended)">
+
+## Prerequisites
+
+- Git
+- Docker Engine or Docker Desktop with Docker Compose v2
+- `curl`, `jq`, and OpenSSL
+- An OpenAI or Anthropic API key
+
+Use a disposable provider key with a low spending limit for evaluation, and revoke it afterward.
+
+## Run the stack
+
+<Steps>
+
+1. **Clone the repository and create your environment file.**
+
+   ```bash
+   git clone https://github.com/krahimov/open-managed-agents.git
+   cd open-managed-agents
+   cp .env.example .env
+   ```
+
+2. **Generate the two local secrets.**
+
+   ```bash
+   openssl rand -hex 32       # BETTER_AUTH_SECRET
+   openssl rand -base64 32    # PLATFORM_ROOT_SECRET — back this up
+   ```
+
+   Edit `.env` and paste the generated values. For the shortest local-only smoke test, also enable auth bypass and configure one model provider:
+
+   ```dotenv
+   BETTER_AUTH_SECRET=<first generated value>
+   PLATFORM_ROOT_SECRET=<second generated value>
+   AUTH_DISABLED=1
+
+   OPENAI_API_KEY=<disposable OpenAI key>
+   OPENAI_MODEL=gpt-5.4-mini
+   # Or use ANTHROPIC_API_KEY and ANTHROPIC_MODEL=claude-sonnet-4-6.
+   ```
+
+   <Aside type="caution" title="Local evaluation only">
+     `AUTH_DISABLED=1` maps every request to the `default` tenant. Never use it for a shared or Internet-facing deployment. For persistent use, leave it unset, sign in through the Console, and create a tenant API key.
+   </Aside>
+
+3. **Start SQLite + local filesystem storage.**
+
+   ```bash
+   docker compose up -d --build
+   curl --fail --silent http://localhost:8787/health | jq
+   ```
+
+   A successful response contains `"status": "ok"`, `"runtime": "node"`, and a SQLite database backend. The Console is available at [localhost:8787](http://localhost:8787).
+
+4. **Create an agent and session.**
+
+   ```bash
+   BASE=http://localhost:8787
+   MODEL=gpt-5.4-mini
+
+   AGENT=$(curl --fail --silent -X POST "$BASE/v1/agents" \
+     -H 'content-type: application/json' \
+     -d "{\"name\":\"hello-agent\",\"model\":\"$MODEL\",\"system\":\"Reply in one short sentence.\",\"tools\":[]}" \
+     | jq -r .id)
+
+   test -n "$AGENT" && test "$AGENT" != null
+
+   SESSION=$(curl --fail --silent -X POST "$BASE/v1/sessions" \
+     -H 'content-type: application/json' \
+     -d "{\"agent\":\"$AGENT\",\"title\":\"quickstart\"}" \
+     | jq -r .id)
+
+   test -n "$SESSION" && test "$SESSION" != null
+   ```
+
+   Node's local runtime supplies its local environment automatically. Cloud agents require an explicit `environment_id`.
+
+5. **Send a message and stream the response.**
+
+   ```bash
+   curl --fail-with-body -N -X POST "$BASE/v1/sessions/$SESSION/messages" \
+     -H 'content-type: application/json' \
+     -d '{"content":"Reply with exactly: openma is running"}'
+   ```
+
+   The SSE stream should contain the model reply and finish with `session.status_idle`.
+
+6. **Stop the stack and revoke the smoke-test key.**
+
+   ```bash
+   docker compose down
+   ```
+
+   Data remains under `./data`. Revoke the disposable OpenAI or Anthropic key in the provider dashboard.
+
+</Steps>
+
+## If the first turn fails
+
+| Symptom | Resolution |
+|---|---|
+| `401 Unauthorized` | Set `AUTH_DISABLED=1` for this local test, or sign in and send a real tenant `x-api-key`. |
+| “No model card” or provider authentication error | Configure one provider key and use its matching model ID. After editing `.env`, run `docker compose up -d --force-recreate oma-server`. |
+| Port `8787` is unavailable | Set `OMA_PORT` in `.env` and update `BASE`. |
+| Compose command is missing | Install Docker Compose v2 and confirm with `docker compose version`. |
+| Remote-sandbox memory turn stalls or fails | Daytona, E2B, and BoxRun need shared `MEMORY_S3_*` configuration for memory-store mounts. Local subprocess mode uses `./data/memory-blobs`. |
+| Previously stored credentials cannot decrypt | Restore the original `PLATFORM_ROOT_SECRET`; losing it makes encrypted rows unrecoverable. |
+
+<Aside type="danger" title="The default sandbox is not isolated">
+  `SANDBOX_PROVIDER=subprocess` executes trusted agent commands as host child processes. Use an isolated provider before running untrusted agents.
+</Aside>
+
+  </TabItem>
+  <TabItem label="Hosted">
 
 ## Prerequisites
 
 - A web browser
-- `curl` (or Postman, or any HTTP client)
-- About 5 minutes
-
-## Steps
+- `curl` or another HTTP client
+- A hosted openma account
 
 <Steps>
 
 1. **Create an account.**
 
-   Go to [app.openma.dev](https://app.openma.dev) and sign up with email, email-OTP, or Google. Your tenant is created automatically on first sign-in — no manual setup.
+   Go to [app.openma.dev](https://app.openma.dev) and sign up. Your tenant is created on first sign-in.
 
 2. **Create an API key.**
 
-   In the Console, open **API Keys → New key**. Copy it now; you won't see it again.
+   In the Console, open **API Keys → New key**. Copy it now; it is only shown once.
 
    ```bash
    export OMA_BASE_URL="https://app.openma.dev"
-   export OMA_API_KEY="oma_..."     # the key you just copied
+   export OMA_API_KEY="oma_..."
    ```
 
-3. **Create your first agent.**
+3. **Create an agent.**
 
    ```bash
-   curl -X POST "$OMA_BASE_URL/v1/agents" \
+   AGENT_ID=$(curl --fail --silent -X POST "$OMA_BASE_URL/v1/agents" \
      -H "x-api-key: $OMA_API_KEY" \
-     -H "Content-Type: application/json" \
-     -d '{
-       "name": "hello-agent",
-       "model": "claude-sonnet-4-6",
-       "system": "You are a friendly assistant. Keep replies under 3 sentences.",
-       "tools": []
-     }'
+     -H 'content-type: application/json' \
+     -d '{"name":"hello-agent","model":"claude-sonnet-4-6","system":"Reply in one short sentence.","tools":[]}' \
+     | jq -r .id)
    ```
 
-   Save the returned `id` — you'll need it next.
+4. **Create a session using an environment from your tenant.**
 
-4. **Start a session and stream a turn.**
+   Create or select an environment in the Console, then set its ID:
 
    ```bash
-   AGENT_ID="agent_..."   # from previous step
-   ENV_ID="env_..."       # any environment in your tenant; create one in the Console if you don't have one yet
+   ENV_ID="env_..."
 
-   curl -X POST "$OMA_BASE_URL/v1/sessions" \
+   SESSION_ID=$(curl --fail --silent -X POST "$OMA_BASE_URL/v1/sessions" \
      -H "x-api-key: $OMA_API_KEY" \
-     -H "Content-Type: application/json" \
-     -d "{ \"agent\": \"$AGENT_ID\", \"environment_id\": \"$ENV_ID\", \"title\": \"hello\" }"
+     -H 'content-type: application/json' \
+     -d "{\"agent\":\"$AGENT_ID\",\"environment_id\":\"$ENV_ID\",\"title\":\"quickstart\"}" \
+     | jq -r .id)
    ```
 
-   The response includes a session `id`. Post a user turn AND stream the reply token-by-token in one shot:
+5. **Send a message and stream the reply.**
 
    ```bash
-   SESSION_ID="sess_..."
-
-   curl -N -X POST "$OMA_BASE_URL/v1/sessions/$SESSION_ID/messages" \
+   curl --fail-with-body -N -X POST "$OMA_BASE_URL/v1/sessions/$SESSION_ID/messages" \
      -H "x-api-key: $OMA_API_KEY" \
-     -H "Content-Type: application/json" \
-     -d '{ "content": "What is 2+2?" }'
+     -H 'content-type: application/json' \
+     -d '{"content":"Reply with exactly: openma is running"}'
    ```
 
-   You'll see Server-Sent Events for the user echo, every model token, every tool call, and every tool result. The connection auto-closes when the turn finishes (`session.status_idle`). For long-lived sessions use `GET /v1/sessions/$SESSION_ID/events/stream` instead — never closes, replays history on connect.
-
-5. **Check it in the Console.**
-
-   Back in [app.openma.dev](https://app.openma.dev), open **Sessions** → click your new session. You'll see the full event stream, including the model's reply.
+   The stream closes after `session.status_idle`. The session and its complete event history are also visible under **Sessions** in the Console.
 
 </Steps>
 
-<Aside type="tip" title="That's the whole loop">
-  Every richer feature — sandboxed code execution, MCP servers, custom skills, Linear/GitHub/Slack integrations — works through the same `agents` + `sessions` shape. Add tools, add a sandbox `environment`, plug in an `integration`, and the rest follows.
-</Aside>
+  </TabItem>
+</Tabs>
 
 ## Where to go next
 
-<LinkCard
-  title="Concepts"
-  href="/concepts/"
-  description="Learn the nouns: Agent, Session, Environment, Vault, Skill, Tool, Harness, Integration."
-/>
-<LinkCard
-  title="Use the Console"
-  href="/console/getting-started/"
-  description="Create agents, sessions, environments, and skills from the UI instead of the API."
-/>
-<LinkCard
-  title="Build with the API"
-  href="/build/api/"
-  description="REST surface, auth, SSE streaming, the CLI, and the SDK types package."
-/>
+<LinkCard title="Concepts" href="/concepts/" description="Learn the nouns: Agent, Session, Environment, Vault, Skill, Tool, Harness, Integration." />
+<LinkCard title="Node + Docker" href="/self-host/node-docker/" description="Authentication, Postgres, isolated sandboxes, memory storage, backups, and operations." />
+<LinkCard title="Build with the API" href="/build/api/" description="REST surface, authentication, SSE streaming, CLI, and SDK types." />
