@@ -80,6 +80,8 @@ export interface DaytonaFileSystem {
 export interface DaytonaPreviewLink {
   url: string;
   token: string;
+  /** Alternative private preview transport, used by Modal Connect tokens. */
+  headers?: Record<string, string>;
 }
 
 export interface DaytonaSandboxInstance {

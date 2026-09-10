@@ -16,7 +16,8 @@
     "./orchestrator": "./src/orchestrator.ts",
     "./machines": "./src/machines/index.ts",
     "./machines/manager": "./src/machines/manager.ts",
-    "./machines/browser": "./src/machines/browser.ts"
+    "./machines/browser": "./src/machines/browser.ts",
+    "./adapters/modal": "./src/adapters/modal.ts"
   },
   "scripts": {
     "test": "vitest run --config vitest.config.ts",
@@ -26,6 +27,7 @@
     "@aws-sdk/client-s3": "^3.1044.0",
     "@open-managed-agents/observability": "workspace:*",
     "@open-managed-agents/shared": "workspace:*",
+    "modal": "0.10.0",
     "nanoid": "^5.1.9"
   },
   "peerDependencies": {

@@ -269,6 +269,7 @@ export function EnvironmentDetail() {
                 onValueChange={(v) => setSandbox((s) => ({ ...s, provider: v }))}
               >
                 <SelectOption value="daytona">Daytona</SelectOption>
+                <SelectOption value="modal">Modal (experimental)</SelectOption>
                 <SelectOption value="subprocess">Local subprocess</SelectOption>
                 <SelectOption value="litebox">LiteBox</SelectOption>
                 <SelectOption value="boxrun">BoxRun</SelectOption>

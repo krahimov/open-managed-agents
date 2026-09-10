@@ -48,6 +48,8 @@ export type AgentMachineSdkMode = "tools" | "tools_only" | "off";
 
 /** Frozen per-machine configuration (persisted as `config_json`). */
 export interface AgentMachineSpec {
+  /** Omitted on existing machines, which use Daytona. */
+  provider?: "daytona" | "modal";
   image: string;
   /** Named provider snapshot. When set, `image`/resources are not sent
    *  to the provider at create time (design §0 "Configuration"). */
