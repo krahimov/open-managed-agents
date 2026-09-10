@@ -21,7 +21,7 @@ export function buildSandboxEnvForEnvironment(
   setString(out, "SANDBOX_IMAGE", sandbox.image);
   setString(out, "DAYTONA_WORKDIR", sandbox.workdir);
   setString(out, "SANDBOX_SCOPE", sandbox.scope);
-  setString(out, "DAYTONA_SNAPSHOT", sandbox.snapshot);
+  setString(out, out.SANDBOX_PROVIDER === "modal" ? "MODAL_IMAGE_ID" : "DAYTONA_SNAPSHOT", sandbox.snapshot);
   setBoolean(out, "MACHINE_BROWSER", sandbox.browser);
   setBoolean(out, "MACHINE_DESKTOP", sandbox.desktop);
   setPositiveNumber(out, "MACHINE_IDLE_STOP_MINUTES", sandbox.idle_stop_minutes);

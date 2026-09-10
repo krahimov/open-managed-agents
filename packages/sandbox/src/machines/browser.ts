@@ -24,6 +24,7 @@ function options(req) {
   const headers = { ...req.headers, host: '127.0.0.1:' + upstreamPort };
   delete headers.origin;
   delete headers['x-daytona-preview-token'];
+  delete headers.authorization;
   return { hostname: '127.0.0.1', port: upstreamPort, method: req.method, path: req.url, headers };
 }
 const server = http.createServer((req, res) => {
@@ -101,6 +102,7 @@ export async function bootstrapAgentComputer(sb: DaytonaSandboxInstance, spec: A
   const packages = [...new Set([
     ...(spec.bootstrapTools ? spec.aptPackages : []),
     ...(spec.browser ? ["chromium", "nodejs", "curl", "ca-certificates", "util-linux", "fonts-liberation"] : []),
+    ...(spec.desktop && spec.provider === "modal" ? ["scrot", "websockify", "x11-utils"] : []),
     ...(spec.desktop ? ["xvfb", "xfce4", "xfce4-terminal", "x11vnc", "novnc", "dbus-x11", "xauth", "xdotool"] : []),
   ])];
   // The marker is outside /workspace, so workspace restores cannot falsely
@@ -136,7 +138,7 @@ export async function bootstrapAgentComputer(sb: DaytonaSandboxInstance, spec: A
   }
   if (spec.desktop) {
     if (!sb.computerUse) throw new Error("Daytona SDK does not support desktop control");
-    console.info("[agent-computer] starting Daytona desktop", { sandboxId: sb.id });
+    console.info("[agent-computer] starting desktop", { sandboxId: sb.id });
     await sb.computerUse.start();
   }
   if (!spec.browser) return;
@@ -169,7 +171,7 @@ export async function resolveAgentComputerBrowser(sb: DaytonaSandboxInstance, ge
   return {
     httpUrl: base.href.replace(/\/$/, ""),
     wsUrl: ws.href,
-    headers: { "x-daytona-preview-token": preview.token, "X-Daytona-Skip-Preview-Warning": "true" },
+    headers: preview.headers ?? { "x-daytona-preview-token": preview.token, "X-Daytona-Skip-Preview-Warning": "true" },
     generation,
     downloadsPath: `${workdir}/downloads`,
   };

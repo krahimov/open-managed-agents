@@ -23,6 +23,7 @@ allowBuilds:
   '@anthropic-ai/tokenizer': true
   '@clerk/shared': false
   better-sqlite3: true
+  cbor-extract: false
   esbuild: true
   msw: false
   protobufjs: true

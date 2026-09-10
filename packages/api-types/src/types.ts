@@ -199,14 +199,13 @@ export interface EnvironmentConfig {
       max_file_bytes?: number;
       /** `session` (default): one sandbox per session, discarded at the
        *  end. `agent`: one persistent "agent machine" shared by every
-       *  session of the agent. Node supports Daytona only and rejects
-       *  other providers for agent scope. */
+       *  session of the agent. Node supports Daytona and experimental Modal computers. */
       scope?: "agent" | "session";
       /** Run a Chromium inside the agent machine and expose it to
        *  the agent's browser tools + the console live view. Defaults to
        *  true in agent scope; ignored in session scope. */
       browser?: boolean;
-      /** Enable Daytona desktop, headed Chromium, and authenticated VNC. */
+      /** Enable a cloud desktop, headed Chromium, and authenticated VNC. */
       desktop?: boolean;
       /** Minutes of inactivity before the agent machine auto-stops
        *  (Daytona autoStopInterval). Default 30. */

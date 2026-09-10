@@ -1,3 +1,4 @@
+import { createModalMachineDriver } from '@open-managed-agents/sandbox/adapters/modal';
 import { buildTelegramConnectRoutes } from "./lib/telegram-connect-routes.js";
 import { TelegramOnboarding } from "./lib/telegram-onboarding.js";
 import { DesktopGateway } from "./lib/desktop-gateway.js";
@@ -614,7 +615,7 @@ const outputsRoot = process.env.SESSION_OUTPUTS_DIR ?? "./data/session-outputs";
 mkdirSync(outputsRoot, { recursive: true });
 const sessionOutputsBackend = (() => {
   const provider = (process.env.SANDBOX_PROVIDER ?? "subprocess").toLowerCase();
-  if ((provider === "daytona" || provider === "e2b") && s3MemoryConfig) {
+  if ((provider === "daytona" || provider === "modal" || provider === "e2b") && s3MemoryConfig) {
     return {
       adapter: nodeS3OutputsAdapter({
         endpoint: s3MemoryConfig.endpoint,
@@ -674,6 +675,7 @@ const machineStore = new NodeAgentMachineStore({ sql, dialect });
 await machineStore.ensureSchema();
 const agentMachines = new AgentMachineManager({
   store: machineStore,
+  drivers: { modal: createModalMachineDriver(process.env) },
   tickIntervalMs: 0,
   apiKey: process.env.DAYTONA_API_KEY,
   apiUrl: process.env.DAYTONA_API_URL,
@@ -720,7 +722,7 @@ const desktopGateway = new DesktopGateway(async (tenantId, agentId) => {
     await machineStore.upsertAttachment({ sessionId, machineId: row.id, tenantId, workerId: 'desktop-viewer', generation: row.generation, turnActive: false, bgProcesses: 0, viewers: 1, now: Date.now() });
     const heartbeat = setInterval(() => { void machineStore.heartbeat(sessionId, Date.now()).catch(() => {}); }, 20_000);
     heartbeat.unref();
-    return { url: url.href, headers: { 'x-daytona-preview-token': preview.token, 'X-Daytona-Skip-Preview-Warning': 'true' }, release: async () => { clearInterval(heartbeat); await machineStore.detach(sessionId); } };
+    return { url: url.href, headers: preview.headers ?? { 'x-daytona-preview-token': preview.token, 'X-Daytona-Skip-Preview-Warning': 'true' }, release: async () => { clearInterval(heartbeat); await machineStore.detach(sessionId); } };
   });
 }, new URL(process.env.PUBLIC_BASE_URL ?? 'http://localhost:8787').origin);
 
@@ -767,6 +769,7 @@ const SANDBOX_PROVIDER_PATHS: Record<string, string> = {
   boxlite: "@open-managed-agents/sandbox/adapters/litebox",
   boxrun: "@open-managed-agents/sandbox/adapters/boxrun",
   daytona: "@open-managed-agents/sandbox/adapters/daytona",
+  modal: "@open-managed-agents/sandbox/adapters/modal",
   e2b: "@open-managed-agents/sandbox/adapters/e2b",
 };
 
@@ -778,8 +781,8 @@ async function buildSandbox(
 ): Promise<import("@open-managed-agents/sandbox").SandboxExecutor> {
   const sandboxEnv = buildSandboxEnvForEnvironment(process.env, environment);
   const provider = sandboxProviderFromEnvironment(process.env, environment);
-  if (sandboxEnv.SANDBOX_SCOPE === "agent" && provider !== "daytona") {
-    throw new Error("Agent computer scope requires the Daytona provider.");
+  if (sandboxEnv.SANDBOX_SCOPE === "agent" && ! ["daytona", "modal"].includes(provider)) {
+    throw new Error("Agent computer scope requires Daytona or Modal.");
   }
   const path = SANDBOX_PROVIDER_PATHS[provider];
   if (!path) {
@@ -901,7 +904,7 @@ const sessionRegistry = new SessionRegistry({
       computer: browser && buildSandboxEnvForEnvironment(process.env, context.environment).MACHINE_DESKTOP === 'true' ? {
         screenshot: () => withDesktop(context.tenantId, agent.id, async desktop => {
           const shot = await desktop.screenshot.takeFullScreen();
-          if (!shot.screenshot) throw new Error('Daytona returned an empty desktop screenshot');
+          if (!shot.screenshot) throw new Error('Computer returned an empty desktop screenshot');
           return shot.screenshot.replace(/^data:image\/png;base64,/, '');
         }),
         click: (x, y, button, double) => withDesktop(context.tenantId, agent.id, d => d.mouse.click(x, y, button, double)),
@@ -1618,7 +1621,7 @@ v1.route("/agents", buildAgentComputerRoutes({
     if (!row) throw new Error("Computer is not running");
     if (row.config.desktop) return withDesktop(tenantId, agentId, async desktop => {
       const shot = await desktop.screenshot.takeFullScreen();
-      if (!shot.screenshot) throw new Error('Daytona returned an empty desktop screenshot');
+      if (!shot.screenshot) throw new Error('Computer returned an empty desktop screenshot');
       return Buffer.from(shot.screenshot.replace(/^data:image\/png;base64,/, ''), 'base64');
     });
     return agentMachines.withLock(row.id, async () => {

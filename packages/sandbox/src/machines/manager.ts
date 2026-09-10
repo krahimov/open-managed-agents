@@ -9,7 +9,18 @@ import type { SandboxBrowserEndpoint } from "../ports";
 import { DEFAULT_ATTACHMENT_STALE_MS, MachineBusyError, MachineLockedError, MachineConfigMismatchError } from "./ports";
 import type { AgentMachineRow, AgentMachineSpec, AgentMachineStore } from "./ports";
 
+/** Provider transport. Existing session/file code uses the structural box port
+ * originally introduced for Daytona; drivers need no Daytona SDK dependency. */
+export interface MachineDriver {
+  client(): Promise<DaytonaClient>;
+  isNotFound(error: unknown): boolean;
+  checkpoint?(sb: DaytonaSandboxInstance): Promise<string>;
+  deleteCheckpoint?(id: string): Promise<void>;
+  dispose?(): void;
+}
+
 export interface AgentMachineManagerOptions {
+  drivers?: Partial<Record<"modal", MachineDriver>>;
   store: AgentMachineStore;
   apiKey?: string;
   apiUrl?: string;
@@ -84,11 +95,11 @@ export class AgentMachineManager {
     const row = await this.get(tenantId, agentId);
     if (!row?.providerRef) return null;
     try {
-      const sb = await (await this.client()).get(row.providerRef);
+      const sb = await (await this.client(row.provider)).get(row.providerRef);
       if (sb.state !== "started") return null;
       return { sb, generation: row.generation, freshlyCreated: false };
     } catch (err) {
-      if (isDaytonaNotFound(err, this.options.daytonaModule)) return null;
+      if (this.isNotFound(err, row.provider)) return null;
       throw err;
     }
   }
@@ -107,14 +118,25 @@ export class AgentMachineManager {
       await this.options.store.update(row.id, { state: "stopping", desiredState: "stopped" }, this.now());
       try {
         const box = row.providerRef
-          ? await this.getProviderBox(row.providerRef, row.generation)
+          ? await this.getProviderBox(row.providerRef, row.generation, row.provider)
           : null;
         if (box && box.sb.state !== "stopped" && box.sb.state !== "archived") {
           // Catch orphan processes left by a crashed host. An expired
           // attachment alone does not prove that its Linux work finished.
           if (await this.hasRunningProcesses(box.sb)) throw new MachineBusyError("agent machine has running background processes");
           await this.options.snapshot?.(row, box.sb);
-          await box.sb.stop(120);
+          const driver = this.driver(row.provider);
+          if (driver?.checkpoint) {
+            const checkpoint = await driver.checkpoint(box.sb);
+            // Commit the restore image BEFORE terminating the only live disk.
+            await this.options.store.update(row.id, { snapshot: checkpoint, lastBackupAt: this.now() }, this.now());
+            await box.sb.stop(120);
+            if (row.snapshot && row.snapshot !== row.config.snapshot && row.snapshot !== checkpoint) {
+              await driver.deleteCheckpoint?.(row.snapshot).catch(err => this.warn("old computer checkpoint cleanup failed", err));
+            }
+          } else {
+            await box.sb.stop(120);
+          }
         }
         await this.options.store.update(row.id, { state: "stopped", lastStoppedAt: this.now(), errorReason: null }, this.now());
         await this.event(row, "stopped");
@@ -133,27 +155,34 @@ export class AgentMachineManager {
   async acquire(input: Pick<AgentMachineProviderInput, "tenantId" | "agentId" | "spec">): Promise<AcquiredBox> {
     const { row } = await this.options.store.insertIfAbsent({
       id: generateAgentMachineId(), tenantId: input.tenantId, agentId: input.agentId,
-      provider: "daytona", spec: input.spec,
+      provider: input.spec.provider ?? "daytona", spec: input.spec,
       bootstrapHash: createHash("sha256").update(JSON.stringify(input.spec)).digest("hex"), now: this.now(),
     });
+    if (row.provider !== (input.spec.provider ?? "daytona")) throw new MachineConfigMismatchError();
     if (canonicalSpec(row.config) !== canonicalSpec(input.spec)) throw new MachineConfigMismatchError();
     return this.withLock(row.id, async () => {
       const current = (await this.options.store.getById(row.id))!;
-      const client = await this.client();
+      const client = await this.client(current.provider);
       let sb: DaytonaSandboxInstance | null = null;
       let created = false;
       try {
         if (current.providerRef) {
           try { sb = await client.get(current.providerRef); }
-          catch (err) { if (!isDaytonaNotFound(err, this.options.daytonaModule)) throw err; }
+          catch (err) { if (!this.isNotFound(err, current.provider)) throw err; }
         }
+        if (current.provider === "modal" && sb?.state !== "started") sb = null;
         if (!sb) {
           // Recover the create→DB-write crash window by the immutable
           // machine label before creating another chargeable box.
           const found = await client.list({ "oma-machine-id": current.id });
-          sb = found.items.find((s) => s.labels?.["oma-tenant-id"] === current.tenantId) ?? null;
+          sb = found.items.find((s) => s.labels?.["oma-tenant-id"] === current.tenantId && (current.provider !== "modal" || s.state === "started")) ?? null;
         }
+        // Modal terminates rather than suspending a VM. A stopped VM must be
+        // replaced from its committed filesystem checkpoint.
         const previousRef = current.providerRef;
+        if (current.provider === "modal" && previousRef && !sb && !current.snapshot) {
+          throw new Error("Modal computer expired without a checkpoint; refusing to replace its disk with an empty computer");
+        }
         if (!sb) {
           await this.options.store.update(current.id, { state: previousRef ? "recreating" : "creating", desiredState: "running" }, this.now());
           sb = await client.create({
@@ -186,7 +215,7 @@ export class AgentMachineManager {
         // Restore before browser startup: Chromium must not open its
         // profile while the previous profile is being unpacked into it.
         if (needsRestore) {
-          await this.options.restore?.({ ...current, providerRef: sb.id, generation }, sb);
+          if (current.provider !== "modal" || !current.snapshot) await this.options.restore?.({ ...current, providerRef: sb.id, generation }, sb);
           await this.options.store.update(current.id, {
             bootstrapHash: createHash("sha256").update(JSON.stringify(current.config)).digest("hex"),
           }, this.now());
@@ -270,7 +299,7 @@ export class AgentMachineManager {
           // tick waits. Never overwrite its state with the earlier snapshot.
           const row = await this.options.store.getById(candidate.id);
           if (!row || row.state !== "running") return;
-          const box = row.providerRef ? await this.getProviderBox(row.providerRef, row.generation) : null;
+          const box = row.providerRef ? await this.getProviderBox(row.providerRef, row.generation, row.provider) : null;
           if (!box) {
             await this.options.store.update(row.id, { state: "error", errorReason: "provider machine no longer exists", lastStateSyncAt: this.now() }, this.now());
             return;
@@ -317,6 +346,7 @@ export class AgentMachineManager {
     this.timer = null;
     await this.ticking;
     for (const provider of [...this.providers]) await provider.release();
+    for (const driver of Object.values(this.options.drivers ?? {})) driver?.dispose?.();
   }
 
   private async hasRunningProcesses(sb: DaytonaSandboxInstance): Promise<boolean> {
@@ -333,11 +363,11 @@ export class AgentMachineManager {
     }
   }
 
-  private async getProviderBox(id: string, generation: number): Promise<AcquiredBox | null> {
+  private async getProviderBox(id: string, generation: number, provider: string): Promise<AcquiredBox | null> {
     try {
-      return { sb: await (await this.client()).get(id), generation, freshlyCreated: false };
+      return { sb: await (await this.client(provider)).get(id), generation, freshlyCreated: false };
     } catch (err) {
-      if (isDaytonaNotFound(err, this.options.daytonaModule)) return null;
+      if (this.isNotFound(err, provider)) return null;
       throw err;
     }
   }
@@ -350,7 +380,19 @@ export class AgentMachineManager {
     if (spec.browser) throw new Error("agent machine browser bootstrap is not configured");
   }
 
-  private client(): Promise<DaytonaClient> {
+  private driver(provider: string): MachineDriver | undefined {
+    if (provider === "daytona") return undefined;
+    if (provider !== "modal" || !this.options.drivers?.modal) throw new Error(`Computer provider ${provider} is not configured`);
+    return this.options.drivers.modal;
+  }
+
+  private isNotFound(error: unknown, provider: string): boolean {
+    return this.driver(provider)?.isNotFound(error) ?? isDaytonaNotFound(error, this.options.daytonaModule);
+  }
+
+  private client(provider: string): Promise<DaytonaClient> {
+    const driver = this.driver(provider);
+    if (driver) return driver.client();
     if (!this.clientPromise) this.clientPromise = (async () => {
       const apiKey = this.options.apiKey ?? process.env.DAYTONA_API_KEY;
       if (!apiKey) throw new Error("DAYTONA_API_KEY is required for agent machines");
@@ -369,6 +411,7 @@ export class AgentMachineManager {
 
 function canonicalSpec(spec: AgentMachineSpec): string {
   return JSON.stringify({
+    provider: spec.provider ?? "daytona",
     image: spec.snapshot ? null : spec.image,
     snapshot: spec.snapshot || null,
     workdir: spec.workdir.replace(/\/+$/, "") || "/",
