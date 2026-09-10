@@ -3,8 +3,9 @@
 Branch: `codex/modal-cloud-computers`. Production still uses Daytona.
 The live Modal harness check and basic Cua comparison passed. See
 [the comparison report](cloud-computer-comparison.md) for the differences in
-coverage. The full HTTP deployment test is still pending. Provider selection
-and merging remain a separate decision after review.
+coverage. A [saved QA agent also passed a deployed staging run](modal-staging-qa.md)
+through the HTTP API and session queue. Provider selection and merging remain
+a separate decision after review.
 
 ## Implementation
 
@@ -70,10 +71,10 @@ inspect orphan work and prevent idle shutdown while it is still running.
 - The initial implementation supports agent scope only. Desktop-enabled images
   require Debian tools. Per-agent CPU/memory settings are not exposed yet.
 - Cross-provider migration of an existing computer is not implemented.
-- Real external account sign-in/refresh and a deployed HTTP/session-queue test
-  remain acceptance checks. The live test used the
-  actual Orrery Codex harness and MCP tool bridge with an in-memory machine
-  store. It did not deploy or exercise the full server HTTP/session queue.
+- Real external account OAuth sign-in/refresh inside the cloud computer remains
+  an acceptance check. The first live test used an in-memory machine store;
+  the later staging QA run exercised the deployed server, session queue, SQLite
+  machine store, report download endpoint and live desktop viewer.
 
 ## Validation and comparison
 

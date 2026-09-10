@@ -55,8 +55,9 @@ filesystem snapshot operation. This establishes a limitation of the selected SDK
 transport, not every Cua product. We have not established browser profile
 persistence through suspend/resume or VM replacement.
 
-Neither trial exercised the deployed Orrery HTTP server and session queue or a
-real external account's OAuth refresh. The Modal acceptance script used the real
+Neither initial trial exercised the deployed Orrery HTTP server and session queue
+or a real external account's OAuth refresh. A later [staging QA run](modal-staging-qa.md)
+passed through the deployed server and queue. The Modal acceptance script used the real
 Codex harness and tools with an in-memory machine store. The Cua task used the
 same harness through a temporary authenticated local Python SDK bridge. A full
 Cua provider integration is not part of this branch.
@@ -79,6 +80,6 @@ reports, screenshots and agent tool events and are not committed to the reposito
 
 Modal is further along for this project because the branch integrates it with
 Orrery and verifies replacement persistence. The next Modal milestone is handling
-the 24-hour boundary and testing the full server in staging. Choosing Cua would
+the 24-hour boundary and checkpoint cleanup. The later staging QA run passed. Choosing Cua would
 first require establishing its persistence contract and implementing an equivalent
 provider adapter. The provider decision and any merge remain with the user.
