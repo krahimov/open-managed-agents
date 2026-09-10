@@ -1,9 +1,10 @@
 # Modal computers experiment
 
 Branch: `codex/modal-cloud-computers`. Production still uses Daytona.
-Do not merge or select a replacement provider until the live Modal agent test
-and Cua comparison are complete. The live Modal harness check has passed;
-the full HTTP deployment test and Cua comparison are still pending.
+The live Modal harness check and basic Cua comparison passed. See
+[the comparison report](cloud-computer-comparison.md) for the differences in
+coverage. The full HTTP deployment test is still pending. Provider selection
+and merging remain a separate decision after review.
 
 ## Implementation
 
@@ -69,8 +70,8 @@ inspect orphan work and prevent idle shutdown while it is still running.
 - The initial implementation supports agent scope only. Desktop-enabled images
   require Debian tools. Per-agent CPU/memory settings are not exposed yet.
 - Cross-provider migration of an existing computer is not implemented.
-- Real external account sign-in/refresh, a deployed HTTP/session-queue test,
-  and a Cua live comparison remain acceptance checks. The live test used the
+- Real external account sign-in/refresh and a deployed HTTP/session-queue test
+  remain acceptance checks. The live test used the
   actual Orrery Codex harness and MCP tool bridge with an in-memory machine
   store. It did not deploy or exercise the full server HTTP/session queue.
 
