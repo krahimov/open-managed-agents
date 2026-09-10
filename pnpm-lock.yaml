@@ -16994,22 +16994,6 @@ snapshots:
     optionalDependencies:
       cbor-extract: 2.2.2
 
-  ccount@2.0.1: {}
-
-  chai@6.2.2: {}
-
-  chalk@5.6.2: {}
-
-  character-entities-html4@2.1.0: {}
-
-  character-entities-legacy@3.0.0: {}
-
-  character-entities@2.0.2: {}
-
-  character-reference-invalid@2.0.1: {}
-
-  chardet@2.1.1: {}
-
   chokidar@4.0.3:
     dependencies:
       readdirp: 4.1.2
@@ -19528,8 +19512,6 @@ snapshots:
       smol-toml: 1.6.1
       uuid: 11.1.1
 
-  module-details-from-path@1.0.4: {}
-
   motion-dom@12.38.0:
     dependencies:
       motion-utils: 12.36.0
@@ -19641,10 +19623,6 @@ snapshots:
     dependencies:
       detect-libc: 2.1.2
     optional: true
-
-  node-mock-http@1.0.4: {}
-
-  node-releases@2.0.37: {}
 
   node-rsa@1.1.1:
     dependencies:
