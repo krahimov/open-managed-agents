@@ -10914,6 +10914,8 @@ packages:
 
 snapshots:
 
+  '@adobe/css-tools@4.4.4': {}
+
   '@agentclientprotocol/sdk@0.20.0(zod@3.25.76)':
     dependencies:
       zod: 3.25.76
