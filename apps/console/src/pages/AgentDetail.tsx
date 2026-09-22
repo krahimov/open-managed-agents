@@ -842,7 +842,18 @@ function AmbientRulesPanel({
                       )}
                       <span>{rule.next_wake_at ? `Next ${new Date(rule.next_wake_at).toLocaleString()}` : "No next wake"}</span>
                       {rule.last_decision && <span>Last {rule.last_decision.outcome}</span>}
+                      {rule.last_decision?.session_id && (
+                        <Link to={`/sessions/${rule.last_decision.session_id}`} className="text-brand hover:underline">View session</Link>
+                      )}
                     </div>
+                    {rule.trigger.source === "webhook" && (
+                      <details className="mt-2 text-xs text-fg-muted">
+                        <summary className="cursor-pointer">Webhook endpoint</summary>
+                        <code className="block mt-2 break-all select-all">POST {window.location.origin}/v1/agents/{agentId}/ambient-rules/{rule.id}/events</code>
+                        <p className="mt-2">Authenticate with your tenant API key. Send a unique event_id for each incident; reuse it for retries.</p>
+                        <pre className="mt-2 overflow-x-auto">{'{"event_id":"incident-123","data":{"window_id":"w05"}}'}</pre>
+                      </details>
+                    )}
                   </div>
                   <div className="flex items-center gap-2">
                     <label className="inline-flex items-center gap-2 text-xs text-fg-muted min-h-9">

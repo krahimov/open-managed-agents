@@ -212,6 +212,7 @@ const agentsRoutes = new Hono<{
   const ctx = c as unknown as AppCtx;
   const services = ctx.var.services;
   const app = buildAgentRoutes({
+    sessionsApp: () => buildCfSessionRoutesForContext(ctx),
     services: () => cfRouteServicesFromCtx(ctx),
     validateModel: async (tenantId, model) => {
       const cards = await services.modelCards.list({ tenantId });

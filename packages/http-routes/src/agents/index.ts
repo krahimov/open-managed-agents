@@ -1,3 +1,4 @@
+import { buildAmbientWebhookRoutes, type AmbientWebhookDeps } from "./webhook";
 // Agents — full CRUD with AMA-shape envelope.
 //
 // Sourced from apps/main/src/routes/agents.ts pre-extract: same AMA shape,
@@ -181,7 +182,7 @@ function invalidReasoningLevel(value: unknown): string | null {
   return `reasoning_level must be one of ${REASONING_LEVELS.join("|")}`;
 }
 
-export interface AgentRoutesDeps {
+export interface AgentRoutesDeps extends AmbientWebhookDeps {
   services: RouteServicesArg;
   /** Optional model card validation. CF passes a function backed by
    *  services.modelCards; Node passes nothing → validation skipped. */
@@ -219,6 +220,7 @@ export interface AgentRoutesDeps {
 
 export function buildAgentRoutes(deps: AgentRoutesDeps) {
   const app = new Hono<Vars>();
+  app.route("/", buildAmbientWebhookRoutes(deps));
 
   // POST /v1/agents — create
   app.post("/", async (c) => {
