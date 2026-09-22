@@ -1887,6 +1887,7 @@ v1.get("/agents/:id/evidence/activity", async (c) => {
 const maxAgentsPerTenant = resolveMaxAgentsPerTenant();
 v1.route("/agents", buildAgentRoutes({
   services,
+  sessionsApp: () => sessionRoutesApp,
   validateModel: validateNodeModel,
   // Auth-enabled deployments must not accept client-supplied approved_by on
   // grant writes — approvals are audit evidence and need verified identity.

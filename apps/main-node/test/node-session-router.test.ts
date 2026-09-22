@@ -134,3 +134,13 @@ describe("NodeSessionRouter event stream replay", () => {
     expect(getEventsAsync).not.toHaveBeenCalled();
   });
 });
+
+// Ambient concurrency checks request the latest lifecycle event.
+it("returns the newest event when requesting descending history", async () => {
+  const { router } = setup(vi.fn(async () => [event(1), event(2), event(3)]));
+  const page = await router.getEvents("session", { order: "desc", limit: 1 });
+  expect(page.data.map((item) => item.seq)).toEqual([3]);
+  expect(page.has_more).toBe(true);
+  const ascending = await router.getEvents("session", { limit: 1 });
+  expect(ascending.data.map((item) => item.seq)).toEqual([1]);
+});

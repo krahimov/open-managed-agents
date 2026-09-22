@@ -125,7 +125,8 @@ export class NodeSessionRouter implements SessionRouter {
     const log = this.deps.newEventLog(sessionId);
     const events = await log.getEventsAsync(opts.afterSeq);
     const limit = opts.limit ?? 100;
-    const data = events.slice(0, limit) as unknown as StoredEvent[];
+    const ordered = opts.order === "desc" ? [...events].reverse() : events;
+    const data = ordered.slice(0, limit) as unknown as StoredEvent[];
     return { data, has_more: events.length > limit };
   }
 
