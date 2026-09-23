@@ -20,6 +20,8 @@ it("requires verification, workspace confirmation, and approval", async () => {
   expect(screen.queryByText("Access approved for this agent")).not.toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Verify connection" }));
   await screen.findByText("Workspace: Erandry");
+  expect(screen.getByText("Shared vault · Verified — awaiting your approval")).toBeInTheDocument();
+  expect(screen.queryByText(/Account\/workspace unverified/)).not.toBeInTheDocument();
   const approve = screen.getByRole("button", { name: "Reuse this connection" });
   expect(approve).toBeDisabled();
   expect(api.mock.calls.some(([path]) => path.endsWith("/approve"))).toBe(false);
