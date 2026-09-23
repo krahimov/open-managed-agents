@@ -53,23 +53,15 @@ describe("autoRequestAccessForNewServers", () => {
     expect(line).toContain("slack: requires a one-time OAuth app registration");
   });
 
-  it("attaches the vault instead of posting a card when a credential already exists", async () => {
+  it("saved credentials do not suppress cards; only explicit agent approval does", async () => {
     const requested: string[] = [];
-    const attached: string[] = [];
     const r = await autoRequestAccessForNewServers([], [sentry, slack], {
-      requestAccess: async (a) => {
-        requested.push(a.service);
-        return { request_id: "x", status: "pending" };
-      },
-      findCredentialVault: async (url) => (url.includes("sentry") ? "vlt-connected" : null),
-      attachVault: async (id) => {
-        attached.push(id);
-      },
+      requestAccess: async (a) => { requested.push(a.service); return { request_id: "x", status: "pending" }; },
+      isConnectionApproved: async (url) => url.includes("sentry"),
     });
     expect(requested).toEqual(["slack"]);
-    expect(attached).toEqual(["vlt-connected"]);
     expect(r.connected).toEqual(["sentry"]);
-    expect(describeAutoAccess(r)).toContain("Already connected via an existing vault credential (vault attached): sentry");
+    expect(describeAutoAccess(r)).toContain("Already explicitly approved for this agent: sentry");
   });
 
   it("reports servers whose card could not be posted instead of throwing", async () => {
@@ -107,7 +99,7 @@ describe("setup preamble connection status", () => {
       failed: ["github"],
     });
     expect(status.split("\n")).toEqual([
-      "- sentry: connected (existing credential verified, vault attached)",
+      "- sentry: connected (explicitly approved for this agent)",
       "- slack: connect card posted — waiting for the user (needs a one-time app setup; the card guides them)",
       "- linear: connect card posted — waiting for the user",
       "- github: could not post a connect card — call request_access for it",

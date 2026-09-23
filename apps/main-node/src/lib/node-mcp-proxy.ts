@@ -81,8 +81,7 @@ export type McpCredentialCheck = "ok" | "refreshed" | "invalid" | "unreachable";
  * Is this stored credential actually usable against its MCP server?
  * Probes tools/list with the access token; on 401/403 tries a refresh
  * (when refresh metadata exists), persists rotated tokens and re-probes.
- * "unreachable" = network/timeout — the caller decides (setup treats it as
- * "can't tell, assume fine" so a flaky provider doesn't spam connect cards).
+ * "unreachable" = network/timeout — authentication has not been verified. Callers must not grant access.
  * Added after setup reported Linear + Sentry "already connected" on the
  * strength of expired rows alone (2026-09-02).
  */
@@ -121,7 +120,7 @@ export async function verifyMcpCredential(
 
   const first = await probe(input.token);
   if (first === null) return "unreachable";
-  if (!authRejected(first)) return "ok";
+  if (!authRejected(first)) return first >= 200 && first < 300 ? "ok" : "unreachable";
   if (!input.refresh) return "invalid";
   const next = await refreshNodeMcpOAuthToken(input.refresh, fetcher);
   if (!next) return "invalid";
@@ -132,7 +131,7 @@ export async function verifyMcpCredential(
   }
   const second = await probe(next.access_token);
   if (second === null) return "unreachable";
-  return authRejected(second) ? "invalid" : "refreshed";
+  return authRejected(second) ? "invalid" : second >= 200 && second < 300 ? "refreshed" : "unreachable";
 }
 
 /**

@@ -641,7 +641,7 @@ export class CodexSdkHarness {
       "  service access, skills) go through your oma_platform MCP tools.",
     ].join("\n");
     const agentsMd = isSetup
-      ? buildSetupPrompt(ctx.agent)
+      ? (ctx.systemPrompt || buildSetupPrompt(ctx.agent))
       : [ctx.systemPrompt, materializedMemory.guidance, skillsGuidance, platformNotes]
           .filter(Boolean)
           .join("\n\n");
@@ -711,7 +711,7 @@ export class CodexSdkHarness {
         ...(isolated ? {
           features: COMPUTER_CODEX_FEATURES,
           forced_login_method: "chatgpt",
-          developer_instructions: isSetup ? buildSetupPrompt(ctx.agent) : "All files, shell commands, browser actions and desktop actions use the oma_platform MCP tools. They run on your persistent cloud Linux computer. Local shell and image tools are disabled; the local process has a read-only sandbox. Do not use local apply_patch. Your workspace is /workspace on the remote computer. " + ctx.systemPrompt,
+          developer_instructions: isSetup ? (ctx.systemPrompt || buildSetupPrompt(ctx.agent)) : "All files, shell commands, browser actions and desktop actions use the oma_platform MCP tools. They run on your persistent cloud Linux computer. Local shell and image tools are disabled; the local process has a read-only sandbox. Do not use local apply_patch. Your workspace is /workspace on the remote computer. " + ctx.systemPrompt,
         } : {}),
         ...(Object.keys(mcpServers).length > 0 ? { mcp_servers: mcpServers } : {}),
       },
