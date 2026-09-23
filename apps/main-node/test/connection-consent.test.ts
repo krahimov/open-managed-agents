@@ -125,4 +125,25 @@ describe("live protocol and workspace verification", () => {
     vi.stubGlobal("fetch", protocolFetch({ ok: false, error: "invalid_auth" }));
     expect((await verifyConnection(credential)).status).toBe("unverified");
   });
+  it.each([false, true])("uses Linear MCP identity for resource-scoped OAuth tokens (provider error: %s)", async providerError => {
+    const fetchMock = vi.fn(async (url: any, init: any) => {
+      expect(new URL(String(url)).hostname).toBe("mcp.linear.app");
+      if (init?.method === "DELETE" || init?.method === "GET") return new Response(null, { status: 405 });
+      const body = JSON.parse(init.body);
+      if (body.id === undefined) return new Response(null, { status: 202 });
+      const result = body.method === "initialize"
+        ? { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "linear", version: "1" } }
+        : body.method === "tools/list"
+          ? { tools: ["get_user", "get_workspace"].map(name => ({ name, inputSchema: { type: "object" } })) }
+          : { isError: providerError, content: [{ type: "text", text: JSON.stringify(body.params.name === "get_user" ? { email: "user@example.com" } : { id: "workspace-1", name: "Fabrik Labs " }) }] };
+      return Response.json({ jsonrpc: "2.0", id: body.id, result });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const linear = { auth: { type: "mcp_oauth", access_token: "resource-scoped-token", mcp_server_url: "https://mcp.linear.app/mcp" } } as never;
+    const result = await verifyConnection(linear);
+    expect(result.status).toBe(providerError ? "unverified" : "verified");
+    if (!providerError) expect(result).toEqual({ status: "verified", account: "user@example.com", workspace: "Fabrik Labs", workspace_id: "workspace-1" });
+    const calls = fetchMock.mock.calls.filter(([,init]) => init?.body && JSON.parse(init.body).method === "tools/call").map(([,init]) => JSON.parse(init.body).params);
+    expect(calls[0]).toEqual({ name: "get_user", arguments: { query: "me" } });
+  });
 });

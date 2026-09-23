@@ -36,7 +36,7 @@ export interface ConnectionVerification {
   message?: string;
 }
 
-/** No agent tools run here. Only protocol discovery and fixed identity queries. */
+/** Only protocol discovery and fixed, read-only provider identity queries. */
 export async function verifyConnection(credential: CredentialRow): Promise<ConnectionVerification> {
   const auth = credential.auth as unknown as Record<string, string | undefined>;
   const token = auth.access_token || auth.token || auth.bearer_token;
@@ -51,7 +51,7 @@ export async function verifyConnection(credential: CredentialRow): Promise<Conne
     await client.connect(new StreamableHTTPClientTransport(new URL(url), {
       requestInit: { headers: { authorization: `Bearer ${token}` } }, fetch: boundedFetch,
     }), { timeout: 10_000 });
-    await client.listTools({}, { timeout: 10_000 });
+    const toolList = await client.listTools({}, { timeout: 10_000 });
     const host = new URL(url).hostname;
     if (host === "mcp.slack.com") {
       const response = await boundedFetch("https://slack.com/api/auth.test", {
@@ -64,6 +64,29 @@ export async function verifyConnection(credential: CredentialRow): Promise<Conne
       return { status: "verified", account: identity.user, workspace: identity.team, workspace_id: identity.team_id };
     }
     if (host === "mcp.linear.app") {
+      // Linear's MCP OAuth tokens can be scoped to the MCP resource and
+      // rejected by the separate GraphQL API. Ask the authenticated MCP
+      // server for the current user/workspace; never infer identity from labels.
+      if (["get_user", "get_workspace"].every(name => toolList.tools.some(tool => tool.name === name))) {
+        const readIdentity = async (name: string, args: Record<string, string>) => {
+          const result = await client.callTool({ name, arguments: args }, undefined, { timeout: 10_000 });
+          if (result.isError) throw new Error("Identity query failed");
+          if (result.structuredContent) return result.structuredContent as Record<string, unknown>;
+          for (const content of result.content as Array<{ type: string; text?: string }>) {
+            if (content.type === "text" && content.text) {
+              try { return JSON.parse(content.text) as Record<string, unknown>; } catch { /* Try the next text block. */ }
+            }
+          }
+          throw new Error("Identity response unavailable");
+        };
+        const user = await readIdentity("get_user", { query: "me" });
+        const workspace = await readIdentity("get_workspace", {});
+        const account = user.email || user.name;
+        if (typeof account !== "string" || !account || typeof workspace.id !== "string" || !workspace.id || typeof workspace.name !== "string" || !workspace.name.trim()) {
+          return { status: "unverified", message: "Linear account and workspace could not be verified. Reconnect and try again." };
+        }
+        return { status: "verified", account, workspace: workspace.name.trim(), workspace_id: workspace.id };
+      }
       const response = await boundedFetch("https://api.linear.app/graphql", {
         method: "POST", headers: { "content-type": "application/json", authorization: token.startsWith("lin_api_") ? token : `Bearer ${token}` },
         body: JSON.stringify({ query: "{ viewer { id name email } organization { id name } }" }),
