@@ -62,7 +62,7 @@ const baseState = {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("oauth callback grant recording", () => {
-  it("calls onGranted with the session/request from the flow and tells the popup grant_recorded", async () => {
+  it("stages session credentials for explicit approval instead of granting on OAuth completion", async () => {
     stubUpstreams();
     const grants: GrantNotification[] = [];
     const f = fakeServices({ ...baseState, session_id: "sess-1", request_id: "acreq-1", service: "sentry" });
@@ -76,18 +76,11 @@ describe("oauth callback grant recording", () => {
     const res = await app.request("https://api.example/v1/oauth/callback?code=abc&state=st1");
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(grants).toEqual([
-      {
-        tenantId: "t1",
-        sessionId: "sess-1",
-        requestId: "acreq-1",
-        service: "sentry",
-        vaultId: "vlt-1",
-        mcpServerUrl: "https://mcp.sentry.dev/mcp",
-      },
-    ]);
+    expect(grants).toEqual([]);
     expect(f.created).toHaveLength(1);
-    expect(html).toContain('"grant_recorded":true');
+    expect(html).toContain('"grant_recorded":false');
+    expect(html).toContain('"requires_approval":true');
+    expect(html).toContain('"credential_id":"cred-new"');
     expect(html).toContain('"request_id":"acreq-1"');
     expect(html).toContain('"service":"sentry"');
   });

@@ -1,3 +1,4 @@
+import { ConnectionConsent } from "./lib/connection-consent.js";
 import { buildTelegramConnectRoutes } from "./lib/telegram-connect-routes.js";
 import { TelegramOnboarding } from "./lib/telegram-onboarding.js";
 import { DesktopGateway } from "./lib/desktop-gateway.js";
@@ -175,11 +176,9 @@ import {
 import {
   buildNodeOAuthRoutes,
   describeOAuthAppRequirement,
-  type GrantNotification,
 } from "./lib/node-oauth-routes.js";
 import {
   forwardNodeMcpRequestWithRefresh,
-  verifyMcpCredential,
   type NodeMcpProxyRefresh,
 } from "./lib/node-mcp-proxy.js";
 import { NodeSessionWorkQueue } from "./lib/node-session-work-queue.js";
@@ -879,8 +878,7 @@ const sessionRegistry = new SessionRegistry({
             ...a,
             mcp_server_url: a.mcp_server_url ?? matchAgentMcpServer(agent, a.service),
           }),
-        findCredentialVault: (url) => findCredentialVaultForUrl(context.tenantId, url),
-        attachVault: (vaultId) => attachVaultToAgent(context.tenantId, agent.id, vaultId),
+        isConnectionApproved: async (url) => !!await connectionConsent.authorizedCredential(context.tenantId, agent.id, url),
         createAmbientRule: (a) =>
           createAmbientRuleFromSession(context.tenantId, agent.id, context.sessionId, a),
         env: { TAVILY_API_KEY: process.env.TAVILY_API_KEY },
@@ -1050,8 +1048,7 @@ const sessionRegistry = new SessionRegistry({
       // pipeline as the DefaultHarness buildTools hooks.
       requestServiceAccess: (tenantId, sessionId, a) =>
         postAccessRequest(tenantId, sessionId, a),
-      findCredentialVault: findCredentialVaultForUrl,
-      attachVaultToAgent,
+      isConnectionApproved: async (tenantId, agentId, url) => !!await connectionConsent.authorizedCredential(tenantId, agentId, url),
       setupAccessStatus: ensureSetupAccessReconciled,
       createAmbientRule: (tenantId, sessionId, agentId, a) =>
         createAmbientRuleFromSession(tenantId, agentId, sessionId, a),
@@ -1144,7 +1141,7 @@ const sessionRegistry = new SessionRegistry({
     // on the harness, so update_harness never "adds" them and no card would
     // be posted (seen live 2026-09-02: Incident commander template, four
     // servers, zero cards). Reconcile every server once per setup session:
-    // verified/refreshed credential → vault attached; otherwise a connect
+    // explicitly approved connection → ready; otherwise a connect
     // card right now. The outcome rides in the preamble so the agent tells
     // the user what's pending instead of inventing status.
     const accessStatus = isSetup
@@ -2382,10 +2379,37 @@ v1.route("/vaults", buildVaultRoutes({
 }));
 v1.route(
   "/oauth",
-  buildNodeOAuthRoutes({ services, env: process.env, onGranted: recordAccessGrant }),
+  buildNodeOAuthRoutes({ services, env: process.env }),
 );
 
+const connectionConsent = new ConnectionConsent({
+  services,
+  readRequest: async (sessionId, requestId) => {
+    const rows = await sql.prepare("SELECT data FROM session_events WHERE session_id = ? AND type = 'system.access_request' ORDER BY seq DESC")
+      .bind(sessionId).all<{ data: string }>();
+    for (const row of rows.results ?? []) {
+      const event = JSON.parse(row.data);
+      if (event.request_id === requestId) return event;
+    }
+    return null;
+  },
+  onApproved: async ({ sessionId, requestId, service, binding }) => {
+    await sessionRouter.appendEvent(sessionId, {
+      type: "system.access_granted", id: generateEventId(), request_id: requestId,
+      service, vault_id: binding.vault_id, mcp_server_url: binding.mcp_server_url,
+    } as SessionEvent);
+    logger.info({ op: "connection.approved", session_id: sessionId, credential_id: binding.credential_id }, "connection explicitly approved");
+    await sessionRouter.appendEvent(sessionId, {
+      type: "user.message", id: generateEventId(), content: [{ type: "text",
+        text: `[access granted] ${service} was explicitly approved for this agent. Account: ${binding.account ?? "identity unavailable"}. Workspace: ${binding.workspace ?? "identity unavailable"}. Confirm this matches the requested workspace before using it.`,
+      }],
+    } as SessionEvent);
+  },
+});
+v1.route("/connection-access", connectionConsent.routes());
+
 type SetupAccessRecord = {
+  consent_version: 2;
   requested: Array<{ name: string; note?: string }>;
   connected: string[];
   failed: string[];
@@ -2410,7 +2434,7 @@ async function ensureSetupAccessReconciled(
   };
   const row = await sessionsService.get({ tenantId, sessionId }).catch(() => null);
   const stored = (row?.metadata as { setup_access?: SetupAccessRecord } | undefined)?.setup_access;
-  if (stored && Array.isArray(stored.connected)) return format(stored);
+  if (stored?.consent_version === 2 && Array.isArray(stored.connected)) return format(stored);
 
   const inflight = setupAccessInFlight.get(sessionId);
   if (inflight) return inflight;
@@ -2422,10 +2446,9 @@ async function ensureSetupAccessReconciled(
       if (servers.length === 0) return undefined;
       const result = await autoRequestAccessForNewServers(undefined, servers, {
         requestAccess: (a) => postAccessRequest(tenantId, sessionId, a),
-        findCredentialVault: (url) => findCredentialVaultForUrl(tenantId, url),
-        attachVault: (vaultId) => attachVaultToAgent(tenantId, agent.id, vaultId),
+        isConnectionApproved: async (url) => !!await connectionConsent.authorizedCredential(tenantId, agent.id, url),
       });
-      const record: SetupAccessRecord = { ...result, checked_at: Date.now() };
+      const record: SetupAccessRecord = { ...result, consent_version: 2, checked_at: Date.now() };
       await sessionsService
         .update({ tenantId, sessionId, metadata: { setup_access: record } })
         .catch(() => {});
@@ -2445,136 +2468,6 @@ async function ensureSetupAccessReconciled(
   return run;
 }
 
-/** Union `vaultId` into the agent's default_vault_ids (metadata merge). */
-async function attachVaultToAgent(tenantId: string, agentId: string, vaultId: string): Promise<void> {
-  const agent = await agentsService.get({ tenantId, agentId });
-  if (!agent) return;
-  const current = (agent.metadata as { default_vault_ids?: unknown } | undefined)?.default_vault_ids;
-  const ids = Array.isArray(current)
-    ? current.filter((id): id is string => typeof id === "string" && id.length > 0)
-    : [];
-  if (ids.includes(vaultId)) return;
-  await agentsService.update({
-    tenantId,
-    agentId,
-    input: { metadata: { default_vault_ids: [...ids, vaultId] } },
-  });
-}
-
-/** Vault id holding a WORKING credential bound to `mcpServerUrl` (any of the
- *  tenant's vaults), or null. Setup uses it to skip the connect card for a
- *  server the workspace already authorized (e.g. Sentry connected by an
- *  earlier agent) and just attach that vault. "Working" is verified live:
- *  the token is probed, expired OAuth tokens are refreshed (and persisted)
- *  first, and a credential the provider rejects does NOT count — the card
- *  is posted instead and the OAuth callback upserts the row. */
-async function findCredentialVaultForUrl(tenantId: string, mcpServerUrl: string): Promise<string | null> {
-  const target = normalizeMcpUrlForMatch(mcpServerUrl);
-  if (!target) return null;
-  const vaults = await vaultService.list({ tenantId, includeArchived: false }).catch(() => []);
-  const vaultIds = vaults.map((v) => v.id);
-  if (vaultIds.length === 0) return null;
-  const grouped = await credentialService.listByVaults({ tenantId, vaultIds }).catch(() => []);
-  for (const group of grouped) {
-    for (const cred of group.credentials) {
-      if ((cred as { archived_at?: string | null }).archived_at) continue;
-      const auth = (cred as unknown as { auth?: Record<string, unknown> }).auth ?? {};
-      const url = auth.mcp_server_url;
-      if (typeof url !== "string" || normalizeMcpUrlForMatch(url) !== target) continue;
-      const token = [auth.bearer_token, auth.token, auth.access_token].find(
-        (t): t is string => typeof t === "string" && t.length > 0,
-      );
-      if (!token) {
-        // API-key / composio shapes: nothing to probe with a bearer — trust the row.
-        return group.vault_id;
-      }
-      const credentialId = (cred as { id: string }).id;
-      const vaultId = group.vault_id;
-      const refresh: NodeMcpProxyRefresh | undefined =
-        auth.type === "mcp_oauth" &&
-        typeof auth.refresh_token === "string" &&
-        typeof auth.token_endpoint === "string"
-          ? {
-              refreshToken: auth.refresh_token,
-              tokenEndpoint: auth.token_endpoint,
-              clientId: typeof auth.client_id === "string" ? auth.client_id : undefined,
-              clientSecret: typeof auth.client_secret === "string" ? auth.client_secret : undefined,
-              persist: async (t) => {
-                await credentialService.refreshAuth({
-                  tenantId,
-                  vaultId,
-                  credentialId,
-                  auth: {
-                    access_token: t.access_token,
-                    refresh_token: t.refresh_token,
-                    expires_at: t.expires_in
-                      ? new Date(Date.now() + t.expires_in * 1000).toISOString()
-                      : undefined,
-                  },
-                });
-              },
-            }
-          : undefined;
-      const check = await verifyMcpCredential({ url: mcpServerUrl, token, refresh });
-      logger.info(
-        { op: "setup.credential_check", mcp_server_url: mcpServerUrl, credential_id: credentialId, result: check },
-        "setup credential check",
-      );
-      if (check !== "invalid") return vaultId;
-      // rejected → keep looking (another vault may hold a live one)
-    }
-  }
-  return null;
-}
-
-/**
- * Server-side half of a connect card: the OAuth callback persisted a vault
- * credential for a flow the card started from a session, so (1) record a
- * durable system.access_granted on that session, (2) nudge the agent with
- * the same "[access granted]" user.message the card used to post from the
- * browser, and (3) graft the vault onto the session's agent so its future
- * sessions (scheduled ones included) actually carry the credential —
- * setup-created agents otherwise ended up with NO default vault and every
- * OAuth MCP server 401'd despite valid credentials in "Connected Apps".
- */
-async function recordAccessGrant(grant: GrantNotification): Promise<void> {
-  const session = await sessionsService.get({
-    tenantId: grant.tenantId,
-    sessionId: grant.sessionId,
-  });
-  if (!session || session.archived_at) return;
-
-  await sessionRouter.appendEvent(grant.sessionId, {
-    type: "system.access_granted",
-    id: generateEventId(),
-    request_id: grant.requestId ?? "",
-    service: grant.service,
-    vault_id: grant.vaultId,
-    mcp_server_url: grant.mcpServerUrl,
-  } as SessionEvent);
-
-  if (session.agent_id) {
-    try {
-      await attachVaultToAgent(grant.tenantId, session.agent_id, grant.vaultId);
-    } catch (err) {
-      logger.warn(
-        { err, op: "oauth.grant_vault_graft_failed", session_id: grant.sessionId },
-        "credential stored but could not attach the vault to the agent",
-      );
-    }
-  }
-
-  await sessionRouter.appendEvent(grant.sessionId, {
-    type: "user.message",
-    id: generateEventId(),
-    content: [
-      {
-        type: "text",
-        text: `[access granted] ${grant.service} is now connected — continue where you left off.`,
-      },
-    ],
-  } as SessionEvent);
-}
 // ── Composio key resolution ────────────────────────────────────────────────
 // Managed-first: tenants paste their own Composio key in the console (stored
 // as a composio_mcp vault credential — same shape the MCP proxy already
@@ -3644,11 +3537,16 @@ async function resolveNodeMcpProxyTarget(
   }
 
   const vaultIds = session.vault_ids ?? [];
-  if (vaultIds.length === 0) return null;
-
-  const grouped = await credentialService
-    .listByVaults({ tenantId, vaultIds })
-    .catch(() => []);
+  const selected = session.agent_id
+    ? await connectionConsent.authorizedCredential(tenantId, session.agent_id, server.url)
+    : null;
+  // A removed or archived selection must not silently switch to another account.
+  if (!selected && session.agent_id && await connectionConsent.hasApproval(tenantId, session.agent_id, server.url)) return null;
+  const grouped = selected
+    ? [{ vault_id: selected.vault_id, credentials: [selected] }]
+    : vaultIds.length > 0
+      ? await credentialService.listByVaults({ tenantId, vaultIds }).catch(() => [])
+      : [];
   const composioCandidates: NodeMcpProxyTarget[] = [];
   for (const group of grouped) {
     for (const credential of group.credentials) {
@@ -3669,7 +3567,7 @@ async function resolveNodeMcpProxyTarget(
             expires_at?: string;
           }
         | undefined;
-      if (!auth || !credentialMatchesMcpServerUrl(auth, server.url)) continue;
+      if (!auth || (!selected && !credentialMatchesMcpServerUrl(auth, server.url))) continue;
 
       if (auth.type === "composio_mcp") {
         const apiKey = resolveNodeComposioApiKey(auth);

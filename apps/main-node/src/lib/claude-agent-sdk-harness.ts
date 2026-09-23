@@ -148,11 +148,7 @@ export interface ClaudeAgentSdkHarnessDeps {
     sessionId: string,
     args: { service: string; reason: string; mcp_server_url?: string },
   ) => Promise<{ request_id: string; status: string; note?: string }>;
-  /** Vault holding an active credential for an MCP server URL (setup:
-   *  lets update_harness attach the vault instead of posting a card). */
-  findCredentialVault?: (tenantId: string, mcpServerUrl: string) => Promise<string | null>;
-  /** Attach a vault to an agent's default vaults (idempotent). */
-  attachVaultToAgent?: (tenantId: string, agentId: string, vaultId: string) => Promise<void>;
+  isConnectionApproved?: (tenantId: string, agentId: string, url: string) => Promise<boolean>;
   /** Setup sessions: reconcile the servers already on the harness (cards /
    *  vault attach) once and return the status block for the preamble. */
   setupAccessStatus?: (
@@ -358,11 +354,8 @@ export class ClaudeAgentSdkHarness {
           const sessionId = ctx.session_id ?? "";
           const auto = await autoRequestAccessForNewServers(before.mcp_servers, after.mcp_servers, {
             requestAccess: (a) => this.#deps.requestServiceAccess!(tenantId, sessionId, a),
-            findCredentialVault: this.#deps.findCredentialVault
-              ? (url) => this.#deps.findCredentialVault!(tenantId, url)
-              : undefined,
-            attachVault: this.#deps.attachVaultToAgent
-              ? (vaultId) => this.#deps.attachVaultToAgent!(tenantId, agentId, vaultId)
+            isConnectionApproved: this.#deps.isConnectionApproved
+              ? (url) => this.#deps.isConnectionApproved!(tenantId, agentId, url)
               : undefined,
           });
           const line = describeAutoAccess(auto);
