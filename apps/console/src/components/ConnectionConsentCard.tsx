@@ -11,6 +11,7 @@ interface Connection {
   vault_name?: string;
 }
 interface Verification {
+  credential_id?: string;
   status: "verified" | "unverified";
   verification_id?: string;
   account?: string;
@@ -58,7 +59,7 @@ export function ConnectionConsentCard({ request, sessionId: explicitSessionId, g
     setBusy(true); setError(null); setVerification(null); setConfirmed(false);
     try {
       const result = await api<Verification>(`${base}/verify`, { method: "POST", body: JSON.stringify(connection) });
-      setVerification(result);
+      setVerification({ ...result, credential_id: connection.credential_id });
     } catch {
       setError("Verification failed. No access was granted. Please retry.");
     } finally { setBusy(false); }
@@ -140,7 +141,7 @@ export function ConnectionConsentCard({ request, sessionId: explicitSessionId, g
       <p className="text-xs text-fg-subtle">Choose the account this agent may use. Saved connections are not shared with it until you approve.</p>
       {connections.map(connection => <div key={connection.credential_id} className="border border-border rounded p-3 space-y-1">
         <p className="text-sm">{connection.label}</p>
-        <p className="text-xs text-fg-subtle">{connection.vault_name} · Account/workspace unverified</p>
+        <p className="text-xs text-fg-subtle">{connection.vault_name} · {verification?.credential_id === connection.credential_id && verification.status === "verified" ? "Verified — awaiting your approval" : "Account/workspace unverified"}</p>
         <Button variant="outline" size="sm" disabled={busy || connecting} onClick={() => void verify({ credential_id: connection.credential_id, vault_id: connection.vault_id })}>Verify connection</Button>
       </div>)}
       <Button variant="outline" size="sm" disabled={busy} onClick={() => void connectAnother()}>{connecting ? "Restart sign-in" : "Connect another"}</Button>
