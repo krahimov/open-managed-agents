@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate } from "react-router";
 import { ArchiveIcon, TrashIcon } from "lucide-react";
 
@@ -10,30 +10,10 @@ import { FilterChip, CreatedFilterChip } from "../components/FilterChip";
 import { RowActionsMenu } from "../components/RowActionsMenu";
 import { Button } from "@/components/ui/button";
 import { PopoverContent } from "@/components/ui/popover";
-import type { ModelCard } from "@open-managed-agents/api-types";
 import type { AgentRecord as Agent } from "../types/agent";
 import { AgentFormDialog } from "./agents/AgentFormDialog";
+import { useAgentFormAux } from "./agents/useAgentFormAux";
 
-type Runtime = {
-  id: string;
-  hostname: string;
-  status: string;
-  agents: Array<{ id: string }>;
-  /** Skills daemon detected locally on the user's machine, keyed by acp
-   *  agent id. Source for the blocklist multi-select that appears when
-   *  the user picks an acp agent. */
-  local_skills?: Record<
-    string,
-    Array<{
-      id: string;
-      name?: string;
-      description?: string;
-      source?: string;
-      source_label?: string;
-    }>
-  >;
-};
-type RuntimesResponse = { runtimes?: Runtime[]; data?: Runtime[] };
 
 type StatusValue = "any" | "active" | "archived";
 
@@ -46,13 +26,7 @@ const STATUS_OPTIONS: { value: StatusValue; label: string }[] = [
 export function AgentsList() {
   const { api } = useApi();
   const nav = useNavigate();
-  const [allAgents, setAllAgents] = useState<Agent[]>([]);
-  const [customSkills, setCustomSkills] = useState<
-    Array<{ id: string; name: string; description: string }>
-  >([]);
-  const [modelCards, setModelCards] = useState<ModelCard[]>([]);
-  const [runtimes, setRuntimes] = useState<Runtime[]>([]);
-  const [, setAuxLoading] = useState(true);
+  const { allAgents, customSkills, modelCards, runtimes } = useAgentFormAux();
   const [showCreate, setShowCreate] = useState(false);
 
   // Server-driven filter state. Each piece flows into agentsParams below
@@ -85,50 +59,6 @@ export function AgentsList() {
     loadMore,
     refresh: refreshAgents,
   } = useInfiniteApiQuery<Agent>("/v1/agents", { limit: 20, params: agentsParams });
-
-  // Aux fetches that aren't paginated UI surfaces — refreshed on mount and
-  // after agent CRUD. Pull all agents (for the callable-agents dropdown)
-  // separately so it isn't constrained by the main list's page size.
-  //
-  // Failures of the secondary fetches (skills / model cards / runtimes) are
-  // tolerated and logged: missing data degrades a dropdown but shouldn't
-  // block agent CRUD. Failures of the primary `/v1/agents` call surface
-  // via the toast that `useApi` raises automatically; setting `auxLoading`
-  // back to false in `finally` keeps the spinner from getting stuck.
-  const loadAux = async () => {
-    setAuxLoading(true);
-    try {
-      const all = await api<{ data: Agent[] }>("/v1/agents?limit=200&status=any");
-      setAllAgents(all.data);
-      await Promise.allSettled([
-        (async () => {
-          const sk = await api<{
-            data: Array<{ id: string; name: string; description: string }>;
-          }>("/v1/skills");
-          setCustomSkills(sk.data);
-        })().catch((e) => console.warn("[AgentsList] /v1/skills aux fetch failed", e)),
-        (async () => {
-          const mc = await api<{ data: ModelCard[] }>("/v1/model_cards?limit=200");
-          setModelCards(mc.data);
-        })().catch((e) => console.warn("[AgentsList] /v1/model_cards aux fetch failed", e)),
-        (async () => {
-          const rt = await api<RuntimesResponse>("/v1/runtimes");
-          const rows = Array.isArray(rt.runtimes)
-            ? rt.runtimes
-            : Array.isArray(rt.data)
-              ? rt.data
-              : [];
-          setRuntimes(rows);
-        })().catch((e) => console.warn("[AgentsList] /v1/runtimes aux fetch failed", e)),
-      ]);
-    } finally {
-      setAuxLoading(false);
-    }
-  };
-
-  useEffect(() => {
-    loadAux();
-  }, []);
 
   const modelStr = (m: Agent["model"]) => (typeof m === "string" ? m : m?.id || "");
 

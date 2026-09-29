@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import yaml from "js-yaml";
 import {
   OMA_SETUP_HARNESS,
@@ -66,6 +67,7 @@ export function AgentSetup() {
   const [searchParams] = useSearchParams();
   const sessionId = searchParams.get("session");
   const nav = useNavigate();
+  const qc = useQueryClient();
   const { api } = useApi();
   const [harness, setHarness] = useState<Harness>({});
   const [agentName, setAgentName] = useState("");
@@ -102,6 +104,13 @@ export function AgentSetup() {
     }
   }, []);
 
+  // The setup chat edits the agent server-side; drop cached agent-page data
+  // so it shows the refined config on the way back.
+  const refreshAgent = () => {
+    void qc.invalidateQueries({ queryKey: [`/v1/agents/${id}`] });
+    void qc.invalidateQueries({ queryKey: [`/v1/agents/${id}/versions`] });
+  };
+
   const yamlText = useMemo(() => harnessToYaml(harness), [harness]);
 
   if (!id) return null;
@@ -115,9 +124,28 @@ export function AgentSetup() {
       <div className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-2.5">
         <div className="min-w-0">
           <div className="truncate text-sm font-medium text-fg">{agentName || "New agent"}</div>
-          <div className="text-xs text-fg-muted">Setup — refine the harness together with the agent</div>
+          <div className="text-xs text-fg-muted">
+            Setup — refine the harness together with the agent, or edit settings directly
+          </div>
         </div>
-        <Button size="sm" className="ml-auto" onClick={() => nav(`/agents/${id}`)}>
+        <Button
+          size="sm"
+          variant="outline"
+          className="ml-auto"
+          onClick={() => {
+            refreshAgent();
+            nav(`/agents/${id}?edit=1`);
+          }}
+        >
+          Edit settings
+        </Button>
+        <Button
+          size="sm"
+          onClick={() => {
+            refreshAgent();
+            nav(`/agents/${id}`);
+          }}
+        >
           Done
         </Button>
       </div>

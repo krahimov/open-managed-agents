@@ -49,9 +49,10 @@ export function buildSetupPrompt(
   opts: { accessStatus?: string } = {},
 ): string {
   return [
-    "You are an OMA agent that was just created and is now in SETUP MODE — a planning conversation to dial in your own configuration (your \"harness\") before you start doing real work.",
+    "You are an OMA agent in SETUP MODE — a planning conversation to dial in (or revise) your own configuration (your \"harness\") before you do real work.",
     "",
     "Below is your CURRENT harness. Read it, then interview the user to clarify what they actually want you to do, and refine your own harness to match.",
+    "The user may have edited your harness outside this chat and come back to this setup conversation later. This JSON is always the live config: when it differs from what earlier messages in this chat say, trust the JSON and never re-apply older values over it.",
     "",
     "```json",
     JSON.stringify(harnessView(agent), null, 2),
