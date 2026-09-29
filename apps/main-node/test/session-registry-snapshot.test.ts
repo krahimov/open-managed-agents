@@ -13,7 +13,7 @@ import { bootstrapTestDb } from "./_helpers/bootstrap-test-db";
 const TENANT = "tn_registry_snapshot";
 
 describe("SessionRegistry", () => {
-  it.each([false, true])("runs snapshot turns with setup=%s and reserves computers only for work", async (isSetup) => {
+  it.each([false, true])("runs turns with setup=%s (setup reads the live agent) and reserves computers only for work", async (isSetup) => {
     const { sql, db, cleanup } = await bootstrapTestDb();
     try {
       await sql
@@ -84,6 +84,16 @@ describe("SessionRegistry", () => {
         buildHarnessContext: async (input) => input,
       });
 
+      // Edit the agent after the session was created (e.g. from the console's
+      // edit dialog). Work sessions keep their frozen snapshot; setup
+      // sessions — which edit the live agent and can be resumed later —
+      // must see the current config.
+      const edited = await agents.update({
+        tenantId: TENANT,
+        agentId: agent.id,
+        input: { system: "edited after session create" },
+      });
+
       if (!isSetup) {
         await expect(registry.getOrCreate(session.id, TENANT)).rejects.toThrow("Total disk limit exceeded");
       }
@@ -94,7 +104,14 @@ describe("SessionRegistry", () => {
         } as UserMessageEvent),
       );
 
-      expect(toolsAgent?.mcp_servers).toEqual(snapshot.mcp_servers);
+      if (isSetup) {
+        expect(toolsAgent?.system).toBe("edited after session create");
+        expect(toolsAgent?.version).toBe(edited.version);
+        expect(toolsAgent?.mcp_servers).toEqual(edited.mcp_servers);
+      } else {
+        expect(toolsAgent?.system).toBe(snapshot.system);
+        expect(toolsAgent?.mcp_servers).toEqual(snapshot.mcp_servers);
+      }
       if (isSetup) {
         expect(buildSandbox).not.toHaveBeenCalled();
         expect(provision).not.toHaveBeenCalled();

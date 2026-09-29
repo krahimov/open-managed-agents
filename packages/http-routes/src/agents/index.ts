@@ -754,6 +754,31 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
     return c.json({ data });
   });
 
+  // GET /v1/agents/:id/setup_session — the agent's most recent resumable
+  // setup session (metadata.oma_setup), so the console's "Setup chat" button
+  // can reopen the original conversation instead of starting a fresh one.
+  // Setup is almost always an agent's first session, so scan oldest-first
+  // (ambient-heavy agents pile up newer sessions on top of it).
+  app.get("/:id/setup_session", async (c) => {
+    const services = resolveServices(deps.services, c);
+    const id = c.req.param("id");
+    const tenantId = c.var.tenant_id;
+    const exists = await services.agents.get({ tenantId, agentId: id });
+    if (!exists) return c.json({ error: "Agent not found" }, 404);
+    const rows = await services.sessions.list({
+      tenantId,
+      agentId: id,
+      order: "asc",
+      limit: 200,
+    });
+    const setup = rows
+      .filter((s) => s.metadata?.oma_setup === true && s.status !== "terminated")
+      .pop();
+    return c.json({
+      data: setup ? { id: setup.id, status: setup.status, created_at: setup.created_at } : null,
+    });
+  });
+
   // GET /v1/agents/:id/versions/:version
   app.get("/:id/versions/:version", async (c) => {
     const services = resolveServices(deps.services, c);

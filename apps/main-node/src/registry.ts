@@ -643,6 +643,15 @@ export class SessionRegistry {
         adapter,
         sandbox,
         loadAgent: async (agentId) => {
+          // Setup sessions edit the LIVE agent (update_harness writes the
+          // row) and can be resumed later from the agent page after manual
+          // edits — so they must see the current config, not the snapshot
+          // frozen at creation, or the preamble shows a stale harness and
+          // the setup agent re-applies old values over the user's edits.
+          if (sessionRuntime.isSetup) {
+            const live = await this.deps.agentsService.get({ tenantId, agentId });
+            if (live) return applySessionReasoningOverride(live);
+          }
           if (
             sessionRuntime.agentSnapshot &&
             (!sessionRuntime.agentSnapshot.id || sessionRuntime.agentSnapshot.id === agentId)
