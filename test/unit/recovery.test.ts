@@ -88,7 +88,9 @@ describe("recoverInterruptedState — tool_use orphans", () => {
     const results = history.getEvents().filter((e: any) => e.type === "agent.tool_result");
     expect(results).toHaveLength(1);
     expect(results[0].tool_use_id).toBe("tu_bash_1");
-    expect(results[0].content).toMatch(/interrupted by maintenance restart/);
+    // bash = side_effect: outcome-unknown result (docs/durable-execution.md)
+    expect(results[0].content).toMatch(/MAY have taken effect/);
+    expect(results[0].is_error).toBe(true);
 
     expect(report.warnings.find((w) => w.source === "tool_call_interrupted")).toMatchObject({
       details: { tool_use_id: "tu_bash_1", tool_name: "bash" },

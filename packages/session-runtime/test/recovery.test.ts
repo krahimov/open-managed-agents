@@ -149,7 +149,9 @@ describe("recoverInterruptedState", () => {
     expect(events).toHaveLength(2);
     expect(events[1].type).toBe("agent.tool_result");
     expect(events[1].tool_use_id).toBe("use_orphan");
-    expect(events[1].content).toMatch(/interrupted/i);
+    // bash is side_effect: outcome-unknown message, not a silent retry.
+    expect(events[1].content).toMatch(/crashed before it completed/i);
+    expect(events[1].content).toMatch(/MAY have taken effect/);
     // Placeholder appears AFTER the use, preserving causal order so the
     // next eventsToMessages projection sees a clean (use, result) pair.
     expect(events[0].type).toBe("agent.tool_use");

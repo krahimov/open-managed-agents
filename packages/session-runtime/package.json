@@ -6,6 +6,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./recovery": "./src/recovery.ts",
+    "./tool-classification": "./src/tool-classification.ts",
     "./ports": "./src/ports.ts",
     "./adapter": "./src/adapter.ts",
     "./machine": "./src/machine.ts"

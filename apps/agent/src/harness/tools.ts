@@ -8,6 +8,7 @@ import { evaluatePolicy } from "@open-managed-agents/shared";
 import type { ToMarkdownProvider } from "@open-managed-agents/markdown";
 import type { SandboxExecutor, ProcessHandle } from "./interface";
 import { nanoid } from "nanoid";
+import { idempotencyKeyFor } from "@open-managed-agents/session-runtime";
 // Browser tools depend on the runtime-agnostic BrowserHarness interface.
 // Concrete adapters (CF / Node / CDP / Disabled) live in the package and
 // dynamic-import their workerd / Node peers only at first launch().
@@ -192,10 +193,14 @@ async function pollWithStrategies(
  * converts for the AI SDK.
  */
 type ToolResultValue = string | Record<string, unknown>;
-function safe<T>(fn: (args: T) => Promise<ToolResultValue>): (args: T) => Promise<ToolResultValue> {
-  return async (args: T) => {
+/** AI SDK execute options (subset). */
+type ToolExecuteOptions = { toolCallId?: string; abortSignal?: AbortSignal };
+function safe<T>(
+  fn: (args: T, options?: ToolExecuteOptions) => Promise<ToolResultValue>,
+): (args: T, options?: ToolExecuteOptions) => Promise<ToolResultValue> {
+  return async (args: T, options?: ToolExecuteOptions) => {
     try {
-      const result = await fn(args);
+      const result = await fn(args, options);
       // Handle empty string results (CC pattern: prevent model stop sequence issues)
       if (typeof result === "string" && result.trim() === "") return "(completed with no output)";
       return result;
@@ -215,6 +220,50 @@ function safe<T>(fn: (args: T) => Promise<ToolResultValue>): (args: T) => Promis
       return `Error: ${truncated}`;
     }
   };
+}
+
+/** Correlation key for a pending MCP tools/call: tool name + JSON args. */
+function mcpCallSignature(toolName: string, args: unknown): string {
+  return `${toolName}\u0000${JSON.stringify(args ?? {})}`;
+}
+
+/**
+ * If `req` is a JSON-RPC `tools/call` whose (name, arguments) matches a
+ * registered pending call, consume that call's idempotency key and stamp
+ * it as `params._meta.idempotency_key` + `Idempotency-Key` header.
+ * Anything else (initialize, tools/list, notifications, batches,
+ * non-JSON) passes through untouched.
+ */
+async function stampMcpIdempotencyKey(req: Request, pendingKeys: Map<string, string[]>): Promise<Request> {
+  let text: string;
+  try {
+    text = await req.clone().text();
+  } catch {
+    return req;
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let msg: any;
+  try {
+    msg = JSON.parse(text);
+  } catch {
+    return req;
+  }
+  if (!msg || Array.isArray(msg) || msg.method !== "tools/call" || !msg.params) return req;
+  const sig = mcpCallSignature(String(msg.params.name), msg.params.arguments);
+  const queue = pendingKeys.get(sig);
+  const key = queue?.shift();
+  if (!key) return req;
+  if (queue && queue.length === 0) pendingKeys.delete(sig);
+  msg.params._meta = { ...(msg.params._meta ?? {}), idempotency_key: key };
+  const headers = new Headers(req.headers);
+  headers.set("Idempotency-Key", key);
+  headers.delete("content-length");
+  return new Request(req.url, {
+    method: req.method,
+    headers,
+    body: JSON.stringify(msg),
+    signal: req.signal,
+  });
 }
 
 /**
@@ -464,7 +513,11 @@ export async function buildTools(
      *  turndown/pdf-parse/mammoth. Optional — when absent the tool falls
      *  back to raw curl + a warning to the model. */
     toMarkdown?: ToMarkdownProvider;
-    delegateToAgent?: (agentId: string, message: string) => Promise<string>;
+    delegateToAgent?: (
+      agentId: string,
+      message: string,
+      opts?: { idempotencyKey?: string },
+    ) => Promise<string>;
     environmentConfig?: { networking?: { type: string; allowed_hosts?: string[] } };
     /** MCP routing context — wired from SessionDO. AI SDK's MCP HTTP
      *  transport gets a custom `fetch` that calls
@@ -1382,11 +1435,21 @@ export async function buildTools(
         // routing metadata and hand the Request to main; main does the
         // credential injection + upstream fetch and returns the Response
         // verbatim (streaming).
-        const proxyFetch: typeof globalThis.fetch = (input, init) => {
-          const req = new Request(input, init);
+        //
+        // Idempotency (docs/durable-execution.md): the SDK's callTool has no
+        // _meta/header hook, so each wrapped execute below registers its
+        // key under (tool name, JSON args); when the matching tools/call
+        // JSON-RPC request passes through here we stamp
+        // `params._meta.idempotency_key` + an `Idempotency-Key` header.
+        const pendingKeys = new Map<string, string[]>();
+        const proxyFetch: typeof globalThis.fetch = async (input, init) => {
+          let req = new Request(input, init);
           req.headers.set("x-oma-tenant", tenantId);
           req.headers.set("x-oma-session", sessionId);
           req.headers.set("x-oma-mcp-server", serverName);
+          if (pendingKeys.size > 0 && req.method === "POST") {
+            req = await stampMcpIdempotencyKey(req, pendingKeys);
+          }
           return mcpBinding.fetch(req);
         };
         try {
@@ -1401,12 +1464,48 @@ export async function buildTools(
             }),
             timeoutPromise,
           ]);
-          const remoteTools = await Promise.race([
-            mcpClient.tools(),
+          // listTools + toolsFromDefinitions (instead of tools()) so the
+          // server's ToolAnnotations survive — readOnlyHint/idempotentHint
+          // drive crash-recovery classification (classifyTool).
+          const definitions = await Promise.race([
+            mcpClient.listTools(),
             timeoutPromise,
           ]);
+          const annotationsByName = new Map<string, unknown>();
+          for (const def of definitions.tools ?? []) {
+            if (def.annotations) annotationsByName.set(def.name, def.annotations);
+          }
+          const remoteTools = mcpClient.toolsFromDefinitions(definitions);
           for (const [toolName, t] of Object.entries(remoteTools)) {
-            tools[`mcp__${server.name}__${toolName}`] = t;
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            const baseTool = t as any;
+            const origExecute = baseTool.execute?.bind(baseTool);
+            tools[`mcp__${server.name}__${toolName}`] = {
+              ...baseTool,
+              ...(annotationsByName.has(toolName) ? { annotations: annotationsByName.get(toolName) } : {}),
+              ...(origExecute
+                ? {
+                    execute: async (args: unknown, options: ToolExecuteOptions) => {
+                      if (!options?.toolCallId) return origExecute(args, options);
+                      const key = idempotencyKeyFor(sessionId, options.toolCallId);
+                      const sig = mcpCallSignature(toolName, args);
+                      const queue = pendingKeys.get(sig) ?? [];
+                      queue.push(key);
+                      pendingKeys.set(sig, queue);
+                      try {
+                        return await origExecute(args, options);
+                      } finally {
+                        const q = pendingKeys.get(sig);
+                        if (q) {
+                          const i = q.indexOf(key);
+                          if (i >= 0) q.splice(i, 1);
+                          if (q.length === 0) pendingKeys.delete(sig);
+                        }
+                      }
+                    },
+                  }
+                : {}),
+            };
           }
         } catch (err) {
           // Connection / handshake / tools/list failure for one server
@@ -1436,12 +1535,18 @@ export async function buildTools(
         inputSchema: z.object({
           message: z.string().describe("The task to delegate"),
         }),
-        execute: safe(async ({ message }) => {
+        execute: safe(async ({ message }, options) => {
           if (!env?.delegateToAgent) {
             return "Multi-agent delegation not available: no thread executor configured";
           }
           try {
-            return await env.delegateToAgent(ca.id, message);
+            // Idempotency key (docs/durable-execution.md): re-invoking the
+            // same tool call reattaches to the child thread it already
+            // spawned instead of creating a second one.
+            const idempotencyKey = options?.toolCallId
+              ? idempotencyKeyFor(env.sessionId, options.toolCallId)
+              : undefined;
+            return await env.delegateToAgent(ca.id, message, { idempotencyKey });
           } catch (e) {
             return `Sub-agent error: ${e instanceof Error ? e.message : String(e)}`;
           }
@@ -1474,12 +1579,15 @@ export async function buildTools(
               "produce — the sub-agent gets only this string and returns text.",
           ),
       }),
-      execute: safe(async ({ task }) => {
+      execute: safe(async ({ task }, options) => {
         if (!env?.delegateToAgent) {
           return "general sub-agent unavailable: no thread executor configured";
         }
         try {
-          return await env.delegateToAgent("general", task);
+          const idempotencyKey = options?.toolCallId
+            ? idempotencyKeyFor(env.sessionId, options.toolCallId)
+            : undefined;
+          return await env.delegateToAgent("general", task, { idempotencyKey });
         } catch (e) {
           return `general sub-agent error: ${e instanceof Error ? e.message : String(e)}`;
         }

@@ -124,6 +124,12 @@ export interface Env {
    *  enables capture. Tenant-scoped opt-out is a future
    *  (TODO(llm-logging): add per-tenant flag in tenant config). */
   LLM_LOGS_DISABLED?: string;
+  /** Opt-in auto-resume of crash-interrupted turns from the durable event
+   *  log (docs/durable-execution.md). "1" enables it for every default-
+   *  harness session; per agent via `metadata.auto_resume_turns: true`.
+   *  Off by default on CF because the resume drains through the stale-turn
+   *  path, which can run inside alarm() (wall-time budget). */
+  OMA_AUTO_RESUME_TURNS?: string;
   TAVILY_API_KEY?: string;
   /** Project-level Composio secret used only by main/vault forwarding paths.
    *  Never expose this to agent workers, sandboxes, skills, or prompts. */

@@ -255,17 +255,46 @@ function buildMessages(
   let pendingAssistantContent: AssistantModelMessage["content"] = [];
   let pendingToolContent: ToolModelMessage["content"] = [];
 
+  // Step-merge state (write-ahead execution, docs/durable-execution.md):
+  // a step's tool results may be persisted BETWEEN that step's tool_use
+  // events (parallel tools finishing at different times). Events carrying
+  // the same `model_request_start_id` as the assistant message just
+  // flushed re-open it instead of starting a new one, so the projection
+  // still yields one assistant message + one tool message per step.
+  // Events without the field (legacy logs) keep the old behavior.
+  let pendingAssistantStepId: string | null = null;
+  let lastAssistantStepId: string | null = null;
   const flushAssistant = () => {
     if (pendingAssistantContent.length > 0) {
       messages.push({ role: "assistant", content: pendingAssistantContent });
       pendingAssistantContent = [];
+      lastAssistantStepId = pendingAssistantStepId;
+      pendingAssistantStepId = null;
     }
   };
   const flushTools = () => {
     if (pendingToolContent.length > 0) {
       messages.push({ role: "tool", content: pendingToolContent });
       pendingToolContent = [];
+      lastAssistantStepId = null;
     }
+  };
+  const beginAssistantPart = (event: SessionEvent) => {
+    const stepId = (event as { model_request_start_id?: string }).model_request_start_id ?? null;
+    const last = messages[messages.length - 1];
+    if (
+      stepId &&
+      pendingToolContent.length > 0 &&
+      pendingAssistantContent.length === 0 &&
+      lastAssistantStepId === stepId &&
+      last?.role === "assistant"
+    ) {
+      messages.pop();
+      pendingAssistantContent = last.content as AssistantModelMessage["content"];
+    } else {
+      flushTools();
+    }
+    pendingAssistantStepId = stepId;
   };
 
   for (let i = fromIdx; i < toIdx; i++) {
@@ -285,6 +314,7 @@ function buildMessages(
       case "user.message": {
         flushAssistant();
         flushTools();
+        lastAssistantStepId = null;
         messages.push({
           role: "user",
           content: userContentToParts((event as UserMessageEvent).content),
@@ -292,7 +322,7 @@ function buildMessages(
         break;
       }
       case "agent.thinking": {
-        flushTools();
+        beginAssistantPart(event);
         const e = event as AgentThinkingEvent;
         if (e.text != null) {
           pendingAssistantContent.push({
@@ -304,7 +334,7 @@ function buildMessages(
         break;
       }
       case "agent.message": {
-        flushTools();
+        beginAssistantPart(event);
         const e = event as AgentMessageEvent;
         for (const block of e.content) {
           if (block.type === "text") {
@@ -316,7 +346,7 @@ function buildMessages(
       case "agent.tool_use":
       case "agent.mcp_tool_use":
       case "agent.custom_tool_use": {
-        flushTools();
+        beginAssistantPart(event);
         const e = event as AgentToolUseEvent | AgentMcpToolUseEvent | AgentCustomToolUseEvent;
         const toolName = event.type === "agent.mcp_tool_use"
           ? `mcp_${(e as AgentMcpToolUseEvent).mcp_server_name}_call`
@@ -371,17 +401,46 @@ async function buildMessagesAsync(
   let pendingAssistantContent: AssistantModelMessage["content"] = [];
   let pendingToolContent: ToolModelMessage["content"] = [];
 
+  // Step-merge state (write-ahead execution, docs/durable-execution.md):
+  // a step's tool results may be persisted BETWEEN that step's tool_use
+  // events (parallel tools finishing at different times). Events carrying
+  // the same `model_request_start_id` as the assistant message just
+  // flushed re-open it instead of starting a new one, so the projection
+  // still yields one assistant message + one tool message per step.
+  // Events without the field (legacy logs) keep the old behavior.
+  let pendingAssistantStepId: string | null = null;
+  let lastAssistantStepId: string | null = null;
   const flushAssistant = () => {
     if (pendingAssistantContent.length > 0) {
       messages.push({ role: "assistant", content: pendingAssistantContent });
       pendingAssistantContent = [];
+      lastAssistantStepId = pendingAssistantStepId;
+      pendingAssistantStepId = null;
     }
   };
   const flushTools = () => {
     if (pendingToolContent.length > 0) {
       messages.push({ role: "tool", content: pendingToolContent });
       pendingToolContent = [];
+      lastAssistantStepId = null;
     }
+  };
+  const beginAssistantPart = (event: SessionEvent) => {
+    const stepId = (event as { model_request_start_id?: string }).model_request_start_id ?? null;
+    const last = messages[messages.length - 1];
+    if (
+      stepId &&
+      pendingToolContent.length > 0 &&
+      pendingAssistantContent.length === 0 &&
+      lastAssistantStepId === stepId &&
+      last?.role === "assistant"
+    ) {
+      messages.pop();
+      pendingAssistantContent = last.content as AssistantModelMessage["content"];
+    } else {
+      flushTools();
+    }
+    pendingAssistantStepId = stepId;
   };
 
   for (let i = fromIdx; i < toIdx; i++) {
@@ -393,6 +452,7 @@ async function buildMessagesAsync(
       case "user.message": {
         flushAssistant();
         flushTools();
+        lastAssistantStepId = null;
         messages.push({
           role: "user",
           content: await userContentToPartsAsync((event as UserMessageEvent).content, resolver),
@@ -400,7 +460,7 @@ async function buildMessagesAsync(
         break;
       }
       case "agent.thinking": {
-        flushTools();
+        beginAssistantPart(event);
         const e = event as AgentThinkingEvent;
         if (e.text != null) {
           pendingAssistantContent.push({
@@ -412,7 +472,7 @@ async function buildMessagesAsync(
         break;
       }
       case "agent.message": {
-        flushTools();
+        beginAssistantPart(event);
         const e = event as AgentMessageEvent;
         for (const block of e.content) {
           if (block.type === "text") {
@@ -424,7 +484,7 @@ async function buildMessagesAsync(
       case "agent.tool_use":
       case "agent.mcp_tool_use":
       case "agent.custom_tool_use": {
-        flushTools();
+        beginAssistantPart(event);
         const e = event as AgentToolUseEvent | AgentMcpToolUseEvent | AgentCustomToolUseEvent;
         const toolName = event.type === "agent.mcp_tool_use"
           ? `mcp_${(e as AgentMcpToolUseEvent).mcp_server_name}_call`
