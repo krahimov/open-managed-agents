@@ -30,6 +30,7 @@ import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { getLogger } from "@open-managed-agents/observability";
 import { withSessionProxyContext } from "./outbound-proxy";
+import { secretsForCommand } from "./command-secrets";
 
 const moduleLogger = getLogger("litebox-sandbox");
 
@@ -341,9 +342,8 @@ export class LiteBoxSandbox implements SandboxExecutor {
 
   private buildEnv(command: string): Record<string, string> {
     const out: Record<string, string> = { ...this.envVars };
-    for (const { prefix, secrets } of this.commandSecrets) {
-      if (command.startsWith(prefix)) Object.assign(out, secrets);
-    }
+    // Exact simple-command match only — see ./command-secrets.ts.
+    Object.assign(out, secretsForCommand(command, this.commandSecrets));
     return out;
   }
 }

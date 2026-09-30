@@ -20,6 +20,7 @@
 import type { ProcessHandle, SandboxExecutor, SandboxFactory } from "../ports";
 import { readS3MemoryBucket } from "../ports";
 import { withSessionProxyContext } from "./outbound-proxy";
+import { secretsForCommand } from "./command-secrets";
 
 // Structural types so this file compiles without `e2b` installed. The
 // driver shape is matched at runtime; mismatches surface as adapter
@@ -372,9 +373,8 @@ export class E2BSandboxExecutor implements SandboxExecutor {
    */
   private applyEnv(command: string): string {
     const env: Record<string, string> = { ...this.envVars };
-    for (const { prefix, secrets } of this.commandSecrets) {
-      if (command.startsWith(prefix)) Object.assign(env, secrets);
-    }
+    // Exact simple-command match only — see ./command-secrets.ts.
+    Object.assign(env, secretsForCommand(command, this.commandSecrets));
     if (Object.keys(env).length === 0) return command;
     const exports = Object.entries(env)
       .map(([k, v]) => `export ${k}=${shellEscape(v)};`)

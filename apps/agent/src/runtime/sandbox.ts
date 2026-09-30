@@ -414,6 +414,7 @@ export class CloudflareSandbox implements SandboxExecutor {
   async setOutboundContext(opts: {
     tenantId: string;
     sessionId: string;
+    egress?: { allowedHosts: string[] } | null;
   }): Promise<void> {
     if (!opts.tenantId || !opts.sessionId) return;
     try {
@@ -426,6 +427,9 @@ export class CloudflareSandbox implements SandboxExecutor {
       await sandbox.setOutboundHandler("inject_vault_creds", {
         tenantId: opts.tenantId,
         sessionId: opts.sessionId,
+        // Non-secret: the environment's allow-list, enforced per request
+        // by the handler (oma-sandbox.ts). null = unrestricted.
+        egress: opts.egress ?? null,
       });
       console.log(`[sandbox] setOutboundHandler bound (RPC mode)`);
     } catch (err) {

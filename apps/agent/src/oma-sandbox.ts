@@ -24,6 +24,7 @@
 
 import { Sandbox } from "@cloudflare/sandbox";
 import type { Env } from "@open-managed-agents/shared";
+import { isHostAllowedByEgress, type EgressPolicy } from "@open-managed-agents/shared";
 import {
   buildCfTenantDbProvider,
   getCfServicesForTenant,
@@ -64,6 +65,24 @@ interface SdkContext<P = unknown> {
 interface OutboundContextParams {
   tenantId?: string;
   sessionId?: string;
+  /** Environment allow-list (networking: limited). null/absent = unrestricted. */
+  egress?: EgressPolicy | null;
+}
+
+/**
+ * Enforce the environment's egress allow-list for a container request.
+ * Returns a 403 Response to short-circuit, or null to proceed. Runs before
+ * any credential lookup so a denied host never triggers a vault RPC.
+ */
+export function egressDenial(url: URL, params: OutboundContextParams): Response | null {
+  if (isHostAllowedByEgress(url.hostname, params.egress)) return null;
+  console.log(
+    `[oma-sandbox] egress denied host=${url.hostname} sid=${(params.sessionId ?? "").slice(0, 12)}`,
+  );
+  return new Response(
+    `oma: egress to "${url.hostname}" is blocked by this environment's networking policy (allowed_hosts)\n`,
+    { status: 403, headers: { "content-type": "text/plain" } },
+  );
 }
 
 /**
@@ -100,6 +119,9 @@ const injectVaultCredsHandler = async (
   const url = new URL(request.url);
   const params = ctx.params ?? {};
   const e = env as Env;
+
+  const denied = egressDenial(url, params);
+  if (denied) return denied;
 
   // Look up credential metadata for this host. Lightweight RPC — only
   // the resolved bearer token crosses the wire. Body + response stay
@@ -514,6 +536,9 @@ const githubAuthHandler = async (
   const url = new URL(request.url);
   const params = ctx.params ?? {};
   const e = env as Env;
+
+  const denied = egressDenial(url, params);
+  if (denied) return denied;
 
   let cred: { scheme: "Basic" | "Bearer"; token: string; slug: string } | null = null;
 

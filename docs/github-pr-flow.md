@@ -61,7 +61,7 @@ Secret injection path:
 **Key properties:**
 - `authorization_token` and `value` are **write-only** — never appear in any API response
 - Secrets stored in separate KV keys (`secret:{sessionId}:{resourceId}`), not in resource metadata
-- `registerCommandSecrets(prefix, secrets)` only injects env vars for commands matching the prefix
+- `registerCommandSecrets(prefix, secrets)` only injects env vars when the whole command is a single simple command whose name equals the prefix exactly (CF: shell-AST gated; e2b / daytona / litebox: no shell metacharacters allowed). The Node `LocalSubprocessSandbox` no longer implements it — credentials reach it only through the oma-vault proxy. This is a mitigation, not a boundary: a binary that takes attacker-controlled arguments (e.g. `git -c ...`) can still be coaxed into revealing its env
 - `echo $GITHUB_TOKEN` → empty (no global env var, only per-exec for `git`/`gh`/`cd` commands)
 - `git remote -v` → clean URL (token removed after clone)
 - Credential helper reads `$GITHUB_TOKEN` from per-exec env: `git config credential.helper '!f() { echo "password=${GITHUB_TOKEN}"; }; f'`

@@ -38,10 +38,17 @@ export interface SandboxExecutor {
    * On CF the handler intercepts container HTTPS requests and RPCs into
    * the main worker for vault credential injection. On other backends it's
    * a no-op or implementation-specific.
+   *
+   * `egress` is the session environment's effective allow-list
+   * (`resolveEgressPolicy` in @open-managed-agents/shared; null/absent =
+   * unrestricted). The CF handler enforces it per request; Node adapters
+   * ignore it because oma-vault looks the policy up itself from the signed
+   * session identity.
    */
   setOutboundContext?(opts: {
     tenantId: string;
     sessionId: string;
+    egress?: { allowedHosts: string[] } | null;
   }): Promise<void>;
   /**
    * Hand the (tenant, env, session) tuple to the OmaSandbox container DO so
