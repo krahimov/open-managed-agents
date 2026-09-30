@@ -105,6 +105,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     const sessionIdParam = c.req.query("session_id")?.trim() || undefined;
     const requestIdParam = c.req.query("request_id")?.trim() || undefined;
     const serviceParam = c.req.query("service")?.trim().toLowerCase() || undefined;
+    const chooseAccount = c.req.query("account_selection") === "choose";
     const popupError = (title: string, body: string, extra: Record<string, unknown> = {}) =>
       closeHtml(title, body, { request_id: requestIdParam, session_id: sessionIdParam, ...extra });
 
@@ -153,11 +154,12 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     let clientId: string | null = callerClientId || null;
     let clientSecret: string | undefined = callerClientSecret || undefined;
 
-    // One dynamically-registered client per (issuer, callback), cached — a
-    // fresh registration on every attempt spams the provider's client store
-    // and aggravates proxy-state failures on retries (mcp.linear.app's
-    // "Invalid flow state"). Invalidated on invalid_client at token exchange.
-    const dcrCacheKey = `oauth_dcr:${meta.authServer.issuer}|${callbackUri}`;
+    // Connecting another account needs a separate provider auth context.
+    // Reuse that connection's registration on retries, without sharing the
+    // registration with another connection or tenant.
+    const dcrCacheKey = chooseAccount
+      ? `oauth_dcr_connection:${JSON.stringify([tenantId, vaultId, meta.authServer.issuer, callbackUri])}`
+      : `oauth_dcr:${meta.authServer.issuer}|${callbackUri}`;
     if (!clientId && meta.authServer.registration_endpoint) {
       const cached = await deps.services.kv.get(dcrCacheKey).catch(() => null);
       if (cached) {
@@ -262,6 +264,9 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     authUrl.searchParams.set("code_challenge", codeChallenge);
     authUrl.searchParams.set("code_challenge_method", "S256");
     authUrl.searchParams.set("resource", meta.resource.resource);
+    // Linear's MCP proxy currently drops prompt=consent before redirecting
+    // to Linear. Do not claim it forces account selection. The console offers
+    // a provider account-switch step and verifies the returned identity.
     const requestedScope = c.req.query("scope");
     if (requestedScope) {
       authUrl.searchParams.set("scope", requestedScope);
@@ -269,6 +274,9 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       authUrl.searchParams.set("scope", meta.resource.scopes_supported.join(" "));
     }
 
+    deps.services.logger?.info({ op: "oauth.authorization_started", service: serviceParam,
+      account_selection: chooseAccount ? "choose" : "default",
+      connection_scoped_client: chooseAccount && !callerClientId && Boolean(meta.authServer.registration_endpoint) }, "starting provider authorization");
     return c.redirect(authUrl.toString());
   });
 
