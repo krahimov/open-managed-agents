@@ -15,6 +15,16 @@ import { DefaultHarness } from "./harness/default-loop";
 import { AcpProxyHarness } from "./harness/acp-proxy-loop";
 registerHarness("default", () => new DefaultHarness());
 registerHarness("acp-proxy", () => new AcpProxyHarness());
+// Pi agent runtime (pi-agent-core + pi-ai). Credentials are recovered from
+// the platform-resolved ctx.model — see harness/pi/model.ts. Imported on
+// first use so isolates that never run a Pi session don't pay for
+// evaluating its provider SDKs at startup. PiHarness only implements run().
+registerHarness("pi", () => ({
+  run: async (ctx) => {
+    const { PiHarness } = await import("./harness/pi");
+    return new PiHarness().run(ctx);
+  },
+}));
 
 // --- Export DO classes (required by wrangler) ---
 export { SessionDO } from "./runtime/session-do";
