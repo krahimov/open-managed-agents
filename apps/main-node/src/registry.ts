@@ -25,6 +25,7 @@ import { join } from "node:path";
 import {
   RuntimeAdapterImpl,
   SessionStateMachine,
+  type SessionMachineDeps,
 } from "@open-managed-agents/session-runtime";
 import type { SqlClient } from "@open-managed-agents/sql-client";
 import { SqlStreamRepo, type SqlEventLog } from "@open-managed-agents/event-log/sql";
@@ -118,7 +119,18 @@ export interface SessionRegistryDeps {
     tenantId: string;
     sessionId: string;
     eventLog: SqlEventLog;
+    /** Turn abort signal — hand to NodeHarnessRuntime({ abortSignal }). */
+    abortSignal?: AbortSignal;
   }): Promise<unknown>;
+
+  /** Optional outcome supervisor hook (user.define_outcome), bound to the
+   *  session's tenant. See SessionMachineDeps.runOutcome. */
+  runOutcome?(
+    input: Parameters<NonNullable<SessionMachineDeps["runOutcome"]>>[0] & {
+      tenantId: string;
+      sessionId: string;
+    },
+  ): Promise<void>;
 
   /** Sandbox workdir root, e.g. /app/data/sandboxes. Per-session dirs
    *  are joined under it. */
@@ -172,19 +184,26 @@ export class SessionRegistry {
   }
 
   /**
-   * Process-startup orphan reconciliation. Reads sessions WHERE
-   * status='running' and calls onWake() on each. Survivors of a prior
-   * crash get their event log cleaned up (placeholder agent.message +
-   * tool_result events injected) and the row flips back to 'idle'.
+   * Process-startup orphan reconciliation for sessions the work queue
+   * will NOT resume. Interrupted turns that still have a live work item
+   * (pending/running in session_work_items) are owned by the queue: it
+   * reclaims the stale lease and re-runs the turn, reconciling the orphan
+   * first (NodeSessionWorkQueue recovery policy). Touching those here
+   * would also clobber a turn that another replica is still running
+   * during a rolling deploy.
    *
-   * No automatic re-execution of the interrupted turn — the user gets
-   * a clean state and can retry by sending a new user.message. Mirrors
-   * what apps/main-node did inline before this refactor.
+   * What's left — status='running' with nothing to resume (no queue
+   * row, or its row already failed/dead) — gets its event log cleaned up
+   * (placeholder agent.message + tool_result events) and flips to idle.
    */
   async bootstrap(): Promise<void> {
     const r = await this.deps.sql
       .prepare(
-        `SELECT id, tenant_id FROM sessions WHERE status='running' AND turn_id IS NOT NULL`,
+        `SELECT id, tenant_id FROM sessions s
+          WHERE s.status='running' AND s.turn_id IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM session_work_items w
+               WHERE w.session_id = s.id AND w.status IN ('pending', 'running'))`,
       )
       .all<{ id: string; tenant_id: string }>();
     const rows = r.results ?? [];
@@ -263,28 +282,23 @@ export class SessionRegistry {
   }
 
   /**
-   * Abort the in-flight harness for a session. Routed from
-   * POST /v1/sessions/:id/events when the body contains a `user.interrupt`
-   * event. No-op if the session has no machine yet (nothing to interrupt).
-   * The machine's adapter handles emitting the session-side
-   * agent.message_stream_end(status="aborted") event chain.
+   * Abort the in-flight turn for a session in THIS process. Routed from
+   * POST /v1/sessions/:id/events `user.interrupt` (NodeSessionRouter).
+   * The machine's AbortController is plumbed into the harness
+   * (HarnessRuntime.abortSignal → streamText); the turn unwinds and emits
+   * its own session.status_idle. Resolves true when a turn was running
+   * here; turns on other replicas are reached via the work queue's
+   * cancel flag instead.
    */
-  interrupt(sessionId: string): void {
+  async interrupt(sessionId: string): Promise<boolean> {
     const p = this.map.get(sessionId);
-    if (!p) return;
-    p.then((entry) => {
-      const m = entry.machine as unknown as {
-        interrupt?: () => void;
-        abortInFlight?: () => void;
-      };
-      if (typeof m.interrupt === "function") m.interrupt();
-      else if (typeof m.abortInFlight === "function") m.abortInFlight();
-      // If the machine doesn't expose either method, the user.interrupt
-      // event is appended to the log by the route handler (P3 wires the
-      // actual abort plumbing into SessionStateMachine).
-    }).catch(() => {
-      /* getOrCreate failed — nothing to abort */
-    });
+    if (!p) return false;
+    try {
+      const entry = await p;
+      return entry.machine.interrupt({ kind: "user_interrupt" });
+    } catch {
+      return false; // getOrCreate failed — nothing to abort
+    }
   }
 
   // ── helpers ─────────────────────────────────────────────────────────
@@ -702,8 +716,12 @@ export class SessionRegistry {
             ...input,
             tenantId,
             sessionId,
-            eventLog,
+            // Turn-scoped (lease-fenced) log when the work queue supplied one.
+            eventLog: (input.eventLog as SqlEventLog | undefined) ?? eventLog,
           }),
+        ...(this.deps.runOutcome
+          ? { runOutcome: (input) => this.deps.runOutcome!({ ...input, tenantId, sessionId }) }
+          : {}),
         publish: (event: SessionEvent) => {
           this.deps.hub.publish(sessionId, event);
           try {

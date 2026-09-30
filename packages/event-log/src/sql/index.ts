@@ -51,6 +51,53 @@ function isUniqueViolation(err: unknown): boolean {
 }
 
 /**
+ * Optional write guard for {@link SqlEventLog}. When set, every INSERT is
+ * conditional on `EXISTS (<clause>)` evaluated in the same statement, and
+ * a guarded insert that matches no row throws {@link AppendRejectedError}
+ * instead of writing. Used by the Node work queue to fence event writes
+ * behind the current lease epoch: a worker whose lease was reclaimed by
+ * another replica can no longer add rows to the session's history.
+ *
+ * `clause` is a complete SELECT (e.g. `SELECT 1 FROM t WHERE id = ? AND
+ * epoch = ?`); `params` binds its placeholders in order.
+ */
+export interface AppendGuard {
+  clause: string;
+  params: unknown[];
+}
+
+/**
+ * Thrown by a guarded append whose guard no longer holds (the writer lost
+ * its lease). `code` is stable so callers in packages that can't import
+ * this class can still detect it structurally.
+ */
+export class AppendRejectedError extends Error {
+  readonly code = "append_rejected";
+  constructor(message = "event append rejected: write guard no longer holds") {
+    super(message);
+    this.name = "AppendRejectedError";
+  }
+}
+
+export function isAppendRejectedError(err: unknown): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    (err as { code?: unknown }).code === "append_rejected"
+  );
+}
+
+interface EventRow {
+  seq: number;
+  type?: string;
+  data?: string;
+  ts: number;
+  processed_at: number | null;
+  cancelled_at?: number | null;
+  session_thread_id: string | null;
+}
+
+/**
  * Per-session event log backed by a shared SQL store.
  *
  * `seq` is per-session; we mint it on insert via a subquery instead of
@@ -69,60 +116,102 @@ function isUniqueViolation(err: unknown): boolean {
  * better-sqlite3 never hits this (sync writes serialise in-process), and
  * cross-session writes never collide because they hit different
  * (session_id) partitions of the PRIMARY KEY.
+ *
+ * appendAsync returns the row exactly as stored (seq via RETURNING), so
+ * callers publish THAT event instead of re-reading the log to find "the
+ * last row" (quadratic, and racy with other writers).
  */
 export class SqlEventLog implements EventLogRepo {
+  /** Serial chain for the sync append() port method + its first error. */
+  private syncChain: Promise<void> = Promise.resolve();
+  private syncError: unknown = null;
+
   constructor(
     private sql: SqlClient,
     private sessionId: string,
     /** Stamps event.id and event.processed_at; mirrors cf-do/index.ts. */
     private stamp: (e: SessionEvent) => void,
+    private guard: AppendGuard | null = null,
   ) {}
+
+  /** Same log, with every write fenced behind `guard` (see AppendGuard). */
+  withGuard(guard: AppendGuard | null): SqlEventLog {
+    return new SqlEventLog(this.sql, this.sessionId, this.stamp, guard);
+  }
 
   /**
    * append() is documented as sync in the EventLogRepo port to match the
-   * CF DO adapter's free synchronous SQL. The SQL impl wraps async work
-   * inside a fire-and-forget Promise; callers that need durability before
-   * returning should use {@link appendAsync} instead. Lost-write window:
-   * < 1ms in practice (better-sqlite3 sync underneath an async wrap).
+   * CF DO adapter's free synchronous SQL. The SQL impl queues the write on
+   * a per-instance serial chain; failures are retained and rethrown by
+   * {@link flush}. Callers that need durability (or the stored seq) before
+   * continuing should use {@link appendAsync}.
    */
   append(event: SessionEvent): void {
     this.stamp(event);
-    void this.appendAsync(event);
+    this.syncChain = this.syncChain
+      .then(() => this.appendAsync(event))
+      .then(
+        () => undefined,
+        (err) => {
+          this.syncError ??= err;
+        },
+      );
   }
 
-  async appendAsync(event: SessionEvent): Promise<void> {
+  /** Await every append() issued so far; rethrow the first failure. */
+  async flush(): Promise<void> {
+    await this.syncChain;
+    if (this.syncError) {
+      const err = this.syncError;
+      this.syncError = null;
+      throw err;
+    }
+  }
+
+  async appendAsync(event: SessionEvent): Promise<SessionEvent> {
+    this.stamp(event);
     const ts = Date.now();
-    // Mirror cf-do/index.ts: user.* are pending until drained;
-    // everything else is "ingested" at write time. session_thread_id
-    // defaults to primary; events from sub-agent threads carry their
-    // own session_thread_id on the wire.
-    const isPending =
-      event.type === "user.message" ||
-      event.type === "user.tool_confirmation" ||
-      event.type === "user.custom_tool_result";
-    const processedAt = isPending ? null : ts;
+    // User-side inputs enter the log only when the runtime promotes them
+    // out of its pending queue (see apps/main-node's work queue), so every
+    // row is "ingested" at write time. Rows written before that change
+    // may still carry processed_at NULL; readers treat them as processed.
+    const processedAt = ts;
     const threadId =
       (event as unknown as { session_thread_id?: string }).session_thread_id ??
       "sthr_primary";
+    const eventId = (event as { id?: string }).id ?? null;
+    const guardSql = this.guard ? ` WHERE EXISTS (${this.guard.clause})` : "";
+    const guardParams = this.guard ? this.guard.params : [];
+    const data = JSON.stringify(event);
     for (let attempt = 1; ; attempt++) {
       try {
-        await this.sql
+        // The aggregate lives in a derived table so the guard can filter
+        // it to zero rows (a bare aggregate always yields exactly one row).
+        const row = await this.sql
           .prepare(
-            `INSERT INTO session_events (session_id, seq, type, data, ts, processed_at, session_thread_id)
-             SELECT ?, COALESCE(MAX(seq), 0) + 1, ?, ?, ?, ?, ?
-               FROM session_events WHERE session_id = ?`,
+            `INSERT INTO session_events (session_id, seq, type, data, ts, processed_at, session_thread_id, event_id)
+             SELECT ?, m.next_seq, ?, ?, ?, ?, ?, ?
+               FROM (SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
+                       FROM session_events WHERE session_id = ?) m${guardSql}
+             RETURNING seq, ts, processed_at, session_thread_id`,
           )
           .bind(
             this.sessionId,
             event.type,
-            JSON.stringify(event),
+            data,
             ts,
             processedAt,
             threadId,
+            eventId,
             this.sessionId,
+            ...guardParams,
           )
-          .run();
-        return;
+          .first<EventRow>();
+        if (!row) {
+          if (this.guard) throw new AppendRejectedError();
+          throw new Error("session_events insert returned no row");
+        }
+        return rowToEvent({ ...row, data });
       } catch (err) {
         if (!isUniqueViolation(err) || attempt >= MAX_APPEND_ATTEMPTS) throw err;
         // Lost the MAX(seq)+1 race to a concurrent writer. Jittered
@@ -131,6 +220,27 @@ export class SqlEventLog implements EventLogRepo {
         await new Promise((r) => setTimeout(r, Math.random() * 5 * attempt));
       }
     }
+  }
+
+  /**
+   * Indexed lookup by event id (event_id column, backfilled by
+   * ensureSchema). Returns the stored event or null.
+   */
+  async findEventByIdAsync(eventId: string): Promise<SessionEvent | null> {
+    const row = await this.sql
+      .prepare(
+        `SELECT seq, type, data, ts, processed_at, cancelled_at, session_thread_id
+           FROM session_events
+          WHERE session_id = ? AND event_id = ?
+          ORDER BY seq ASC LIMIT 1`,
+      )
+      .bind(this.sessionId, eventId)
+      .first<EventRow>();
+    return row ? rowToEvent(row) : null;
+  }
+
+  async hasEventAsync(eventId: string): Promise<boolean> {
+    return (await this.findEventByIdAsync(eventId)) !== null;
   }
 
   /**
@@ -166,22 +276,8 @@ export class SqlEventLog implements EventLogRepo {
       afterSeq !== undefined
         ? this.sql.prepare(sql).bind(this.sessionId, afterSeq)
         : this.sql.prepare(sql).bind(this.sessionId);
-    const r = await stmt.all<{
-      seq: number; type: string; data: string; ts: number;
-      processed_at: number | null; cancelled_at: number | null; session_thread_id: string | null;
-    }>();
-    return (r.results ?? []).map((row) => {
-      const ev = JSON.parse(row.data) as SessionEvent & Record<string, unknown>;
-      ev.seq = row.seq;
-      ev.ts = row.ts;
-      // Stash row-level pending lifecycle onto the event object — same
-      // contract as cf-do/index.ts so eventsToMessages can skip cancelled
-      // events without a separate query path.
-      if (row.processed_at !== null) ev.processed_at_ms = row.processed_at;
-      if (row.cancelled_at !== null) ev.cancelled_at_ms = row.cancelled_at;
-      if (row.session_thread_id != null) ev.session_thread_id = row.session_thread_id;
-      return ev as SessionEvent;
-    });
+    const r = await stmt.all<EventRow>();
+    return (r.results ?? []).map(rowToEvent);
   }
 
   getLastEventSeq(_type: string): number {
@@ -220,6 +316,19 @@ export class SqlEventLog implements EventLogRepo {
     }
     return null;
   }
+}
+
+function rowToEvent(row: EventRow): SessionEvent {
+  const ev = JSON.parse(row.data ?? "{}") as SessionEvent & Record<string, unknown>;
+  ev.seq = Number(row.seq);
+  ev.ts = Number(row.ts);
+  // Stash row-level pending lifecycle onto the event object — same
+  // contract as cf-do/index.ts so eventsToMessages can skip cancelled
+  // events without a separate query path.
+  if (row.processed_at != null) ev.processed_at_ms = Number(row.processed_at);
+  if (row.cancelled_at != null) ev.cancelled_at_ms = Number(row.cancelled_at);
+  if (row.session_thread_id != null) ev.session_thread_id = row.session_thread_id;
+  return ev as SessionEvent;
 }
 
 /**
@@ -364,6 +473,7 @@ export async function ensureSchema(
       processed_at BIGINT,
       cancelled_at BIGINT,
       session_thread_id TEXT,
+      event_id TEXT,
       PRIMARY KEY (session_id, seq)
     );
   `);
@@ -383,6 +493,21 @@ export async function ensureSchema(
     await sql.exec(`ALTER TABLE session_events ADD COLUMN session_thread_id TEXT`);
     await sql.exec(`UPDATE session_events SET session_thread_id = 'sthr_primary' WHERE session_thread_id IS NULL`);
   }
+  // event_id: indexed copy of data.id so id lookups (dedupe on pending
+  // promotion, wakeup idempotency) don't scan + parse the whole log.
+  // One-shot backfill from the JSON payload when the column is added.
+  if (!cols.has("event_id")) {
+    await sql.exec(`ALTER TABLE session_events ADD COLUMN event_id TEXT`);
+    await sql.exec(
+      dialect === "postgres"
+        ? `UPDATE session_events SET event_id = (data::jsonb ->> 'id') WHERE event_id IS NULL`
+        : `UPDATE session_events SET event_id = json_extract(data, '$.id') WHERE event_id IS NULL`,
+    );
+  }
+  await sql.exec(`
+    CREATE INDEX IF NOT EXISTS idx_session_events_event_id
+      ON session_events (session_id, event_id);
+  `);
   await sql.exec(`
     CREATE INDEX IF NOT EXISTS idx_session_events_type
       ON session_events (session_id, type, seq DESC);

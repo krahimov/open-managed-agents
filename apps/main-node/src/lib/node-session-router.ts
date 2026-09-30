@@ -6,8 +6,18 @@
 
 import type { SqlClient } from "@open-managed-agents/sql-client";
 import { SqlEventLog } from "@open-managed-agents/event-log/sql";
-import type { SessionEvent, StoredEvent } from "@open-managed-agents/shared";
-import { buildTrajectory, type SessionRecord, type EnvironmentConfig } from "@open-managed-agents/shared";
+import type {
+  SessionEvent,
+  StoredEvent,
+  UserDefineOutcomeEvent,
+} from "@open-managed-agents/shared";
+import {
+  buildTrajectory,
+  generateEventId,
+  generateOutcomeId,
+  type SessionRecord,
+  type EnvironmentConfig,
+} from "@open-managed-agents/shared";
 import { isSpecEvent } from "@open-managed-agents/api-types";
 import { getLogger } from "@open-managed-agents/observability";
 
@@ -22,6 +32,7 @@ import type {
   SessionAppendResult,
   SessionStreamFrame,
   SessionStreamHandle,
+  TurnInputEvent,
 } from "@open-managed-agents/session-runtime";
 import type { SessionRegistry } from "../registry.js";
 import type { EventStreamHub } from "./event-stream-hub.js";
@@ -35,18 +46,29 @@ interface NodeSessionRouterDeps {
   workQueue?: NodeSessionWorkQueue;
 }
 
+/** Events that queue a turn instead of landing in the log on arrival. */
+const QUEUE_INPUT_TYPES = new Set([
+  "user.message",
+  "user.tool_confirmation",
+  "user.custom_tool_result",
+]);
+
 export class NodeSessionRouter implements SessionRouter {
   constructor(private deps: NodeSessionRouterDeps) {}
+
+  /** Persist then publish exactly the stored row (with its seq). */
+  private async appendAndPublish(sessionId: string, event: SessionEvent): Promise<SessionEvent> {
+    const stored = await this.deps.newEventLog(sessionId).appendAsync(event);
+    this.deps.hub.publish(sessionId, stored);
+    return stored;
+  }
 
   async init(_sessionId: string, params: SessionInitParams): Promise<void> {
     // Node has no warmup-on-init step (sandbox is lazy on first event).
     // We still need to persist any init events so trajectory + SSE see them.
     if (!params.initEvents?.length) return;
-    const log = this.deps.newEventLog(_sessionId);
     for (const ev of params.initEvents) {
-      await log.appendAsync(ev);
-      const stored = await log.getEventsAsync();
-      this.deps.hub.publish(_sessionId, stored[stored.length - 1]);
+      await this.appendAndPublish(_sessionId, ev);
     }
   }
 
@@ -71,51 +93,138 @@ export class NodeSessionRouter implements SessionRouter {
     sessionId: string,
     event: SessionEvent,
   ): Promise<SessionAppendResult> {
-    const log = this.deps.newEventLog(sessionId);
     if (event.type === "user.interrupt") {
-      this.deps.registry.interrupt(sessionId);
+      await this.interruptWith(sessionId, event);
       return { status: 202, body: '{"accepted":true,"interrupted":true}' };
     }
-    await log.appendAsync(event);
-    const stored = await log.getEventsAsync();
-    const last = stored[stored.length - 1];
-    this.deps.hub.publish(sessionId, last);
+    if (event.type === "user.define_outcome") {
+      return this.defineOutcome(sessionId, event as UserDefineOutcomeEvent);
+    }
+    if (!QUEUE_INPUT_TYPES.has(event.type)) {
+      await this.appendAndPublish(sessionId, event);
+      return { status: 202, body: JSON.stringify({ accepted: true }) };
+    }
 
-    if (event.type === "user.message") {
-      // Look up the agent_id off the sessions row; SessionRegistry
-      // expects (sid, tenantId, agentId, event).
-      const row = await this.deps.sql
-        .prepare(`SELECT tenant_id, agent_id FROM sessions WHERE id = ?`)
-        .bind(sessionId)
-        .first<{ tenant_id: string; agent_id: string | null }>();
-      if (row?.agent_id) {
-        if (this.deps.workQueue) {
-          await this.deps.workQueue.enqueue({
-            tenantId: row.tenant_id,
-            sessionId,
-            agentId: row.agent_id,
-            event: last,
-          });
-          void this.deps.workQueue.wake(sessionId).catch((err) => {
-            moduleLog.error(
-              { err, op: "node_session_router.work_queue_failed", session_id: sessionId },
-              "session work queue failed",
-            );
-          });
-        } else {
-          const entry = await this.deps.registry.getOrCreate(sessionId, row.tenant_id);
-          void entry.machine
-            .runHarnessTurn(
-              row.agent_id,
-              event as import("@open-managed-agents/shared").UserMessageEvent,
-            )
-            .catch((err) => {
-              moduleLog.error({ err, op: "node_session_router.harness_turn_failed", session_id: sessionId }, "harness turn failed");
-            });
-        }
+    // Queue inputs are held in the pending queue (session_work_items) and
+    // promoted into the event log when their turn starts — AMA semantics:
+    // `processed_at` stays null until the agent picks the event up, and a
+    // message sent mid-turn can't interleave into the running answer.
+    const input = event as SessionEvent & { id?: string; processed_at?: string };
+    input.id ??= generateEventId();
+    delete input.processed_at;
+
+    // Look up the agent_id off the sessions row; SessionRegistry expects
+    // (sid, tenantId, agentId, event).
+    const row = await this.deps.sql
+      .prepare(`SELECT tenant_id, agent_id FROM sessions WHERE id = ?`)
+      .bind(sessionId)
+      .first<{ tenant_id: string; agent_id: string | null }>();
+    if (!row?.agent_id) {
+      // Nothing will ever run a turn for this session; keep the record.
+      await this.appendAndPublish(sessionId, input);
+      return { status: 202, body: JSON.stringify({ accepted: true }) };
+    }
+
+    if (this.deps.workQueue) {
+      const queued = await this.deps.workQueue.enqueue({
+        tenantId: row.tenant_id,
+        sessionId,
+        agentId: row.agent_id,
+        event: input,
+      });
+      if (queued.created) {
+        // Outbox notification (OMA extension, chunks opt-in on SSE): lets
+        // clients render the queued input now and correlate it with the
+        // system.user_message_promoted frame the turn emits later.
+        this.deps.hub.publish(sessionId, {
+          type: "system.user_message_pending",
+          event_id: queued.eventId,
+          pending_seq: queued.pendingSeq,
+          enqueued_at: queued.enqueuedAt,
+          session_thread_id:
+            (input as { session_thread_id?: string }).session_thread_id ?? "sthr_primary",
+          event: input,
+        } as unknown as SessionEvent);
       }
+      void this.deps.workQueue.wake(sessionId).catch((err) => {
+        moduleLog.error(
+          { err, op: "node_session_router.work_queue_failed", session_id: sessionId },
+          "session work queue failed",
+        );
+      });
+    } else {
+      // No durable queue (tests / embedded use): run in-process. The
+      // machine promotes the event into the log at turn start.
+      const entry = await this.deps.registry.getOrCreate(sessionId, row.tenant_id);
+      void entry.machine
+        .runTurn(row.agent_id, input as unknown as TurnInputEvent)
+        .catch((err) => {
+          moduleLog.error({ err, op: "node_session_router.harness_turn_failed", session_id: sessionId }, "harness turn failed");
+        });
     }
     return { status: 202, body: JSON.stringify({ accepted: true }) };
+  }
+
+  /**
+   * AMA user.interrupt: flush queued inputs for the session, abort the
+   * running turn (this process immediately; another replica on its next
+   * lease heartbeat), and record the interrupt. The aborted turn ends
+   * itself with session.status_idle; when no turn was running but queued
+   * inputs were flushed we emit that idle here (CF parity — a no-op
+   * interrupt emits nothing).
+   */
+  private async interruptWith(sessionId: string, event: SessionEvent): Promise<void> {
+    // Record the interrupt first so it precedes the aborted turn's idle.
+    await this.appendAndPublish(sessionId, event);
+    const { cancelled, runningCount } = this.deps.workQueue
+      ? await this.deps.workQueue.requestCancel(sessionId)
+      : { cancelled: [], runningCount: 0 };
+    const hadLocalTurn = await this.deps.registry.interrupt(sessionId);
+    for (const row of cancelled) {
+      this.deps.hub.publish(sessionId, {
+        type: "system.user_message_cancelled",
+        event_id: row.event_id,
+        pending_seq: row.pending_seq,
+        session_thread_id: row.session_thread_id,
+        cancelled_at: row.cancelled_at ?? Date.now(),
+      } as unknown as SessionEvent);
+    }
+    if (!hadLocalTurn && runningCount === 0 && cancelled.length > 0) {
+      await this.appendAndPublish(sessionId, {
+        type: "session.status_idle",
+        stop_reason: { type: "end_turn" },
+      } as SessionEvent);
+    }
+  }
+
+  /**
+   * user.define_outcome: validate, mint the outcome id, record it. The
+   * outcome supervisor picks it up when the next turn ends (the active
+   * outcome is derived from the event log — see activeOutcomeFromEvents).
+   */
+  private async defineOutcome(
+    sessionId: string,
+    e: UserDefineOutcomeEvent,
+  ): Promise<SessionAppendResult> {
+    const hasRubric =
+      typeof e.rubric === "string"
+        ? e.rubric.trim().length > 0
+        : !!e.rubric && (
+            (e.rubric.type === "text" && !!e.rubric.content) ||
+            (e.rubric.type === "file" && !!e.rubric.file_id)
+          );
+    if (!hasRubric && !e.verifier) {
+      return {
+        status: 400,
+        body: JSON.stringify({
+          error: "user.define_outcome requires at least one of `rubric` or `verifier`",
+        }),
+      };
+    }
+    const outcome_id =
+      e.outcome_id && e.outcome_id.startsWith("outc_") ? e.outcome_id : generateOutcomeId();
+    await this.appendAndPublish(sessionId, { ...e, outcome_id } as SessionEvent);
+    return { status: 202, body: JSON.stringify({ accepted: true, outcome_id }) };
   }
 
   async getEvents(
@@ -244,6 +353,20 @@ export class NodeSessionRouter implements SessionRouter {
     // side of the replay/live handoff can lose them.
     const detach = this.deps.hub.attach(sessionId, writer);
     try {
+      if (needsReplay && includeChunks && this.deps.workQueue) {
+        // Outbox replay (CF parity): a reconnecting chunks-enabled client
+        // sees queued inputs without a separate GET /pending.
+        for (const row of await this.deps.workQueue.listPending(sessionId)) {
+          enqueue({
+            type: "system.user_message_pending",
+            event_id: row.event_id,
+            pending_seq: row.pending_seq,
+            enqueued_at: row.enqueued_at,
+            session_thread_id: row.session_thread_id,
+            event: row.event,
+          } as unknown as StreamEvent, true);
+        }
+      }
       if (needsReplay) {
         const history = await this.deps.newEventLog(sessionId)
           .getEventsAsync(opts.lastEventId ?? undefined);
@@ -291,7 +414,7 @@ export class NodeSessionRouter implements SessionRouter {
   }
 
   async interrupt(sessionId: string): Promise<void> {
-    this.deps.registry.interrupt(sessionId);
+    await this.interruptWith(sessionId, { type: "user.interrupt" } as SessionEvent);
   }
 
   async exec(
@@ -379,16 +502,11 @@ export class NodeSessionRouter implements SessionRouter {
     // Node injects a synthetic session.error so the SSE consumer sees a
     // recovery probe land. Mirrors the package handler's previous inline
     // implementation.
-    const log = this.deps.newEventLog(sessionId);
-    const ev = {
+    const last = await this.appendAndPublish(sessionId, {
       type: "session.error",
       error: "debug_recovery",
       message: "synthetic recovery event injected via __debug_recovery__",
-    } as unknown as SessionEvent;
-    await log.appendAsync(ev);
-    const stored = await log.getEventsAsync();
-    const last = stored[stored.length - 1];
-    this.deps.hub.publish(sessionId, last);
+    } as unknown as SessionEvent);
     return { status: 202, body: JSON.stringify({ injected: last }) };
   }
 
@@ -447,16 +565,31 @@ export class NodeSessionRouter implements SessionRouter {
 
   async getPending(
     sessionId: string,
-    _opts?: { rawSearch?: string },
+    opts?: { rawSearch?: string },
   ): Promise<{ status: number; body: string }> {
-    // Node SqlEventLog doesn't yet have the dual-table queue surface
-    // (CF SessionDO holds pending in its DO sqlite). For now return an
-    // empty page so SDK callers don't 500 — pending events still drive
-    // the harness via in-process registry, just no read API for them.
-    void sessionId;
+    // AMA pending queue: queue inputs accepted but not yet promoted into
+    // the event log (session_work_items rows in status='pending'). Same
+    // response shape as the CF SessionDO GET /pending.
+    const params = new URLSearchParams(opts?.rawSearch ?? "");
+    const threadId = params.get("session_thread_id") ?? "sthr_primary";
+    const includeCancelled = params.get("include_cancelled") === "true";
+    const rows = this.deps.workQueue
+      ? await this.deps.workQueue.listPending(sessionId, { includeCancelled })
+      : [];
+    const data = rows
+      .filter((r) => r.session_thread_id === threadId)
+      .map((r) => ({
+        pending_seq: r.pending_seq,
+        enqueued_at: r.enqueued_at,
+        session_thread_id: r.session_thread_id,
+        type: r.type,
+        event_id: r.event_id,
+        cancelled_at: r.cancelled_at,
+        data: r.event,
+      }));
     return {
       status: 200,
-      body: JSON.stringify({ data: [], has_more: false }),
+      body: JSON.stringify({ data, has_more: false }),
     };
   }
 

@@ -10,10 +10,12 @@
     "./harness/interface": "./src/harness/interface.ts",
     "./harness/tools": "./src/harness/tools.ts",
     "./harness/registry": "./src/harness/registry.ts",
+    "./harness/pi": "./src/harness/pi/index.ts",
     "./harness/provider": "./src/harness/provider.ts",
     "./harness/tool-budget": "./src/harness/tool-budget.ts",
     "./harness/platform-guidance": "./src/harness/platform-guidance.ts",
     "./runtime/history": "./src/runtime/history.ts",
+    "./runtime/outcome-supervisor": "./src/runtime/outcome-supervisor.ts",
     "./runtime/resource-mounter": "./src/runtime/resource-mounter.ts"
   },
   "dependencies": {
@@ -22,6 +24,8 @@
     "@cloudflare/containers": "^0.3.0",
     "@cloudflare/playwright": "^1.3.0",
     "@cloudflare/sandbox": "^0.9.1",
+    "@earendil-works/pi-agent-core": "0.99.1",
+    "@earendil-works/pi-ai": "0.99.1",
     "@open-managed-agents/agents-store": "workspace:*",
     "@open-managed-agents/api-types": "workspace:*",
     "@open-managed-agents/browser-harness": "workspace:*",

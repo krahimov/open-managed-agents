@@ -79,6 +79,7 @@ import {
 } from "@open-managed-agents/model-cards-store";
 import { toFileRecord } from "@open-managed-agents/files-store";
 import { SqlEventLog } from "@open-managed-agents/event-log/sql";
+import { sessionErrorAlreadyEmitted } from "@open-managed-agents/session-runtime";
 import type { AgentConfig, CredentialConfig, EnvironmentConfig, SessionEvent, Trajectory } from "@open-managed-agents/shared";
 import { generateEventId, extractTextFromContent, extractTraceFacts } from "@open-managed-agents/shared";
 import type { TraceFacts } from "@open-managed-agents/shared";
@@ -86,6 +87,7 @@ import { DefaultHarness } from "@open-managed-agents/agent/harness/default-loop"
 import { CodexSdkHarness } from "./lib/codex-sdk-harness.js";
 import type { SdkMemoryPort } from "./lib/sdk-harness-memory.js";
 import { ClaudeAgentSdkHarness } from "./lib/claude-agent-sdk-harness.js";
+import type { PiHarness } from "@open-managed-agents/agent/harness/pi";
 import {
   buildSetupPrompt,
   buildSetupTools,
@@ -182,6 +184,7 @@ import {
   type NodeMcpProxyRefresh,
 } from "./lib/node-mcp-proxy.js";
 import { NodeSessionWorkQueue } from "./lib/node-session-work-queue.js";
+import { createNodeOutcomeRunner } from "./lib/node-outcome.js";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -760,6 +763,33 @@ if (usePostgres) {
 
 // ─── Sandbox factory ────────────────────────────────────────────────────
 
+// The subprocess provider has zero isolation (host user, host filesystem,
+// direct network that can bypass oma-vault + egress policy). It stays the
+// default so the docker-compose quickstart (NODE_ENV=production in the image)
+// keeps working, but production boots warn loudly, and operators can make it
+// a hard error with OMA_REQUIRE_ISOLATED_SANDBOX=1. See docs/self-host.md.
+const requireIsolatedSandbox = parseBooleanEnv(process.env.OMA_REQUIRE_ISOLATED_SANDBOX, false);
+const allowUnsafeSubprocess = parseBooleanEnv(process.env.OMA_ALLOW_UNSAFE_SUBPROCESS, false);
+{
+  const defaultProvider = (process.env.SANDBOX_PROVIDER ?? "subprocess").toLowerCase();
+  if (defaultProvider === "subprocess" && requireIsolatedSandbox) {
+    throw new Error(
+      "OMA_REQUIRE_ISOLATED_SANDBOX=1 but SANDBOX_PROVIDER is subprocess (the default). " +
+        "Set SANDBOX_PROVIDER to daytona / e2b / litebox / boxrun.",
+    );
+  }
+  if (defaultProvider === "subprocess" && process.env.NODE_ENV === "production" && !allowUnsafeSubprocess) {
+    logger.warn(
+      { op: "sandbox.unsafe_subprocess_in_production" },
+      "SECURITY: SANDBOX_PROVIDER=subprocess with NODE_ENV=production. Agent commands run as host " +
+        "subprocesses with NO isolation: they share this process's OS user and filesystem (sqlite db, " +
+        "vault CA key, /proc/<pid>/environ) and can bypass the oma-vault proxy / egress policy by unsetting " +
+        "HTTP(S)_PROXY. Only run trusted agents, or switch to daytona / e2b / litebox / boxrun. " +
+        "Set OMA_ALLOW_UNSAFE_SUBPROCESS=1 to acknowledge and silence this warning.",
+    );
+  }
+}
+
 const SANDBOX_PROVIDER_PATHS: Record<string, string> = {
   subprocess: "@open-managed-agents/sandbox/adapters/local-subprocess",
   litebox: "@open-managed-agents/sandbox/adapters/litebox",
@@ -779,6 +809,11 @@ async function buildSandbox(
   const provider = sandboxProviderFromEnvironment(process.env, environment);
   if (sandboxEnv.SANDBOX_SCOPE === "agent" && provider !== "daytona") {
     throw new Error("Agent computer scope requires the Daytona provider.");
+  }
+  if (provider === "subprocess" && requireIsolatedSandbox) {
+    throw new Error(
+      "OMA_REQUIRE_ISOLATED_SANDBOX=1: refusing to start a subprocess sandbox for this environment.",
+    );
   }
   const path = SANDBOX_PROVIDER_PATHS[provider];
   if (!path) {
@@ -822,7 +857,7 @@ function outputsPathFor(
 
 const sessionBrowsers = new Map<string, ReturnType<typeof createSandboxBrowserHarness>>();
 
-const sessionRegistry = new SessionRegistry({
+const sessionRegistry: SessionRegistry = new SessionRegistry({
   sql,
   hub,
   onSessionEvent: webhookStore
@@ -840,6 +875,28 @@ const sessionRegistry = new SessionRegistry({
   buildSandbox,
   sandboxWorkdirRoot: process.env.SANDBOX_WORKDIR ?? "./data/sandboxes",
   sqlDialect: dialect,
+  runOutcome: createNodeOutcomeRunner({
+    resolveJudgeModel: async (agent, tenantId) => {
+      const creds = await resolveNodeModelCredentials(agent, tenantId);
+      return {
+        model: resolveModel(creds.model, creds.apiKey, creds.baseURL, creds.apiCompat, creds.customHeaders),
+        modelId: creds.model,
+      };
+    },
+    loadRubricFile: async (tenantId, fileId) => {
+      const file = await filesService.get({ tenantId, fileId });
+      const object = file ? await filesBlob.get(file.r2_key) : null;
+      return object ? new TextDecoder().decode(await object.bytes()) : null;
+    },
+    runExec: async (tenantId, sessionId, cmd, timeoutMs): Promise<{ exit_code: number; output: string }> => {
+      const entry: { sandbox: { exec(cmd: string, timeoutMs?: number): Promise<string> } } =
+        await sessionRegistry.getOrCreate(sessionId, tenantId);
+      const raw: string = await entry.sandbox.exec(cmd, timeoutMs);
+      // sandbox.exec returns "exit=N\n<merged-output>"
+      const m = raw.match(/^exit=(-?\d+)\n([\s\S]*)$/);
+      return m ? { exit_code: parseInt(m[1], 10), output: m[2] } : { exit_code: -1, output: raw };
+    },
+  }),
   buildModel: async (agent, tenantId) => {
     const creds = await resolveNodeModelCredentials(agent, tenantId);
     return resolveModel(
@@ -1077,6 +1134,15 @@ const sessionRegistry = new SessionRegistry({
       cancelWakeup: (sessionId, id) => sessionWakeups.cancel(sessionId, id),
       listWakeups: (sessionId) => sessionWakeups.list(sessionId),
     });
+    // Loaded lazily on first use: importing Pi's provider SDKs (openai,
+    // @anthropic-ai/sdk, @google/genai, bedrock) at boot is dead weight for
+    // deployments that never use it, and on Node 24 it intermittently
+    // aborted startup (better-sqlite3 native cleanup-hook assertion).
+    let pi: Promise<PiHarness> | null = null;
+    const loadPi = () =>
+      (pi ??= import("@open-managed-agents/agent/harness/pi").then(
+        ({ PiHarness }) => new PiHarness({ resolveCredentials: resolveNodeModelCredentials }),
+      ));
     return {
       run: (ctx: unknown) => {
         const c = ctx as HarnessContext;
@@ -1097,6 +1163,11 @@ const sessionRegistry = new SessionRegistry({
             return Promise.reject(new Error(msg));
           }
           return sdk.run(c);
+        }
+        if (harness === "pi") {
+          // Pi agent runtime over OMA's platform tools — same tool/sandbox/
+          // vault surface as the default harness, so no host gate needed.
+          return loadPi().then((h) => h.run(c));
         }
         if (harness === "codex-sdk") {
           // Same hard gate as claude-agent-sdk: runs the Codex CLI ON THE
@@ -1127,6 +1198,7 @@ const sessionRegistry = new SessionRegistry({
       log: input.eventLog,
       hub,
       sandbox: input.sandbox,
+      abortSignal: input.abortSignal,
     });
     await runtime.refreshHistory();
     // Setup sessions replace the agent's own system prompt with the setup
@@ -1189,14 +1261,46 @@ const slackReplyBridge = platformRootSecret
     })
   : null;
 
+/** Persist, then publish exactly the stored row (persist-before-broadcast). */
+async function appendAndPublish(sessionId: string, event: SessionEvent): Promise<SessionEvent> {
+  const stored = await newEventLog(sessionId).appendAsync(event);
+  hub.publish(sessionId, stored);
+  return stored;
+}
+
+/** A queue input that failed before its turn promoted it would vanish from
+ *  the transcript (it only lives in session_work_items) — record it. */
+async function ensurePromoted(item: { sessionId: string; eventId: string; event: SessionEvent }): Promise<void> {
+  if (await newEventLog(item.sessionId).hasEventAsync(item.eventId)) return;
+  await appendAndPublish(item.sessionId, {
+    ...item.event,
+    id: item.eventId,
+    processed_at: new Date().toISOString(),
+  } as SessionEvent);
+}
+
+// Turn queue + pending queue + leases. See node-session-work-queue.ts for
+// the recovery policy (stale lease → resume with orphan reconciliation,
+// capped at OMA_TURN_MAX_ATTEMPTS, then dead-letter + session.error).
 const sessionWorkQueue = new NodeSessionWorkQueue({
   sql,
   dialect,
-  run: async (item) => {
+  staleAfterMs: parsePositiveIntEnv(process.env.OMA_TURN_LEASE_MS),
+  maxAttempts: parsePositiveIntEnv(process.env.OMA_TURN_MAX_ATTEMPTS),
+  run: async (item, ctx) => {
     const entry = await sessionRegistry.getOrCreate(item.sessionId, item.tenantId);
     await entry.sandbox.setTurnActive?.(true);
     try {
-    await entry.machine.runHarnessTurn(item.agentId, item.event);
+      await entry.machine.runTurn(item.agentId, item.event, {
+        signal: ctx.signal,
+        // Every event this turn writes is fenced on the lease epoch: once
+        // another worker reclaims the item, our writes are rejected.
+        eventLog: entry.eventLog.withGuard(ctx.guard),
+        pendingSeq: item.pendingSeq,
+        // The queue guarantees exclusive ownership of the session, so a
+        // leftover running turn marker is an orphan of a dead attempt.
+        recoverOrphans: true,
+      });
     } finally {
       const browser = sessionBrowsers.get(item.sessionId);
       sessionBrowsers.delete(item.sessionId);
@@ -1207,23 +1311,43 @@ const sessionWorkQueue = new NodeSessionWorkQueue({
       }
     }
     // Best-effort, never throws — a Slack hiccup must not fail the turn.
-    await slackReplyBridge?.mirrorTurnReply({
-      tenantId: item.tenantId,
-      sessionId: item.sessionId,
-      triggerEvent: item.event,
-    });
+    if (item.event.type === "user.message") {
+      await slackReplyBridge?.mirrorTurnReply({
+        tenantId: item.tenantId,
+        sessionId: item.sessionId,
+        triggerEvent: item.event,
+      });
+    }
   },
   onError: async (item, err) => {
-    const log = newEventLog(item.sessionId);
-    await log.appendAsync({
+    // The machine already recorded session.error for harness failures;
+    // only failures before/around the machine (session build, agent
+    // lookup, ...) need one here.
+    if (sessionErrorAlreadyEmitted(err)) return;
+    await ensurePromoted(item);
+    await appendAndPublish(item.sessionId, {
       type: "session.error",
       error: "harness_turn_failed",
       message: err instanceof Error ? err.message : String(err),
       work_item_id: item.id,
     } as unknown as SessionEvent);
-    const stored = await log.getEventsAsync();
-    const last = stored[stored.length - 1];
-    if (last) hub.publish(item.sessionId, last);
+  },
+  onAbandoned: async (item, reason) => {
+    await ensurePromoted(item);
+    await appendAndPublish(item.sessionId, {
+      type: "session.error",
+      error: reason === "dead" ? "turn_abandoned" : "turn_interrupted",
+      message:
+        reason === "dead"
+          ? `turn abandoned after ${item.attempts} attempt(s): the worker running it kept dying before it could finish`
+          : "the worker running this turn died after it was interrupted",
+      work_item_id: item.id,
+    } as unknown as SessionEvent);
+    // Reconcile the dead attempt's turn marker + cut-off tool calls so the
+    // session reads idle and the next message sees a valid history.
+    const entry = await sessionRegistry.getOrCreate(item.sessionId, item.tenantId);
+    await entry.machine.onWake();
+    await appendAndPublish(item.sessionId, { type: "session.status_idle" } as SessionEvent);
   },
 });
 await sessionWorkQueue.ensureSchema();
@@ -1239,23 +1363,25 @@ const sessionWakeups = new NodeSessionWakeups({
     void sessionWorkQueue.wake(item.sessionId);
   },
   persistEvent: async (sessionId, event) => {
-    const log = newEventLog(sessionId);
-    await log.appendAsync(event);
-    const stored = await log.getEventsAsync();
-    const last = stored[stored.length - 1];
-    if (last) hub.publish(sessionId, last);
+    // The wakeup's synthetic user.message is a queue input: the machine
+    // promotes it into the log when its turn starts. Appending it at fire
+    // time would interleave it into a turn that's still running.
+    if (event.type === "user.message") return;
+    await appendAndPublish(sessionId, event);
   },
-  hasEvent: async (sessionId, eventId) => {
-    const stored = await newEventLog(sessionId).getEventsAsync();
-    return stored.some((e) => (e as { id?: string }).id === eventId);
-  },
+  hasEvent: async (sessionId, eventId) =>
+    (await newEventLog(sessionId).hasEventAsync(eventId)) ||
+    (await sessionWorkQueue.hasEvent(sessionId, eventId)),
 });
 await sessionWakeups.ensureSchema();
 
 await sessionRegistry.bootstrap();
-void sessionWorkQueue.wakeAll().catch((err) => {
+void sessionWorkQueue.sweep().catch((err) => {
   logger.error({ err, op: "session_work_queue.bootstrap_failed" }, "session work queue bootstrap failed");
 });
+// Periodic reclaim pump: stale leases (crashed replica, deploy overlap)
+// are resumed without waiting for a restart or a new event.
+sessionWorkQueue.start();
 
 // ─── Services bundle ────────────────────────────────────────────────────
 
@@ -3407,6 +3533,9 @@ logger.info({ op: "main-node.scheduler.started" }, "scheduler started");
 const shutdown = async (signal: string) => {
   logger.info({ op: "main-node.shutdown", signal }, `received ${signal}, shutting down`);
   clearInterval(machineTick);
+  // Stop claiming new turns. In-flight turns keep their lease until the
+  // process exits; the next owner resumes them once the lease goes stale.
+  sessionWorkQueue.stop();
   if (telegramTick) clearInterval(telegramTick);
   await agentMachines.dispose();
   desktopGateway.close();
