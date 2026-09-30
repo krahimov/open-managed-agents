@@ -146,6 +146,7 @@ export default defineConfig({
       { find: "@open-managed-agents/kv-store", replacement: "./packages/kv-store/src/index.ts" },
       { find: "@open-managed-agents/quotas", replacement: "./packages/quotas/src/index.ts" },
       { find: "@open-managed-agents/rate-limit", replacement: "./packages/rate-limit/src/index.ts" },
+      { find: "@open-managed-agents/vault-forward/proxy-token", replacement: "./packages/vault-forward/src/proxy-token.ts" },
       { find: "@open-managed-agents/vault-forward", replacement: "./packages/vault-forward/src/index.ts" },
       { find: "@open-managed-agents/schema", replacement: "./packages/schema/src/index.ts" },
       { find: "@open-managed-agents/http-routes", replacement: "./packages/http-routes/src/index.ts" },
@@ -177,11 +178,12 @@ export default defineConfig({
     // First request in each isolate applies the consolidated D1 migrations,
     // which can push beforeAll hooks past vitest's 10s default under load.
     hookTimeout: 30000,
-    // apps/main-node + packages/integrations-adapters-node + packages/sandbox
+    // apps/main-node + apps/oma-vault + packages/integrations-adapters-node +
+    // packages/sandbox (+ the Node-only vault-forward proxy-token test)
     // carry their own vitest.config.ts (Node pool — they need better-sqlite3,
     // real child processes, or the Node-only Daytona adapter + fakes, which
     // workerd can't load). Run via `pnpm run test:packages`.
-    exclude: ["**/node_modules/**", "**/.git/**", "**/.claude/worktrees/**", "**/.pnpm-store/**", "test/e2e/**", "packages/cap/test/**", "packages/session-runtime/test/**", "apps/console/**", "apps/main-node/**", "packages/integrations-adapters-node/**", "packages/sandbox/tests/**"],
+    exclude: ["scripts/**", "**/node_modules/**", "**/.git/**", "**/.claude/worktrees/**", "**/.pnpm-store/**", "test/e2e/**", "packages/cap/test/**", "packages/session-runtime/test/**", "apps/console/**", "apps/main-node/**", "packages/integrations-adapters-node/**", "packages/sandbox/tests/**", "apps/oma-vault/**", "packages/vault-forward/test/proxy-token.test.ts"],
     pool: cloudflarePool(cfWorkerOptions),
   },
 });

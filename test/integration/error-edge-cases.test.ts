@@ -27,7 +27,7 @@ function del(path: string) {
 
 async function createAgent(overrides?: Record<string, unknown>) {
   const res = await post("/v1/agents", {
-    name: "EdgeAgent",
+    name: `EdgeAgent ${crypto.randomUUID().slice(0, 8)}`,
     model: "claude-sonnet-4-6",
     harness: "edge-noop",
     ...overrides,

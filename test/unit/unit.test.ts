@@ -32,7 +32,7 @@ describe.skip("SqliteHistory message conversion", () => {
       method: "POST",
       headers: HEADERS,
       body: JSON.stringify({
-        name: "History Test",
+        name: `History Test ${harnessName}`,
         model: "claude-sonnet-4-6",
         harness: harnessName,
       }),
@@ -272,7 +272,7 @@ describe("Tool building", () => {
       method: "POST",
       headers: HEADERS,
       body: JSON.stringify({
-        name: "Tool Test",
+        name: `Tool Test ${harnessName}`,
         model: "claude-sonnet-4-6",
         tools: toolConfig,
         harness: harnessName,
@@ -406,7 +406,7 @@ describe("Edge cases", () => {
     const agentRes = await api("/v1/agents", {
       method: "POST",
       headers: HEADERS,
-      body: JSON.stringify({ name: "Edge", model: "claude-sonnet-4-6", harness: "noop" }),
+      body: JSON.stringify({ name: `Edge ${crypto.randomUUID()}`, model: "claude-sonnet-4-6", harness: "noop" }),
     });
     const agent = (await agentRes.json()) as any;
     const envRes = await api("/v1/environments", {
@@ -482,6 +482,17 @@ describe("Edge cases", () => {
     const fetched = (await getRes.json()) as any;
     expect(fetched.name).toBe('Agent "with" <special> & chars');
     expect(fetched.system).toContain("\n");
+  });
+
+  it("creates agents with names longer than D1's 50-byte LIKE limit", async () => {
+    // The duplicate-name guard searches by name; a LIKE pattern over 50
+    // bytes used to 500 on D1 ("LIKE or GLOB pattern too complex").
+    const name = `Long name ${crypto.randomUUID()} ${"x".repeat(80)}`;
+    const body = JSON.stringify({ name, model: "claude-sonnet-4-6" });
+    const res = await api("/v1/agents", { method: "POST", headers: HEADERS, body });
+    expect(res.status).toBe(201);
+    const dup = await api("/v1/agents", { method: "POST", headers: HEADERS, body });
+    expect(dup.status).toBe(409);
   });
 
   it("handles empty content array in user message", async () => {
