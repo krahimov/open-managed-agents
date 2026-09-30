@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { ConnectionConsentCard } from "./ConnectionConsentCard";
 const api = vi.hoisted(() => vi.fn());
 vi.mock("../lib/api", () => ({ useApi: () => ({ api }) }));
 const request = { request_id: "request", service: "slack", mcp_server_url: "https://mcp.slack.com/mcp", auth_kind: "mcp_oauth" };
 const connection = { credential_id: "chosen", vault_id: "shared", label: "Old Slack account", vault_name: "Shared vault" };
-function mount() { render(<MemoryRouter><ConnectionConsentCard request={request} sessionId="session" /></MemoryRouter>); }
+function mount(connectionRequest = request) { render(<MemoryRouter><ConnectionConsentCard request={connectionRequest} sessionId="session" /></MemoryRouter>); }
 beforeEach(() => { api.mockReset(); vi.stubGlobal("BroadcastChannel", class { addEventListener() {} close() {} }); });
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 it("requires verification, workspace confirmation, and approval", async () => {
@@ -43,5 +43,46 @@ it("creates a separate vault for another account without overwriting the old one
   mount(); fireEvent.click(await screen.findByRole("button", { name: "Connect another" }));
   await waitFor(() => expect(popup.location.href).toContain("vault_id=new-vault"));
   expect(popup.location.href).toContain("request_id=request");
+  expect(popup.location.href).toContain("account_selection=choose");
+  expect(api.mock.calls.some(([path]) => path.endsWith("/approve"))).toBe(false);
+});
+
+it("offers an account switch before starting Linear authorization", async () => {
+  const popup = { location: { href: "" }, close: vi.fn() };
+  const open = vi.spyOn(window, "open").mockReturnValue(popup as any);
+  api.mockImplementation(async (path: string) => path === "/v1/vaults" ? { id: "new-vault" } : { connections: [] });
+  mount({ ...request, service: "linear", mcp_server_url: "https://mcp.linear.app/mcp" });
+  fireEvent.click(await screen.findByRole("button", { name: "Connect another" }));
+  expect(screen.getByRole("link", { name: "Open Linear to switch accounts" })).toHaveAttribute("href", "https://linear.app");
+  expect(open).not.toHaveBeenCalled();
+  expect(api.mock.calls.some(([path]) => path === "/v1/vaults")).toBe(false);
+  fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+  expect(screen.queryByRole("button", { name: "Continue to Linear sign-in" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Connect another" }));
+  fireEvent.click(screen.getByRole("button", { name: "Continue to Linear sign-in" }));
+  await waitFor(() => expect(popup.location.href).toContain("account_selection=choose"));
+  expect(api.mock.calls.some(([path]) => path.endsWith("/approve"))).toBe(false);
+});
+
+it("ignores a previous popup and verifies the selected return without granting access", async () => {
+  const popup = { location: { href: "" }, close: vi.fn() };
+  vi.spyOn(window, "open").mockReturnValue(popup as any);
+  api.mockImplementation(async (path: string) => {
+    if (path === "/v1/vaults") return { id: "new-vault" };
+    if (path.endsWith("/verify")) return { status: "verified", verification_id: "receipt", account: "other@example.test", workspace: "Other workspace", workspace_id: "T-other" };
+    return { connections: [connection] };
+  });
+  mount();
+  fireEvent.click(await screen.findByRole("button", { name: "Connect another" }));
+  await waitFor(() => expect(popup.location.href).toContain("vault_id=new-vault"));
+  const complete = (vaultId: string) => act(() => window.dispatchEvent(new MessageEvent("message", {
+    origin: window.location.origin,
+    data: { type: "oauth_complete", request_id: "request", session_id: "session", credential_id: "new-credential", vault_id: vaultId },
+  })));
+  complete("previous-attempt-vault");
+  expect(api.mock.calls.some(([path]) => path.endsWith("/verify"))).toBe(false);
+  complete("new-vault");
+  await screen.findByText("Workspace: Other workspace");
+  expect(screen.getByRole("button", { name: "Reuse this connection" })).toBeDisabled();
   expect(api.mock.calls.some(([path]) => path.endsWith("/approve"))).toBe(false);
 });

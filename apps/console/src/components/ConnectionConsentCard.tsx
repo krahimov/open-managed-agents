@@ -43,10 +43,16 @@ export function ConnectionConsentCard({ request, sessionId: explicitSessionId, g
   const [connected, setConnected] = useState(false);
   const [busy, setBusy] = useState(false);
   const [connecting, setConnecting] = useState(false);
+  const [pendingVaultId, setPendingVaultId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [newConnection, setNewConnection] = useState(false);
+  const [choosingAccount, setChoosingAccount] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [appReq, setAppReq] = useState(request.oauth_app);
+  const isLinearOAuth = (() => {
+    try { return request.auth_kind !== "mcp_api_key" && new URL(request.mcp_server_url).hostname === "mcp.linear.app"; }
+    catch { return false; }
+  })();
   const refresh = useCallback(async () => {
     const result = await api<{ connections: Connection[]; approved: boolean }>(base);
     setConnections(result.connections);
@@ -74,6 +80,7 @@ export function ConnectionConsentCard({ request, sessionId: explicitSessionId, g
       // cannot complete this card. Provider completion alone is not a grant.
       if (data?.request_id !== request.request_id || data?.session_id !== sessionId) return;
       if (data.type === "oauth_complete" && typeof data.credential_id === "string" && typeof data.vault_id === "string") {
+        if (data.vault_id !== pendingVaultId) return;
         setConnecting(false);
         void refresh().catch(() => {});
         void verify({ credential_id: data.credential_id, vault_id: data.vault_id });
@@ -87,12 +94,14 @@ export function ConnectionConsentCard({ request, sessionId: explicitSessionId, g
     let channel: BroadcastChannel | undefined;
     try { channel = new BroadcastChannel("openma-oauth"); channel.addEventListener("message", handle); } catch { /* postMessage remains available */ }
     return () => { window.removeEventListener("message", handle); channel?.close(); };
-  }, [connecting, request.request_id, sessionId, refresh, verify]);
+  }, [connecting, pendingVaultId, request.request_id, sessionId, refresh, verify]);
 
   const createVault = () => api<{ id: string }>("/v1/vaults", {
     method: "POST", body: JSON.stringify({ name: `${request.service} connection` }),
   });
   const connectAnother = async () => {
+    setChoosingAccount(false);
+    setPendingVaultId(null);
     setError(null); setVerification(null); setConfirmed(false); setNewConnection(true);
     if (request.auth_kind === "mcp_api_key" || (appReq?.required && !appReq.configured)) return;
     // Open during the click, before awaiting network requests.
@@ -102,8 +111,10 @@ export function ConnectionConsentCard({ request, sessionId: explicitSessionId, g
     try {
       // A new account must never overwrite a credential another agent uses.
       const vault = await createVault();
+      setPendingVaultId(vault.id);
       const params = new URLSearchParams({ mcp_server_url: request.mcp_server_url, vault_id: vault.id,
-        redirect_uri: window.location.href, service: request.service, session_id: sessionId!, request_id: request.request_id });
+        redirect_uri: window.location.href, service: request.service, session_id: sessionId!, request_id: request.request_id,
+        account_selection: "choose" });
       popup.location.href = `/v1/oauth/authorize?${params}`;
     } catch {
       popup.close(); setConnecting(false); setError("Could not start sign-in. Please retry.");
@@ -144,7 +155,23 @@ export function ConnectionConsentCard({ request, sessionId: explicitSessionId, g
         <p className="text-xs text-fg-subtle">{connection.vault_name} · {verification?.credential_id === connection.credential_id && verification.status === "verified" ? "Verified — awaiting your approval" : "Account/workspace unverified"}</p>
         <Button variant="outline" size="sm" disabled={busy || connecting} onClick={() => void verify({ credential_id: connection.credential_id, vault_id: connection.vault_id })}>Verify connection</Button>
       </div>)}
-      <Button variant="outline" size="sm" disabled={busy} onClick={() => void connectAnother()}>{connecting ? "Restart sign-in" : "Connect another"}</Button>
+      <Button variant="outline" size="sm" disabled={busy} onClick={() => {
+        if (isLinearOAuth) {
+          setConnecting(false); setPendingVaultId(null);
+          setVerification(null); setConfirmed(false); setChoosingAccount(true);
+        } else void connectAnother();
+      }}>{connecting ? "Restart sign-in" : "Connect another"}</Button>
+      {choosingAccount && <div className="border border-border rounded p-3 space-y-2">
+        <p className="text-sm font-medium">Choose your Linear account first</p>
+        <p className="text-xs text-fg-subtle">Linear may reuse the account signed in to your browser. Open Linear and switch to the workspace you want before continuing.</p>
+        <p className="text-xs text-fg-subtle">For another email, open the workspace menu, select Switch workspace, then Create or join a workspace. Click your email in the upper-right corner and select Add account.</p>
+        <a href="https://linear.app" target="_blank" rel="noopener noreferrer" className="text-sm underline">Open Linear to switch accounts</a>
+        <p className="text-xs text-fg-subtle">After sign-in, check the account and workspace shown here. This agent gets access only after you approve that connection.</p>
+        <div className="flex gap-2">
+          <Button size="sm" onClick={() => void connectAnother()}>Continue to Linear sign-in</Button>
+          <Button variant="outline" size="sm" onClick={() => setChoosingAccount(false)}>Cancel</Button>
+        </div>
+      </div>}
       {newConnection && request.auth_kind === "mcp_api_key" && <form className="flex gap-2" onSubmit={e => { e.preventDefault(); void saveKey(); }}>
         <input aria-label="API key" type="password" autoComplete="off" value={apiKey} onChange={e => setApiKey(e.target.value)} className="border rounded px-2 text-sm" />
         <Button size="sm" disabled={busy || !apiKey.trim()}>Save and verify</Button>
