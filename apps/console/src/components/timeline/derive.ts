@@ -1,5 +1,6 @@
 import { formatDuration } from "../../lib/format";
 import type { Event } from "../../lib/events";
+import { buildToolCallIndex, TOOL_STATUS_LABEL } from "../../lib/tool-status";
 import type { Span, Turn, TurnTriggerKind } from "./types";
 
 /**
@@ -16,7 +17,15 @@ import type { Span, Turn, TurnTriggerKind } from "./types";
  * collapses sub-second events together — only used as a fallback for
  * very old sessions that predate processed_at.
  */
-export function deriveSpans(events: Event[]): { spans: Span[]; totalMs: number } {
+export function deriveSpans(
+  events: Event[],
+  /** Wider event context (e.g. the whole thread) used only to resolve
+   *  tool-call status. A call made in one turn is often answered in the
+   *  next (tool confirmation, custom tool result), so the turn's own
+   *  events can't tell "awaiting approval" from "denied". Defaults to
+   *  `events`. Bar durations always come from `events` alone. */
+  statusContext: Event[] = events,
+): { spans: Span[]; totalMs: number } {
   const tsMs = (e: Event): number | null => {
     const pa = (e.data as { processed_at?: string } | undefined)?.processed_at
       ?? (e as { processed_at?: string }).processed_at;
@@ -49,6 +58,7 @@ export function deriveSpans(events: Event[]): { spans: Span[]; totalMs: number }
   const toolResults = new Map<string, { t: number; e: Event }>();
   const mcpResults = new Map<string, { t: number; e: Event }>();
   const customResults = new Map<string, { t: number; e: Event }>();
+  const toolIndex = buildToolCallIndex(statusContext);
   // model_request_start_id → end's timestamp + usage. Anthropic's wire
   // format pairs the per-call span pair this way (rather than positional
   // FIFO), so multiple parallel or nested model calls stay correctly
@@ -71,7 +81,11 @@ export function deriveSpans(events: Event[]): { spans: Span[]; totalMs: number }
   for (const { e, t } of timed) {
     if (e.type === "agent.tool_result" && e.tool_use_id) toolResults.set(e.tool_use_id, { t, e });
     else if (e.type === "agent.mcp_tool_result" && e.mcp_tool_use_id) mcpResults.set(e.mcp_tool_use_id, { t, e });
-    else if (e.type === "user.custom_tool_result" && (e as Event).id) customResults.set(String(e.id), { t, e });
+    else if (e.type === "user.custom_tool_result") {
+      // Keyed by the call it answers (custom_tool_use_id), not its own id.
+      const cid = (e as { custom_tool_use_id?: unknown }).custom_tool_use_id;
+      if (typeof cid === "string") customResults.set(cid, { t, e });
+    }
     else if (e.type === "span.model_request_end") {
       const data = (e.data as { model_request_start_id?: string; model_usage?: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }; finish_reason?: string } | undefined);
       const sid = (e as { model_request_start_id?: string }).model_request_start_id ?? data?.model_request_start_id;
@@ -123,16 +137,20 @@ export function deriveSpans(events: Event[]): { spans: Span[]; totalMs: number }
     const pushSpan = (span: Omit<Span, "events">) => spans.push({ ...span, events: sourceEvents });
 
     if (e.type === "agent.tool_use" || e.type === "agent.custom_tool_use") {
-      const result = e.type === "agent.tool_use"
-        ? toolResults.get(String(e.id))
-        : customResults.get(String(e.id));
+      // Custom tools are closed by an agent.tool_result too (the runtime
+      // materializes the client's answer); the raw user.custom_tool_result
+      // is the fallback for logs that only have the client input.
+      const result = toolResults.get(String(e.id))
+        ?? (e.type === "agent.custom_tool_use" ? customResults.get(String(e.id)) : undefined);
       const endMs = result ? result.t - t0 : startMs;
       if (result) sourceEvents.push(result.e);
+      const status = toolIndex.info(typeof e.id === "string" ? e.id : undefined).status;
       pushSpan({
         key: `tool-${e.id ?? i}`,
         family: e.type === "agent.tool_use" ? "tool" : "custom_tool",
         label: String(e.name ?? "tool"),
-        detail: result ? "completed" : "no result",
+        detail: TOOL_STATUS_LABEL[status],
+        ...(status === "failed" || status === "denied" ? { isError: true } : {}),
         startMs,
         durationMs: Math.max(0, endMs - startMs),
       });
@@ -140,11 +158,13 @@ export function deriveSpans(events: Event[]): { spans: Span[]; totalMs: number }
       const result = mcpResults.get(String(e.id));
       const endMs = result ? result.t - t0 : startMs;
       if (result) sourceEvents.push(result.e);
+      const status = toolIndex.info(typeof e.id === "string" ? e.id : undefined).status;
       pushSpan({
         key: `mcp-${e.id ?? i}`,
         family: "mcp",
         label: `${String(e.mcp_server_name ?? "mcp")}:${String(e.name ?? "?")}`,
-        detail: result ? "completed" : "no result",
+        detail: TOOL_STATUS_LABEL[status],
+        ...(status === "failed" || status === "denied" ? { isError: true } : {}),
         startMs,
         durationMs: Math.max(0, endMs - startMs),
       });
@@ -350,7 +370,10 @@ export function bucketIntoTurns(events: Event[]): Turn[] {
     }
     current.events.push(e);
     if (e.type === "session.status_idle") {
-      current.status = "completed";
+      // Idle on requires_action parks the turn on the client; it hasn't
+      // completed (the next turn starts with the confirmation / result).
+      const stop = (e as { stop_reason?: { type?: string } }).stop_reason;
+      current.status = stop?.type === "requires_action" ? "awaiting_action" : "completed";
       current.endedAt = parseEventTs(e);
     } else if (e.type === "session.status_terminated") {
       current.status = "terminated";

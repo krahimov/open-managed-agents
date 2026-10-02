@@ -1,13 +1,19 @@
 // Shared egress policy (packages/shared/src/egress.ts) + the CF container
 // outbound handler's enforcement hook (apps/agent/src/oma-sandbox.ts).
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   isHostAllowedByEgress,
   isPrivateOrReservedIp,
   normalizeHostPattern,
   resolveEgressPolicy,
 } from "@open-managed-agents/shared";
-import { egressDenial } from "../../apps/agent/src/oma-sandbox";
+import {
+  OmaSandbox,
+  egressDenial,
+  isPlatformR2Request,
+  platformR2Scope,
+  r2EgressDenial,
+} from "../../apps/agent/src/oma-sandbox";
 
 describe("resolveEgressPolicy", () => {
   it("is null for unrestricted / missing networking", () => {
@@ -84,5 +90,109 @@ describe("CF outbound handler egressDenial", () => {
   it("lets allowed hosts and unrestricted sessions through", () => {
     expect(egressDenial(new URL("https://api.github.com/user"), params)).toBeNull();
     expect(egressDenial(new URL("https://evil.example/"), { tenantId: "tn", sessionId: "s" })).toBeNull();
+  });
+});
+
+// QA F1: the static `*.r2.cloudflarestorage.com` passthrough used to skip
+// the egress policy for every R2 account. Only the platform's own
+// account + buckets may bypass it now.
+describe("CF outbound R2 scoping", () => {
+  const ACCOUNT = "0123456789abcdef0123456789abcdef";
+  const env = {
+    CLOUDFLARE_ACCOUNT_ID: ACCOUNT,
+    R2_ENDPOINT: `https://${ACCOUNT}.r2.cloudflarestorage.com`,
+    BACKUP_BUCKET_NAME: "managed-agents-backups",
+    MEMORY_BUCKET_NAME: "managed-agents-memory",
+    WORKSPACE_BUCKET_NAME: "managed-agents-workspace",
+  };
+  const scope = platformR2Scope(env);
+  const denyAll = { tenantId: "tn", sessionId: "s", egress: resolveEgressPolicy({ type: "limited", allowed_hosts: [] }) };
+  const unrestricted = { tenantId: "tn", sessionId: "s", egress: null };
+  const backupUrl = new URL(`https://${ACCOUNT}.r2.cloudflarestorage.com/managed-agents-backups/backups/b1.sqsh?X-Amz-Signature=x`);
+  const foreignUrl = new URL("https://attackeraccount.r2.cloudflarestorage.com/loot/exfil.tar?X-Amz-Signature=y");
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("derives the platform account host and buckets from configuration", () => {
+    expect([...scope.hosts]).toEqual([`${ACCOUNT}.r2.cloudflarestorage.com`]);
+    expect(scope.buckets).toEqual(new Set([
+      "managed-agents-backups", "managed-agents-memory", "managed-agents-workspace", "managed-agents-files",
+    ]));
+    expect(platformR2Scope({}).hosts.size).toBe(0);
+    expect(platformR2Scope({ R2_ENDPOINT: "https://minio.local:9000" }).hosts.size).toBe(0);
+  });
+
+  it("recognizes path-style and virtual-hosted platform bucket URLs only", () => {
+    expect(isPlatformR2Request(backupUrl, scope)).toBe(true);
+    expect(isPlatformR2Request(new URL(`https://managed-agents-memory.${ACCOUNT}.r2.cloudflarestorage.com/t/x`), scope)).toBe(true);
+    expect(isPlatformR2Request(new URL(`https://${ACCOUNT}.r2.cloudflarestorage.com/managed-agents-files/t/out.txt`), scope)).toBe(true);
+    // other accounts, other buckets on our account, the account root, look-alikes
+    expect(isPlatformR2Request(foreignUrl, scope)).toBe(false);
+    expect(isPlatformR2Request(new URL("https://attackeraccount.r2.cloudflarestorage.com/managed-agents-backups/x"), scope)).toBe(false);
+    expect(isPlatformR2Request(new URL(`https://${ACCOUNT}.r2.cloudflarestorage.com/someone-elses-bucket/x`), scope)).toBe(false);
+    expect(isPlatformR2Request(new URL(`https://${ACCOUNT}.r2.cloudflarestorage.com/`), scope)).toBe(false);
+    expect(isPlatformR2Request(new URL(`https://evil.managed-agents-memory.${ACCOUNT}.r2.cloudflarestorage.com/x`), scope)).toBe(false);
+    expect(isPlatformR2Request(new URL(`https://x${ACCOUNT}.r2.cloudflarestorage.com/managed-agents-backups/x`), scope)).toBe(false);
+    // unconfigured platform: nothing is exempt
+    expect(isPlatformR2Request(backupUrl, platformR2Scope({}))).toBe(false);
+  });
+
+  it("applies the session policy to non-platform R2 and fails closed without one", async () => {
+    expect(r2EgressDenial(backupUrl, env, denyAll)).toBeNull();
+    expect(r2EgressDenial(backupUrl, env, undefined)).toBeNull();
+    const denied = r2EgressDenial(foreignUrl, env, denyAll);
+    expect(denied?.status).toBe(403);
+    expect(await denied!.text()).toContain("attackeraccount.r2.cloudflarestorage.com");
+    expect(r2EgressDenial(foreignUrl, env, unrestricted)).toBeNull();
+    expect(r2EgressDenial(foreignUrl, env, undefined)?.status).toBe(403);
+    expect(r2EgressDenial(foreignUrl, env, { tenantId: "tn", sessionId: "s" })?.status).toBe(403);
+    const allowR2 = { tenantId: "tn", sessionId: "s", egress: resolveEgressPolicy({ type: "limited", allowed_hosts: ["attackeraccount.r2.cloudflarestorage.com"] }) };
+    expect(r2EgressDenial(foreignUrl, env, allowR2)).toBeNull();
+  });
+
+  it("wires the static and runtime R2 handlers through the policy", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response("ok"));
+    const cls = OmaSandbox as unknown as {
+      outboundByHost: Record<string, (r: Request, e: unknown, c: unknown) => Promise<Response>>;
+      outboundHandlers: Record<string, (r: Request, e: unknown, c: unknown) => Promise<Response>>;
+    };
+    const staticHandler = cls.outboundByHost["*.r2.cloudflarestorage.com"];
+    const runtimeHandler = cls.outboundHandlers.r2_storage;
+    const put = (url: URL) => new Request(url, { method: "PUT", body: "data" });
+    const ctx = (params: unknown) => ({ containerId: "c", className: "OmaSandbox", params });
+
+    // Before the session context is bound: platform storage only.
+    expect((await staticHandler(put(foreignUrl), env, ctx(undefined))).status).toBe(403);
+    expect((await staticHandler(put(backupUrl), env, ctx(undefined))).status).toBe(200);
+    // Bound with a deny-all limited policy: still no exfil to other accounts.
+    expect((await runtimeHandler(put(foreignUrl), env, ctx(denyAll))).status).toBe(403);
+    expect((await runtimeHandler(put(backupUrl), env, ctx(denyAll))).status).toBe(200);
+    // Unrestricted sessions keep reaching arbitrary R2.
+    expect((await runtimeHandler(put(foreignUrl), env, ctx(unrestricted))).status).toBe(200);
+    const forwarded = fetchSpy.mock.calls.map(([r]) => new URL((r as Request).url).hostname);
+    expect(forwarded).toEqual([backupUrl.hostname, backupUrl.hostname, foreignUrl.hostname]);
+  });
+
+  it("binds the R2 host handler with the session params when the catch-all is bound", async () => {
+    // @cloudflare/sandbox is stubbed in this pool (test/sandbox-stub.ts), so
+    // give the parent class the SDK's setOutboundHandler for the duration
+    // and check OmaSandbox forwards the same params to the R2 host binding.
+    const parent = Object.getPrototypeOf(OmaSandbox.prototype) as Record<string, unknown>;
+    const catchAll = vi.fn(async () => {});
+    parent.setOutboundHandler = catchAll;
+    try {
+      const byHost = vi.fn(async () => {});
+      const fake = Object.assign(Object.create(OmaSandbox.prototype), {
+        setOutboundByHost: byHost,
+      }) as InstanceType<typeof OmaSandbox>;
+      await fake.setOutboundHandler("inject_vault_creds", denyAll);
+      expect(catchAll).toHaveBeenCalledWith("inject_vault_creds", denyAll);
+      expect(byHost).toHaveBeenCalledWith("*.r2.cloudflarestorage.com", "r2_storage", denyAll);
+      byHost.mockClear();
+      await fake.setOutboundHandler("github_auth", denyAll);
+      expect(byHost).not.toHaveBeenCalled();
+    } finally {
+      delete parent.setOutboundHandler;
+    }
   });
 });

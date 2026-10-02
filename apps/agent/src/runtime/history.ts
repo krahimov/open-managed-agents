@@ -240,10 +240,149 @@ export async function eventsToMessagesAsync(
 }
 
 /**
- * Walk events[fromIdx..toIdx) into ModelMessage[]. Maintains pending
- * assistant + tool state internally, flushes at the end. Used by
- * eventsToMessages on either the full stream, the pre-boundary range, or
- * the post-boundary range.
+ * Shared accumulator behind `buildMessages` / `buildMessagesAsync`.
+ *
+ * Step grouping (write-ahead execution, docs/durable-execution.md): a model
+ * step's tool results may be persisted BETWEEN that step's assistant events
+ * (parallel tools finishing at different times), e.g.
+ *   use A, result A, use B, use C, result B, result C   (all one step)
+ * Assistant events carry the step's `model_request_start_id`; tool results do
+ * not. While a step is open, every assistant part tagged with that step id
+ * joins the step's assistant message and every tool result joins the step's
+ * tool message. Nothing is emitted for the step until a different step, a
+ * user message, or the end of the range arrives; then the step is flushed
+ * assistant-first. One step therefore always projects to exactly one
+ * assistant message holding all its parts, followed by one tool message
+ * holding all its results.
+ *
+ * Events without the field (legacy logs) keep the old behavior: a tool
+ * result closes the pending assistant message, and the next assistant part
+ * closes the pending tool message.
+ */
+class MessageAccumulator {
+  private readonly messages: ModelMessage[] = [];
+  private assistant: AssistantModelMessage["content"] = [];
+  private tools: ToolModelMessage["content"] = [];
+  /** `model_request_start_id` of the open step; null in legacy mode. */
+  private stepId: string | null = null;
+
+  private flush(): void {
+    if (this.assistant.length > 0) {
+      this.messages.push({ role: "assistant", content: this.assistant });
+      this.assistant = [];
+    }
+    if (this.tools.length > 0) {
+      this.messages.push({ role: "tool", content: this.tools });
+      this.tools = [];
+    }
+    this.stepId = null;
+  }
+
+  user(content: any[]): void {
+    this.flush();
+    this.messages.push({ role: "user", content });
+  }
+
+  /** Call before pushing any assistant part (reasoning / text / tool-call). */
+  beginAssistantPart(event: SessionEvent): void {
+    const stepId = (event as { model_request_start_id?: string }).model_request_start_id ?? null;
+    // Same step: keep grouping even if some of its results already arrived.
+    if (stepId && stepId === this.stepId) return;
+    // Otherwise an assistant part after tool results starts a new round.
+    if (this.tools.length > 0) this.flush();
+    if (stepId) this.stepId = stepId;
+  }
+
+  pushAssistant(part: Exclude<AssistantModelMessage["content"], string>[number]): void {
+    (this.assistant as Exclude<AssistantModelMessage["content"], string>).push(part);
+  }
+
+  toolResult(part: ToolModelMessage["content"][number]): void {
+    if (!this.stepId && this.assistant.length > 0) {
+      // Legacy: the result closes the assistant message it answers.
+      this.messages.push({ role: "assistant", content: this.assistant });
+      this.assistant = [];
+    }
+    this.tools.push(part);
+  }
+
+  finish(): ModelMessage[] {
+    this.flush();
+    return this.messages;
+  }
+}
+
+/**
+ * Project one non-user event into the accumulator. Shared by the sync and
+ * async builders (only `user.message` content conversion differs).
+ */
+function projectAgentEvent(
+  acc: MessageAccumulator,
+  event: SessionEvent,
+  toolNameById: Map<string, string>,
+): void {
+  switch (event.type) {
+    case "agent.thinking": {
+      acc.beginAssistantPart(event);
+      const e = event as AgentThinkingEvent;
+      if (e.text != null) {
+        acc.pushAssistant({
+          type: "reasoning",
+          text: e.text,
+          ...(e.providerOptions ? { providerOptions: e.providerOptions as Record<string, any> } : {}),
+        });
+      }
+      return;
+    }
+    case "agent.message": {
+      acc.beginAssistantPart(event);
+      const e = event as AgentMessageEvent;
+      for (const block of e.content) {
+        if (block.type === "text") {
+          acc.pushAssistant({ type: "text", text: block.text });
+        }
+      }
+      return;
+    }
+    case "agent.tool_use":
+    case "agent.mcp_tool_use":
+    case "agent.custom_tool_use": {
+      acc.beginAssistantPart(event);
+      const e = event as AgentToolUseEvent | AgentMcpToolUseEvent | AgentCustomToolUseEvent;
+      const toolName = event.type === "agent.mcp_tool_use"
+        ? `mcp_${(e as AgentMcpToolUseEvent).mcp_server_name}_call`
+        : (e as AgentToolUseEvent | AgentCustomToolUseEvent).name;
+      acc.pushAssistant({
+        type: "tool-call",
+        toolCallId: e.id,
+        toolName,
+        input: e.input,
+      });
+      return;
+    }
+    case "agent.tool_result":
+    case "agent.mcp_tool_result": {
+      const e = event as AgentToolResultEvent | AgentMcpToolResultEvent;
+      const toolCallId = event.type === "agent.tool_result"
+        ? (e as AgentToolResultEvent).tool_use_id
+        : (e as AgentMcpToolResultEvent).mcp_tool_use_id;
+      const toolName = toolNameById.get(toolCallId) ?? "unknown";
+      const output = wireContentToToolOutput((e as AgentToolResultEvent).content);
+      acc.toolResult({
+        type: "tool-result",
+        toolCallId,
+        toolName,
+        output: output as any,
+      });
+      return;
+    }
+  }
+}
+
+/**
+ * Walk events[fromIdx..toIdx) into ModelMessage[] (see MessageAccumulator
+ * for grouping rules). Used by eventsToMessages on either the full stream,
+ * the pre-boundary range, or the post-boundary range.
  */
 function buildMessages(
   events: SessionEvent[],
@@ -251,52 +390,7 @@ function buildMessages(
   toIdx: number,
   toolNameById: Map<string, string>,
 ): ModelMessage[] {
-  const messages: ModelMessage[] = [];
-  let pendingAssistantContent: AssistantModelMessage["content"] = [];
-  let pendingToolContent: ToolModelMessage["content"] = [];
-
-  // Step-merge state (write-ahead execution, docs/durable-execution.md):
-  // a step's tool results may be persisted BETWEEN that step's tool_use
-  // events (parallel tools finishing at different times). Events carrying
-  // the same `model_request_start_id` as the assistant message just
-  // flushed re-open it instead of starting a new one, so the projection
-  // still yields one assistant message + one tool message per step.
-  // Events without the field (legacy logs) keep the old behavior.
-  let pendingAssistantStepId: string | null = null;
-  let lastAssistantStepId: string | null = null;
-  const flushAssistant = () => {
-    if (pendingAssistantContent.length > 0) {
-      messages.push({ role: "assistant", content: pendingAssistantContent });
-      pendingAssistantContent = [];
-      lastAssistantStepId = pendingAssistantStepId;
-      pendingAssistantStepId = null;
-    }
-  };
-  const flushTools = () => {
-    if (pendingToolContent.length > 0) {
-      messages.push({ role: "tool", content: pendingToolContent });
-      pendingToolContent = [];
-      lastAssistantStepId = null;
-    }
-  };
-  const beginAssistantPart = (event: SessionEvent) => {
-    const stepId = (event as { model_request_start_id?: string }).model_request_start_id ?? null;
-    const last = messages[messages.length - 1];
-    if (
-      stepId &&
-      pendingToolContent.length > 0 &&
-      pendingAssistantContent.length === 0 &&
-      lastAssistantStepId === stepId &&
-      last?.role === "assistant"
-    ) {
-      messages.pop();
-      pendingAssistantContent = last.content as AssistantModelMessage["content"];
-    } else {
-      flushTools();
-    }
-    pendingAssistantStepId = stepId;
-  };
-
+  const acc = new MessageAccumulator();
   for (let i = fromIdx; i < toIdx; i++) {
     const event = events[i];
     // AMA `user.interrupt` flushes pending user inputs by setting
@@ -310,78 +404,13 @@ function buildMessages(
     if ((event as unknown as { cancelled_at_ms?: number }).cancelled_at_ms != null) {
       continue;
     }
-    switch (event.type) {
-      case "user.message": {
-        flushAssistant();
-        flushTools();
-        lastAssistantStepId = null;
-        messages.push({
-          role: "user",
-          content: userContentToParts((event as UserMessageEvent).content),
-        });
-        break;
-      }
-      case "agent.thinking": {
-        beginAssistantPart(event);
-        const e = event as AgentThinkingEvent;
-        if (e.text != null) {
-          pendingAssistantContent.push({
-            type: "reasoning",
-            text: e.text,
-            ...(e.providerOptions ? { providerOptions: e.providerOptions as Record<string, any> } : {}),
-          });
-        }
-        break;
-      }
-      case "agent.message": {
-        beginAssistantPart(event);
-        const e = event as AgentMessageEvent;
-        for (const block of e.content) {
-          if (block.type === "text") {
-            pendingAssistantContent.push({ type: "text", text: block.text });
-          }
-        }
-        break;
-      }
-      case "agent.tool_use":
-      case "agent.mcp_tool_use":
-      case "agent.custom_tool_use": {
-        beginAssistantPart(event);
-        const e = event as AgentToolUseEvent | AgentMcpToolUseEvent | AgentCustomToolUseEvent;
-        const toolName = event.type === "agent.mcp_tool_use"
-          ? `mcp_${(e as AgentMcpToolUseEvent).mcp_server_name}_call`
-          : (e as AgentToolUseEvent | AgentCustomToolUseEvent).name;
-        pendingAssistantContent.push({
-          type: "tool-call",
-          toolCallId: e.id,
-          toolName,
-          input: e.input,
-        });
-        break;
-      }
-      case "agent.tool_result":
-      case "agent.mcp_tool_result": {
-        flushAssistant();
-        const e = event as AgentToolResultEvent | AgentMcpToolResultEvent;
-        const toolCallId = event.type === "agent.tool_result"
-          ? (e as AgentToolResultEvent).tool_use_id
-          : (e as AgentMcpToolResultEvent).mcp_tool_use_id;
-        const toolName = toolNameById.get(toolCallId) ?? "unknown";
-        const output = wireContentToToolOutput((e as AgentToolResultEvent).content);
-        pendingToolContent.push({
-          type: "tool-result",
-          toolCallId,
-          toolName,
-          output: output as any,
-        });
-        break;
-      }
+    if (event.type === "user.message") {
+      acc.user(userContentToParts((event as UserMessageEvent).content));
+    } else {
+      projectAgentEvent(acc, event, toolNameById);
     }
   }
-
-  flushAssistant();
-  flushTools();
-  return messages;
+  return acc.finish();
 }
 
 /**
@@ -397,129 +426,19 @@ async function buildMessagesAsync(
   toolNameById: Map<string, string>,
   resolver: FileResolver,
 ): Promise<ModelMessage[]> {
-  const messages: ModelMessage[] = [];
-  let pendingAssistantContent: AssistantModelMessage["content"] = [];
-  let pendingToolContent: ToolModelMessage["content"] = [];
-
-  // Step-merge state (write-ahead execution, docs/durable-execution.md):
-  // a step's tool results may be persisted BETWEEN that step's tool_use
-  // events (parallel tools finishing at different times). Events carrying
-  // the same `model_request_start_id` as the assistant message just
-  // flushed re-open it instead of starting a new one, so the projection
-  // still yields one assistant message + one tool message per step.
-  // Events without the field (legacy logs) keep the old behavior.
-  let pendingAssistantStepId: string | null = null;
-  let lastAssistantStepId: string | null = null;
-  const flushAssistant = () => {
-    if (pendingAssistantContent.length > 0) {
-      messages.push({ role: "assistant", content: pendingAssistantContent });
-      pendingAssistantContent = [];
-      lastAssistantStepId = pendingAssistantStepId;
-      pendingAssistantStepId = null;
-    }
-  };
-  const flushTools = () => {
-    if (pendingToolContent.length > 0) {
-      messages.push({ role: "tool", content: pendingToolContent });
-      pendingToolContent = [];
-      lastAssistantStepId = null;
-    }
-  };
-  const beginAssistantPart = (event: SessionEvent) => {
-    const stepId = (event as { model_request_start_id?: string }).model_request_start_id ?? null;
-    const last = messages[messages.length - 1];
-    if (
-      stepId &&
-      pendingToolContent.length > 0 &&
-      pendingAssistantContent.length === 0 &&
-      lastAssistantStepId === stepId &&
-      last?.role === "assistant"
-    ) {
-      messages.pop();
-      pendingAssistantContent = last.content as AssistantModelMessage["content"];
-    } else {
-      flushTools();
-    }
-    pendingAssistantStepId = stepId;
-  };
-
+  const acc = new MessageAccumulator();
   for (let i = fromIdx; i < toIdx; i++) {
     const event = events[i];
     if ((event as unknown as { cancelled_at_ms?: number }).cancelled_at_ms != null) {
       continue;
     }
-    switch (event.type) {
-      case "user.message": {
-        flushAssistant();
-        flushTools();
-        lastAssistantStepId = null;
-        messages.push({
-          role: "user",
-          content: await userContentToPartsAsync((event as UserMessageEvent).content, resolver),
-        });
-        break;
-      }
-      case "agent.thinking": {
-        beginAssistantPart(event);
-        const e = event as AgentThinkingEvent;
-        if (e.text != null) {
-          pendingAssistantContent.push({
-            type: "reasoning",
-            text: e.text,
-            ...(e.providerOptions ? { providerOptions: e.providerOptions as Record<string, any> } : {}),
-          });
-        }
-        break;
-      }
-      case "agent.message": {
-        beginAssistantPart(event);
-        const e = event as AgentMessageEvent;
-        for (const block of e.content) {
-          if (block.type === "text") {
-            pendingAssistantContent.push({ type: "text", text: block.text });
-          }
-        }
-        break;
-      }
-      case "agent.tool_use":
-      case "agent.mcp_tool_use":
-      case "agent.custom_tool_use": {
-        beginAssistantPart(event);
-        const e = event as AgentToolUseEvent | AgentMcpToolUseEvent | AgentCustomToolUseEvent;
-        const toolName = event.type === "agent.mcp_tool_use"
-          ? `mcp_${(e as AgentMcpToolUseEvent).mcp_server_name}_call`
-          : (e as AgentToolUseEvent | AgentCustomToolUseEvent).name;
-        pendingAssistantContent.push({
-          type: "tool-call",
-          toolCallId: e.id,
-          toolName,
-          input: e.input,
-        });
-        break;
-      }
-      case "agent.tool_result":
-      case "agent.mcp_tool_result": {
-        flushAssistant();
-        const e = event as AgentToolResultEvent | AgentMcpToolResultEvent;
-        const toolCallId = event.type === "agent.tool_result"
-          ? (e as AgentToolResultEvent).tool_use_id
-          : (e as AgentMcpToolResultEvent).mcp_tool_use_id;
-        const toolName = toolNameById.get(toolCallId) ?? "unknown";
-        const output = wireContentToToolOutput((e as AgentToolResultEvent).content);
-        pendingToolContent.push({
-          type: "tool-result",
-          toolCallId,
-          toolName,
-          output: output as any,
-        });
-        break;
-      }
+    if (event.type === "user.message") {
+      acc.user(await userContentToPartsAsync((event as UserMessageEvent).content, resolver));
+    } else {
+      projectAgentEvent(acc, event, toolNameById);
     }
   }
-
-  flushAssistant();
-  flushTools();
-  return messages;
+  return acc.finish();
 }
 
 // Tail preservation params (Claude Code-style defaults — observed values

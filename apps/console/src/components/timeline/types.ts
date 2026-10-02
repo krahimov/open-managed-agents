@@ -20,6 +20,9 @@ export interface Span {
   family: SpanFamily;
   label: string;
   detail?: string;
+  /** Tool spans whose result is an error (is_error, recovery placeholder,
+   *  denied call). Rendered with danger colors regardless of family. */
+  isError?: boolean;
   /** ms since the first event */
   startMs: number;
   /** 0 for instants */
@@ -108,7 +111,7 @@ export type TurnTriggerKind =
   | "custom_tool_result"
   | "init";
 
-export type TurnStatus = "completed" | "running" | "errored" | "terminated";
+export type TurnStatus = "completed" | "running" | "awaiting_action" | "errored" | "terminated";
 
 export interface Turn {
   id: string;
@@ -142,6 +145,7 @@ export const TRIGGER_DOT: Record<TurnTriggerKind, string> = {
 export const STATUS_TEXT: Record<TurnStatus, string> = {
   completed: "text-fg-subtle",
   running: "text-info",
+  awaiting_action: "text-warning",
   errored: "text-danger",
   terminated: "text-danger",
 };

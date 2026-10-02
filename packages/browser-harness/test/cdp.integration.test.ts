@@ -113,7 +113,9 @@ describe.skipIf(!executable)("real Chromium over the agent computer proxy", () =
       await terminate(proxy);
       await terminate(chrome);
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      await rm(dir, { force: true, recursive: true });
+      // Chrome helper processes can still be flushing the profile right
+      // after the browser exits; retry ENOTEMPTY/EBUSY instead of failing.
+      await rm(dir, { force: true, recursive: true, maxRetries: 10, retryDelay: 200 });
     }
   }, 30_000);
 });

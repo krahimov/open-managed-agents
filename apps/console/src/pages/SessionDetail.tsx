@@ -24,6 +24,8 @@ import { TimelineView } from "../components/timeline/TimelineView";
 import { SaveAsEvalDialog } from "./evals/SaveAsEvalDialog";
 import type { Event } from "../lib/events";
 import { eventKey } from "../lib/event-key";
+import { buildToolCallIndex, type ToolCallInfo } from "../lib/tool-status";
+import { ToolConfirmationControls } from "../components/ToolConfirmationControls";
 import type { Trajectory, TrajectoryOutcome } from "../lib/trajectory";
 import { rewardHeadline, outcomeToStatusTone } from "../lib/trajectory";
 // ai-elements primitives — used to render the chat surface (messages,
@@ -80,6 +82,14 @@ export function SessionDetail() {
   // Durable grants (system.access_granted) → matching connect cards render
   // "Connected" even after a reload; see AccessRequestCard.
   const grantedRequestIds = useMemo(() => grantedRequestIdsOf(events), [events]);
+  // Tool calls the client owes an answer for (requires_action idle). Drives
+  // the header pill; per-card state is derived per thread at render time.
+  const awaitingActions = useMemo(() => buildToolCallIndex(events).awaiting, [events]);
+  const awaitingKind = awaitingActions.size === 0
+    ? null
+    : [...awaitingActions.values()].includes("tool_confirmation")
+      ? "tool_confirmation"
+      : "custom_tool_result";
   /** In-flight assistant streams keyed by message_id. Each entry holds
    *  the deltas accumulated so far. Wiped on the matching agent.message
    *  (same message_id), which becomes the canonical render. */
@@ -775,12 +785,22 @@ export function SessionDetail() {
           stays one band tall. */}
       <div className="pl-3 pr-4 py-3 flex flex-col gap-2 shrink-0">
         <div className="flex items-center gap-2 flex-wrap">
-          <StatusPill status={status as "idle" | "running" | "terminated" | "error" | string} />
+          {status === "idle" && awaitingKind ? (
+            // Idle on requires_action is not "done": the turn is parked on
+            // the client. Say so instead of a plain Idle pill.
+            <StatusPill
+              status="waiting"
+              label={awaitingKind === "tool_confirmation" ? "Awaiting approval" : "Awaiting client result"}
+            />
+          ) : (
+            <StatusPill status={status as "idle" | "running" | "terminated" | "error" | string} />
+          )}
           {/* Trajectory outcome chip — only when the trajectory has actually
               finished. While the session is still running we let StatusPill
               carry the "Running…" signal alone (per Phase 3 spec) instead of
-              double-pilling. */}
-          <TrajectoryOutcomeChip trajectory={trajectory} />
+              double-pilling. A turn parked on requires_action hasn't
+              finished either, whatever the (possibly stale) envelope says. */}
+          {!awaitingKind && <TrajectoryOutcomeChip trajectory={trajectory} />}
           {/* Reward chip — final_reward + verifier_id tooltip. Hidden when
               the verifier hasn't run (no trajectory.reward) so we don't
               imply "no reward = score 0". */}
@@ -1058,6 +1078,7 @@ export function SessionDetail() {
                   }
                 }
                 const pairedResultIds = new Set<string>();
+                const toolIndex = buildToolCallIndex(filtered);
                 return filtered.map((e, i) => {
                   // Stable React key — `e.id` (sevt_*) lives on every event
                   // server-side via the stamp callback in session-do.ts, so
@@ -1088,6 +1109,7 @@ export function SessionDetail() {
                   // call id on EventBase.id (overrides the inherited field
                   // per emitToolCallEvent), so the lookup is uniform.
                   let pairedResult: typeof filtered[number] | undefined;
+                  let toolInfo: ToolCallInfo | undefined;
                   if (
                     e.type === "agent.tool_use"
                     || e.type === "agent.custom_tool_use"
@@ -1098,6 +1120,7 @@ export function SessionDetail() {
                       pairedResult = resultByToolUseId.get(tuid);
                       pairedResultIds.add(tuid);
                     }
+                    toolInfo = toolIndex.info(tuid);
                   }
                   return (
                     <EventRender
@@ -1106,6 +1129,9 @@ export function SessionDetail() {
                       event={e}
                       livePending={false}
                       pairedResult={pairedResult}
+                      toolInfo={toolInfo}
+                      sessionId={id}
+                      threadId={activeThreadId}
                       modelErrorCause={
                         e.type === "session.error"
                           ? sessionErrorCause.get((e as { id?: string }).id ?? "")
@@ -1519,11 +1545,20 @@ function EventRender({
   event,
   livePending = false,
   pairedResult,
+  toolInfo,
+  sessionId,
+  threadId,
   modelErrorCause,
   onApproveEnvironmentYaml,
   grantedRequestIds,
 }: {
   event: Event;
+  /** Derived lifecycle for tool-use events (lib/tool-status). Drives the
+   *  card state and the human-in-the-loop controls. */
+  toolInfo?: ToolCallInfo;
+  /** Needed to post user.tool_confirmation from the card. */
+  sessionId?: string;
+  threadId?: string;
   /** request_ids with a server-recorded system.access_granted. */
   grantedRequestIds?: Set<string>;
   /**
@@ -1716,31 +1751,46 @@ function EventRender({
           : JSON.stringify(rawContent, null, 2);
       // is_error is set by the agent runtime when a tool call failed
       // (bash non-zero exit + stderr surfaced, mcp tool returned an
-      // error envelope, _finalizeStaleTurns injected an abort placeholder
-      // for DO-eviction recovery, etc.). When present we route the same
-      // payload through ToolOutput.errorText so the Tool block renders
-      // in destructive styling, and badge to 'output-error' so the
-      // header pill shows Failed instead of Completed. Without this,
-      // bash returning "Sandbox container failed to start after 10
-      // attempts..." looked identical to a successful run.
-      const isError = pairedResult
-        ? Boolean((pairedResult as { is_error?: boolean }).is_error)
-        : false;
+      // error envelope, crash recovery injected an "outcome unknown"
+      // placeholder, the call was interrupted, ...). Denied calls are
+      // recognised from the user.tool_confirmation itself, so they render
+      // as Denied even when the runtime didn't stamp is_error. Error and
+      // denied payloads go through ToolOutput.errorText so the block
+      // renders in destructive styling instead of looking like success.
+      const info: ToolCallInfo = toolInfo ?? (pairedResult
+        ? { status: (pairedResult as { is_error?: boolean }).is_error === true ? "failed" : "completed", result: pairedResult }
+        : { status: "running" });
+      const isError = info.status === "failed" || info.status === "denied";
       const errorText = isError
         ? (typeof output === "string" ? output : JSON.stringify(output ?? null))
         : undefined;
-      const state = pairedResult
-        ? (isError ? "output-error" : "output-available")
-        : "input-available";
+      const header = toolHeaderState(info.status);
       return (
-        <Tool>
-          <ToolHeader type="dynamic-tool" toolName={title} state={state} />
+        <Tool defaultOpen={info.status === "awaiting_approval" || info.status === "awaiting_client"}>
+          <ToolHeader
+            type="dynamic-tool"
+            toolName={title}
+            state={header.state}
+            statusLabel={header.label}
+          />
           <ToolContent>
             <ToolInput input={event.input ?? {}} />
             <ToolOutput
               output={isError ? undefined : output}
               errorText={errorText}
             />
+            {info.status === "awaiting_approval" && sessionId && event.id && (
+              <ToolConfirmationControls
+                sessionId={sessionId}
+                toolUseId={event.id}
+                threadId={threadId}
+              />
+            )}
+            {info.status === "awaiting_client" && (
+              <div className="text-xs text-fg-subtle" role="status">
+                Waiting for the client to post a <span className="font-mono">user.custom_tool_result</span> for this call.
+              </div>
+            )}
           </ToolContent>
         </Tool>
       );
@@ -1759,15 +1809,20 @@ function EventRender({
         : typeof rawContent === "string"
           ? rawContent
           : JSON.stringify(rawContent, null, 2);
+      const orphanIsError = (event as { is_error?: boolean }).is_error === true;
       return (
         <Tool>
           <ToolHeader
             type="dynamic-tool"
             toolName="tool result (unpaired)"
-            state="output-available"
+            state={orphanIsError ? "output-error" : "output-available"}
+            statusLabel={orphanIsError ? "Failed" : undefined}
           />
           <ToolContent>
-            <ToolOutput output={output} errorText={undefined} />
+            <ToolOutput
+              output={orphanIsError ? undefined : output}
+              errorText={orphanIsError ? (typeof output === "string" ? output : JSON.stringify(output ?? null)) : undefined}
+            />
           </ToolContent>
         </Tool>
       );
@@ -1821,6 +1876,22 @@ function EventRender({
 
     default:
       return null;
+  }
+}
+
+/** Map a derived tool status onto the ai-elements Tool header visuals. */
+function toolHeaderState(status: ToolCallInfo["status"]): {
+  state: "input-available" | "approval-requested" | "approval-responded" | "output-available" | "output-error" | "output-denied";
+  label?: string;
+} {
+  switch (status) {
+    case "completed": return { state: "output-available" };
+    case "failed": return { state: "output-error", label: "Failed" };
+    case "denied": return { state: "output-denied" };
+    case "awaiting_approval": return { state: "approval-requested" };
+    case "awaiting_client": return { state: "approval-requested", label: "Waiting for client result" };
+    case "responded": return { state: "approval-responded" };
+    case "running": return { state: "input-available" };
   }
 }
 

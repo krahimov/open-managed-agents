@@ -33,7 +33,7 @@
     "typecheck": "tsc --noEmit && pnpm run typecheck:node",
     "typecheck:node": "pnpm --filter @open-managed-agents/sandbox typecheck && pnpm --filter @open-managed-agents/main-node typecheck && pnpm --filter @open-managed-agents/oma-vault typecheck && pnpm --filter @open-managed-agents/cap typecheck",
     "test": "vitest run && pnpm run test:packages && pnpm run test:console && pnpm run test:scripts",
-    "test:packages": "pnpm --filter @open-managed-agents/sandbox test && pnpm --filter @open-managed-agents/session-runtime test && pnpm --filter @open-managed-agents/main-node test && pnpm --filter @open-managed-agents/cap test && pnpm --filter @open-managed-agents/integrations-adapters-node test && pnpm --filter @open-managed-agents/oma-vault test && pnpm --filter @open-managed-agents/vault-forward test",
+    "test:packages": "pnpm --filter @open-managed-agents/sandbox test && pnpm --filter @open-managed-agents/session-runtime test && pnpm --filter @open-managed-agents/main-node test && pnpm --filter @open-managed-agents/cap test && pnpm --filter @open-managed-agents/integrations-adapters-node test && pnpm --filter @open-managed-agents/oma-vault test && pnpm --filter @open-managed-agents/vault-forward test && pnpm --filter @open-managed-agents/browser-harness test",
     "test:console": "pnpm --filter managed-agents-console test",
     "test:scripts": "node --test scripts/*.test.mjs",
     "test:e2e": "playwright test --config=playwright.config.ts",

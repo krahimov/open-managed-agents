@@ -183,7 +183,11 @@ export default defineConfig({
     // carry their own vitest.config.ts (Node pool — they need better-sqlite3,
     // real child processes, or the Node-only Daytona adapter + fakes, which
     // workerd can't load). Run via `pnpm run test:packages`.
-    exclude: ["scripts/**", "**/node_modules/**", "**/.git/**", "**/.claude/worktrees/**", "**/.pnpm-store/**", "test/e2e/**", "packages/cap/test/**", "packages/session-runtime/test/**", "apps/console/**", "apps/main-node/**", "packages/integrations-adapters-node/**", "packages/sandbox/tests/**", "apps/oma-vault/**", "packages/vault-forward/test/proxy-token.test.ts"],
+    // packages/browser-harness/test/cdp.integration.test.ts spawns Chrome +
+    // a Node proxy (node:child_process, node:http servers) and crashes the
+    // workerd pool worker at import; it runs under the package's Node
+    // config (opt-in via BROWSER_EXECUTABLE_PATH) from test:packages.
+    exclude: ["scripts/**", "**/node_modules/**", "**/.git/**", "**/.claude/worktrees/**", "**/.pnpm-store/**", "test/e2e/**", "packages/cap/test/**", "packages/session-runtime/test/**", "apps/console/**", "apps/main-node/**", "packages/integrations-adapters-node/**", "packages/sandbox/tests/**", "apps/oma-vault/**", "packages/vault-forward/test/proxy-token.test.ts", "packages/browser-harness/test/cdp.integration.test.ts"],
     pool: cloudflarePool(cfWorkerOptions),
   },
 });
