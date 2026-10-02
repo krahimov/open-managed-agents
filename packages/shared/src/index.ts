@@ -19,3 +19,4 @@ export * from "./file-storage";
 export * from "./pagination";
 export * from "./policy";
 export * from "./sql-like";
+export * from "./egress";

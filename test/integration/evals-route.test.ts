@@ -28,7 +28,7 @@ async function setupAgentAndEnv() {
     method: "POST",
     headers: HEADERS,
     body: JSON.stringify({
-      name: "Eval Agent",
+      name: `Eval Agent ${crypto.randomUUID().slice(0, 8)}`,
       model: "claude-sonnet-4-6",
       system: "you are helpful",
       tools: [{ type: "agent_toolset_20260401" }],

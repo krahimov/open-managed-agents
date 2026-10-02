@@ -57,6 +57,42 @@ All three converge on `apps/main/src/routes/mcp-proxy.ts`'s shared helpers:
 - `resolveOutboundCredentialByHost(env, services, tenantId, sid, hostname)` — for arbitrary HTTPS, matches by hostname
 - `forwardWithRefresh(services, tenantId, target, method, headers, body, audit?)` — fetch upstream + auto-refresh on 401 + audit log
 
+### Self-host (Node) parity: `apps/oma-vault`
+
+On the Node runtime the sandbox-container caller is the `oma-vault` MITM
+proxy, not a service binding, so identity has to be carried on the wire:
+
+- main-node signs `{tenant, session, iat}` with HMAC-SHA256 and puts the
+  token in the sandbox's `HTTP(S)_PROXY` credentials
+  (`@open-managed-agents/vault-forward/proxy-token`). The key comes from
+  HKDF(`OMA_VAULT_PROXY_SECRET` or `PLATFORM_ROOT_SECRET` or a shared key
+  file, label `oma-vault-proxy-v1`).
+- oma-vault verifies the token, loads the session (same tenant, not
+  archived), and resolves credentials **only from that session's
+  `vault_ids`**, using the same `pickCredentialByHost` + `buildAuthHeader`
+  as the CF path. Unsigned, forged or tampered tokens get `407`. Token-less
+  requests are denied by default. The old cross-tenant host-only match is
+  still available as `OMA_VAULT_LEGACY_HOST_MATCHING=1`, but only for
+  token-less traffic.
+- Bearer tokens are injected only into `https://` requests
+  (`OMA_VAULT_ALLOW_INSECURE_HTTP_INJECTION=1` to override).
+- Egress: the session environment's `networking: limited` allow-list and a
+  private-address (SSRF) block are enforced per request. On CF, the same
+  allow-list is enforced in `injectVaultCredsHandler` / `githubAuthHandler`
+  (`apps/agent/src/oma-sandbox.ts`) from handler params bound in
+  `SessionDO` (shared evaluation: `packages/shared/src/egress.ts`).
+
+Remaining gaps:
+
+- oma-vault does not refresh `mcp_oauth` tokens on 401. It injects the
+  stored access token.
+- oma-vault does not apply the agent connection-consent gate that main-node's
+  MCP proxy applies, matching the CF outbound path.
+- Both proxies see only HTTP(S) that is routed through them. The Node
+  `subprocess` provider can bypass by unsetting `HTTP(S)_PROXY`. The CF
+  `*.r2.cloudflarestorage.com` bypass (needed for backups) is not
+  egress-filtered.
+
 ## OAuth refresh on 401
 
 For credentials of type `mcp_oauth`, `forwardWithRefresh` automatically:

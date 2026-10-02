@@ -1,0 +1,72 @@
+name: CI
+
+# Typecheck + test gate for every PR and every push to main. Before this
+# workflow existed nothing ran the suites on PRs, and main silently went red
+# (stale migrations list in test/test-worker.ts, stale unit tests).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup pnpm
+        # No version pin — reads `packageManager` from root package.json.
+        uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'  # matches Dockerfile (node:22-slim); better-sqlite3 11 crashes natively on Node 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Typecheck (CF + Node targets)
+        run: pnpm run typecheck
+
+  test-workers:
+    # Root vitest suite — runs inside workerd via @cloudflare/vitest-pool-workers.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'  # matches Dockerfile (node:22-slim); better-sqlite3 11 crashes natively on Node 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec vitest run
+
+  test-packages:
+    # Node-pool suites (better-sqlite3, child processes, Node-only adapters).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'  # matches Dockerfile (node:22-slim); better-sqlite3 11 crashes natively on Node 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run test:packages
+
+  test-console:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'  # matches Dockerfile (node:22-slim); better-sqlite3 11 crashes natively on Node 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run test:console
+      - run: pnpm run test:scripts

@@ -170,14 +170,16 @@ describe("buildTrajectory", () => {
     expect(t.environment_config.id).toBe("env-x");
   });
 
-  it("throws when no env_snapshot and no fallback", async () => {
+  it("falls back to a stub env config when no env_snapshot and no fallback", async () => {
+    // Synthetic environments (Node's env_local_runtime) have no snapshot and
+    // no environments row — the trajectory must still build.
     const session = makeSession({ environment_snapshot: undefined });
-    await expect(
-      buildTrajectory(session, {
-        fetchAllEvents: async () => [],
-        fetchFullStatus: async () => null,
-      })
-    ).rejects.toThrow(/no environment_snapshot/);
+    const t = await buildTrajectory(session, {
+      fetchAllEvents: async () => [],
+      fetchFullStatus: async () => null,
+    });
+    expect(t.environment_config.id).toBe(session.environment_id ?? "env-unknown");
+    expect(t.environment_config.config).toEqual({ type: "unknown" });
   });
 
   it("throws when no agent_snapshot", async () => {

@@ -375,6 +375,13 @@ export interface AgentMessageEvent extends EventBase {
    *  message came from a streaming step (the common case); legacy /
    *  non-streamed messages may omit it. */
   message_id?: string;
+  /** See AgentToolUseEvent.model_request_start_id. */
+  model_request_start_id?: string;
+  /** Set by the harness on the reply that ENDS its model loop: the last
+   *  text of a step with no tool calls, non-empty, written once the whole
+   *  step is known. Crash recovery finalizes a turn from the log only when
+   *  this is present (docs/durable-execution.md). Absent = not known final. */
+  step_final?: boolean;
 }
 
 export interface AgentMessageStreamStartEvent extends EventBase {
@@ -466,13 +473,37 @@ export interface AgentThinkingEvent extends EventBase {
    *  thinking came from a streaming step; legacy/non-streamed
    *  thinking events may omit it. */
   thinking_id?: string;
+  /** See AgentToolUseEvent.model_request_start_id. */
+  model_request_start_id?: string;
 }
+
+/**
+ * Crash-recovery class of a tool call (docs/durable-execution.md):
+ *   idempotent  — read-only / safe to repeat; recovery may re-execute it.
+ *   side_effect — may have changed external state; never auto-repeated.
+ *   client      — executed by the client (custom tools) or awaiting user
+ *                 confirmation; the server never fabricates its result.
+ */
+export type ToolExecutionClass = "idempotent" | "side_effect" | "client";
 
 export interface AgentCustomToolUseEvent extends EventBase {
   type: "agent.custom_tool_use";
   id: string;
   name: string;
   input: Record<string, unknown>;
+  /** Durable-execution metadata (see docs/durable-execution.md). Stamped
+   *  by the default harness on write-ahead tool calls. `idempotency_key` =
+   *  `${session_id}:${tool_use_id}` — stable across retries/recovery so
+   *  tool backends can dedupe. `execution_class` drives crash recovery:
+   *  `idempotent` calls may be re-executed, `side_effect` calls get an
+   *  "outcome unknown" error result, `client` calls wait for the client. */
+  idempotency_key?: string;
+  execution_class?: ToolExecutionClass;
+  /** Id of the `span.model_request_start` of the model step that produced
+   *  this event. Lets the history projection keep one step's content in a
+   *  single assistant message even when tool results were persisted
+   *  between that step's tool calls (write-ahead execution). */
+  model_request_start_id?: string;
 }
 
 export interface AgentToolUseEvent extends EventBase {
@@ -481,6 +512,19 @@ export interface AgentToolUseEvent extends EventBase {
   name: string;
   input: Record<string, unknown>;
   evaluated_permission?: "allow" | "ask";
+  /** Durable-execution metadata (see docs/durable-execution.md). Stamped
+   *  by the default harness on write-ahead tool calls. `idempotency_key` =
+   *  `${session_id}:${tool_use_id}` — stable across retries/recovery so
+   *  tool backends can dedupe. `execution_class` drives crash recovery:
+   *  `idempotent` calls may be re-executed, `side_effect` calls get an
+   *  "outcome unknown" error result, `client` calls wait for the client. */
+  idempotency_key?: string;
+  execution_class?: ToolExecutionClass;
+  /** Id of the `span.model_request_start` of the model step that produced
+   *  this event. Lets the history projection keep one step's content in a
+   *  single assistant message even when tool results were persisted
+   *  between that step's tool calls (write-ahead execution). */
+  model_request_start_id?: string;
 }
 
 export interface AgentToolResultEvent extends EventBase {
@@ -491,6 +535,9 @@ export interface AgentToolResultEvent extends EventBase {
   // downstream consumers (UI, scorers, projections) should extract a
   // text representation if they only need text.
   content: string | ContentBlock[];
+  /** True when the result reports a failure (e.g. a crash-recovery
+   *  "outcome unknown" result). Mirrors Anthropic's tool_result.is_error. */
+  is_error?: boolean;
 }
 
 export interface SessionRunningEvent extends EventBase {
@@ -518,6 +565,19 @@ export interface AgentMcpToolUseEvent extends EventBase {
   mcp_server_name: string;
   name: string;
   input: Record<string, unknown>;
+  /** Durable-execution metadata (see docs/durable-execution.md). Stamped
+   *  by the default harness on write-ahead tool calls. `idempotency_key` =
+   *  `${session_id}:${tool_use_id}` — stable across retries/recovery so
+   *  tool backends can dedupe. `execution_class` drives crash recovery:
+   *  `idempotent` calls may be re-executed, `side_effect` calls get an
+   *  "outcome unknown" error result, `client` calls wait for the client. */
+  idempotency_key?: string;
+  execution_class?: ToolExecutionClass;
+  /** Id of the `span.model_request_start` of the model step that produced
+   *  this event. Lets the history projection keep one step's content in a
+   *  single assistant message even when tool results were persisted
+   *  between that step's tool calls (write-ahead execution). */
+  model_request_start_id?: string;
 }
 
 export interface AgentMcpToolResultEvent extends EventBase {
@@ -1024,6 +1084,24 @@ export interface SystemSkillRequestEvent extends EventBase {
   description?: string;
 }
 
+/**
+ * Internal pending-queue marker: resume an agent turn that was interrupted
+ * by a process crash / DO eviction, continuing from the durable event log
+ * (completed tool results are NOT re-run; the user message is NOT
+ * re-appended). Enqueued by the runtime's stale-turn recovery, promoted
+ * into the log like any queued event for auditability. Not part of the
+ * model context. See docs/durable-execution.md.
+ */
+export interface SystemTurnResumeEvent extends EventBase {
+  type: "system.turn_resume";
+  reason: string;
+  /** Turn id (sessions.turn_id) of the interrupted turn, when known. */
+  interrupted_turn_id?: string;
+  /** 1-based count of auto-resumes since the last user.message. */
+  attempt: number;
+  session_thread_id?: string;
+}
+
 export type SessionEvent =
   | UserMessageEvent
   | UserInterruptEvent
@@ -1077,7 +1155,8 @@ export type SessionEvent =
   | SystemAccessRequestEvent
   | SystemAccessGrantedEvent
   | SystemAmbientRuleCreatedEvent
-  | SystemSkillRequestEvent;
+  | SystemSkillRequestEvent
+  | SystemTurnResumeEvent;
 
 /**
  * Event types defined by Anthropic's Managed Agents spec — what their

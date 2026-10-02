@@ -10,8 +10,11 @@
  *       ▼
  *   oma-vault (this process)
  *     - mockttp HTTPS proxy with self-signed CA (regenerated per install)
- *     - on incoming request: lookup credentials by host
- *     - inject Authorization / x-api-key / etc. header
+ *     - on incoming request: verify the HMAC-signed session token carried
+ *       in the proxy credentials → (tenant, session)
+ *     - enforce the session environment's egress policy + SSRF guard
+ *     - resolve a credential for the host from THAT session's vault_ids
+ *     - inject Authorization / x-api-key / etc. header (https only)
  *     - forward to upstream
  *       │
  *       ▼
@@ -22,8 +25,10 @@
  * shared sqlite db.
  *
  * This is the self-host analog of @cloudflare/sandbox's outboundByHost +
- * MAIN_MCP.outboundForward pattern. Same security model: per-sandbox CA,
- * MITM proxy, credential matched on hostname, inject header, forward.
+ * MAIN_MCP.lookupOutboundCredential pattern. Same security model: MITM
+ * proxy, session-scoped credential matched on hostname, inject header,
+ * forward. Configuration + env vars: docs/self-host.md "Vault credential
+ * injection".
  */
 
 import { promises as fs } from "node:fs";
@@ -35,9 +40,30 @@ import {
   createPostgresSqlClient,
   type SqlClient,
 } from "@open-managed-agents/sql-client";
-import type { CredentialAuth } from "@open-managed-agents/shared";
+import {
+  defaultProxyKeyFileForCaDir,
+  extractProxyTokenFromTags,
+  resolveProxyTokenKey,
+  verifyProxyToken,
+  type ProxySessionIdentity,
+} from "@open-managed-agents/vault-forward/proxy-token";
 import { createNodeLogger } from "@open-managed-agents/observability/logger/node";
 import { setRootLogger, type Logger } from "@open-managed-agents/observability";
+import {
+  findLegacyCredentialForUrl,
+  findSessionCredentialForUrl,
+  loadSessionScope,
+  type MatchedCred,
+  type SessionScope,
+} from "./resolver.js";
+import {
+  checkEgressPolicy,
+  checkPrivateDestination,
+  createGuardedLookup,
+  EgressBlockedError,
+  forwardUpstream,
+  type PrivateEgressOptions,
+} from "./egress-guard.js";
 
 const logger: Logger = await createNodeLogger({ bindings: { service: "oma-vault" } });
 setRootLogger(logger);
@@ -54,12 +80,6 @@ const usePostgres =
 const dbPath = process.env.DATABASE_PATH ?? "./data/oma.db";
 const caDir = process.env.OMA_VAULT_CA_DIR ?? "./data/oma-vault-ca";
 const port = Number(process.env.OMA_VAULT_PORT ?? 14322);
-// Tenant scoping: default "*" means look across ALL tenants by host. Set to
-// a specific `tn_xxx` id to lock the proxy to a single tenant — required
-// for multi-user prod deploys, since cross-tenant matching can leak a
-// credential between tenants when both register the same host.
-const scopeTenantId = process.env.OMA_TENANT ?? "*";
-
 mkdirSync(resolve(caDir), { recursive: true });
 
 const sql: SqlClient = usePostgres
@@ -161,281 +181,129 @@ async function waitForCA(
 
 const ca = await loadOrCreateCA();
 
-// ─── Credential matching ─────────────────────────────────────────────────
+// ─── Session identity (signed proxy tokens) ──────────────────────────────
 
-interface MatchedCred {
-  vaultId: string;
-  credentialId: string;
-  injectHeader: { name: string; value: string };
+const proxyKey = resolveProxyTokenKey({
+  env: process.env,
+  keyFile: defaultProxyKeyFileForCaDir(resolve(caDir)),
+  createKeyFile: true,
+});
+if (!proxyKey) {
+  // createKeyFile: true means this only happens on an unwritable caDir.
+  throw new Error(`[oma-vault] could not resolve or create a proxy token key under ${caDir}`);
+}
+const proxyTokenKey: Uint8Array = proxyKey.key;
+logger.info(
+  { op: "oma_vault.proxy_key", source: proxyKey.source, path: proxyKey.path },
+  `proxy session tokens verified with key from ${proxyKey.source}${proxyKey.path ? ` (${proxyKey.path})` : ""}`,
+);
+
+const envFlag = (name: string): boolean => {
+  const v = (process.env[name] ?? "").trim().toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
+};
+
+// OMA_TENANT: when set to a concrete tenant id, tokens for any other tenant
+// are refused (defence-in-depth for single-tenant deploys) and it scopes the
+// legacy host matcher. Default "*" = accept any tenant's (verified) token.
+const tenantLock = (process.env.OMA_TENANT ?? "*").trim() || "*";
+// Legacy: anonymous (token-less) traffic gets the pre-fix cross-tenant
+// host-only credential match. Explicit opt-in; never used for requests that
+// carry a session token.
+const legacyHostMatching = envFlag("OMA_VAULT_LEGACY_HOST_MATCHING");
+// Anonymous (token-less) traffic: "deny" (default) → 407; "passthrough" →
+// forwarded with no credentials and no environment egress policy.
+const anonymousPolicy: "deny" | "passthrough" =
+  legacyHostMatching || (process.env.OMA_VAULT_ANONYMOUS ?? "").trim().toLowerCase() === "passthrough"
+    ? "passthrough"
+    : "deny";
+// Credentials are only injected into https:// requests unless explicitly
+// allowed — a plain-http request would put the bearer token on the wire.
+const allowHttpInjection = envFlag("OMA_VAULT_ALLOW_INSECURE_HTTP_INJECTION");
+const privateEgress: PrivateEgressOptions = {
+  allowPrivate: envFlag("OMA_VAULT_ALLOW_PRIVATE_EGRESS"),
+  privateAllowlist: new Set(
+    (process.env.OMA_VAULT_PRIVATE_EGRESS_ALLOWLIST ?? "")
+      .split(",")
+      .map((h) => h.trim().toLowerCase())
+      .filter(Boolean),
+  ),
+};
+const guardedLookup = createGuardedLookup(privateEgress);
+
+if (legacyHostMatching) {
+  logger.warn(
+    { op: "oma_vault.legacy_host_matching", tenant_scope: tenantLock },
+    "OMA_VAULT_LEGACY_HOST_MATCHING=1: token-less requests get the first credential matching the host " +
+      (tenantLock === "*" ? "across ALL tenants" : `in tenant ${tenantLock}`) +
+      " — credentials can leak between sessions/tenants. Single-operator deploys only.",
+  );
 }
 
-interface ProxySessionContext {
-  tenantId: string;
-  sessionId: string;
+// Short-lived cache so a burst of requests from one sandbox doesn't hit the
+// db per request. Short TTL keeps archive / vault / environment edits fresh.
+const SCOPE_TTL_MS = 5_000;
+const scopeCache = new Map<string, { at: number; scope: SessionScope | null }>();
+
+async function getSessionScope(identity: ProxySessionIdentity): Promise<SessionScope | null> {
+  const key = `${identity.tenantId}|${identity.sessionId}`;
+  const hit = scopeCache.get(key);
+  if (hit && Date.now() - hit.at < SCOPE_TTL_MS) return hit.scope;
+  const scope = await loadSessionScope(sql, identity);
+  scopeCache.set(key, { at: Date.now(), scope });
+  if (scopeCache.size > 1_000) {
+    const oldest = scopeCache.keys().next().value;
+    if (oldest !== undefined) scopeCache.delete(oldest);
+  }
+  return scope;
 }
 
-/**
- * Find the active credential whose mcp_server_url host matches the request
- * host. Returns the header to inject, or null when no credential applies.
- *
- * Today's matcher: exact hostname match against
- * URL(credential.mcp_server_url).host. Wildcards / suffix match TBD when
- * we hit a use case (e.g. `*.googleapis.com` for google credentials).
- */
-/**
- * Find the active credential whose mcp_server_url host matches the request
- * host. Returns the header to inject, or null when no credential applies.
- *
- * Today's matcher: exact hostname match against
- * URL(credential.mcp_server_url).host. Wildcards / suffix match TBD when
- * we hit a use case (e.g. `*.googleapis.com` for google credentials).
- *
- * Cross-tenant note: with better-auth multi-tenant, credentials live under
- * per-user tenants (tn_xxx), not under a static OMA_TENANT. The proxy
- * intercepts traffic from any sandbox and has no way to attribute the
- * request to a specific tenant from its hostname alone — we'd need a
- * per-session port or a sandbox-side header tag for that.
- *
- * For the PoC we look across ALL tenants by host, matching the first
- * active credential. SECURITY LIMITATION: if two tenants both register a
- * credential for the same host (e.g. `https://api.github.com`), the
- * second tenant's request can pick up the first tenant's token. Not OK
- * for shared multi-tenant deploys; OK for single-operator self-host
- * (every credential ultimately belongs to "me"). Document the limit.
- *
- * Setting OMA_TENANT to a specific tenant id locks lookup to that tenant
- * only — recommended for prod multi-user deploys until per-session
- * attribution lands.
- */
-async function findCredentialForUrl(
-  url: string,
-  sessionContext?: ProxySessionContext | null,
-): Promise<MatchedCred | null> {
-  let host: string;
-  try {
-    host = new URL(url).host;
-  } catch {
-    return null;
-  }
+type Attribution =
+  | { kind: "session"; scope: SessionScope }
+  | { kind: "anonymous" }
+  | { kind: "reject"; status: number; reason: string };
 
-  if (sessionContext) {
-    const sessionScoped = await findGithubSessionCredentialForUrl(url, sessionContext);
-    if (sessionScoped) return sessionScoped;
+async function attributeRequest(req: CompletedRequest): Promise<Attribution> {
+  const extracted = extractProxyTokenFromTags(req.tags);
+  if (extracted.kind === "none") return { kind: "anonymous" };
+  if (extracted.kind === "ambiguous") {
+    return { kind: "reject", status: 407, reason: "multiple session tokens presented" };
   }
-
-  // Cross-tenant lookup against the partial unique index
-  // idx_credentials_mcp_url_active. The index contains hostname-as-substring
-  // (LIKE) is unindexed; we materialize candidates by parsing mcp_server_url.
-  // Acceptable cost: typical deploys have O(10) credentials.
-  type Row = { id: string; tenant_id: string; vault_id: string; auth: string };
-  // Cross-tenant lookup. When OMA_TENANT="*" we accept any tenant; when
-  // it's a specific tenant id we filter to that one (recommended for
-  // multi-user prod deploys).
-  const result = await sql
-    .prepare(
-      `SELECT id, tenant_id, vault_id, auth
-         FROM credentials
-        WHERE archived_at IS NULL
-          AND mcp_server_url IS NOT NULL
-          AND ( ? = '*' OR tenant_id = ? )`,
-    )
-    .bind(scopeTenantId, scopeTenantId)
-    .all<Row>();
-  for (const row of result.results ?? []) {
-    let auth: CredentialAuth;
-    try { auth = JSON.parse(row.auth) as CredentialAuth; } catch { continue; }
-    if (!auth.mcp_server_url) continue;
-    let credHost: string;
-    try { credHost = new URL(auth.mcp_server_url).host; } catch { continue; }
-    if (credHost !== host) continue;
-    const headerSpec = authToHeader(auth);
-    if (!headerSpec) continue;
+  const verified = verifyProxyToken(proxyTokenKey, extracted.token);
+  if (!verified.ok) {
     return {
-      vaultId: row.vault_id,
-      credentialId: row.id,
-      injectHeader: headerSpec,
+      kind: "reject",
+      status: 407,
+      reason:
+        `invalid session token (${verified.reason})` +
+        (verified.reason === "bad_signature"
+          ? " — main-node and oma-vault must share PLATFORM_ROOT_SECRET / OMA_VAULT_PROXY_SECRET / OMA_VAULT_PROXY_KEY_FILE"
+          : ""),
     };
   }
-  return null;
-}
-
-async function findGithubSessionCredentialForUrl(
-  url: string,
-  ctx: ProxySessionContext,
-): Promise<MatchedCred | null> {
-  let parsedUrl: URL;
+  if (tenantLock !== "*" && verified.identity.tenantId !== tenantLock) {
+    return { kind: "reject", status: 407, reason: "tenant not permitted by OMA_TENANT" };
+  }
+  let scope: SessionScope | null;
   try {
-    parsedUrl = new URL(url);
-  } catch {
-    return null;
+    scope = await getSessionScope(verified.identity);
+  } catch (err) {
+    logger.error({ err, op: "oma_vault.session_lookup_failed" }, "session lookup failed");
+    return { kind: "reject", status: 503, reason: "session lookup failed" };
   }
-  const hostname = parsedUrl.hostname.toLowerCase();
-  if (hostname !== "github.com" && hostname !== "api.github.com") return null;
-
-  const session = await sql
-    .prepare(
-      `SELECT id FROM sessions
-        WHERE id = ? AND tenant_id = ? AND archived_at IS NULL
-        LIMIT 1`,
-    )
-    .bind(ctx.sessionId, ctx.tenantId)
-    .first<{ id: string }>()
-    .catch(() => null);
-  if (!session) return null;
-
-  const rows = await sql
-    .prepare(
-      `SELECT id, config
-         FROM session_resources
-        WHERE session_id = ?
-          AND type IN ('github_repository', 'github_repo')
-        ORDER BY created_at`,
-    )
-    .bind(ctx.sessionId)
-    .all<{ id: string; config: string }>()
-    .catch(() => ({ results: [] as Array<{ id: string; config: string }> }));
-
-  const requestSlug = parseGithubRepoSlug(url);
-  let fallback: MatchedCred | null = null;
-
-  for (const row of rows.results ?? []) {
-    let resource: { url?: string; repo_url?: string };
-    try {
-      resource = JSON.parse(row.config) as { url?: string; repo_url?: string };
-    } catch {
-      continue;
-    }
-    const repoUrl = resource.url || resource.repo_url;
-    if (!repoUrl) continue;
-    const resourceSlug = parseGithubRepoSlug(repoUrl);
-    if (!resourceSlug) continue;
-
-    const token = await readSessionSecret(ctx.tenantId, ctx.sessionId, row.id);
-    if (!token) continue;
-
-    const matched: MatchedCred = {
-      vaultId: "session",
-      credentialId: `session_resource:${row.id}`,
-      injectHeader: githubAuthHeaderFor(hostname, token),
-    };
-    if (requestSlug && requestSlug === resourceSlug) return matched;
-    if (!fallback) fallback = matched;
-  }
-
-  return fallback;
+  if (!scope) return { kind: "reject", status: 407, reason: "session not found or archived" };
+  return { kind: "session", scope };
 }
 
-async function readSessionSecret(
-  tenantId: string,
-  sessionId: string,
-  resourceId: string,
-): Promise<string | null> {
-  const key = `t:${tenantId}:secret:${sessionId}:${resourceId}`;
-  const now = Date.now();
-  const row = await sql
-    .prepare(
-      `SELECT value
-         FROM kv_entries
-        WHERE key = ?
-          AND (tenant_id = ? OR tenant_id = 'default')
-          AND (expires_at IS NULL OR expires_at > ?)
-        ORDER BY CASE WHEN tenant_id = ? THEN 0 ELSE 1 END
-        LIMIT 1`,
-    )
-    .bind(key, tenantId, now, tenantId)
-    .first<{ value: string }>()
-    .catch(() => null);
-  return row?.value ?? null;
-}
-
-function githubAuthHeaderFor(
-  hostname: string,
-  token: string,
-): { name: string; value: string } {
-  if (hostname.toLowerCase() === "github.com") {
-    return {
-      name: "authorization",
-      value: `Basic ${Buffer.from(`x-access-token:${token}`, "utf8").toString("base64")}`,
-    };
-  }
-  return { name: "authorization", value: `Bearer ${token}` };
-}
-
-function parseGithubRepoSlug(input: string): string | null {
-  if (!input) return null;
-  let owner: string | undefined;
-  let repo: string | undefined;
-
-  if (input.startsWith("http://") || input.startsWith("https://")) {
-    let url: URL;
-    try {
-      url = new URL(input);
-    } catch {
-      return null;
-    }
-    const host = url.hostname.toLowerCase();
-    const parts: string[] = [];
-    for (const segment of url.pathname.split("/")) {
-      if (!segment || segment === ".") continue;
-      if (segment === "..") {
-        parts.pop();
-        continue;
-      }
-      parts.push(segment);
-    }
-    if (host === "github.com" || host === "www.github.com") {
-      owner = parts[0];
-      repo = parts[1];
-    } else if (host === "api.github.com" && parts[0] === "repos") {
-      owner = parts[1];
-      repo = parts[2];
-    }
-  }
-
-  if (!owner) {
-    const ssh = input.match(/^git@github\.com:([^/]+)\/([^/]+?)(?:\.git)?$/);
-    if (ssh) {
-      owner = ssh[1];
-      repo = ssh[2];
-    }
-  }
-
-  if (!owner) {
-    const bare = input.match(/^([^/]+)\/([^/]+?)(?:\.git)?$/);
-    if (bare) {
-      owner = bare[1];
-      repo = bare[2];
-    }
-  }
-
-  if (!owner || !repo) return null;
-  repo = repo.replace(/\.git$/i, "");
-  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?$/.test(owner)) return null;
-  if (!/^[A-Za-z0-9._-]+$/.test(repo)) return null;
-  return `${owner.toLowerCase()}/${repo.toLowerCase()}`;
-}
-
-function authToHeader(auth: CredentialAuth): { name: string; value: string } | null {
-  switch (auth.type) {
-    case "static_bearer":
-      return { name: "authorization", value: `Bearer ${auth.token}` };
-    case "cap_cli":
-      // cap_cli credentials are injected via cap's spec-driven enforcement
-      // (header_inject mode for most CLIs). The simple Bearer fallback
-      // here works for header-mode CLIs whose spec just sets Authorization;
-      // metadata_ep / exec_helper CLIs need richer routing — handled when
-      // self-host oma-vault adopts cap.handleHttp directly (follow-up PR).
-      if (typeof auth.token === "string" && auth.token.length > 0) {
-        return { name: "authorization", value: `Bearer ${auth.token}` };
-      }
-      return null;
-    case "mcp_oauth":
-      // OAuth would need refresh-token handling; not in PoC scope. Skip
-      // until the oma-vault supports it; the credential just gets ignored.
-      return null;
-    default:
-      return null;
-  }
+function deny(status: number, message: string) {
+  return {
+    statusCode: status,
+    headers: {
+      "content-type": "text/plain",
+      ...(status === 407 ? { "proxy-authenticate": 'Basic realm="oma-vault"' } : {}),
+    },
+    body: `oma-vault: ${message}\n`,
+  };
 }
 
 // ─── mockttp proxy ───────────────────────────────────────────────────────
@@ -446,42 +314,99 @@ const proxy = getLocal({
   recordTraffic: false,
 });
 
-// Match all proxied traffic. For each request: look up credentials, inject
-// header, forward. Plain HTTP and HTTPS via CONNECT both flow through the
-// same handler thanks to mockttp's TLS termination.
+// Strip any incoming Authorization headers — the agent must not be able to
+// override the injected value or smuggle a stolen token. Mirrors the
+// Infisical Agent Vault + CF outboundByHost zero-trust behaviour. Also strip
+// hop-by-hop / connection-level headers (`host` is re-derived from the URL).
+const STRIP = new Set([
+  "authorization",
+  "x-api-key",
+  "x-goog-api-key",
+  "host",
+  "content-length",
+  "connection",
+  "keep-alive",
+  "proxy-authorization",
+  "proxy-connection",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
+
+// Match all proxied traffic. Plain HTTP and HTTPS via CONNECT both flow
+// through the same handler thanks to mockttp's TLS termination.
 proxy.forAnyRequest().thenCallback(async (req: CompletedRequest) => {
   const url = req.url;
-  const sessionContext = parseProxySessionContext(req.headers);
-  const matched = await findCredentialForUrl(url, sessionContext);
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return deny(400, "invalid request URL");
+  }
 
-  // Strip any incoming Authorization headers — the agent must not be able
-  // to override the injected value or smuggle a stolen token. Mirrors the
-  // Infisical Agent Vault + CF outboundByHost zero-trust behaviour.
-  //
-  // Also strip hop-by-hop / connection-level headers that would confuse
-  // node:fetch's outbound — `host` (we let fetch infer from the URL),
-  // `content-length` (fetch sets it), proxy-* headers, etc. Without this
-  // strip, fetch() throws "fetch failed" when the inbound `host:
-  // oma-vault:14322` clashes with the upstream URL's actual host.
-  const STRIP = new Set([
-    "authorization",
-    "x-api-key",
-    "x-goog-api-key",
-    "host",
-    "content-length",
-    "connection",
-    "keep-alive",
-    "proxy-authorization",
-    "proxy-connection",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-  ]);
+  // 1. Who is this? Only a verified token attributes a request to a session.
+  const who = await attributeRequest(req);
+  if (who.kind === "reject") {
+    logger.warn(
+      { op: "oma_vault.reject", status: who.status, reason: who.reason, host: parsed.hostname },
+      `rejected ${req.method} ${parsed.hostname}: ${who.reason}`,
+    );
+    return deny(who.status, who.reason);
+  }
+  if (who.kind === "anonymous" && anonymousPolicy === "deny") {
+    logger.warn(
+      { op: "oma_vault.reject_anonymous", host: parsed.hostname },
+      `rejected ${req.method} ${parsed.hostname}: no session token (set OMA_VAULT_ANONYMOUS=passthrough to allow token-less traffic)`,
+    );
+    return deny(407, "session token required");
+  }
+
+  // 2. Environment egress policy (networking: limited).
+  if (who.kind === "session") {
+    const policy = checkEgressPolicy(url, who.scope.egress);
+    if (!policy.allowed) {
+      logger.info(
+        { op: "oma_vault.egress_denied", session_id: who.scope.sessionId, host: parsed.hostname },
+        `egress denied for session ${who.scope.sessionId}: ${policy.reason}`,
+      );
+      return deny(403, `egress blocked: ${policy.reason}`);
+    }
+  }
+
+  // 3. SSRF guard (pre-flight; re-checked at connect time).
+  const ssrf = await checkPrivateDestination(url, privateEgress);
+  if (!ssrf.allowed) {
+    logger.warn(
+      { op: "oma_vault.private_egress_denied", host: parsed.hostname, reason: ssrf.reason },
+      `private egress denied: ${ssrf.reason}`,
+    );
+    return deny(403, `egress blocked: ${ssrf.reason}`);
+  }
+
+  // 4. Credential resolution — session's own vaults only.
+  let matched: MatchedCred | null = null;
+  try {
+    matched =
+      who.kind === "session"
+        ? await findSessionCredentialForUrl(sql, url, who.scope)
+        : legacyHostMatching
+          ? await findLegacyCredentialForUrl(sql, url, tenantLock)
+          : null;
+  } catch (err) {
+    logger.error({ err, op: "oma_vault.credential_lookup_failed", host: parsed.hostname }, "credential lookup failed");
+  }
+  if (matched && parsed.protocol !== "https:" && !allowHttpInjection) {
+    logger.warn(
+      { op: "oma_vault.skip_insecure_inject", host: parsed.host, credential_id: matched.credentialId },
+      `not injecting credential into plain-http request to ${parsed.host} (OMA_VAULT_ALLOW_INSECURE_HTTP_INJECTION=1 to allow)`,
+    );
+    matched = null;
+  }
+
   const headers: Record<string, string> = {};
   for (const [k, v] of Object.entries(req.headers)) {
-    const lower = k.toLowerCase();
-    if (STRIP.has(lower)) continue;
+    if (STRIP.has(k.toLowerCase())) continue;
     if (typeof v === "string") headers[k] = v;
     else if (Array.isArray(v)) headers[k] = v.join(", ");
   }
@@ -489,90 +414,42 @@ proxy.forAnyRequest().thenCallback(async (req: CompletedRequest) => {
   if (matched) {
     headers[matched.injectHeader.name] = matched.injectHeader.value;
     logger.info(
-      { op: "oma_vault.inject", header: matched.injectHeader.name, url, credential_id: matched.credentialId },
+      {
+        op: "oma_vault.inject",
+        header: matched.injectHeader.name,
+        url,
+        credential_id: matched.credentialId,
+        session_id: who.kind === "session" ? who.scope.sessionId : undefined,
+      },
       `inject ${matched.injectHeader.name} for ${url}`,
     );
   } else {
     logger.debug({ op: "oma_vault.passthrough", method: req.method, url }, `passthrough ${req.method} ${url}`);
   }
 
-  // Forward to upstream. Read body as buffer to handle binary uploads.
+  // 5. Forward. node:http(s) + guarded lookup so the SSRF check covers the
+  // address actually dialled. rawBody: the upstream body is passed through
+  // byte-for-byte with its original content-encoding.
   const bodyBuf = req.body.buffer;
-  let upstream: Response;
   try {
-    upstream = await fetch(url, {
+    const upstream = await forwardUpstream({
+      url,
       method: req.method,
       headers,
-      body: bodyBuf.byteLength > 0 ? bodyBuf : undefined,
-      redirect: "manual",
+      body: bodyBuf.byteLength > 0 ? bodyBuf : null,
+      lookup: guardedLookup,
     });
+    return { statusCode: upstream.statusCode, headers: upstream.headers, rawBody: upstream.body };
   } catch (err) {
+    if (err instanceof EgressBlockedError) {
+      logger.warn({ op: "oma_vault.private_egress_denied", host: parsed.hostname, reason: err.message }, err.message);
+      return deny(403, `egress blocked: ${err.message}`);
+    }
     const msg = (err as Error).message ?? String(err);
     logger.error({ err, op: "oma_vault.forward_failed", url }, `forward failed for ${url}: ${msg}`);
-    return {
-      statusCode: 502,
-      headers: { "content-type": "text/plain" },
-      body: `oma-vault: upstream forward failed: ${msg}`,
-    };
+    return deny(502, `upstream forward failed: ${msg}`);
   }
-
-  const respHeaders: Record<string, string> = {};
-  upstream.headers.forEach((v, k) => {
-    // content-encoding would force the client to re-decompress something
-    // we already have decoded. content-length will be wrong post-buffer.
-    // Drop both; let the client re-derive.
-    const lower = k.toLowerCase();
-    if (lower === "content-encoding" || lower === "content-length") return;
-    respHeaders[k] = v;
-  });
-
-  return {
-    statusCode: upstream.status,
-    headers: respHeaders,
-    body: Buffer.from(await upstream.arrayBuffer()),
-  };
 });
-
-function parseProxySessionContext(
-  headers: Record<string, string | string[] | undefined>,
-): ProxySessionContext | null {
-  const raw = headerValue(headers["proxy-authorization"]);
-  if (!raw) return null;
-  const match = raw.match(/^basic\s+(.+)$/i);
-  if (!match) return null;
-
-  let decoded: string;
-  try {
-    decoded = Buffer.from(match[1], "base64").toString("utf8");
-  } catch {
-    return null;
-  }
-  const sep = decoded.indexOf(":");
-  if (sep <= 0) return null;
-  const username = decoded.slice(0, sep);
-  const password = decoded.slice(sep + 1);
-  if (username !== "oma" || !password) return null;
-
-  let payload: string;
-  try {
-    payload = Buffer.from(password, "base64url").toString("utf8");
-  } catch {
-    return null;
-  }
-  const payloadSep = payload.indexOf("|");
-  if (payloadSep <= 0 || payloadSep === payload.length - 1) return null;
-  const tenantId = payload.slice(0, payloadSep);
-  const sessionId = payload.slice(payloadSep + 1);
-  if (!/^[A-Za-z0-9_.:-]+$/.test(tenantId)) return null;
-  if (!/^[A-Za-z0-9_.:-]+$/.test(sessionId)) return null;
-  return { tenantId, sessionId };
-}
-
-function headerValue(value: string | string[] | undefined): string | null {
-  if (typeof value === "string") return value;
-  if (Array.isArray(value) && typeof value[0] === "string") return value[0];
-  return null;
-}
 
 await proxy.start(port);
 
@@ -580,15 +457,19 @@ logger.info(
   {
     op: "oma_vault.listening",
     port,
-    tenant_scope: scopeTenantId === "*" ? "all" : scopeTenantId,
+    tenant_scope: tenantLock === "*" ? "all" : tenantLock,
+    anonymous: anonymousPolicy,
+    legacy_host_matching: legacyHostMatching,
+    private_egress: privateEgress.allowPrivate ? "allowed" : "blocked",
     ca_cert: resolve(caDir, "ca.crt"),
   },
   `listening on http://0.0.0.0:${port}`,
 );
-// User-facing copy/paste env block — kept on stdout intentionally so first
-// run shows operators what to configure for sandbox processes.
+// User-facing hint on stdout. Sandbox processes don't need this copied by
+// hand: main-node's sandbox adapters set HTTP(S)_PROXY per session with a
+// signed session token (packages/sandbox/src/adapters/outbound-proxy.ts).
 const caCert = resolve(caDir, "ca.crt");
-process.stdout.write(`\n# OMA vault sandbox env (copy into sandbox process):\nHTTPS_PROXY=http://localhost:${port}\nHTTP_PROXY=http://localhost:${port}\nNODE_EXTRA_CA_CERTS=${caCert}\nSSL_CERT_FILE=${caCert}\n\n`);
+process.stdout.write(`\n# OMA vault: point main-node at this proxy with\nOMA_VAULT_PROXY_URL=http://localhost:${port}\nOMA_VAULT_CA_CERT=${caCert}\n# (sandbox HTTP(S)_PROXY is set per session by main-node, carrying a signed session token)\n\n`);
 
 const shutdown = (signal: string) => {
   logger.info({ op: "oma_vault.shutdown", signal }, `received ${signal}, stopping proxy`);

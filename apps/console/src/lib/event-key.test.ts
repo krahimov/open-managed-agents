@@ -31,4 +31,42 @@ describe("session event replay identity", () => {
       {type:"agent.mcp_tool_result",mcp_tool_use_id:"mcp_2",content:"ok"},
     ])).toHaveLength(2);
   });
+
+  describe("pending-queue frames", () => {
+    // QA F7 reproducer: Node frames carry event_id + nested event but no
+    // top-level id/seq/ts, so distinct frames used to share one key.
+    for (const type of ["system.user_message_pending", "system.user_message_promoted"]) {
+      it(`keeps distinct Node ${type} frames apart and dedupes repeats`, () => {
+        const a = { type, event_id: "message-a", pending_seq: 1, event: { type: "user.message", content: [{ type: "text", text: "first" }] } };
+        const b = { type, event_id: "message-b", pending_seq: 2, event: { type: "user.message", content: [{ type: "text", text: "second" }] } };
+        expect(eventKey(a)).not.toBe(eventKey(b));
+        expect(replay([a, b, { ...a }])).toHaveLength(2);
+      });
+    }
+
+    it("falls back to the nested event id when event_id is missing", () => {
+      const frame = (id: string) => ({ type: "system.user_message_pending", event: { type: "user.message", id } });
+      expect(eventKey(frame("sevt_1"))).not.toBe(eventKey(frame("sevt_2")));
+    });
+
+    it("keys CF promoted frames by event_id, not the promoted row's seq", () => {
+      // CF promoted frames echo the seq of the user event they promote.
+      const userEvent = { type: "user.message", seq: 7 };
+      const promoted = { type: "system.user_message_promoted", event_id: "sevt_u", pending_seq: 3, seq: 7, processed_at: "t", session_thread_id: "sthr_primary" };
+      expect(eventKey(promoted)).toBe("system.user_message_promoted:sevt_u");
+      expect(replay([userEvent, promoted])).toHaveLength(2);
+    });
+
+    it("keeps CF legacy-backfill promoted frames (empty event_id) distinct by seq", () => {
+      const p = (seq: number) => ({ type: "system.user_message_promoted", event_id: "", seq, processed_at: "t" });
+      expect(replay([p(4), p(5), p(4)])).toHaveLength(2);
+      expect(eventKey(p(4))).not.toBe(eventKey({ type: "user.message", seq: 4 }));
+    });
+
+    it("does not let a pending and a promoted frame for the same input collide", () => {
+      const pending = { type: "system.user_message_pending", event_id: "sevt_x", pending_seq: 1 };
+      const promoted = { type: "system.user_message_promoted", event_id: "sevt_x", pending_seq: 1 };
+      expect(eventKey(pending)).not.toBe(eventKey(promoted));
+    });
+  });
 });

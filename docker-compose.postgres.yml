@@ -101,6 +101,10 @@ services:
       DATABASE_URL: postgres://oma:oma@postgres:5432/oma
       OMA_VAULT_CA_DIR: /app/data/oma-vault-ca
       OMA_VAULT_PORT: "14322"
+      # Signing key for per-session proxy tokens — must match oma-server's
+      # (see docker-compose.yml / docs/self-host.md).
+      PLATFORM_ROOT_SECRET: ${PLATFORM_ROOT_SECRET:-}
+      OMA_VAULT_PROXY_SECRET: ${OMA_VAULT_PROXY_SECRET:-}
       OMA_TENANT: ${OMA_TENANT:-*}
     volumes:
       - ./data:/app/data

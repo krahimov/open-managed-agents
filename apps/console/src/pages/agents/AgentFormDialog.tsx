@@ -1665,11 +1665,12 @@ export function AgentFormDialog({
                       className={inputCls}
                     >
                       <option value="default">default — platform loop, model-card API billing</option>
+                      <option value="pi">pi — Pi agent runtime, platform tools, model-card API billing</option>
                       <option value="claude-agent-sdk">
                         claude-agent-sdk — local Claude Code, subscription billing
                       </option>
                       {form.harness &&
-                        !["default", "claude-agent-sdk", "acp-proxy"].includes(form.harness) && (
+                        !["default", "pi", "claude-agent-sdk", "acp-proxy"].includes(form.harness) && (
                           <option value={form.harness}>{form.harness}</option>
                         )}
                     </select>

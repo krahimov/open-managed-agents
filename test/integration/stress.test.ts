@@ -29,7 +29,7 @@ registerHarness("noop", () => ({ async run() {} }));
 // Helper: create agent + env + session quickly
 async function createFullSession(overrides?: Record<string, unknown>) {
   const agentRes = await post("/v1/agents", {
-    name: "Stress Agent",
+    name: `Stress Agent ${crypto.randomUUID().slice(0, 8)}`,
     model: "claude-sonnet-4-6",
     system: "You are helpful.",
     _oma: { harness: "noop" },

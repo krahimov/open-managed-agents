@@ -24,6 +24,7 @@
 
 import { Sandbox } from "@cloudflare/sandbox";
 import type { Env } from "@open-managed-agents/shared";
+import { isHostAllowedByEgress, type EgressPolicy } from "@open-managed-agents/shared";
 import {
   buildCfTenantDbProvider,
   getCfServicesForTenant,
@@ -61,9 +62,139 @@ interface SdkContext<P = unknown> {
   params: P;
 }
 
+/** Mirrors @cloudflare/containers' (unexported) OutboundParamsArg. */
+type OutboundParamsArg<Params> = [Params] extends [undefined]
+  ? []
+  : undefined extends Params
+    ? [params?: Params]
+    : [params: Params];
+
 interface OutboundContextParams {
   tenantId?: string;
   sessionId?: string;
+  /** Environment allow-list (networking: limited). null/absent = unrestricted. */
+  egress?: EgressPolicy | null;
+}
+
+/**
+ * Enforce the environment's egress allow-list for a container request.
+ * Returns a 403 Response to short-circuit, or null to proceed. Runs before
+ * any credential lookup so a denied host never triggers a vault RPC.
+ */
+export function egressDenial(url: URL, params: OutboundContextParams): Response | null {
+  if (isHostAllowedByEgress(url.hostname, params.egress)) return null;
+  console.log(
+    `[oma-sandbox] egress denied host=${url.hostname} sid=${(params.sessionId ?? "").slice(0, 12)}`,
+  );
+  return new Response(
+    `oma: egress to "${url.hostname}" is blocked by this environment's networking policy (allowed_hosts)\n`,
+    { status: 403, headers: { "content-type": "text/plain" } },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// R2 egress scoping (QA F1)
+//
+// The container talks to R2 directly for platform storage: workspace
+// backups (@cloudflare/sandbox createBackup/restoreBackup mint presigned
+// URLs for `https://<CLOUDFLARE_ACCOUNT_ID>.r2.cloudflarestorage.com/
+// <BACKUP_BUCKET_NAME>/<key>`, path-style) and s3fs FUSE mounts of the
+// memory / workspace / session-outputs buckets against R2_ENDPOINT
+// (virtual-hosted `<bucket>.<account>.r2.cloudflarestorage.com` or
+// path-style). That traffic must keep working under `networking: limited`
+// (and before the session context is bound), so it bypasses the session
+// allow-list — but ONLY for the platform's own account + buckets. Any other
+// R2 host/bucket (e.g. an attacker's presigned URL) is ordinary egress and
+// is checked against the session policy; with no policy bound it is denied.
+// ---------------------------------------------------------------------------
+
+const R2_HOST_SUFFIX = ".r2.cloudflarestorage.com";
+const R2_HOST_PATTERN = `*${R2_HOST_SUFFIX}`;
+/** Session outputs bucket — hardcoded in runtime/sandbox.ts
+ *  (mountSessionOutputs); keep in sync. */
+const PLATFORM_FILES_BUCKET = "managed-agents-files";
+
+export interface PlatformR2Scope {
+  /** Platform account hosts, e.g. `<account>.r2.cloudflarestorage.com`. */
+  hosts: Set<string>;
+  /** Platform bucket names reachable on those hosts. */
+  buckets: Set<string>;
+}
+
+type R2ScopeEnv = Pick<
+  Env,
+  "CLOUDFLARE_ACCOUNT_ID" | "R2_ENDPOINT" | "BACKUP_BUCKET_NAME" | "MEMORY_BUCKET_NAME" | "WORKSPACE_BUCKET_NAME"
+>;
+
+/** Derive the platform's own R2 hosts + buckets from worker configuration. */
+export function platformR2Scope(env: Partial<R2ScopeEnv> | undefined): PlatformR2Scope {
+  const hosts = new Set<string>();
+  const account = env?.CLOUDFLARE_ACCOUNT_ID?.trim().toLowerCase();
+  if (account && /^[a-z0-9-]+$/.test(account)) hosts.add(`${account}${R2_HOST_SUFFIX}`);
+  if (env?.R2_ENDPOINT) {
+    try {
+      const h = new URL(env.R2_ENDPOINT).hostname.toLowerCase();
+      if (h.endsWith(R2_HOST_SUFFIX)) hosts.add(h);
+    } catch {
+      // Malformed endpoint contributes nothing (fail closed).
+    }
+  }
+  const buckets = new Set<string>();
+  for (const b of [env?.BACKUP_BUCKET_NAME, env?.MEMORY_BUCKET_NAME, env?.WORKSPACE_BUCKET_NAME, PLATFORM_FILES_BUCKET]) {
+    const name = b?.trim().toLowerCase();
+    if (name) buckets.add(name);
+  }
+  return { hosts, buckets };
+}
+
+/**
+ * True iff `url` addresses one of the platform's own buckets on one of its
+ * own account hosts — path-style `https://<account-host>/<bucket>/...` or
+ * virtual-hosted `https://<bucket>.<account-host>/...`. Everything else
+ * (other accounts, other buckets, the account root) is NOT platform storage.
+ */
+export function isPlatformR2Request(url: URL, scope: PlatformR2Scope): boolean {
+  if (scope.hosts.size === 0 || scope.buckets.size === 0) return false;
+  const host = url.hostname.toLowerCase().replace(/\.+$/, "");
+  for (const base of scope.hosts) {
+    if (host === base) {
+      let bucket: string;
+      try {
+        bucket = decodeURIComponent(url.pathname.split("/")[1] ?? "").toLowerCase();
+      } catch {
+        return false;
+      }
+      return scope.buckets.has(bucket);
+    }
+    if (host.endsWith(`.${base}`)) {
+      return scope.buckets.has(host.slice(0, -(base.length + 1)));
+    }
+  }
+  return false;
+}
+
+/**
+ * Egress decision for an R2 request. Platform storage always passes.
+ * Otherwise the session policy applies; `params` without a bound `egress`
+ * field (no session context yet — static handler, or a malformed binding)
+ * is denied rather than treated as unrestricted.
+ */
+export function r2EgressDenial(
+  url: URL,
+  env: Partial<R2ScopeEnv> | undefined,
+  params: OutboundContextParams | undefined,
+): Response | null {
+  if (isPlatformR2Request(url, platformR2Scope(env))) return null;
+  if (!params || !("egress" in params)) {
+    console.log(
+      `[oma-sandbox] egress denied host=${url.hostname} reason=r2-not-platform-storage-no-session-policy`,
+    );
+    return new Response(
+      `oma: egress to "${url.hostname}" is blocked: not platform storage and no session networking policy is bound\n`,
+      { status: 403, headers: { "content-type": "text/plain" } },
+    );
+  }
+  return egressDenial(url, params);
 }
 
 /**
@@ -100,6 +231,9 @@ const injectVaultCredsHandler = async (
   const url = new URL(request.url);
   const params = ctx.params ?? {};
   const e = env as Env;
+
+  const denied = egressDenial(url, params);
+  if (denied) return denied;
 
   // Look up credential metadata for this host. Lightweight RPC — only
   // the resolved bearer token crosses the wire. Body + response stay
@@ -193,6 +327,24 @@ export class OmaSandbox extends Sandbox {
    * by sessionId via getSandbox(env, sessionId), so the stored context
    * belongs to exactly one logical session.
    */
+  /**
+   * Binding the catch-all (`inject_vault_creds`, from
+   * runtime/sandbox.ts:setOutboundContext) also binds the R2 host handler
+   * with the same params, so R2 egress is policy-checked from then on.
+   * Runtime host overrides take precedence over the static outboundByHost
+   * entry in the containers SDK dispatcher.
+   */
+  override async setOutboundHandler<Params = unknown>(
+    methodName: string,
+    ...paramsArg: OutboundParamsArg<Params>
+  ): Promise<void> {
+    await super.setOutboundHandler<Params>(methodName, ...paramsArg);
+    if (methodName === "inject_vault_creds") {
+      await (this.setOutboundByHost as (host: string, method: string, ...p: unknown[]) => Promise<void>)
+        .call(this, R2_HOST_PATTERN, "r2_storage", ...paramsArg);
+    }
+  }
+
   async setBackupContext(ctx: BackupContext): Promise<void> {
     await this.ctx.storage.put(BACKUP_CTX_KEY, ctx);
   }
@@ -441,10 +593,9 @@ export class OmaSandbox extends Sandbox {
   }
 }
 
-// Per-host bypass for R2 — createBackup / restoreBackup do raw S3-style
+// Per-host transport for R2 — createBackup / restoreBackup do raw S3-style
 // PUT/GET/HEAD against `*.r2.cloudflarestorage.com` from inside the
-// container, and so do agent-driven presigned PUTs from the
-// /v1/internal/sessions/:id/uploads/presign flow. Routing those through
+// container, and s3fs mounts do the same for memory / outputs. Routing those through
 // inject_vault_creds (which materializes bodies + uses Workers fetch)
 // corrupts the squashfs blob — see cloudflare/sandbox-sdk#619 ("Failed
 // to mount squashfs: This doesn't look like a squashfs image" when
@@ -477,6 +628,34 @@ const r2OutboundPassthrough = async (request: Request): Promise<Response> => {
       redirect: "manual",
     }),
   );
+};
+
+/**
+ * Runtime-bound R2 handler (`r2_storage`). Bound by OmaSandbox's
+ * setOutboundHandler override with the same params as the catch-all, so
+ * it sees the session's egress policy. Platform storage bypasses the
+ * policy (see r2EgressDenial); anything else must be allowed by it.
+ */
+const r2StorageHandler = async (
+  request: Request,
+  env: unknown,
+  ctx: SdkContext<OutboundContextParams>,
+): Promise<Response> => {
+  const denied = r2EgressDenial(new URL(request.url), env as Env, ctx.params);
+  if (denied) return denied;
+  return r2OutboundPassthrough(request);
+};
+
+/**
+ * Static R2 handler — used only until the session context is bound (the
+ * SDK passes `ctx.params = undefined` to static handlers). Platform
+ * storage (workspace restore, FUSE mounts during warmup) passes; any other
+ * R2 destination is denied because no policy is available to allow it.
+ */
+const r2StaticHandler = async (request: Request, env: unknown): Promise<Response> => {
+  const denied = r2EgressDenial(new URL(request.url), env as Env, undefined);
+  if (denied) return denied;
+  return r2OutboundPassthrough(request);
 };
 
 // Per-host network-layer GitHub credential injection (γ proxy).
@@ -514,6 +693,9 @@ const githubAuthHandler = async (
   const url = new URL(request.url);
   const params = ctx.params ?? {};
   const e = env as Env;
+
+  const denied = egressDenial(url, params);
+  if (denied) return denied;
 
   let cred: { scheme: "Basic" | "Bearer"; token: string; slug: string } | null = null;
 
@@ -617,20 +799,23 @@ const githubAuthHandler = async (
 //   git push attempts silently sent the `__cap_managed__` sentinel
 //   through unauthenticated. Caught 2026-05-13 testing `gh repo list`.
 //
-// r2OutboundPassthrough doesn't need params (purely streams the request
-// to R2 unchanged), so it stays as a direct function reference in
-// outboundByHost below.
+// r2_storage: per-host for `*.r2.cloudflarestorage.com`, params bound at
+//   runtime by OmaSandbox.setOutboundHandler (same params as the catch-all)
+//   so non-platform R2 traffic is checked against the session egress
+//   policy. The static `outboundByHost` entry below is the pre-binding
+//   fallback and only lets platform storage through.
 (OmaSandbox as unknown as {
   outboundHandlers: Record<string, typeof injectVaultCredsHandler>;
 }).outboundHandlers = {
   inject_vault_creds: injectVaultCredsHandler,
   github_auth: githubAuthHandler,
+  r2_storage: r2StorageHandler,
 };
 
 (OmaSandbox as unknown as {
   outboundByHost: Record<string, (req: Request, env: unknown, ctx: SdkContext<OutboundContextParams>) => Promise<Response>>;
 }).outboundByHost = {
-  "*.r2.cloudflarestorage.com": r2OutboundPassthrough,
+  [R2_HOST_PATTERN]: r2StaticHandler,
   // github.com / api.github.com handled at runtime via
   // sandbox.setOutboundByHost("...", "github_auth", { tenantId, sessionId })
   // from session-do.ts:setOutboundContext — see comment on outboundHandlers

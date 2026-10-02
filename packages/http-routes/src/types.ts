@@ -69,7 +69,7 @@ export interface RouteServices {
   kv: KvStore;
   /** Per-session event log writer. Bound to a sessionId at the call site. */
   newEventLog: (sessionId: string) => {
-    appendAsync(ev: unknown): Promise<void>;
+    appendAsync(ev: unknown): Promise<unknown>;
     getEventsAsync(afterSeq?: number): Promise<unknown[]>;
   };
   hub: EventStreamHub;

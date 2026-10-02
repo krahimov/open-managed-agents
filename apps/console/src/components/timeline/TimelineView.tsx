@@ -59,7 +59,7 @@ export function TimelineView({
       || (typeof (e as { seq?: number }).seq === "number" && `seq:${(e as { seq?: number }).seq}` === eventId);
     const turn = turns.find((t) => t.events.some(matches));
     if (!turn) return;
-    const { spans } = deriveSpans(turn.events);
+    const { spans } = deriveSpans(turn.events, events);
     const span = spans.find((s) => s.events.some(matches));
     if (span) {
       setSelection({ spanKey: span.key, spanLabel: span.label, events: span.events });
@@ -93,6 +93,7 @@ export function TimelineView({
               <div data-turn-id={turn.id}>
                 <TurnCard
                   turn={turn}
+                  allEvents={events}
                   selection={selection}
                   onSelectSpan={(span) =>
                     setSelection((cur) =>
@@ -237,15 +238,18 @@ function TimelineRow({
  */
 function TurnCard({
   turn,
+  allEvents,
   selection,
   onSelectSpan,
 }: {
   turn: Turn;
+  /** Every event in view; resolves tool status across turn boundaries. */
+  allEvents: Event[];
   selection: TimelineSelection | null;
   onSelectSpan: (span: Span) => void;
 }) {
   const [collapsed, setCollapsed] = useState(false);
-  const { spans, totalMs } = useMemo(() => deriveSpans(turn.events), [turn.events]);
+  const { spans, totalMs } = useMemo(() => deriveSpans(turn.events, allEvents), [turn.events, allEvents]);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [pxPerMs, setPxPerMs] = useState<number | null>(null);
@@ -421,11 +425,11 @@ function TurnCard({
                   chartPx={chartPx}
                   leftLabel={
                     <>
-                      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${FAMILY_DOT[s.family]}`} />
+                      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${s.isError ? "bg-danger" : FAMILY_DOT[s.family]}`} />
                       <div className="min-w-0 flex-1">
                         <div className="truncate text-fg-muted font-mono">{s.label}</div>
                         {s.detail && (
-                          <div className="truncate text-fg-subtle font-mono text-[10px]">{s.detail}</div>
+                          <div className={`truncate font-mono text-[10px] ${s.isError ? "text-danger" : "text-fg-subtle"}`}>{s.detail}</div>
                         )}
                       </div>
                     </>
@@ -435,7 +439,7 @@ function TurnCard({
                   {width > 0 ? (
                     <>
                       <div
-                        className={`absolute h-3 top-1 rounded-sm ${FAMILY_BAR[s.family]} group-hover:opacity-100 opacity-90`}
+                        className={`absolute h-3 top-1 rounded-sm ${s.isError ? "bg-danger/70" : FAMILY_BAR[s.family]} group-hover:opacity-100 opacity-90`}
                         style={{ left: `${left}px`, width: `${width}px` }}
                       />
                       {typeof s.ttftMs === "number" && s.durationMs > 0 && (
@@ -448,7 +452,7 @@ function TurnCard({
                     </>
                   ) : (
                     <div
-                      className={`absolute top-0 bottom-0 w-px ${FAMILY_DOT[s.family]}`}
+                      className={`absolute top-0 bottom-0 w-px ${s.isError ? "bg-danger" : FAMILY_DOT[s.family]}`}
                       style={{ left: `${left}px` }}
                     />
                   )}

@@ -62,30 +62,38 @@ export interface NodeHarnessRuntimeOptions {
    *  LocalSubprocessSandbox for local dev, E2BSandbox / CloudflareSandbox
    *  in production. */
   sandbox: SandboxExecutor;
+  /** Turn abort (user.interrupt / lease loss) from SessionStateMachine. */
+  abortSignal?: AbortSignal;
 }
 
 export class NodeHarnessRuntime implements HarnessRuntime {
   history: SqlHistoryStore;
   sandbox: SandboxExecutor;
-  pendingConfirmations?: string[];
+  /** Tool calls the harness left without a result (always_ask / custom
+   *  tools). DefaultHarness only records them when this array exists;
+   *  SessionStateMachine reads it to build the requires_action stop_reason. */
+  pendingConfirmations: string[] = [];
+  /** Aborts on the turn's signal OR on a failed persist (see broadcast). */
+  abortSignal: AbortSignal;
+  private readonly abortController = new AbortController();
   /**
    * Per-runtime serial chain for SqlEventLog writes. The harness fires
    * many `broadcast()` calls in close succession (span_start, span_first_
-   * token, tool_use, tool_result, …); each used to do a fire-and-forget
-   * appendAsync. SqlEventLog mints `seq` via `SELECT COALESCE(MAX(seq),
-   * 0) + 1`, which races on Postgres (true concurrent connections) and
-   * occasionally collides on the sessions PK. Better-sqlite3 hides the
-   * race because its underlying I/O is sync, but PG users hit
-   * `duplicate key value violates unique constraint
-   * "session_events_pkey"`. Serialising the writes through a single
-   * Promise chain preserves logical event order AND eliminates the seq
-   * collision without needing per-row locking.
+   * token, tool_use, tool_result, …). Serialising them preserves logical
+   * event order within the turn (seq allocation itself is safe under
+   * concurrent writers — SqlEventLog retries on the unique PK).
    */
   private writeChain: Promise<void> = Promise.resolve();
+  /** First persistence failure; rethrown by flush(). */
+  private persistError: unknown = null;
 
   constructor(private opts: NodeHarnessRuntimeOptions) {
     this.history = new SqlHistoryStore(opts.log);
     this.sandbox = opts.sandbox;
+    this.abortSignal = this.abortController.signal;
+    const external = opts.abortSignal;
+    if (external?.aborted) this.abortController.abort(external.reason);
+    else external?.addEventListener("abort", () => this.abortController.abort(external.reason), { once: true });
   }
 
   /** Call before each harness.run() so getEvents reflects DB state. */
@@ -95,31 +103,79 @@ export class NodeHarnessRuntime implements HarnessRuntime {
 
   /**
    * Single write path. Persists the event to SqlEventLog (durable,
-   * survives crash) AND publishes to the in-process hub for live SSE
-   * subscribers. The order matters: persist first so a hub subscriber
-   * that races a DB read after the publish always sees the event.
+   * survives crash), then publishes EXACTLY the stored row (with its
+   * seq) to the hub for live SSE subscribers — persist-before-broadcast.
    *
-   * Persists are serialised through `writeChain` so concurrent calls
-   * don't collide on the per-session seq counter (see writeChain
-   * comment above).
+   * broadcast() is sync in the HarnessRuntime contract, so a failed write
+   * can't throw at the call site. Instead the first failure is retained,
+   * later writes are skipped (the log must not get holes papered over),
+   * and the turn is aborted so the harness stops producing work whose
+   * record is being lost. SessionStateMachine awaits flush(), which
+   * rethrows the failure as the turn's error.
    */
   broadcast = (event: SessionEvent): void => {
-    this.history.appendInPlace(event);
-    this.writeChain = this.writeChain
-      .then(() => this.opts.log.appendAsync(event))
-      .then(() => this.opts.log.getEventsAsync())
-      .then((all) => {
-        const last = all[all.length - 1];
-        if (last) this.opts.hub.publish(this.opts.sessionId, last);
-      })
-      .catch((err) => {
-        log.warn({ err, op: "node_harness.broadcast_persist_failed" }, "broadcast persist failed");
-        // Reset the chain so a single failure doesn't poison every
-        // subsequent broadcast (the SQL adapter typically recovers on
-        // the next attempt — connection wasn't lost, just a constraint
-        // hit).
-      });
+    // Failure is retained + aborts the turn inside enqueueWrite; the
+    // rejection here is only observed via flush().
+    void this.enqueueWrite(event).catch(() => {});
   };
+
+  /**
+   * Durable append for write-ahead tool execution (HarnessRuntime.persist,
+   * docs/durable-execution.md): same serialized write chain as broadcast
+   * (so ordering is shared), resolves only once the row is stored and
+   * rejects when it isn't — including a lease-fenced write rejected
+   * because another worker now owns the session (the log handed to this
+   * runtime is the turn's guarded log).
+   */
+  persist = async (event: SessionEvent): Promise<void> => {
+    await this.enqueueWrite(event);
+  };
+
+  /** Wait for every queued persist; rethrow the first failure. */
+  async flush(): Promise<void> {
+    await this.writeChain;
+    if (this.persistError) throw this.persistError;
+  }
+
+  /** Set by close(): the turn ended without waiting for the harness. */
+  private closed = false;
+
+  /**
+   * SessionStateMachine stopped waiting for this harness run (aborted
+   * turn that didn't unwind within its grace period) and is ending the
+   * turn itself. Any write the abandoned harness makes afterwards would
+   * land after the turn's session.status_idle and corrupt the history —
+   * drop it instead.
+   */
+  close(): void {
+    this.closed = true;
+    if (!this.abortController.signal.aborted) this.abortController.abort({ kind: "closed" });
+  }
+
+  private enqueueWrite(event: SessionEvent): Promise<void> {
+    if (this.closed) {
+      log.warn(
+        { op: "node_harness.write_after_close", event_type: event.type },
+        "dropping event written by an abandoned harness run",
+      );
+      return Promise.reject(Object.assign(new Error("harness runtime closed"), { code: "runtime_closed" }));
+    }
+    this.history.appendInPlace(event);
+    const write = this.writeChain.then(async () => {
+      if (this.persistError) throw this.persistError;
+      const stored = await this.opts.log.appendAsync(event);
+      const seq = (stored as { seq?: number }).seq;
+      if (seq !== undefined) (event as { seq?: number }).seq = seq;
+      this.opts.hub.publish(this.opts.sessionId, stored);
+    });
+    this.writeChain = write.catch((err) => {
+      if (this.persistError) return;
+      this.persistError = err;
+      log.warn({ err, op: "node_harness.persist_failed" }, "event persist failed; aborting turn");
+      this.abortController.abort({ kind: "persist_failed" });
+    });
+    return write;
+  }
 
   // Stream lifecycle events: broadcast-only (NOT persisted to events log,
   // matching the CF contract — the eventual agent.message is the canonical

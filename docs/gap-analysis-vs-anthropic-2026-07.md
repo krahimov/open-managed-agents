@@ -31,8 +31,14 @@ code.claude.com/docs (routines, slack, github-actions, agent-sdk/hosting).
   event queue are ahead of Anthropic here.
 - **Credential isolation** — vault outbound injection (tokens never enter
   the sandbox) is the same design Claude Tag ships ("credentials stay out
-  of the sandbox", default-deny egress). OMA had this before Claude Tag
-  launched.
+  of the sandbox"). As of 2026-09, the self-host proxy (oma-vault) also
+  scopes credentials to the session's own `vault_ids`, using HMAC-signed
+  session identity. Before that it matched by hostname across tenants.
+  `networking: limited` allow-lists are now enforced for all proxied
+  container traffic, not just `web_fetch`, on both CF and Node. Caveat: the
+  default Node `subprocess` sandbox has no isolation and can bypass the
+  proxy, so default-deny egress holds only on CF and on isolated Node
+  providers with provider-level network restrictions.
 - **Slack @mentions** — the pipeline (manifest → per-tenant app → OAuth →
   signed webhooks → thread sessions → bot replies via Slack MCP) exists
   and is tested (104 unit tests). See `docs/slack-agent-mentions.md` for

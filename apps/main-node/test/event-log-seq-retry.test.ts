@@ -65,7 +65,13 @@ function fakeClient(failures: Error[]): { sql: SqlClient; attempts: () => number
       if (err) throw err;
       return { meta: { changes: 1 }, success: true };
     },
-    first: async <T>(): Promise<T | null> => null,
+    // appendAsync inserts with RETURNING via first().
+    first: async <T>(): Promise<T | null> => {
+      attempts++;
+      const err = failures.shift();
+      if (err) throw err;
+      return { seq: attempts, ts: 0, processed_at: 0, session_thread_id: "sthr_primary" } as T;
+    },
     all: async <T>(): Promise<SqlSelectResult<T>> => ({
       results: [],
       meta: { changes: 0 },

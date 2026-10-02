@@ -42,7 +42,7 @@ async function setup() {
     method: "POST",
     headers: HEADERS,
     body: JSON.stringify({
-      name: "Trajectory Test Agent",
+      name: `Trajectory Test Agent ${crypto.randomUUID().slice(0, 8)}`,
       model: "claude-sonnet-4-6",
       system: "you are helpful",
       tools: [{ type: "agent_toolset_20260401" }],
@@ -137,7 +137,7 @@ describe("GET /v1/sessions/:id/trajectory", () => {
     const t = (await res.json()) as any;
 
     expect(t.agent_config.id).toBe(agent.id);
-    expect(t.agent_config.name).toBe("Trajectory Test Agent");
+    expect(t.agent_config.name).toMatch(/^Trajectory Test Agent /);
     expect(t.environment_config.id).toBe(environment.id);
   });
 

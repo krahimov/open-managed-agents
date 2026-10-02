@@ -28,19 +28,21 @@ export { outbound, outboundByHost } from "../apps/agent/src/outbound";
 // consolidation files added on top (0018_runtime_multi_tenant.sql is the
 // first such — see multi-tenant CLI bridge daemon PR).
 
-// @ts-expect-error vitest resolves SQL via ?raw
-import authSchema from "../apps/main/migrations/0000_consolidated.sql?raw";
-// @ts-expect-error vitest resolves SQL via ?raw
-import schema0018 from "../apps/main/migrations/0018_runtime_multi_tenant.sql?raw";
+// Every top-level migration file, applied in filename order. Globbing
+// (instead of hand-listing files) keeps new migrations from silently
+// missing in tests — 0019_permission_grants.sql drifted exactly that way.
+const MAIN_MIGRATION_FILES = import.meta.glob<string>(
+  "../apps/main/migrations/*.sql",
+  { query: "?raw", import: "default", eager: true },
+);
 // @ts-expect-error vitest resolves SQL via ?raw
 import integrationsSchema from "../apps/main/migrations-integrations/0001_consolidated.sql?raw";
 // @ts-expect-error vitest resolves SQL via ?raw
 import routerSchema from "../apps/main/migrations-router/0001_consolidated.sql?raw";
 
-const MIGRATIONS_RAW: string[] = [
-  authSchema as string,
-  schema0018 as string,
-];
+const MIGRATIONS_RAW: string[] = Object.keys(MAIN_MIGRATION_FILES)
+  .sort()
+  .map((path) => MAIN_MIGRATION_FILES[path]);
 
 const INTEGRATIONS_MIGRATIONS_RAW: string[] = [integrationsSchema as string];
 

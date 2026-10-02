@@ -133,12 +133,14 @@ export class SqlAgentRepo implements AgentRepo {
       // duplicate-name guard on create). config is a TEXT column on PG,
       // hence the ::jsonb cast; ILIKE for parity with SQLite's ASCII-case-
       // insensitive LIKE. ESCAPE '\' makes user-supplied `%`/`_` literal
-      // (see escapeLikePattern).
-      const pattern = `%${escapeLikePattern(opts.q)}%`;
+      // (see escapeLikePattern). SQLite uses instr() instead of LIKE: D1
+      // caps LIKE patterns at 50 bytes, so a long agent name 500'd the
+      // duplicate-name guard on create. lower() is ASCII-only in SQLite,
+      // matching LIKE's case-insensitivity.
       conds.push(
         this.dialect === "postgres"
-          ? sql`(${agents.config}::jsonb ->> 'name') ILIKE ${pattern} ESCAPE '\\'`
-          : sql`json_extract(${agents.config}, '$.name') LIKE ${pattern} ESCAPE '\\'`,
+          ? sql`(${agents.config}::jsonb ->> 'name') ILIKE ${`%${escapeLikePattern(opts.q)}%`} ESCAPE '\\'`
+          : sql`instr(lower(json_extract(${agents.config}, '$.name')), lower(${opts.q})) > 0`,
       );
     }
     if (opts.after) {

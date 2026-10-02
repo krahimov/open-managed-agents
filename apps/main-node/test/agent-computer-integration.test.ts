@@ -114,6 +114,8 @@ describe("agent computer session integration", () => {
         content: [{ type: "text", text: "Finish the task after I close my laptop." }],
       } as UserMessageEvent);
       expect(accepted.status).toBe(202);
+      // Queued first (outbox frame), promoted into the log when the turn starts.
+      expect(JSON.parse((await frames.next()).value.data).type).toBe("system.user_message_pending");
       expect(JSON.parse((await frames.next()).value.data).type).toBe("user.message");
       await vi.waitFor(() => expect(harnessStarted).toHaveBeenCalledOnce());
       expect(await fixture.sql.prepare("SELECT status FROM sessions WHERE id = ?").bind(session.id).first())
@@ -132,9 +134,9 @@ describe("agent computer session integration", () => {
         .toMatchObject({ status: "idle" });
       expect(await fixture.sql.prepare("SELECT status, attempts FROM session_work_items WHERE session_id = ?").bind(session.id).first())
         .toMatchObject({ status: "done", attempts: 1 });
-      expect(fixture.runWork).toHaveBeenCalledWith(expect.objectContaining({
+      expect(fixture.runWork.mock.calls[0]?.[0]).toMatchObject({
         tenantId: TENANT, agentId: fixture.agent.id, sessionId: session.id,
-      }));
+      });
       expect(fixture.buildModel).toHaveBeenCalledWith(expect.objectContaining({ id: fixture.agent.id }), TENANT);
 
       const stored = await fixture.router.getEvents(session.id);

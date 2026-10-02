@@ -86,6 +86,20 @@ export interface HarnessRuntime {
    */
   broadcast: (event: SessionEvent) => void;
   /**
+   * Durable append: resolves only once `event` is persisted to the session
+   * event log (and then broadcast like `broadcast`). Rejects when the write
+   * failed. The default harness uses it for write-ahead tool execution:
+   * `agent.tool_use` is persisted BEFORE the tool runs and `agent.tool_result`
+   * right after it settles (docs/durable-execution.md). Must share ordering
+   * with `broadcast` (same write queue). Optional for back-compat — when
+   * absent the harness falls back to `broadcast` and loses the durability
+   * guarantee (ordering is kept).
+   *
+   * CF: SQL append + `ctx.storage.sync()`. Node: awaits the SqlEventLog
+   * write chain (NodeHarnessRuntime.persist).
+   */
+  persist?: (event: SessionEvent) => Promise<void>;
+  /**
    * Mark the start of an in-flight LLM stream and broadcast a lifecycle
    * event to subscribers. The runtime persists the stream state to the
    * `streams` table (separate from the events log) so a deploy mid-
@@ -232,7 +246,11 @@ export interface HarnessContext {
     ANTHROPIC_BASE_URL?: string;
     ANTHROPIC_MODEL?: string;
     TAVILY_API_KEY?: string;
-    delegateToAgent?: (agentId: string, message: string) => Promise<string>;
+    delegateToAgent?: (
+      agentId: string,
+      message: string,
+      opts?: { idempotencyKey?: string },
+    ) => Promise<string>;
     CONFIG_KV?: KVNamespace;
     memoryStoreIds?: string[];
     environmentConfig?: { networking?: { type: string; allowed_hosts?: string[] } };

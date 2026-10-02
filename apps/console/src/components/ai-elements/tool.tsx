@@ -35,6 +35,9 @@ export type ToolPart = ToolUIPart | DynamicToolUIPart;
 export type ToolHeaderProps = {
   title?: string;
   className?: string;
+  /** Overrides the badge text for the given state (e.g. "Waiting for
+   *  client result" on the approval-requested visual). */
+  statusLabel?: string;
 } & (
   | { type: ToolUIPart["type"]; state: ToolUIPart["state"]; toolName?: never }
   | {
@@ -64,10 +67,10 @@ const statusIcons: Record<ToolPart["state"], ReactNode> = {
   "output-error": <XCircleIcon className="size-4 text-red-600" />,
 };
 
-export const getStatusBadge = (status: ToolPart["state"]) => (
+export const getStatusBadge = (status: ToolPart["state"], label?: string) => (
   <Badge className="gap-1 rounded-full text-[10px] py-0 h-5 px-1.5 font-normal" variant="secondary">
     {statusIcons[status]}
-    {statusLabels[status]}
+    {label ?? statusLabels[status]}
   </Badge>
 );
 
@@ -77,6 +80,7 @@ export const ToolHeader = ({
   type,
   state,
   toolName,
+  statusLabel,
   ...props
 }: ToolHeaderProps) => {
   const derivedName =
@@ -93,7 +97,7 @@ export const ToolHeader = ({
       <div className="flex items-center gap-2 min-w-0">
         <WrenchIcon className="size-3.5 text-fg-subtle shrink-0" />
         <span className="font-medium text-[13px] text-fg truncate">{title ?? derivedName}</span>
-        {getStatusBadge(state)}
+        {getStatusBadge(state, statusLabel)}
       </div>
       <ChevronDownIcon className="size-3.5 text-fg-subtle transition-transform group-data-[state=open]:rotate-180 shrink-0" />
     </CollapsibleTrigger>

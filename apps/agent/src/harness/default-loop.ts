@@ -11,6 +11,15 @@ import { llmLoggingMiddleware, llmLogKey } from "./llm-logging-middleware";
 import { isOpenAiCompatModel, sanitizeOpenAiToolNames, reasoningProviderOptions } from "./provider";
 import type { ToolSet } from "ai";
 import { OPENAI_MAX_TOOLS, SEARCH_TOOL_NAME, CALL_TOOL_NAME, applyToolBudget } from "./tool-budget";
+import { classifyTool, idempotencyKeyFor } from "@open-managed-agents/session-runtime";
+import type { ToolExecutionClass } from "@open-managed-agents/shared";
+import {
+  ToolUseGates,
+  wrapToolsWriteAhead,
+  reconcileOrphanedToolCalls,
+  mergePersistedResults,
+  type ToolSettlement,
+} from "./durable-tools";
 
 // Single source of truth lives in ./tools.ts (ALL_TOOLS). Importing here so
 // adding a new toolset entry can't drift the event-classification list — the
@@ -45,30 +54,52 @@ function extractMcpServerName(toolName: string): string {
 }
 
 /**
+ * Durable-execution metadata stamped on every tool_use flavor (see
+ * docs/durable-execution.md): idempotency key, recovery class, and the
+ * model step that produced the call (history projection keeps one step in
+ * one assistant message even when results were persisted in between).
+ */
+export interface ToolUseExtras {
+  idempotency_key?: string;
+  execution_class?: ToolExecutionClass;
+  model_request_start_id?: string;
+  /** True when the tool has no server-side execute (→ "ask" for built-ins). */
+  pending?: boolean;
+}
+
+/**
  * Map a tool-call ContentPart to the right wire event family
  * (mcp / built-in / custom). Also emits agent.thread_message_sent for
  * call_agent_* sub-agent invocations.
  *
  * Lives outside DefaultHarness so the bijection contract is co-located
  * with `eventsToMessages` — the inverse mapping in history.ts.
+ *
+ * Returns the events in emit order; the caller decides whether they go
+ * through the durable (awaited) or the fire-and-forget write path.
  */
-function emitToolCallEvent(
-  runtime: HarnessContext["runtime"],
-  tools: Record<string, any>,
-  part: ContentPart<any> & { type: "tool-call" },
-): void {
+export function toolCallEvents(
+  part: { toolCallId: string; toolName: string; input?: unknown },
+  extras: ToolUseExtras = {},
+): SessionEvent[] {
   const callInput = (part.input ?? {}) as Record<string, unknown>;
   const toolName = part.toolName;
   const toolCallId = part.toolCallId;
+  const out: SessionEvent[] = [];
+  const durable = {
+    ...(extras.idempotency_key ? { idempotency_key: extras.idempotency_key } : {}),
+    ...(extras.execution_class ? { execution_class: extras.execution_class } : {}),
+    ...(extras.model_request_start_id ? { model_request_start_id: extras.model_request_start_id } : {}),
+  };
 
   if (toolName.startsWith("call_agent_")) {
-    runtime.broadcast({
+    out.push({
       type: "agent.thread_message_sent",
       to_thread_id: toolCallId,
       content: [{ type: "text", text: String(callInput.message || "") }],
       // v1-additive (docs/trajectory-v1-spec.md "Causality"): mint a
       // deterministic id keyed on toolCallId so the matching
-      // `agent.thread_message_received` (emitted in emitToolResultEvent)
+      // `agent.thread_message_received` (emitted in toolResultEvents)
       // can set parent_event_id back to the same value. There is exactly
       // one sent / received pair per call_agent_* tool invocation, so
       // a derived-from-toolCallId id collides with nothing.
@@ -77,12 +108,13 @@ function emitToolCallEvent(
   }
 
   if (isMcpTool(toolName)) {
-    runtime.broadcast({
+    out.push({
       type: "agent.mcp_tool_use",
       id: toolCallId,
       mcp_server_name: extractMcpServerName(toolName),
       name: toolName,
       input: callInput,
+      ...durable,
     });
   } else if (isBuiltinTool(toolName)) {
     const event: AgentToolUseEvent = {
@@ -90,17 +122,20 @@ function emitToolCallEvent(
       id: toolCallId,
       name: toolName,
       input: callInput,
+      ...durable,
     };
-    if (!tools[toolName]?.execute) event.evaluated_permission = "ask";
-    runtime.broadcast(event);
+    if (extras.pending) event.evaluated_permission = "ask";
+    out.push(event);
   } else {
-    runtime.broadcast({
+    out.push({
       type: "agent.custom_tool_use",
       id: toolCallId,
       name: toolName,
       input: callInput,
+      ...durable,
     });
   }
+  return out;
 }
 
 /**
@@ -117,7 +152,7 @@ function threadSentEventId(toolCallId: string): string {
 }
 
 /**
- * Map a tool-result (or tool-error) ContentPart to a wire event,
+ * Map a tool-result (or tool-error) ContentPart to wire events,
  * normalizing the AI SDK's ToolResultOutput union into the wire's
  * `string | ContentBlock[]` representation. Also emits
  * agent.thread_message_received for call_agent_*.
@@ -132,38 +167,44 @@ function threadSentEventId(toolCallId: string): string {
  *   already-shaped ContentBlock or ContentBlock[] (legacy tool returns)
  *                → wrap or pass through
  */
-function emitToolResultEvent(
-  runtime: HarnessContext["runtime"],
-  part: ContentPart<any> & { type: "tool-result" | "tool-error" },
-): void {
+export function toolResultEvents(part: {
+  type: "tool-result" | "tool-error";
+  toolCallId: string;
+  toolName: string;
+  output?: unknown;
+  result?: unknown;
+  error?: unknown;
+}): SessionEvent[] {
   const toolCallId = part.toolCallId;
   const toolName = part.toolName;
+  const out: SessionEvent[] = [];
   // tool-error has `error`, tool-result has `output`.
   const raw =
     part.type === "tool-error"
-      ? { type: "error-text", value: String((part as any).error ?? "") }
-      : ((part as any).output ?? (part as any).result);
+      ? { type: "error-text", value: String(part.error ?? "") }
+      : (part.output ?? part.result);
 
   const content = normalizeToolOutputForWire(raw);
 
   if (isMcpTool(toolName)) {
-    runtime.broadcast({
+    out.push({
       type: "agent.mcp_tool_result",
       mcp_tool_use_id: toolCallId,
       content: typeof content === "string" ? content : JSON.stringify(content),
       // v1-additive: causal predecessor is the matching agent.mcp_tool_use,
       // whose EventBase.id is set explicitly to toolCallId in
-      // emitToolCallEvent above. Same identity, no extra plumbing.
+      // toolCallEvents above. Same identity, no extra plumbing.
       parent_event_id: toolCallId,
     });
   } else {
-    runtime.broadcast({
+    out.push({
       type: "agent.tool_result",
       tool_use_id: toolCallId,
       content,
+      ...(part.type === "tool-error" ? { is_error: true } : {}),
       // v1-additive: causal predecessor is the matching agent.tool_use,
       // whose EventBase.id is set explicitly to toolCallId in
-      // emitToolCallEvent above. (AgentToolUseEvent.id overrides
+      // toolCallEvents above. (AgentToolUseEvent.id overrides
       // EventBase.id, so tool_use_id IS the parent's EventBase.id.)
       parent_event_id: toolCallId,
     });
@@ -173,15 +214,16 @@ function emitToolResultEvent(
     const text = typeof content === "string"
       ? content
       : content.map((b) => (b.type === "text" ? b.text : "")).join("");
-    runtime.broadcast({
+    out.push({
       type: "agent.thread_message_received",
       from_thread_id: toolCallId,
       content: [{ type: "text", text }],
       // v1-additive: causal predecessor is the agent.thread_message_sent
-      // emitted in emitToolCallEvent above for the same toolCallId.
+      // emitted in toolCallEvents above for the same toolCallId.
       parent_event_id: threadSentEventId(toolCallId),
     });
   }
+  return out;
 }
 
 /**
@@ -281,6 +323,57 @@ export class DefaultHarness implements HarnessInterface {
       triggerFraction,
     });
 
+    // --- Durable execution setup (docs/durable-execution.md) ---
+    //
+    // `persist` is the awaited, durable write path used for write-ahead
+    // tool_use + immediate tool_result. Runtimes that predate it fall back
+    // to the fire-and-forget broadcast (no durability guarantee, same
+    // ordering).
+    const persist = runtime.persist
+      ? (event: SessionEvent) => runtime.persist!(event)
+      : async (event: SessionEvent) => { runtime.broadcast(event); };
+    const sessionId = ctx.session_id;
+    // Primary-thread turns must not see sub-agent thread events (runSubAgent
+    // mirrors them into the parent log tagged with their session_thread_id).
+    // With write-ahead ordering those land BETWEEN the parent's call_agent
+    // tool_use and its result, which would break tool_use/tool_result
+    // pairing in the projection. Thread-scoped turns keep the legacy
+    // unfiltered view.
+    const turnThread = (userMessage as { session_thread_id?: string } | undefined)?.session_thread_id;
+    const visibleEvents = (): SessionEvent[] => {
+      const all = runtime.history.getEvents();
+      if (turnThread && turnThread !== "sthr_primary") return all;
+      return all.filter((e) => {
+        const t = (e as { session_thread_id?: string }).session_thread_id;
+        return t == null || t === "sthr_primary";
+      });
+    };
+
+    // 0. Resolve tool calls an interrupted run left without a result
+    // (crash, DO eviction, in-process retry) BEFORE any model call —
+    // idempotent calls are re-executed, side-effect calls get an
+    // "outcome unknown, verify before retrying" error result, client
+    // calls are left for the client. See durable-tools.ts.
+    const reconciled = await reconcileOrphanedToolCalls({
+      events: visibleEvents(),
+      tools,
+      sessionId,
+      persist,
+      resultEvents: (s) => toolResultEvents(s),
+      abortSignal: runtime.abortSignal,
+    });
+    if (reconciled.reexecuted.length || reconciled.injected.length) {
+      runtime.broadcast({
+        type: "session.warning",
+        source: "tool_call_recovered",
+        message:
+          `Resolved ${reconciled.reexecuted.length + reconciled.injected.length} interrupted tool call(s) ` +
+          `before resuming: re-executed idempotent [${reconciled.reexecuted.join(", ")}], ` +
+          `reported unknown outcome for [${reconciled.injected.join(", ")}].`,
+        details: { reexecuted: reconciled.reexecuted, injected: reconciled.injected },
+      } as SessionEvent);
+    }
+
     // --- Harness decides HOW to deliver context to the model ---
 
     // 1. Compaction check: ask the harness's own shouldCompact + compact
@@ -305,9 +398,15 @@ export class DefaultHarness implements HarnessInterface {
     // async file_id → bytes resolution via ctx.fileFetcher). Custom harnesses
     // can override for sliding-window / RAG / etc. — the await unwraps either
     // sync or async overrides so existing implementations keep working.
+    //
+    // Resume-from-log: after a crash the log already holds every completed
+    // step (assistant content + write-ahead tool_use + tool_result), so the
+    // model continues from the last durable step — completed tools are not
+    // re-run and the user message is not re-sent as a fresh turn.
+    const contextEvents = mergePersistedResults(visibleEvents(), reconciled.extraEvents);
     const messages = this.deriveModelContext
-      ? await this.deriveModelContext(runtime.history.getEvents(), { fileFetcher: ctx.fileFetcher })
-      : await eventsToMessagesAsync(runtime.history.getEvents(), ctx.fileFetcher);
+      ? await this.deriveModelContext(contextEvents, { fileFetcher: ctx.fileFetcher })
+      : await eventsToMessagesAsync(contextEvents, ctx.fileFetcher);
 
     // 3. Apply provider-specific cache strategy. Anthropic: tag system block
     // + last tool + last message + (optional) one mid-conversation breakpoint
@@ -412,6 +511,260 @@ export class DefaultHarness implements HarnessInterface {
       // stream looked like "the model does not answer").
       let lastStreamErrorMessage: string | null = null;
 
+      // ── Write-ahead step state (docs/durable-execution.md) ──────────
+      //
+      // The stream observer (experimental_transform below) mirrors the
+      // current step's content in stream order. When a tool-call part
+      // arrives it durably persists, in order: every not-yet-emitted
+      // reasoning/text part that precedes it, then the agent.tool_use
+      // (with idempotency key + execution class), and only then opens the
+      // gate that lets the wrapped execute run. Results are persisted by
+      // the execute wrapper as soon as the tool settles. onStepFinish then
+      // emits only what the write-ahead path didn't (trailing text,
+      // SDK-generated tool errors, spans) — no double emission.
+      type MirrorPart =
+        | { kind: "reasoning"; id: string; text: string; providerMetadata?: unknown }
+        | { kind: "text"; id: string; text: string }
+        | { kind: "tool-call"; toolCallId: string };
+      let stepParts: MirrorPart[] = [];
+      let stepFlushedIdx = 0;
+      let stepFlushedReasoning = 0;
+      let stepFlushedText = 0;
+      const writeAheadToolUses = new Set<string>();
+      const persistedResults = new Set<string>();
+      const gates = new ToolUseGates();
+      const finalTools = (cached.tools ?? {}) as Record<string, any>;
+      const lookupTool = (name: string) => finalTools[name] ?? tools[name];
+
+      const toolUseExtras = (toolName: string, toolCallId: string): ToolUseExtras => {
+        const t = lookupTool(toolName);
+        const hasExecute = typeof t?.execute === "function";
+        return {
+          idempotency_key: idempotencyKeyFor(sessionId, toolCallId),
+          execution_class: classifyTool(toolName, { hasExecute, annotations: t?.annotations }),
+          model_request_start_id: stepStartId ?? undefined,
+          pending: !hasExecute,
+        };
+      };
+
+      const emitThinking = async (
+        p: { text: string; providerMetadata?: unknown; id?: string },
+        write: (e: SessionEvent) => Promise<void> | void,
+      ) => {
+        // AI SDK reasoning parts in step.content[] don't carry the chunk
+        // id; the mirror does. Fall back to the single-live-stream guess
+        // for parts emitted from onStepFinish.
+        const tid = p.id ?? (liveThinking.size === 1 ? [...liveThinking][0] : undefined);
+        if (tid) {
+          await runtime.broadcastThinkingEnd(tid, "completed");
+          liveThinking.delete(tid);
+        }
+        await write({
+          type: "agent.thinking",
+          text: p.text,
+          providerOptions: p.providerMetadata as Record<string, unknown> | undefined,
+          ...(tid ? { thinking_id: tid } : {}),
+          ...(stepStartId ? { model_request_start_id: stepStartId } : {}),
+        } as SessionEvent);
+      };
+
+      const emitText = async (
+        text: string,
+        write: (e: SessionEvent) => Promise<void> | void,
+        extra?: { step_final?: boolean },
+      ) => {
+        // Trim trailing whitespace at write time. Anthropic's @ai-sdk
+        // provider trims the LAST text of the LAST assistant message
+        // before sending; without our normalization, the same stored
+        // assistant text would render with vs. without `\n` depending on
+        // whether it's the tail of the conversation, busting the cache
+        // on the next turn.
+        const messageId = currentMessageId ?? generateEventId();
+        if (currentMessageId) {
+          await runtime.broadcastStreamEnd(currentMessageId, "completed");
+        }
+        await write({
+          type: "agent.message",
+          message_id: messageId,
+          content: [{ type: "text", text: text.replace(/\s+$/, "") }],
+          ...(stepStartId ? { model_request_start_id: stepStartId } : {}),
+          ...(extra?.step_final ? { step_final: true } : {}),
+        } as SessionEvent);
+        currentMessageId = null; // reset for next step
+      };
+
+      // Write-ahead: persist the step prefix + tool_use for one tool call,
+      // then open its execution gate. Runs inside the stream transform, so
+      // the pipeline (and therefore every later part of this step) waits.
+      const writeAheadToolCall = async (part: { toolCallId: string; toolName: string; input?: unknown }) => {
+        try {
+          for (; stepFlushedIdx < stepParts.length; stepFlushedIdx++) {
+            const p = stepParts[stepFlushedIdx];
+            if (p.kind === "reasoning") {
+              await emitThinking(p, persist);
+              stepFlushedReasoning++;
+            } else if (p.kind === "text") {
+              await emitText(p.text, persist);
+              stepFlushedText++;
+            }
+          }
+          if (liveToolInput.has(part.toolCallId)) {
+            await runtime.broadcastToolInputEnd(part.toolCallId, "completed");
+            liveToolInput.delete(part.toolCallId);
+          }
+          for (const e of toolCallEvents(part, toolUseExtras(part.toolName, part.toolCallId))) {
+            await persist(e);
+          }
+          writeAheadToolUses.add(part.toolCallId);
+          gates.open(part.toolCallId);
+        } catch (err) {
+          // Intent could not be made durable → the tool must not run.
+          gates.fail(part.toolCallId, err);
+          throw err;
+        }
+      };
+
+      const persistSettlement = async (s: ToolSettlement): Promise<SessionEvent[]> => {
+        if (persistedResults.has(s.toolCallId)) return [];
+        persistedResults.add(s.toolCallId);
+        const events = toolResultEvents(s);
+        try {
+          for (const e of events) await persist(e);
+        } catch (err) {
+          persistedResults.delete(s.toolCallId);
+          throw err;
+        }
+        return events;
+      };
+
+      cached.tools = wrapToolsWriteAhead(finalTools, {
+        sessionId,
+        gates,
+        isToolUsePersisted: (id) => writeAheadToolUses.has(id),
+        persistResult: persistSettlement,
+      }) as typeof cached.tools;
+
+      // Live-streaming + first-token handling for one stream part. Used to
+      // live in onChunk; moved into the transform so it is ordered with the
+      // write-ahead flush (onChunk runs downstream and may lag the
+      // transform, which would mint stream ids for text we already
+      // committed).
+      const observeLiveChunk = (chunk: { type: string; [k: string]: unknown }) => {
+        // First chunk of this step → emit span.model_first_token. Pair via
+        // model_request_start_id so consumers can split TTFT (start →
+        // first_token) from generation (first_token → end). Any chunk
+        // counts: text-delta, reasoning-delta, or tool-input-start —
+        // whichever fires first signals "the model has begun responding".
+        if (
+          !stepSawFirstChunk && stepStartId &&
+          (chunk.type === "text-delta" || chunk.type === "reasoning-delta" || chunk.type === "source" ||
+            chunk.type === "tool-call" || chunk.type === "tool-result" || chunk.type === "tool-input-start" ||
+            chunk.type === "tool-input-delta" || chunk.type === "raw")
+        ) {
+          stepSawFirstChunk = true;
+          runtime.broadcast({
+            type: "span.model_first_token",
+            model: modelId,
+            model_request_start_id: stepStartId,
+          });
+        }
+
+        if (chunk.type === "text-delta") {
+          if (!currentMessageId) {
+            currentMessageId = generateEventId();
+            // Fire-and-forget: the stream_start event lands at clients via
+            // WS broadcast before chunks via the same single-threaded DO
+            // send queue.
+            void runtime.broadcastStreamStart(currentMessageId);
+          }
+          void runtime.broadcastChunk(currentMessageId, chunk.text as string);
+        } else if (chunk.type === "reasoning-delta") {
+          // AI SDK assigns a stable id per reasoning block. Use it as
+          // the thinking_id so the client can correlate with the
+          // matching agent.thinking event.
+          const tid = chunk.id as string;
+          if (!liveThinking.has(tid)) {
+            liveThinking.add(tid);
+            void runtime.broadcastThinkingStart(tid);
+          }
+          void runtime.broadcastThinkingChunk(tid, chunk.text as string);
+        } else if (chunk.type === "tool-input-start") {
+          // toolCallId here matches the eventual tool-call's id, which
+          // becomes agent.tool_use.id. Same correlation contract.
+          const id = chunk.id as string;
+          if (!liveToolInput.has(id)) {
+            liveToolInput.add(id);
+            void runtime.broadcastToolInputStart(id, chunk.toolName as string);
+          }
+        } else if (chunk.type === "tool-input-delta") {
+          const id = chunk.id as string;
+          if (!liveToolInput.has(id)) {
+            // Some providers skip the start event; mint lazily.
+            liveToolInput.add(id);
+            void runtime.broadcastToolInputStart(id);
+          }
+          void runtime.broadcastToolInputChunk(id, chunk.delta as string);
+        }
+      };
+
+      // Ordered stream observer: mirrors step content (same rules as the
+      // AI SDK's recordedContent) and runs the write-ahead flush on
+      // tool-call parts. Awaited per part, so it sees the step exactly in
+      // model output order.
+      const observeStreamPart = async (part: { type: string; [k: string]: unknown }) => {
+        switch (part.type) {
+          case "start-step":
+            stepParts = [];
+            stepFlushedIdx = 0;
+            stepFlushedReasoning = 0;
+            stepFlushedText = 0;
+            break;
+          case "text-start":
+            stepParts.push({ kind: "text", id: part.id as string, text: "" });
+            break;
+          case "text-delta": {
+            const p = findOpenPart("text", part.id as string);
+            if (p) p.text += (part.text as string) ?? "";
+            break;
+          }
+          case "reasoning-start":
+            stepParts.push({
+              kind: "reasoning",
+              id: part.id as string,
+              text: "",
+              providerMetadata: part.providerMetadata,
+            });
+            break;
+          case "reasoning-delta":
+          case "reasoning-end": {
+            const p = findOpenPart("reasoning", part.id as string) as
+              | { kind: "reasoning"; text: string; providerMetadata?: unknown }
+              | undefined;
+            if (p) {
+              if (part.type === "reasoning-delta") p.text += (part.text as string) ?? "";
+              p.providerMetadata = part.providerMetadata ?? p.providerMetadata;
+            }
+            break;
+          }
+          case "tool-call": {
+            const tc = part as unknown as { toolCallId: string; toolName: string; input?: unknown; providerExecuted?: boolean };
+            if (tc.providerExecuted) break; // provider-side tool: emitted from onStepFinish
+            stepParts.push({ kind: "tool-call", toolCallId: tc.toolCallId });
+            observeLiveChunk(part);
+            await writeAheadToolCall(tc);
+            return;
+          }
+        }
+        observeLiveChunk(part);
+      };
+      const findOpenPart = (kind: "text" | "reasoning", id: string) => {
+        for (let i = stepParts.length - 1; i >= 0; i--) {
+          const p = stepParts[i];
+          if (p.kind === kind && p.id === id) return p as { kind: typeof kind; id: string; text: string };
+        }
+        return undefined;
+      };
+
       const streamStartedAt = Date.now();
       console.log(`[stream] streamText START model=${modelId} messages=${finalMessages.length} tools=${Object.keys(cached.tools ?? {}).length}`);
 
@@ -469,58 +822,18 @@ export class DefaultHarness implements HarnessInterface {
       stopWhen: stepCountIs(100),
       abortSignal: runtime.abortSignal,
 
-      onChunk: ({ chunk }) => {
-        // First chunk of this step → emit span.model_first_token. Pair via
-        // model_request_start_id so consumers can split TTFT (start →
-        // first_token) from generation (first_token → end). Any chunk
-        // counts: text-delta, reasoning-delta, or tool-input-start —
-        // whichever fires first signals "the model has begun responding".
-        if (!stepSawFirstChunk && stepStartId) {
-          stepSawFirstChunk = true;
-          runtime.broadcast({
-            type: "span.model_first_token",
-            model: modelId,
-            model_request_start_id: stepStartId,
-          });
-        }
-
-        if (chunk.type === "text-delta") {
-          if (!currentMessageId) {
-            currentMessageId = generateEventId();
-            // Fire-and-forget: AI SDK doesn't await onChunk. The stream_start
-            // event lands at clients via WS broadcast before chunks via the
-            // same single-threaded DO send queue.
-            void runtime.broadcastStreamStart(currentMessageId);
-          }
-          void runtime.broadcastChunk(currentMessageId, chunk.text);
-        } else if (chunk.type === "reasoning-delta") {
-          // AI SDK assigns a stable id per reasoning block. Use it as
-          // the thinking_id so the client can correlate with the
-          // matching agent.thinking event landing in onStepFinish.
-          const tid = (chunk as { id: string; text: string }).id;
-          if (!liveThinking.has(tid)) {
-            liveThinking.add(tid);
-            void runtime.broadcastThinkingStart(tid);
-          }
-          void runtime.broadcastThinkingChunk(tid, (chunk as { text: string }).text);
-        } else if (chunk.type === "tool-input-start") {
-          // toolCallId here matches the eventual tool-call's id, which
-          // becomes agent.tool_use.id. Same correlation contract.
-          const c = chunk as { id: string; toolName: string };
-          if (!liveToolInput.has(c.id)) {
-            liveToolInput.add(c.id);
-            void runtime.broadcastToolInputStart(c.id, c.toolName);
-          }
-        } else if (chunk.type === "tool-input-delta") {
-          const c = chunk as { id: string; delta: string };
-          if (!liveToolInput.has(c.id)) {
-            // Some providers skip the start event; mint lazily.
-            liveToolInput.add(c.id);
-            void runtime.broadcastToolInputStart(c.id);
-          }
-          void runtime.broadcastToolInputChunk(c.id, c.delta);
-        }
-      },
+      // Ordered stream observer (replaces onChunk): live chunk streaming
+      // + write-ahead tool_use persistence. A TransformStream's transform
+      // is awaited per part, so the model's output order is preserved and
+      // later parts wait while a tool_use is being made durable. Parts are
+      // passed through unchanged.
+      experimental_transform: () =>
+        new TransformStream({
+          async transform(part, controller) {
+            await observeStreamPart(part as unknown as { type: string; [k: string]: unknown });
+            controller.enqueue(part);
+          },
+        }),
 
       // experimental_: vercel-ai may rename / change signature without
       // notice. Pin ai-sdk version on dep upgrade. The stable alternative
@@ -546,64 +859,74 @@ export class DefaultHarness implements HarnessInterface {
         // of history.ts eventsToMessages — together they form the
         // ModelMessage[] ↔ SessionEvent[] bijection that prompt-cache
         // determinism rests on.
+        //
+        // Write-ahead: parts already made durable by the stream observer
+        // (the reasoning/text prefix before each tool call, every tool_use,
+        // and every result persisted by the execute wrapper) are skipped
+        // here, so each part still maps to exactly one wire event.
+        const broadcast = (e: SessionEvent) => runtime.broadcast(e);
+        let reasoningSeen = 0;
+        let textSeen = 0;
+        // The reply that ends the model loop: last text of a step that made
+        // no tool calls (the AI SDK only takes another step after tool
+        // calls). Empty text is never final — silent_stop must still fail
+        // the turn. Marked here, where the whole step is known, so the
+        // marker is committed in the same write as the reply itself.
+        const stepContent = step.content as ReadonlyArray<{ type: string; text?: string }>;
+        const stepHasToolCalls = stepContent.some((p) => p.type === "tool-call");
+        // Last NON-EMPTY text: a trailing blank text block must not hide the
+        // marker (QA round 4) — recovery skips blank messages too.
+        let lastTextIdx = -1;
+        stepContent.forEach((p, i) => {
+          if (p.type === "text" && (p.text ?? "").trim().length > 0) lastTextIdx = i;
+        });
+        const finalTextIdx =
+          !stepHasToolCalls && step.finishReason !== "tool-calls" ? lastTextIdx : -1;
+        let partIdx = -1;
         for (const part of step.content as ReadonlyArray<ContentPart<any>>) {
+          partIdx++;
           switch (part.type) {
             case "reasoning": {
+              if (reasoningSeen++ < stepFlushedReasoning) break;
               // AI SDK reasoning parts in step.content[] don't carry the
-              // chunk id directly, but onChunk minted at most one stream
-              // per step in practice. Drain whichever streams are live so
-              // the client closes their pulsing bubbles. The canonical
-              // agent.thinking carries thinking_id only when we can
-              // correlate (single-stream case); multi-stream steps just
+              // chunk id directly, but the observer minted at most one
+              // stream per step in practice. Drain whichever streams are
+              // live so the client closes their pulsing bubbles. The
+              // canonical agent.thinking carries thinking_id only when we
+              // can correlate (single-stream case); multi-stream steps just
               // see the stream_end + a thinking event without correlation
               // (renderer falls back to dropping all live streams when
               // any thinking lands — see frontend).
               const partWithId = part as { type: "reasoning"; text: string; id?: string; providerMetadata?: unknown };
-              const tid = partWithId.id ?? (liveThinking.size === 1 ? [...liveThinking][0] : undefined);
-              if (tid) {
-                await runtime.broadcastThinkingEnd(tid, "completed");
-                liveThinking.delete(tid);
-              }
-              runtime.broadcast({
-                type: "agent.thinking",
-                text: part.text,
-                providerOptions: part.providerMetadata as Record<string, unknown> | undefined,
-                ...(tid ? { thinking_id: tid } : {}),
-              } as SessionEvent);
+              await emitThinking(partWithId, broadcast);
               break;
             }
             case "text": {
-              // Trim trailing whitespace at write time. Anthropic's @ai-sdk
-              // provider trims the LAST text of the LAST assistant message
-              // before sending; without our normalization, the same stored
-              // assistant text would render with vs. without `\n` depending on
-              // whether it's the tail of the conversation, busting the cache
-              // on the next turn.
-              const messageId = currentMessageId ?? generateEventId();
-              if (currentMessageId) {
-                await runtime.broadcastStreamEnd(currentMessageId, "completed");
-              }
-              runtime.broadcast({
-                type: "agent.message",
-                message_id: messageId,
-                content: [{ type: "text", text: part.text.replace(/\s+$/, "") }],
-              } as SessionEvent);
-              currentMessageId = null; // reset for next step
+              if (textSeen++ < stepFlushedText) break;
+              await emitText(part.text, broadcast, partIdx === finalTextIdx ? { step_final: true } : undefined);
               break;
             }
             case "tool-call": {
-              const partTC = part as { type: "tool-call"; toolCallId: string };
+              const partTC = part as { type: "tool-call"; toolCallId: string; toolName: string; input?: unknown };
+              if (writeAheadToolUses.has(partTC.toolCallId)) break;
               if (liveToolInput.has(partTC.toolCallId)) {
                 await runtime.broadcastToolInputEnd(partTC.toolCallId, "completed");
                 liveToolInput.delete(partTC.toolCallId);
               }
-              emitToolCallEvent(runtime, tools, part);
+              for (const e of toolCallEvents(partTC, toolUseExtras(partTC.toolName, partTC.toolCallId))) {
+                runtime.broadcast(e);
+              }
+              writeAheadToolUses.add(partTC.toolCallId);
               break;
             }
             case "tool-result":
-            case "tool-error":
-              emitToolResultEvent(runtime, part);
+            case "tool-error": {
+              const partTR = part as { type: "tool-result" | "tool-error"; toolCallId: string; toolName: string };
+              if (persistedResults.has(partTR.toolCallId)) break;
+              persistedResults.add(partTR.toolCallId);
+              for (const e of toolResultEvents(partTR)) runtime.broadcast(e);
               break;
+            }
             // source / file / tool-approval-request: not produced by current
             // tool surface; intentionally skipped. Add cases here if those
             // become reachable — the bijection requires every part write a
@@ -874,6 +1197,9 @@ export class DefaultHarness implements HarnessInterface {
         // failure modes surface (D1 client, KV ops, MCP transport).
         throw classifyExternalError(err);
       } finally {
+        // Any execute still parked on a gate whose tool-call part never
+        // made it through the observer (stream error / abort) must not run.
+        gates.closeAll(new Error("stream ended before the tool call was durably recorded; not executed"));
         const totalElapsed = Date.now() - streamStartedAt;
         console.log(`[stream] streamText END elapsed=${totalElapsed}ms`);
       }

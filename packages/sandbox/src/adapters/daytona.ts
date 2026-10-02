@@ -43,6 +43,7 @@ import { promises as fs } from "node:fs";
 import { nanoid } from "nanoid";
 import { getLogger } from "@open-managed-agents/observability";
 import { withSessionProxyContext } from "./outbound-proxy";
+import { secretsForCommand } from "./command-secrets";
 import type {
   DaytonaExecuteResponse,
   DaytonaModule,
@@ -932,9 +933,8 @@ export class DaytonaSandbox implements SandboxExecutor {
       ...this.envVars,
       OMA_SANDBOX_MAX_FILE_BYTES: String(this.maxFileBytes),
     };
-    for (const { prefix, secrets } of this.commandSecrets) {
-      if (command.startsWith(prefix)) Object.assign(out, secrets);
-    }
+    // Exact simple-command match only — see ./command-secrets.ts.
+    Object.assign(out, secretsForCommand(command, this.commandSecrets));
     return out;
   }
 

@@ -851,6 +851,13 @@ describe("SessionDO recovery — DO-level", () => {
     // register the turn_id in _activeTurnIds so _finalizeStaleTurns
     // skips it (matches the contract for the caller's own active turn).
     const ownTurnId = "turn_inflight_supervisor";
+    // Register the turn as live BEFORE marking the D1 row running: the
+    // DO's fire-and-forget cold-start recovery can otherwise read the row
+    // in between and (correctly) finalize it as an orphan — which then
+    // makes alarm() drop the heartbeat and flakes this test under load.
+    await runInDurableObject(stub, async (instance) => {
+      (instance as { _activeTurnIds: Set<string> })._activeTurnIds.add(ownTurnId);
+    });
     await env.AUTH_DB.prepare(
       `UPDATE sessions SET status='running', turn_id=?, turn_started_at=?
         WHERE id=?`,

@@ -17,21 +17,37 @@
 //      finalize the streams row to "interrupted".
 //
 //   2. `agent.tool_use` (built-in or MCP) without a matching result
-//      event. Anthropic strictly requires every tool use be followed
-//      by a result; without one the next LLM call 400s. We inject a
-//      placeholder `agent.tool_result` / `agent.mcp_tool_result` so the
-//      bijection is intact when eventsToMessages projects the next turn.
+//      event. With write-ahead tool execution (docs/durable-execution.md)
+//      the tool_use is durably persisted BEFORE the tool runs, so an
+//      orphan means "the process died while the tool was executing".
+//      Anthropic strictly requires every tool use be followed by a
+//      result, so recovery resolves each orphan by its execution class
+//      (see ./tool-classification.ts):
+//        - side_effect -> error result: "started, crashed before
+//          completion, MAY have taken effect - verify before retrying",
+//          carrying the idempotency key;
+//        - idempotent  -> error result telling the model it is safe to
+//          re-run - OR, with `deferIdempotent`, left unresolved so the
+//          default harness re-executes it at turn resume (the caller
+//          promises a resume will follow);
+//        - client      -> untouched (see below).
 //
-// `agent.custom_tool_use` orphans are NOT auto-resolved — the
-// `user.custom_tool_result` is user-driven (SDK confirms a custom
-// tool's outcome) and silently completing it on the server would
-// fabricate user input. We surface a warning and let the client decide.
+// `agent.custom_tool_use` orphans (and tool_uses parked on
+// `evaluated_permission: "ask"`) are NOT auto-resolved - the result is
+// user-driven (SDK confirms a custom tool's outcome / user approves) and
+// silently completing it on the server would fabricate user input. We
+// surface a warning and let the client decide.
 //
 // Warnings are returned (not appended to the event log) so the caller
 // can broadcast them to live WS subscribers without polluting history.
 
 import type { SessionEvent } from "@open-managed-agents/shared";
 import type { StreamRepo, EventLogRepo } from "@open-managed-agents/event-log";
+import {
+  buildInterruptedToolResult,
+  findOrphanToolUses,
+  type ToolExecutionClass,
+} from "./tool-classification";
 
 export interface RecoveryWarning {
   source: "stream_interrupted" | "tool_call_interrupted" | "custom_tool_call_interrupted";
@@ -48,19 +64,52 @@ export interface RecoveryReport {
   injectedMcpToolResults: string[];
   /** Custom-tool-use ids surfaced as warning-only (no result injected). */
   pendingCustomToolUses: string[];
+  /** Idempotent tool-use ids deliberately left unresolved for the harness
+   *  to re-execute at turn resume (only with `deferIdempotent`). */
+  pendingReexecution: string[];
+  /** Per-orphan decision record (structured form of the warnings). */
+  recoveredToolCalls: RecoveredToolCall[];
   /** Warnings to broadcast to live subscribers. */
   warnings: RecoveryWarning[];
+}
+
+export interface RecoveredToolCall {
+  tool_use_id: string;
+  tool_name?: string;
+  execution_class: ToolExecutionClass;
+  /** injected_unknown_outcome - side_effect, error result appended
+   *  injected_retry_safe      - idempotent, "safe to re-run" result appended
+   *  deferred_reexecution     - idempotent, left for the harness to re-run
+   *  awaiting_client          - client-owned, untouched */
+  action: "injected_unknown_outcome" | "injected_retry_safe" | "deferred_reexecution" | "awaiting_client";
+  idempotency_key?: string;
+  session_thread_id?: string;
+}
+
+export interface RecoveryOptions {
+  /**
+   * Leave idempotent orphans unresolved (reported in `pendingReexecution`)
+   * instead of injecting a "safe to re-run" result. Only set this when the
+   * caller will resume the turn with the default harness, which
+   * re-executes unresolved idempotent calls before calling the model
+   * (reconcileOrphanedToolCalls in apps/agent/src/harness/durable-tools.ts).
+   * Default false.
+   */
+  deferIdempotent?: boolean;
 }
 
 export async function recoverInterruptedState(
   streams: StreamRepo,
   history: Pick<EventLogRepo, "append" | "getEvents">,
+  opts: RecoveryOptions = {},
 ): Promise<RecoveryReport> {
   const report: RecoveryReport = {
     finalizedStreams: [],
     injectedToolResults: [],
     injectedMcpToolResults: [],
     pendingCustomToolUses: [],
+    pendingReexecution: [],
+    recoveredToolCalls: [],
     warnings: [],
   };
 
@@ -84,69 +133,56 @@ export async function recoverInterruptedState(
     });
   }
 
-  // 2. Tool-use rows with no matching result.
-  const all = history.getEvents();
-  const useTypes = new Map<
-    string,
-    { type: "agent.tool_use" | "agent.mcp_tool_use" | "agent.custom_tool_use"; name?: string }
-  >();
-  const resolved = new Set<string>();
-  for (const e of all) {
-    const ev = e as { type: string; id?: string; name?: string; tool_use_id?: string; mcp_tool_use_id?: string };
-    switch (ev.type) {
-      case "agent.tool_use":
-      case "agent.mcp_tool_use":
-      case "agent.custom_tool_use":
-        if (ev.id) {
-          useTypes.set(ev.id, {
-            type: ev.type as "agent.tool_use" | "agent.mcp_tool_use" | "agent.custom_tool_use",
-            name: ev.name,
-          });
-        }
-        break;
-      case "agent.tool_result":
-        if (ev.tool_use_id) resolved.add(ev.tool_use_id);
-        break;
-      case "agent.mcp_tool_result":
-        if (ev.mcp_tool_use_id) resolved.add(ev.mcp_tool_use_id);
-        break;
-      case "user.custom_tool_result":
-        if (ev.id) resolved.add(ev.id);
-        break;
-    }
-  }
+  // 2. Tool-use rows with no matching result, resolved by execution class.
+  for (const orphan of findOrphanToolUses(history.getEvents())) {
+    const base = {
+      tool_use_id: orphan.tool_use_id,
+      tool_name: orphan.name,
+      execution_class: orphan.execution_class,
+      ...(orphan.idempotency_key ? { idempotency_key: orphan.idempotency_key } : {}),
+      ...(orphan.session_thread_id ? { session_thread_id: orphan.session_thread_id } : {}),
+    };
 
-  for (const [useId, info] of useTypes) {
-    if (resolved.has(useId)) continue;
-    const placeholder = "(interrupted by maintenance restart — retry if needed)";
-    if (info.type === "agent.tool_use") {
-      history.append({
-        type: "agent.tool_result",
-        tool_use_id: useId,
-        content: placeholder,
-      } as SessionEvent);
-      report.injectedToolResults.push(useId);
-    } else if (info.type === "agent.mcp_tool_use") {
-      history.append({
-        type: "agent.mcp_tool_result",
-        mcp_tool_use_id: useId,
-        content: placeholder,
-        is_error: true,
-      } as SessionEvent);
-      report.injectedMcpToolResults.push(useId);
-    } else {
-      report.pendingCustomToolUses.push(useId);
+    if (orphan.execution_class === "client") {
+      report.pendingCustomToolUses.push(orphan.tool_use_id);
+      report.recoveredToolCalls.push({ ...base, action: "awaiting_client" });
       report.warnings.push({
         source: "custom_tool_call_interrupted",
         message: "Custom tool call was interrupted; client should resend the result",
-        details: { tool_use_id: useId, tool_name: info.name },
+        details: { tool_use_id: orphan.tool_use_id, tool_name: orphan.name },
       });
       continue;
     }
+
+    if (orphan.execution_class === "idempotent" && opts.deferIdempotent) {
+      report.pendingReexecution.push(orphan.tool_use_id);
+      report.recoveredToolCalls.push({ ...base, action: "deferred_reexecution" });
+      report.warnings.push({
+        source: "tool_call_interrupted",
+        message: `${orphan.event_type} "${orphan.name ?? "unknown"}" cut short by a server restart; idempotent, will be re-executed on resume`,
+        details: { ...base, action: "deferred_reexecution" },
+      });
+      continue;
+    }
+
+    const result = buildInterruptedToolResult(orphan);
+    if (!result) continue;
+    history.append(result);
+    if (result.type === "agent.mcp_tool_result") {
+      report.injectedMcpToolResults.push(orphan.tool_use_id);
+    } else {
+      report.injectedToolResults.push(orphan.tool_use_id);
+    }
+    const action = orphan.execution_class === "idempotent"
+      ? "injected_retry_safe" as const
+      : "injected_unknown_outcome" as const;
+    report.recoveredToolCalls.push({ ...base, action });
     report.warnings.push({
       source: "tool_call_interrupted",
-      message: `${info.type} cut short by a server restart`,
-      details: { tool_use_id: useId, tool_name: info.name },
+      message: action === "injected_unknown_outcome"
+        ? `${orphan.event_type} "${orphan.name ?? "unknown"}" cut short by a server restart; it may have taken effect (outcome unknown)`
+        : `${orphan.event_type} "${orphan.name ?? "unknown"}" cut short by a server restart; idempotent, model told it is safe to re-run`,
+      details: { ...base, action },
     });
   }
 

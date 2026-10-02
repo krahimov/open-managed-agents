@@ -37,6 +37,7 @@ import type {
   StreamRepo,
 } from "@open-managed-agents/event-log";
 import { recoverInterruptedState as runRecovery } from "./recovery";
+import { findOrphanToolUses } from "@open-managed-agents/session-runtime";
 import {
   RuntimeAdapterImpl,
   type RuntimeAdapter,
@@ -68,6 +69,7 @@ import type { ApiCompat } from "../harness/provider";
 import type { LanguageModel } from "ai";
 import { generateText } from "ai";
 import { extractTextFromContent, type JudgeFn } from "@open-managed-agents/shared";
+import { resolveEgressPolicy, type EgressPolicy } from "@open-managed-agents/shared";
 import {
   runOutcomeSupervisor,
   type ActiveOutcomeState,
@@ -356,6 +358,9 @@ export class SessionDO extends DurableObject<Env> {
    * "turn registered via hintTurnInFlight".
    */
   private _draining = new Set<string>();
+  /** Cold-start recovery scan (ensureSchema). Stale-turn finalization
+   *  awaits it so the two never inject results for the same orphan. */
+  private _coldRecovery: Promise<void> | null = null;
 
   /**
    * Per-thread abort controllers — replaces the single
@@ -413,6 +418,33 @@ export class SessionDO extends DurableObject<Env> {
   }
 
   /** Same idea as getAgentConfig but for environments. */
+  /**
+   * Effective container egress allow-list for this session's environment
+   * (null = unrestricted). Includes MCP server hosts / package registries
+   * when the environment opts in via allow_mcp_servers / allow_package_managers.
+   */
+  private async resolveSandboxEgressPolicy(): Promise<EgressPolicy | null> {
+    const envId = this.state.environment_id;
+    if (!envId) return null;
+    try {
+      const envCfg = await this.getEnvConfig(envId);
+      const networking = envCfg?.config?.networking;
+      if (!networking || networking.type !== "limited") return null;
+      const agent = this.state.agent_id ? await this.getAgentConfig(this.state.agent_id) : null;
+      return resolveEgressPolicy(networking, {
+        mcpServerUrls: (agent?.mcp_servers ?? []).map((s) => s.url),
+      });
+    } catch (err) {
+      // Fail closed: a limited environment we can't read must not silently
+      // become unrestricted. Deny-all still leaves R2 backup traffic working
+      // (static outboundByHost bypass) and the agent sees clear 403s.
+      console.error(
+        `[session-do] egress policy lookup failed env=${envId}: ${(err as Error)?.message ?? err} — denying container egress`,
+      );
+      return { allowedHosts: [] };
+    }
+  }
+
   private async getEnvConfig(envId: string): Promise<EnvironmentConfig | null> {
     if (this.state.environment_snapshot && envId === this.state.environment_id) {
       return this.state.environment_snapshot;
@@ -534,7 +566,13 @@ export class SessionDO extends DurableObject<Env> {
     // stale by definition (the runtime that owned it is gone). Reconcile
     // both kinds of orphans now so the events log is consistent before
     // drainEventQueue runs and the harness rebuilds messages.
-    void this.recoverInterruptedState();
+    // With auto-resume on, idempotent orphans are deferred: stale-turn
+    // finalization either resumes the turn (the default harness re-executes
+    // them) or flushes them as "safe to re-run" results. Otherwise they get
+    // the "safe to re-run" result right away. See docs/durable-execution.md.
+    this._coldRecovery = this.recoverInterruptedState({
+      deferIdempotent: this.autoResumeEnabled(),
+    });
     // Pending-queue cold start: any thread that had queued events when
     // the previous incarnation died still has them in pending_events.
     // Re-fire drainEventQueue per affected thread so they don't sit
@@ -710,11 +748,11 @@ export class SessionDO extends DurableObject<Env> {
   /** Cold-start reconciliation. Pure logic lives in `recoverInterruptedState`
    *  (see ./recovery.ts) so it's testable end-to-end with in-memory adapters.
    *  This wrapper just glues it to DO storage + WS broadcast. */
-  private async recoverInterruptedState(): Promise<void> {
+  private async recoverInterruptedState(opts: { deferIdempotent?: boolean } = {}): Promise<void> {
     if (!this.streams) return;
     const history = new SqliteHistory(this.ctx.storage.sql, this.env.FILES_BUCKET ?? null, `t/${this.state.tenant_id ?? "default"}/sessions/${this.state.session_id ?? "unknown"}`);
     try {
-      const { warnings } = await runRecovery(this.streams, history);
+      const { warnings } = await runRecovery(this.streams, history, opts);
       for (const w of warnings) {
         this.broadcastEvent({
           type: "session.warning",
@@ -1258,6 +1296,15 @@ export class SessionDO extends DurableObject<Env> {
               await this.processUserMessage(event as UserMessageEvent);
             } else if (event.type === "user.tool_confirmation") {
               await this.handleToolConfirmation(event as UserToolConfirmationEvent, history);
+            } else if (event.type === "system.turn_resume") {
+              // Auto-resume of a crash-interrupted turn: the user message is
+              // already in the log (skipAppend) and completed tool results
+              // are durable, so the harness just continues from the log.
+              const resumeMsg: UserMessageEvent = {
+                type: "user.message",
+                content: [{ type: "text", text: "" }],
+              };
+              await this.processUserMessage(resumeMsg, 0, true);
             } else if (event.type === "user.custom_tool_result") {
               const customResult = event as UserCustomToolResultEvent;
               const toolResultEvent: SessionEvent = {
@@ -3166,10 +3213,16 @@ export class SessionDO extends DurableObject<Env> {
       // is routed away from this catch-all by the static `outboundByHost`
       // entry in oma-sandbox.ts — without that bypass the materialize-and-
       // re-PUT flow corrupts the squashfs blob (sandbox-sdk#619).
+      //
+      // Egress: the environment's `networking: limited` allow-list rides
+      // along in the handler params so every container HTTP(S) request is
+      // checked — not just the web_fetch tool.
+      const egress = await this.resolveSandboxEgressPolicy();
       if (sandbox.setOutboundContext && this.state.session_id && this.state.tenant_id) {
         await sandbox.setOutboundContext({
           tenantId: this.state.tenant_id,
           sessionId: this.state.session_id,
+          egress,
         });
       }
 
@@ -3187,11 +3240,11 @@ export class SessionDO extends DurableObject<Env> {
         setOutboundByHost?: (
           hostname: string,
           methodName: string,
-          params: { tenantId: string; sessionId: string },
+          params: { tenantId: string; sessionId: string; egress: EgressPolicy | null },
         ) => Promise<void>;
       };
       if (sandboxHost.setOutboundByHost && this.state.session_id && this.state.tenant_id) {
-        const ctx = { tenantId: this.state.tenant_id, sessionId: this.state.session_id };
+        const ctx = { tenantId: this.state.tenant_id, sessionId: this.state.session_id, egress };
         await Promise.all([
           sandboxHost.setOutboundByHost("api.github.com", "github_auth", ctx),
           sandboxHost.setOutboundByHost("github.com", "github_auth", ctx),
@@ -3403,6 +3456,17 @@ export class SessionDO extends DurableObject<Env> {
    * `runtime.broadcast` already does both — this is the equivalent for tool
    * code that doesn't receive a runtime context.
    */
+  /**
+   * Wait until pending storage writes are durable. DO output gates already
+   * hold outgoing network I/O until writes land; this makes the ordering
+   * explicit for the write-ahead tool path. Tolerates test storages
+   * without sync().
+   */
+  private async syncStorage(): Promise<void> {
+    const storage = this.ctx.storage as unknown as { sync?: () => Promise<void> };
+    if (typeof storage.sync === "function") await storage.sync();
+  }
+
   private persistAndBroadcastEvent(event: SessionEvent) {
     try {
       const history = new SqliteHistory(this.ctx.storage.sql, this.env.FILES_BUCKET ?? null, `t/${this.state.tenant_id ?? "default"}/sessions/${this.state.session_id ?? "unknown"}`);
@@ -3609,6 +3673,7 @@ export class SessionDO extends DurableObject<Env> {
               type: "agent.tool_result",
               tool_use_id: pending.toolCallId,
               content: `Error: ${e instanceof Error ? e.message : String(e)}`,
+              is_error: true,
               parent_event_id: pending.toolCallId,
             };
             history.append(toolResultEvent);
@@ -3623,6 +3688,7 @@ export class SessionDO extends DurableObject<Env> {
         type: "agent.tool_result",
         tool_use_id: confirmation.tool_use_id,
         content: `Denied: ${denyMsg}`,
+        is_error: true,
         // v1-additive: matching agent.tool_use's EventBase.id IS the
         // tool_use_id the confirmation references.
         parent_event_id: confirmation.tool_use_id,
@@ -3851,13 +3917,59 @@ export class SessionDO extends DurableObject<Env> {
    * broadcast on session.thread_created so consumers can build the
    * full tree (Console renders nested when depth > 1).
    */
+  /** Locate a child thread spawned for `idempotencyKey` and whether it
+   *  finished (session.thread_idle), reconstructing its answer from the
+   *  thread-tagged agent.message events mirrored into the parent log. */
+  private findSubAgentThreadByKey(
+    parentHistory: HistoryStore,
+    idempotencyKey: string,
+  ): { threadId: string; completed: boolean; responseText: string } | null {
+    const events = parentHistory.getEvents();
+    let threadId: string | null = null;
+    for (const e of events) {
+      const ev = e as { type: string; idempotency_key?: string; session_thread_id?: string };
+      if (ev.type === "session.thread_created" && ev.idempotency_key === idempotencyKey && ev.session_thread_id) {
+        threadId = ev.session_thread_id;
+      }
+    }
+    if (!threadId) return null;
+    let completed = false;
+    const texts: string[] = [];
+    for (const e of events) {
+      const ev = e as { type: string; session_thread_id?: string };
+      if (ev.session_thread_id !== threadId) continue;
+      if (ev.type === "session.thread_idle") completed = true;
+      if (ev.type === "agent.message") {
+        const msg = e as AgentMessageEvent;
+        texts.push(msg.content?.map((b) => (b.type === "text" ? b.text : "")).join("") || "");
+      }
+    }
+    return { threadId, completed, responseText: texts.join("\n") };
+  }
+
   private async runSubAgent(
     agentId: string,
     message: string,
     parentHistory: HistoryStore,
     sandbox: SandboxExecutor,
     parentThreadId: string = "sthr_primary",
+    idempotencyKey?: string,
   ): Promise<string> {
+    // Idempotent delegation (docs/durable-execution.md): the same
+    // call_agent_* tool call (same idempotency key) reattaches to the child
+    // thread it already spawned. A completed child returns its recorded
+    // answer without re-running; an unfinished child (its in-memory history
+    // died with the previous process) is re-spawned and linked via
+    // retry_of_thread_id.
+    let retryOfThreadId: string | undefined;
+    if (idempotencyKey) {
+      const prior = this.findSubAgentThreadByKey(parentHistory, idempotencyKey);
+      if (prior?.completed) {
+        return prior.responseText || "(sub-agent produced no text output)";
+      }
+      retryOfThreadId = prior?.threadId;
+    }
+
     // Generate a unique thread ID. Prefix `sthr_` matches AMA spec
     // (BetaManagedAgentsSessionThread.id is `sthr_*`); previous prefix
     // was `thread_*` and pre-existing live sessions may still hold those
@@ -3950,6 +4062,8 @@ export class SessionDO extends DurableObject<Env> {
       agent_id: agentId,
       agent_name: subAgent.name,
       parent_thread_id: parentThreadId,
+      ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {}),
+      ...(retryOfThreadId ? { retry_of_thread_id: retryOfThreadId } : {}),
     } as SessionEvent;
     parentHistory.append(threadCreatedEvent);
     this.broadcastEvent(threadCreatedEvent);
@@ -3998,10 +4112,10 @@ export class SessionDO extends DurableObject<Env> {
       // the right subHistory. Until then, omit the closures entirely so
       // tools.schedule / cancel_schedule / list_schedules don't get
       // registered into subTools at all.
-      delegateToAgent: async (nestedAgentId: string, nestedMessage: string) => {
+      delegateToAgent: async (nestedAgentId: string, nestedMessage: string, opts?: { idempotencyKey?: string }) => {
         // Nested delegate: this sub-agent's threadId becomes the new
         // child's parent. Lineage chain matches what Console renders.
-        return this.runSubAgent(nestedAgentId, nestedMessage, parentHistory, sandbox, threadId);
+        return this.runSubAgent(nestedAgentId, nestedMessage, parentHistory, sandbox, threadId, opts?.idempotencyKey);
       },
     });
     const subModelId = typeof subAgent.model === "string" ? subAgent.model : subAgent.model?.id;
@@ -4053,10 +4167,10 @@ export class SessionDO extends DurableObject<Env> {
                 r2: this.env.FILES_BUCKET ?? null,
               },
             }),
-        delegateToAgent: async (nestedAgentId: string, nestedMessage: string) => {
+        delegateToAgent: async (nestedAgentId: string, nestedMessage: string, opts?: { idempotencyKey?: string }) => {
           // Nested delegate inside the env block; see runtime block
           // above for the same lineage rule.
-          return this.runSubAgent(nestedAgentId, nestedMessage, parentHistory, sandbox, threadId);
+          return this.runSubAgent(nestedAgentId, nestedMessage, parentHistory, sandbox, threadId, opts?.idempotencyKey);
         },
       },
       runtime: {
@@ -4066,6 +4180,18 @@ export class SessionDO extends DurableObject<Env> {
           subHistory.append(event);
           const taggedEvent = { ...event, session_thread_id: threadId };
           parentHistory.append(taggedEvent);
+          this.broadcastEvent(taggedEvent);
+          this.fanOutToHooks(taggedEvent);
+          this.maybeCreditCacheTokens(threadId, taggedEvent);
+        },
+        // Durable append for write-ahead tool execution. SQL append is
+        // synchronous; sync() waits for the write to be durable before the
+        // tool's side effect is allowed to start.
+        persist: async (event) => {
+          subHistory.append(event);
+          const taggedEvent = { ...event, session_thread_id: threadId };
+          parentHistory.append(taggedEvent);
+          await this.syncStorage();
           this.broadcastEvent(taggedEvent);
           this.fanOutToHooks(taggedEvent);
           this.maybeCreditCacheTokens(threadId, taggedEvent);
@@ -4248,11 +4374,11 @@ export class SessionDO extends DurableObject<Env> {
       scheduleWakeup: (a) => this.scheduleWakeup(a),
       cancelWakeup: (id) => this.cancelWakeup(id),
       listWakeups: () => this.listWakeups(),
-      delegateToAgent: async (agentId: string, message: string) => {
+      delegateToAgent: async (agentId: string, message: string, opts?: { idempotencyKey?: string }) => {
         // turnThreadId is captured from the enclosing processUserMessage
         // scope (declared at the top of the function) — closure evals
         // lazily at harness.run time, so TDZ isn't a concern.
-        return this.runSubAgent(agentId, message, history, sandbox, turnThreadId);
+        return this.runSubAgent(agentId, message, history, sandbox, turnThreadId, opts?.idempotencyKey);
       },
       watchBackgroundTask: (taskId: string, pid: string, outputFile: string, proc: ProcessHandle | null) => {
         this.watchBackgroundTask(taskId, pid, outputFile, proc, sandbox);
@@ -4502,8 +4628,8 @@ export class SessionDO extends DurableObject<Env> {
                 r2: this.env.FILES_BUCKET ?? null,
               },
             }),
-        delegateToAgent: async (agentId: string, message: string) => {
-          return this.runSubAgent(agentId, message, history, sandbox, turnThreadId);
+        delegateToAgent: async (agentId: string, message: string, opts?: { idempotencyKey?: string }) => {
+          return this.runSubAgent(agentId, message, history, sandbox, turnThreadId, opts?.idempotencyKey);
         },
         watchBackgroundTask: (taskId: string, pid: string, outputFile: string, proc: ProcessHandle | null) => {
           this.watchBackgroundTask(taskId, pid, outputFile, proc, sandbox);
@@ -4514,6 +4640,16 @@ export class SessionDO extends DurableObject<Env> {
         sandbox,
         broadcast: (event) => {
           history.append(event);
+          this.broadcastEvent(event);
+          this.fanOutToHooks(event);
+          this.maybeCreditCacheTokens(turnThreadId, event);
+        },
+        // Durable append (docs/durable-execution.md): write-ahead tool_use
+        // and immediate tool_result go through here. history.append is a
+        // synchronous SQLite write; sync() resolves once it is durable.
+        persist: async (event) => {
+          history.append(event);
+          await this.syncStorage();
           this.broadcastEvent(event);
           this.fanOutToHooks(event);
           this.maybeCreditCacheTokens(turnThreadId, event);
@@ -5689,76 +5825,22 @@ export class SessionDO extends DurableObject<Env> {
     try { this.ensureSchema(); } catch { /* schema already up-to-date */ }
     const sql = this.ctx.storage.sql;
 
-    // 1. Unpaired tool_use detection. Three flavors per the wire spec
-    //    in default-loop.ts:emitToolCallEvent:
-    //      • agent.tool_use         → result keyed by tool_use_id
-    //      • agent.custom_tool_use  → result keyed by tool_use_id
-    //      • agent.mcp_tool_use     → result keyed by mcp_tool_use_id
-    //    The pairing key for use→result is always the use's own `id`.
-    //    Wrapped in try blocks so a missing events table (very early
-    //    cold-start) doesn't short-circuit the sessions row cleanup
-    //    below — that's the contract callers depend on.
-    const usedIds = new Map<string, { type: string; thread?: string | null }>();
-    try {
-      const useCursor = sql.exec(
-        `SELECT type, data, session_thread_id FROM events
-          WHERE type IN ('agent.tool_use','agent.custom_tool_use','agent.mcp_tool_use')`,
-      );
-      for (const row of useCursor) {
-        try {
-          const d = JSON.parse(row.data as string) as { id?: string };
-          if (d.id) usedIds.set(d.id, {
-            type: row.type as string,
-            thread: row.session_thread_id as string | null,
-          });
-        } catch { /* skip malformed */ }
-      }
-    } catch { /* events table missing — skip flush, do row cleanup below */ }
-    if (usedIds.size > 0) {
-      try {
-        const resCursor = sql.exec(
-          `SELECT data FROM events
-            WHERE type IN ('agent.tool_result','agent.mcp_tool_result')`,
-        );
-        for (const row of resCursor) {
-          try {
-            const d = JSON.parse(row.data as string) as {
-              tool_use_id?: string;
-              mcp_tool_use_id?: string;
-            };
-            const id = d.tool_use_id ?? d.mcp_tool_use_id;
-            if (id) usedIds.delete(id);
-          } catch { /* skip */ }
-        }
-      } catch { /* skip */ }
+    // 1. Unpaired tool_use resolution — shared, class-aware policy
+    //    (packages/session-runtime recovery.ts, docs/durable-execution.md).
+    //    With write-ahead execution a tool_use is persisted BEFORE the
+    //    tool runs, so an in-flight call of a LIVE turn looks exactly like
+    //    an orphan. Only reconcile when this incarnation has no live turn
+    //    and no drain in progress; otherwise the next pass (alarm) does it.
+    //    Awaiting the cold-start scan first prevents double injection.
+    if (this._coldRecovery) {
+      try { await this._coldRecovery; } catch { /* logged inside */ }
+    }
+    const noLiveWork = this._activeTurnIds.size === 0 && this._draining.size === 0;
+    const deferIdempotent = this.autoResumeEnabled();
+    if (noLiveWork) {
+      await this.recoverInterruptedState({ deferIdempotent });
     }
     let flushed = 0;
-    for (const [id, meta] of usedIds) {
-      const isMcp = meta.type === "agent.mcp_tool_use";
-      const event = isMcp
-        ? {
-            type: "agent.mcp_tool_result" as const,
-            mcp_tool_use_id: id,
-            content: "Tool call interrupted (DO eviction or restart). Re-send your message to retry.",
-            is_error: true,
-          }
-        : {
-            type: "agent.tool_result" as const,
-            tool_use_id: id,
-            content: "Tool call interrupted (DO eviction or restart). Re-send your message to retry.",
-            is_error: true,
-          };
-      const tagged = (meta.thread
-        ? { ...event, session_thread_id: meta.thread }
-        : event) as unknown as SessionEvent;
-      try {
-        await this.runtimeAdapter.eventLog.append(tagged);
-        this.broadcastEvent(tagged);
-        flushed++;
-      } catch (err) {
-        console.warn(`[finalize-stale] failed to flush tool_use ${id}:`, err);
-      }
-    }
 
     // 2. Force-end stale sessions rows. Skip turns currently held in
     //    _activeTurnIds (live work in this incarnation). Order matters:
@@ -5785,9 +5867,16 @@ export class SessionDO extends DurableObject<Env> {
     // definition older than the current process's lifetime.
     const FRESH_TURN_GRACE_MS = 30_000;
     const now = Date.now();
+    // Auto-resume (step checkpoints): decided once, BEFORE the
+    // rescheduled/idle markers below are appended, from the durable log.
+    let resume: { attempt: number; turnId: string } | null = null;
     for (const o of orphans) {
       if (this._activeTurnIds.has(o.turn_id)) continue;
       if (now - o.turn_started_at < FRESH_TURN_GRACE_MS) continue;
+      if (!resume && noLiveWork && deferIdempotent) {
+        const attempt = this.decideTurnResume();
+        if (attempt) resume = { attempt, turnId: o.turn_id };
+      }
       try {
         await this.runtimeAdapter.endTurn(this.state.session_id, o.turn_id, "idle");
       } catch (err) {
@@ -5797,7 +5886,9 @@ export class SessionDO extends DurableObject<Env> {
       ended++;
       const reschedEvent = {
         type: "session.status_rescheduled",
-        reason: "DO eviction or restart — stream lost; re-send to continue.",
+        reason: resume && resume.turnId === o.turn_id
+          ? "DO eviction or restart — resuming the turn from the last durable step."
+          : "DO eviction or restart — stream lost; re-send to continue.",
       } as unknown as SessionEvent;
       const idleEvent = { type: "session.status_idle" } as unknown as SessionEvent;
       // Events are best-effort post-cleanup; row is the source of truth.
@@ -5806,8 +5897,35 @@ export class SessionDO extends DurableObject<Env> {
       try { await this.runtimeAdapter.eventLog.append(idleEvent); } catch {}
       try { this.broadcastEvent(idleEvent); } catch {}
     }
+    if (resume) {
+      // Resume from the event log: completed steps (assistant content +
+      // tool results) are already durable; the harness reconciles any
+      // deferred idempotent orphans and the model continues. Goes through
+      // the pending queue so it serializes with real user input and is
+      // drained by recoverEventQueue below.
+      const resumeEvent = {
+        type: "system.turn_resume",
+        reason: "Turn interrupted by DO eviction or restart; continuing from the last durable step.",
+        interrupted_turn_id: resume.turnId,
+        attempt: resume.attempt,
+        session_thread_id: "sthr_primary",
+      } as SessionEvent;
+      try {
+        this._stampEventForPending(resumeEvent);
+        this.pending!.enqueue(resumeEvent);
+      } catch (err) {
+        console.warn(`[finalize-stale] enqueue turn_resume failed:`, err);
+        resume = null;
+      }
+    }
+    if (!resume && ended > 0 && noLiveWork && deferIdempotent) {
+      // No resume coming: flush deferred idempotent orphans as
+      // "safe to re-run" results so the log is consistent.
+      await this.recoverInterruptedState({ deferIdempotent: false });
+      flushed++;
+    }
     if (flushed > 0 || ended > 0) {
-      console.log(`[finalize-stale] flushed ${flushed} tool_uses, ended ${ended} stale turns`);
+      console.log(`[finalize-stale] ended ${ended} stale turns, resume=${resume ? resume.attempt : "no"}`);
     }
 
     // After flipping any stale rows to idle, kick the queue. Without this
@@ -5829,6 +5947,83 @@ export class SessionDO extends DurableObject<Env> {
         console.warn(`[finalize-stale] post-recovery drain failed:`, err);
       }
     }
+  }
+
+  /** True when the session's agent runs the default harness — the only
+   *  harness that reconciles orphaned tool calls and resumes from the log. */
+  private usesDefaultHarness(): boolean {
+    const h = this._state ? this.state.agent_snapshot?.harness : undefined;
+    return !h || h === "default";
+  }
+
+  /** Auto-resume of crash-interrupted turns (opt-in, see
+   *  OMA_AUTO_RESUME_TURNS). Requires the default harness, which re-executes
+   *  deferred idempotent tool calls and continues from the log. */
+  private autoResumeEnabled(): boolean {
+    if (!this.usesDefaultHarness()) return false;
+    if (this.env.OMA_AUTO_RESUME_TURNS === "1") return true;
+    const meta = (this._state ? this.state.agent_snapshot?.metadata : undefined) as Record<string, unknown> | undefined;
+    return meta?.auto_resume_turns === true;
+  }
+
+  /**
+   * Should an interrupted primary-thread turn be auto-resumed? Reads the
+   * durable log backward, skipping non-model events:
+   *   - tail is a tool result / deferred (non-client) tool_use / the user
+   *     message itself → resume (the model owes a continuation; no
+   *     completed tool re-runs, the user message is not re-sent);
+   *   - tail is assistant text/thinking (cut mid-answer), a client-owned
+   *     tool call, or a terminal status → don't (user re-sends);
+   *   - at most MAX_AUTO_RESUMES since the last user.message.
+   * Returns the 1-based attempt number, or null.
+   */
+  private decideTurnResume(): number | null {
+    const MAX_AUTO_RESUMES = 3;
+    let events: SessionEvent[];
+    try {
+      const history = new SqliteHistory(this.ctx.storage.sql, this.env.FILES_BUCKET ?? null, `t/${this.state.tenant_id ?? "default"}/sessions/${this.state.session_id ?? "unknown"}`);
+      events = history.getEvents().filter((e) => {
+        const t = (e as { session_thread_id?: string }).session_thread_id;
+        return t == null || t === "sthr_primary";
+      });
+    } catch {
+      return null;
+    }
+    if (this.pending?.peek("sthr_primary")) return null; // queued input drives the next turn
+    let resumes = 0;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i];
+      if (e.type === "system.turn_resume") resumes++;
+      if (e.type === "user.message" && (e as { cancelled_at_ms?: number }).cancelled_at_ms == null) break;
+    }
+    if (resumes >= MAX_AUTO_RESUMES) return null;
+    const orphanClass = new Map(findOrphanToolUses(events).map((o) => [o.tool_use_id, o.execution_class]));
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i] as SessionEvent & { id?: string; cancelled_at_ms?: number };
+      switch (e.type) {
+        case "session.status_idle":
+        case "session.status_terminated":
+        case "session.error":
+        case "agent.message":
+        case "agent.thinking":
+          return null;
+        case "agent.tool_result":
+        case "agent.mcp_tool_result":
+          return resumes + 1;
+        case "agent.tool_use":
+        case "agent.mcp_tool_use":
+        case "agent.custom_tool_use": {
+          const cls = e.id ? orphanClass.get(e.id) : undefined;
+          return cls && cls !== "client" ? resumes + 1 : null;
+        }
+        case "user.message":
+          if (e.cancelled_at_ms != null) continue;
+          return resumes + 1;
+        default:
+          continue; // spans, warnings, rescheduled, system.* — not model context
+      }
+    }
+    return null;
   }
 
   /**
