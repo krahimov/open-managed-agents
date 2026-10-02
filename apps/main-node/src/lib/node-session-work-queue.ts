@@ -112,6 +112,8 @@ export class NodeSessionWorkQueue {
   private readonly maxAttempts: number;
   private readonly sweepIntervalMs: number;
   private readonly active = new Map<string, Promise<void>>();
+  /** idx_session_work_items_one_running exists (see ensureOwnershipIndex). */
+  private ownershipIndexReady = false;
   /** Abort handle of the item this process is running, per session. */
   private readonly running = new Map<string, AbortController>();
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
@@ -170,27 +172,73 @@ export class NodeSessionWorkQueue {
         `ALTER TABLE session_work_items ADD COLUMN cancel_requested_at ${big}`,
       );
     }
-    // Session ownership invariant: at most ONE running item per session.
-    // Claims also check it inline (NOT EXISTS), but under Postgres READ
-    // COMMITTED two concurrent claims of different rows can both pass that
-    // check; the partial unique index makes the second one fail (handled
-    // as "not claimable" in claimNext). Both dialects support partial
-    // indexes and IF NOT EXISTS.
+    await this.ensureOwnershipIndex();
+  }
+
+  /**
+   * Session ownership invariant: at most ONE running item per session.
+   * Claims also check it inline (NOT EXISTS), but under Postgres READ
+   * COMMITTED two concurrent claims of different rows can both pass that
+   * check; the partial unique index makes the second one fail (handled as
+   * "not claimable" in claimNext). Both dialects support partial indexes.
+   *
+   * A database upgraded from before the index can already hold duplicate
+   * running rows (the bug the index prevents), which blocks the build. So
+   * first reconcile: keep the most recently locked row per session and
+   * return the others to pending with a bumped lease_epoch — that fences
+   * their old owners (completion and event writes check the epoch) and
+   * lets the queue resume them later. Not ready → retried on every sweep,
+   * and Postgres refuses claims until it succeeds.
+   */
+  private async ensureOwnershipIndex(): Promise<boolean> {
+    if (this.ownershipIndexReady) return true;
     try {
+      const dupes = await this.deps.sql
+        .prepare(
+          `SELECT session_id FROM session_work_items
+            WHERE status = 'running'
+            GROUP BY session_id HAVING COUNT(*) > 1`,
+        )
+        .all<{ session_id: string }>();
+      for (const { session_id } of dupes.results ?? []) {
+        const rows = await this.deps.sql
+          .prepare(
+            `SELECT id FROM session_work_items
+              WHERE session_id = ? AND status = 'running'
+              ORDER BY COALESCE(locked_at, 0) DESC, lease_epoch DESC, id DESC`,
+          )
+          .bind(session_id)
+          .all<{ id: string }>();
+        for (const { id } of (rows.results ?? []).slice(1)) {
+          await this.deps.sql
+            .prepare(
+              `UPDATE session_work_items
+                  SET status='pending', locked_by=NULL, locked_at=NULL,
+                      lease_epoch=lease_epoch + 1, updated_at=?
+                WHERE id = ? AND status='running'`,
+            )
+            .bind(Date.now(), id)
+            .run();
+        }
+        log.warn(
+          { op: "node_session_work_queue.duplicate_running_reconciled", session_id },
+          "reconciled duplicate running work items for a session",
+        );
+      }
       await this.deps.sql.exec(
         `CREATE UNIQUE INDEX IF NOT EXISTS idx_session_work_items_one_running
            ON session_work_items(session_id) WHERE status = 'running'`,
       );
+      this.ownershipIndexReady = true;
     } catch (err) {
-      // Pre-existing duplicate running rows (only possible from the bug
-      // this index prevents) block the build. Claims still enforce the
-      // invariant via NOT EXISTS; the index is retried on next startup,
-      // after the stale-lease sweep has reset the duplicates.
-      log.warn(
+      log.error(
         { err, op: "node_session_work_queue.running_index_failed" },
-        "could not create one-running-item-per-session index; relying on claim-time check",
+        this.deps.dialect === "postgres"
+          ? "one-running-item-per-session index missing; refusing claims until it can be created"
+          : "one-running-item-per-session index missing; relying on the serialized claim-time check",
       );
     }
+    return this.ownershipIndexReady;
   }
 
   /**
@@ -266,6 +314,7 @@ export class NodeSessionWorkQueue {
 
   /** Reclaim stale leases everywhere, then wake every session with work. */
   async sweep(): Promise<void> {
+    await this.ensureOwnershipIndex();
     await this.reclaimStale(null);
     await this.wakeAll();
   }
@@ -517,6 +566,10 @@ export class NodeSessionWorkQueue {
 
   private async claimNext(sessionId: string): Promise<NodeSessionWorkItem | null> {
     if (this.stopped) return null;
+    // Without the index, Postgres can't make single ownership atomic (see
+    // ensureOwnershipIndex) — don't hand out a second owner. SQLite's
+    // claim UPDATE is serialized, so the inline NOT EXISTS suffices there.
+    if (!(await this.ensureOwnershipIndex()) && this.deps.dialect === "postgres") return null;
     await this.reclaimStale(sessionId);
 
     for (let i = 0; i < 5; i++) {

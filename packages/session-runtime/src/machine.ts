@@ -364,6 +364,19 @@ export class SessionStateMachine {
     // repeat a side effect under a fresh tool-call id.
     if (alreadyPromoted) {
       const terminal = await this.findTurnTerminal(log, alreadyPromoted);
+      if (terminal?.failed) {
+        // The earlier attempt FAILED (error idle, no stop_reason) and died
+        // before the queue recorded it. Keep that outcome: re-raise instead
+        // of acknowledging the item as completed. The session.error is
+        // already in the log, so don't emit another.
+        if (opts.recoverOrphans) await this.onWake(log, { deferIdempotent: false });
+        const err = new Error(
+          `turn for ${(event as { id: string }).id} already failed before the crash` +
+            (terminal.error ? `: ${terminal.error}` : ""),
+        );
+        markSessionErrorEmitted(err);
+        throw err;
+      }
       if (terminal) {
         if (opts.recoverOrphans) await this.onWake(log, { deferIdempotent: false });
         this.logger.log(
@@ -459,9 +472,21 @@ export class SessionStateMachine {
       }
 
       if (runHarness) {
-        const userMessage = event.type === "user.message" ? event : RESUME_MESSAGE;
-        const pending = await this.runHarnessOnce(agent, tools, userMessage, controller.signal, log);
-        if (controller.signal.aborted) throw controller.signal.reason ?? new Error("aborted");
+        let pending: string[] | null = [];
+        if (resuming && modelLoopFinished(await this.readEvents(log, turnFromSeq), threadId)) {
+          // The crash hit after the final model step was persisted but
+          // before the turn's idle: the answer is already in the log.
+          // Finalize instead of calling the model again (which would
+          // duplicate the reply and could re-issue a side-effecting call
+          // under a fresh tool-call id).
+          this.logger.log(
+            `turn for ${(event as { id: string }).id} already has its final model step; finalizing without a model call`,
+          );
+        } else {
+          const userMessage = event.type === "user.message" ? event : RESUME_MESSAGE;
+          pending = await this.runHarnessOnce(agent, tools, userMessage, controller.signal, log);
+          if (controller.signal.aborted) throw controller.signal.reason ?? new Error("aborted");
+        }
         stopReason = computeStopReason(await this.readEvents(log, turnFromSeq), pending);
 
         // Outcome supervisor (user.define_outcome): grade the finished
@@ -779,7 +804,7 @@ export class SessionStateMachine {
   private async findTurnTerminal(
     log: EventLogRepo,
     promoted: SessionEvent,
-  ): Promise<{ stop_reason?: TurnStopReason } | null> {
+  ): Promise<{ stop_reason?: TurnStopReason; failed?: boolean; error?: string } | null> {
     const id = (promoted as { id?: string }).id;
     const seq = seqOf(promoted);
     let after: SessionEvent[];
@@ -792,12 +817,19 @@ export class SessionStateMachine {
       after = all.slice(idx + 1);
     }
     const thread = (promoted as { session_thread_id?: string }).session_thread_id ?? "sthr_primary";
+    let lastError: string | undefined;
     for (const e of after) {
-      if (e.type !== "session.status_idle") continue;
       const t = (e as { session_thread_id?: string }).session_thread_id ?? "sthr_primary";
       if (t !== thread) continue;
+      if (e.type === "session.error") {
+        const ev = e as { message?: string; error?: unknown };
+        lastError = ev.message ?? (typeof ev.error === "string" ? ev.error : undefined);
+        continue;
+      }
+      if (e.type !== "session.status_idle") continue;
       const stop = (e as { stop_reason?: TurnStopReason }).stop_reason;
-      return stop ? { stop_reason: stop } : {};
+      // Error paths write their idle WITHOUT a stop_reason (CF parity).
+      return stop ? { stop_reason: stop } : { failed: true, error: lastError };
     }
     return null;
   }
@@ -882,6 +914,41 @@ export class SessionStateMachine {
     this.deps.publish(stored);
     return stored;
   }
+}
+
+/**
+ * Did the harness's model loop already finish, judging from the turn's
+ * persisted events? True when the last model-step output on the thread is
+ * an agent.message whose step (model_request_start_id) issued no tool
+ * calls and nothing is left unresolved: the AI SDK / Pi loops only take
+ * another step after tool calls, so a text-only step is the final one.
+ * Events without a step id are inconclusive → false (re-run, as before).
+ */
+const STEP_OUTPUT_TYPES = new Set([
+  "agent.message",
+  "agent.tool_use",
+  "agent.custom_tool_use",
+  "agent.mcp_tool_use",
+  "agent.tool_result",
+  "agent.mcp_tool_result",
+]);
+const TOOL_USE_TYPES = new Set(["agent.tool_use", "agent.custom_tool_use", "agent.mcp_tool_use"]);
+
+export function modelLoopFinished(turnEvents: SessionEvent[], threadId?: string): boolean {
+  const thread = threadId ?? "sthr_primary";
+  const onThread = turnEvents.filter(
+    (e) => ((e as { session_thread_id?: string }).session_thread_id ?? "sthr_primary") === thread,
+  );
+  const outputs = onThread.filter((e) => STEP_OUTPUT_TYPES.has(e.type));
+  const last = outputs[outputs.length - 1];
+  if (!last || last.type !== "agent.message") return false;
+  const step = (last as { model_request_start_id?: string }).model_request_start_id;
+  if (!step) return false;
+  const stepCalledTools = outputs.some(
+    (e) => TOOL_USE_TYPES.has(e.type) && (e as { model_request_start_id?: string }).model_request_start_id === step,
+  );
+  if (stepCalledTools) return false;
+  return findUnresolvedToolUses(onThread).length === 0;
 }
 
 function seqOf(event: SessionEvent): number | undefined {

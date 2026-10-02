@@ -203,13 +203,23 @@ async function pollWithStrategies(
 const ABORT_KILL_GRACE_MS = 1_000;
 
 /**
- * Kill a process because its turn was aborted: SIGTERM, then SIGKILL if
- * it's still alive after a short grace. Adapters that spawn into their own
- * process group (LocalSubprocessSandbox) signal the whole group, so
- * `sleep 30; touch marker` dies with its shell instead of finishing.
+ * Kill a process because its turn was aborted: SIGTERM, then SIGKILL after
+ * a short grace. Adapters that spawn into their own process group
+ * (LocalSubprocessSandbox) signal the whole group, so `sleep 30; touch
+ * marker` dies with its shell instead of finishing.
+ *
+ * Resolves as soon as the shell exits (so Stop stays fast), but the group
+ * SIGKILL is sent at the end of the grace REGARDLESS of the shell's status:
+ * the handle tracks the shell, not the group, and a background child that
+ * ignores SIGTERM (`(trap '' TERM; sleep 3; touch x) &`) would otherwise
+ * outlive the abort and perform its side effect later.
  */
 async function killProcessOnAbort(proc: ProcessHandle): Promise<void> {
   try { await proc.kill("SIGTERM"); } catch { /* already gone */ }
+  const escalate = setTimeout(() => {
+    proc.kill("SIGKILL").catch(() => { /* group already gone */ });
+  }, ABORT_KILL_GRACE_MS);
+  (escalate as { unref?: () => void }).unref?.();
   const deadline = Date.now() + ABORT_KILL_GRACE_MS;
   while (Date.now() < deadline) {
     let status = "";
@@ -217,7 +227,6 @@ async function killProcessOnAbort(proc: ProcessHandle): Promise<void> {
     if (status !== "running" && status !== "starting") return;
     await new Promise((r) => setTimeout(r, 50));
   }
-  try { await proc.kill("SIGKILL"); } catch { /* already gone */ }
 }
 
 function bashInterruptedError(command: string): Error {

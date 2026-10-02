@@ -351,3 +351,73 @@ describe("recovery warnings are persisted, not just published", () => {
     expect(f.published.some((e) => e.type === "session.warning")).toBe(true);
   });
 });
+
+// ── Round 2 (QA_REPORT_v2.md) ───────────────────────────────────────────
+
+describe("N1: crash after the final reply but before idle doesn't call the model again", () => {
+  const msg = (text: string, step?: string) =>
+    ({ type: "agent.message", content: [{ type: "text", text }], ...(step ? { model_request_start_id: step } : {}) }) as unknown as SessionEvent;
+
+  it("finalizes from the log when the last step was text-only", async () => {
+    const f = createMachine(async () => {});
+    const event = { type: "user.message", id: "final-reply", content: [] } as unknown as UserMessageEvent;
+    // First attempt: promoted, ran a tool step, then a final text step —
+    // and died right after persisting that final agent.message.
+    f.log.append({ ...event, processed_at: "x" } as unknown as SessionEvent);
+    f.log.append({ type: "session.status_running" } as SessionEvent);
+    f.log.append({ type: "agent.tool_use", id: "t1", name: "bash", input: {}, model_request_start_id: "s1" } as unknown as SessionEvent);
+    f.log.append({ type: "agent.tool_result", tool_use_id: "t1", content: "ok" } as unknown as SessionEvent);
+    f.log.append(msg("all done", "s2"));
+
+    const result = await f.machine.runTurn("agent_qa", event, { recoverOrphans: true });
+
+    expect(f.harnessRuns()).toBe(0);
+    expect(result).toMatchObject({ status: "completed", stopReason: { type: "end_turn" } });
+    expect(types(f.log).filter((t) => t === "agent.message")).toHaveLength(1);
+    expect(types(f.log).at(-1)).toBe("session.status_idle");
+  });
+
+  it("still resumes when the last message's step also issued tool calls", async () => {
+    const f = createMachine(async () => {});
+    const event = { type: "user.message", id: "mid-step", content: [] } as unknown as UserMessageEvent;
+    f.log.append({ ...event, processed_at: "x" } as unknown as SessionEvent);
+    f.log.append({ type: "agent.tool_use", id: "t1", name: "read", input: {}, model_request_start_id: "s1" } as unknown as SessionEvent);
+    f.log.append({ type: "agent.tool_result", tool_use_id: "t1", content: "ok" } as unknown as SessionEvent);
+    f.log.append(msg("let me check", "s1"));
+
+    await f.machine.runTurn("agent_qa", event, { recoverOrphans: true });
+    expect(f.harnessRuns()).toBe(1);
+  });
+
+  it("legacy messages without a step id keep the old resume behaviour", async () => {
+    const f = createMachine(async () => {});
+    const event = { type: "user.message", id: "legacy", content: [] } as unknown as UserMessageEvent;
+    f.log.append({ ...event, processed_at: "x" } as unknown as SessionEvent);
+    f.log.append(msg("no step id"));
+
+    await f.machine.runTurn("agent_qa", event, { recoverOrphans: true });
+    expect(f.harnessRuns()).toBe(1);
+  });
+});
+
+describe("N4: a turn that already failed stays failed when its work item is reclaimed", () => {
+  it("re-raises instead of acknowledging the input as completed", async () => {
+    let calls = 0;
+    const f = createMachine(async () => {
+      calls++;
+      throw new Error("temporary provider failure");
+    });
+    const event = { type: "user.message", id: "fails", content: [] } as unknown as UserMessageEvent;
+
+    await expect(f.machine.runTurn("agent_qa", event, { recoverOrphans: true })).rejects.toThrow(/temporary provider failure/);
+    // Crash between the error idle and markFailed: the queue replays it.
+    await expect(f.machine.runTurn("agent_qa", event, { recoverOrphans: true })).rejects.toThrow(
+      /already failed before the crash: temporary provider failure/,
+    );
+
+    expect(calls).toBe(1);
+    // No second session.error / idle pair for the replay.
+    expect(types(f.log).filter((t) => t === "session.error")).toHaveLength(1);
+    expect(types(f.log).filter((t) => t === "session.status_idle")).toHaveLength(1);
+  });
+});

@@ -264,6 +264,42 @@ describe("F5: at most one running work item per session", () => {
     await sql.prepare(`UPDATE session_work_items SET status='running' WHERE event_id='other'`).run();
   });
 
+  it("upgrading a DB with duplicate running rows reconciles them and installs the index (QA round 2, N2)", async () => {
+    const sql = await sharedDb();
+    const old = new NodeSessionWorkQueue({ sql, dialect: "sqlite", run: async () => {} });
+    queues.push(old);
+    await old.ensureSchema();
+    // Simulate a pre-index database left in the buggy state: two running
+    // owners for one session.
+    await sql.exec(`DROP INDEX idx_session_work_items_one_running`);
+    await old.enqueue(input("old-a"));
+    await old.enqueue(input("old-b"));
+    await sql.prepare(`UPDATE session_work_items SET status='running', locked_by='w-a', locked_at=1 WHERE event_id='old-a'`).run();
+    await sql.prepare(`UPDATE session_work_items SET status='running', locked_by='w-b', locked_at=2 WHERE event_id='old-b'`).run();
+    const before = await sql
+      .prepare(`SELECT event_id, lease_epoch FROM session_work_items WHERE event_id='old-a'`)
+      .first<{ lease_epoch: number }>();
+
+    // Restart: a fresh process runs ensureSchema against that database.
+    const upgraded = new NodeSessionWorkQueue({ sql, dialect: "sqlite", run: async () => {} });
+    queues.push(upgraded);
+    await upgraded.ensureSchema();
+
+    const index = await sql
+      .prepare(`SELECT name FROM sqlite_master WHERE type='index' AND name='idx_session_work_items_one_running'`)
+      .all<{ name: string }>();
+    expect(index.results).toHaveLength(1);
+    const rows = await sql
+      .prepare(`SELECT event_id, status, lease_epoch, locked_by FROM session_work_items ORDER BY event_id`)
+      .all<{ event_id: string; status: string; lease_epoch: number; locked_by: string | null }>();
+    // Most recently locked owner keeps the session; the other goes back to
+    // pending, fenced (epoch bumped) so its old owner can't write anymore.
+    expect(rows.results).toEqual([
+      { event_id: "old-a", status: "pending", lease_epoch: Number(before!.lease_epoch) + 1, locked_by: null },
+      expect.objectContaining({ event_id: "old-b", status: "running", locked_by: "w-b" }),
+    ]);
+  });
+
   it("orders ties deterministically by (pending_seq, created_at, id)", async () => {
     const sql = await sharedDb();
     const order: string[] = [];
