@@ -212,6 +212,25 @@ describe('write-ahead tool execution', () => {
   });
 });
 
+describe('step_final marker', () => {
+  it('marks the last non-empty text even when a blank text block follows it (QA round 4)', async () => {
+    for (const tail of ['', '   ']) {
+      const { events, runtime } = makeRuntime([USER]);
+      const model = new MockLanguageModelV3({
+        doStream: async () => ({ stream: stream([
+          { type: 'stream-start', warnings: [] },
+          { type: 'text-start', id: 'a' }, { type: 'text-delta', id: 'a', delta: 'Done.' }, { type: 'text-end', id: 'a' },
+          { type: 'text-start', id: 'b' }, ...(tail ? [{ type: 'text-delta', id: 'b', delta: tail }] : []), { type: 'text-end', id: 'b' },
+          finish('stop'),
+        ]) }),
+      });
+      await new DefaultHarness().run(ctxFor(runtime, model, {}));
+      const finals = events.filter((e) => e.type === 'agent.message' && e.step_final === true);
+      expect(finals.map((e) => e.content[0].text)).toEqual(['Done.']);
+    }
+  });
+});
+
 describe('history projection with write-ahead ordering', () => {
   it('keeps one step in one assistant message when results interleave with tool_uses', () => {
     const step = 'sevt-step1';

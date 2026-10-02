@@ -874,13 +874,14 @@ export class DefaultHarness implements HarnessInterface {
         // marker is committed in the same write as the reply itself.
         const stepContent = step.content as ReadonlyArray<{ type: string; text?: string }>;
         const stepHasToolCalls = stepContent.some((p) => p.type === "tool-call");
+        // Last NON-EMPTY text: a trailing blank text block must not hide the
+        // marker (QA round 4) — recovery skips blank messages too.
         let lastTextIdx = -1;
-        stepContent.forEach((p, i) => { if (p.type === "text") lastTextIdx = i; });
+        stepContent.forEach((p, i) => {
+          if (p.type === "text" && (p.text ?? "").trim().length > 0) lastTextIdx = i;
+        });
         const finalTextIdx =
-          !stepHasToolCalls && step.finishReason !== "tool-calls" && lastTextIdx >= 0
-          && (stepContent[lastTextIdx].text ?? "").trim().length > 0
-            ? lastTextIdx
-            : -1;
+          !stepHasToolCalls && step.finishReason !== "tool-calls" ? lastTextIdx : -1;
         let partIdx = -1;
         for (const part of step.content as ReadonlyArray<ContentPart<any>>) {
           partIdx++;

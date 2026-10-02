@@ -416,6 +416,17 @@ describe("N1: crash after the final reply but before idle doesn't call the model
     expect(f.harnessRuns()).toBe(1);
   });
 
+  it("round 4: a trailing blank message after the final reply doesn't hide its marker", async () => {
+    const f = createMachine(async () => {});
+    const event = { type: "user.message", id: "blank-tail", content: [] } as unknown as UserMessageEvent;
+    f.log.append({ ...event, processed_at: "x" } as unknown as SessionEvent);
+    f.log.append(msg("Done.", "s1", true));
+    f.log.append(msg("   ", "s1"));
+
+    await f.machine.runTurn("agent_qa", event, { recoverOrphans: true });
+    expect(f.harnessRuns()).toBe(0);
+  });
+
   it("legacy messages without a step id keep the old resume behaviour", async () => {
     const f = createMachine(async () => {});
     const event = { type: "user.message", id: "legacy", content: [] } as unknown as UserMessageEvent;

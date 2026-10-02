@@ -935,12 +935,21 @@ const STEP_OUTPUT_TYPES = new Set([
   "agent.mcp_tool_result",
 ]);
 
+function isBlankMessage(e: SessionEvent): boolean {
+  const content = (e as { content?: Array<{ type?: string; text?: string }> }).content ?? [];
+  return content.every((b) => b.type === "text" && !(b.text ?? "").trim());
+}
+
 export function modelLoopFinished(turnEvents: SessionEvent[], threadId?: string): boolean {
   const thread = threadId ?? "sthr_primary";
   const onThread = turnEvents.filter(
     (e) => ((e as { session_thread_id?: string }).session_thread_id ?? "sthr_primary") === thread,
   );
-  const outputs = onThread.filter((e) => STEP_OUTPUT_TYPES.has(e.type));
+  // Blank messages carry no answer (a step can end with an empty text
+  // block after its real reply) — skip them when finding the last output.
+  const outputs = onThread.filter(
+    (e) => STEP_OUTPUT_TYPES.has(e.type) && !(e.type === "agent.message" && isBlankMessage(e)),
+  );
   const last = outputs[outputs.length - 1];
   if (!last || last.type !== "agent.message") return false;
   if ((last as { step_final?: boolean }).step_final !== true) return false;
