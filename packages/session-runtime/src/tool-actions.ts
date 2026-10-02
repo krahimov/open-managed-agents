@@ -43,8 +43,21 @@ export type TurnStopReason =
       event_ids: string[];
     };
 
-/** Tool uses in `events` with no matching result, in log order. */
-export function findUnresolvedToolUses(events: SessionEvent[]): UnresolvedToolUse[] {
+/**
+ * Tool uses in `events` with no matching result, in log order.
+ *
+ * By default a `user.custom_tool_result` input counts as resolving its
+ * call (findOrphanToolUses parity). Pass `{ clientInputResolves: false }`
+ * to require the materialized `agent.tool_result` OUTPUT event instead:
+ * the model-history projection only consumes that one, so materializing a
+ * client result idempotently (e.g. after a crash between promoting the
+ * client's input and writing its result) must look for the output.
+ */
+export function findUnresolvedToolUses(
+  events: SessionEvent[],
+  opts: { clientInputResolves?: boolean } = {},
+): UnresolvedToolUse[] {
+  const clientInputResolves = opts.clientInputResolves !== false;
   const uses = new Map<string, UnresolvedToolUse>();
   for (const e of events) {
     const ev = e as unknown as Record<string, unknown> & { type: string };
@@ -75,7 +88,9 @@ export function findUnresolvedToolUses(events: SessionEvent[]): UnresolvedToolUs
         break;
       case "user.custom_tool_result":
         // Same pairing as findOrphanToolUses (tool-classification.ts).
-        if (typeof ev.custom_tool_use_id === "string") uses.delete(ev.custom_tool_use_id);
+        if (clientInputResolves && typeof ev.custom_tool_use_id === "string") {
+          uses.delete(ev.custom_tool_use_id);
+        }
         break;
     }
   }
@@ -148,6 +163,7 @@ export function toolResultEventFor(
     type: "agent.tool_result",
     tool_use_id: use.id,
     content,
+    ...(isError ? { is_error: true } : {}),
     // v1-additive (docs/trajectory-v1-spec.md "Causality"): the matching
     // tool_use's EventBase.id IS the tool_use_id.
     parent_event_id: use.id,

@@ -12,9 +12,10 @@
 // Leases:
 //   - Only the HEAD of a session's queue (oldest row that is pending or
 //     running) may run. A claim is a conditional UPDATE of that head from
-//     pending → running, so two replicas racing the same session resolve
-//     to one winner without a separate lock table: they can only ever
-//     target the same row.
+//     pending → running that also requires no OTHER running row for the
+//     session; a partial unique index (one running row per session_id)
+//     enforces that atomically even when two replicas see different heads
+//     (Postgres late commits). A losing claim is simply "not claimable".
 //   - Each claim bumps `lease_epoch` (fencing token). The running worker
 //     heartbeats `locked_at` every heartbeatMs; completion/failure and
 //     every event-log write (SqlEventLog.withGuard(appendGuardFor(item)))
@@ -169,6 +170,27 @@ export class NodeSessionWorkQueue {
         `ALTER TABLE session_work_items ADD COLUMN cancel_requested_at ${big}`,
       );
     }
+    // Session ownership invariant: at most ONE running item per session.
+    // Claims also check it inline (NOT EXISTS), but under Postgres READ
+    // COMMITTED two concurrent claims of different rows can both pass that
+    // check; the partial unique index makes the second one fail (handled
+    // as "not claimable" in claimNext). Both dialects support partial
+    // indexes and IF NOT EXISTS.
+    try {
+      await this.deps.sql.exec(
+        `CREATE UNIQUE INDEX IF NOT EXISTS idx_session_work_items_one_running
+           ON session_work_items(session_id) WHERE status = 'running'`,
+      );
+    } catch (err) {
+      // Pre-existing duplicate running rows (only possible from the bug
+      // this index prevents) block the build. Claims still enforce the
+      // invariant via NOT EXISTS; the index is retried on next startup,
+      // after the stale-lease sweep has reset the duplicates.
+      log.warn(
+        { err, op: "node_session_work_queue.running_index_failed" },
+        "could not create one-running-item-per-session index; relying on claim-time check",
+      );
+    }
   }
 
   /**
@@ -190,8 +212,12 @@ export class NodeSessionWorkQueue {
     const eventJson = JSON.stringify({ ...input.event, id: eventId });
 
     // pending_seq = per-session MAX+1. Concurrent enqueues on Postgres can
-    // mint the same value; it's display/correlation metadata only —
-    // ordering ties break on created_at, id.
+    // mint the same value (and a late commit can sort ahead of a row that
+    // already started); it's display/correlation metadata only — ordering
+    // is the deterministic (pending_seq, created_at, id), and session
+    // ownership never depends on it: claimNext only starts an item when no
+    // other item of the session is running (NOT EXISTS + partial unique
+    // index idx_session_work_items_one_running).
     const res = await this.deps.sql
       .prepare(
         `INSERT INTO session_work_items
@@ -522,17 +548,34 @@ export class NodeSessionWorkQueue {
         continue;
       }
 
-      const claimed = await this.deps.sql
-        .prepare(
-          `UPDATE session_work_items
-              SET status='running', attempts=attempts + 1, lease_epoch=lease_epoch + 1,
-                  locked_by=?, locked_at=?, updated_at=?, cancel_requested_at=NULL
-            WHERE id = ? AND status='pending'
-            RETURNING attempts, lease_epoch`,
-        )
-        .bind(this.workerId, now, now, head.id)
-        .first<{ attempts: number; lease_epoch: number }>();
-      if (!claimed) continue;
+      // Conditional on no OTHER running item for the session: sort order
+      // alone can't guarantee single ownership (a late-committing enqueue
+      // can sort ahead of a row that's already running). The partial
+      // unique index backs this up atomically on Postgres.
+      let claimed: { attempts: number; lease_epoch: number } | null;
+      try {
+        claimed = await this.deps.sql
+          .prepare(
+            `UPDATE session_work_items
+                SET status='running', attempts=attempts + 1, lease_epoch=lease_epoch + 1,
+                    locked_by=?, locked_at=?, updated_at=?, cancel_requested_at=NULL
+              WHERE id = ? AND status='pending'
+                AND NOT EXISTS (
+                  SELECT 1 FROM session_work_items other
+                   WHERE other.session_id = ? AND other.status = 'running' AND other.id <> ?
+                )
+              RETURNING attempts, lease_epoch`,
+          )
+          .bind(this.workerId, now, now, head.id, sessionId, head.id)
+          .first<{ attempts: number; lease_epoch: number }>();
+      } catch (err) {
+        if (isUniqueViolation(err)) return null; // another item just started running
+        throw err;
+      }
+      if (!claimed) {
+        if (await this.hasRunning(sessionId)) return null;
+        continue;
+      }
       return {
         ...toWorkItem(head),
         attempts: Number(claimed.attempts),
@@ -541,6 +584,16 @@ export class NodeSessionWorkQueue {
     }
 
     return null;
+  }
+
+  private async hasRunning(sessionId: string): Promise<boolean> {
+    const row = await this.deps.sql
+      .prepare(
+        `SELECT 1 AS one FROM session_work_items WHERE session_id = ? AND status = 'running' LIMIT 1`,
+      )
+      .bind(sessionId)
+      .first<{ one: number }>();
+    return !!row;
   }
 
   private async markDone(item: NodeSessionWorkItem): Promise<boolean> {
@@ -636,6 +689,16 @@ function toPendingRow(row: {
     cancelled_at: row.status === "cancelled" ? Number(row.updated_at) : null,
     event,
   };
+}
+
+/** Unique-constraint violation from either driver (SQLite / Postgres 23505). */
+function isUniqueViolation(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown; cause?: unknown } | null;
+  if (!e || typeof e !== "object") return false;
+  if (e.code === "23505" || e.code === "SQLITE_CONSTRAINT_UNIQUE") return true;
+  const msg = typeof e.message === "string" ? e.message : "";
+  if (/UNIQUE constraint failed|duplicate key value violates unique constraint/i.test(msg)) return true;
+  return e.cause !== undefined && e.cause !== err ? isUniqueViolation(e.cause) : false;
 }
 
 function isLeaseAbort(signal: AbortSignal): boolean {

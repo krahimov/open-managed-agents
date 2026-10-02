@@ -201,6 +201,7 @@ export function toolResultEvents(part: {
       type: "agent.tool_result",
       tool_use_id: toolCallId,
       content,
+      ...(part.type === "tool-error" ? { is_error: true } : {}),
       // v1-additive: causal predecessor is the matching agent.tool_use,
       // whose EventBase.id is set explicitly to toolCallId in
       // toolCallEvents above. (AgentToolUseEvent.id overrides

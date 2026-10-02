@@ -414,9 +414,17 @@ describe("main-node crash recovery (real process, SIGKILL)", () => {
     }
 
     expect(sessRow.status).toBe("idle");
-    expect(events).toHaveLength(2);
-    expect(events[0].type).toBe("agent.tool_use");
-    expect(events[1].type).toBe("agent.tool_result");
+    // tool_use + injected result + the persisted recovery warning (durable
+    // so it survives a refresh, not just live-published).
+    expect(events.map((e) => e.type)).toEqual([
+      "agent.tool_use",
+      "agent.tool_result",
+      "session.warning",
+    ]);
+    expect(JSON.parse(events[2].data)).toMatchObject({
+      source: "tool_call_interrupted",
+      tool_use_id: "use_dangling",
+    });
     const result = JSON.parse(events[1].data) as {
       tool_use_id: string;
       content: string;
@@ -454,8 +462,11 @@ describe("main-node crash recovery (real process, SIGKILL)", () => {
       .all("sess_mcp_orphan") as Array<{ type: string; data: string }>;
     db.close();
 
-    expect(events).toHaveLength(2);
-    expect(events[1].type).toBe("agent.mcp_tool_result");
+    expect(events.map((e) => e.type)).toEqual([
+      "agent.mcp_tool_use",
+      "agent.mcp_tool_result",
+      "session.warning",
+    ]);
     const result = JSON.parse(events[1].data) as {
       mcp_tool_use_id: string;
       is_error: boolean;
@@ -500,9 +511,9 @@ describe("main-node crash recovery (real process, SIGKILL)", () => {
     db.close();
 
     expect(sessRow.status).toBe("idle");
-    // Only the original event remains — no user.custom_tool_result auto-injected.
-    expect(events).toHaveLength(1);
-    expect(events[0].type).toBe("agent.custom_tool_use");
+    // No user.custom_tool_result / tool_result auto-injected — only the
+    // persisted warning-only signal follows the original event.
+    expect(events.map((e) => e.type)).toEqual(["agent.custom_tool_use", "session.warning"]);
   });
 
   it("crash with stale orphan (turn_started_at 24h ago) is still recovered (no time-based cutoff)", async () => {
@@ -590,10 +601,11 @@ describe("main-node crash recovery (real process, SIGKILL)", () => {
 
     expect(stillRunning.n).toBe(0);
     expect(streamRow.status).toBe("interrupted");
-    // Original tool_use + injected tool_result.
+    // Original tool_use + injected tool_result + persisted warning.
     expect(toolEvents.map((e) => e.type)).toEqual([
       "agent.tool_use",
       "agent.tool_result",
+      "session.warning",
     ]);
   });
 
@@ -645,10 +657,12 @@ describe("main-node crash recovery (real process, SIGKILL)", () => {
     db.close();
     expect(stillRunning.n).toBe(0);
     // No second tool_result injected on the second restart — recovery
-    // is idempotent, the matched tool_use/tool_result pair stays as is.
+    // is idempotent, the matched tool_use/tool_result pair (and the first
+    // recovery's persisted warning) stays as is.
     expect(events.map((e) => e.type)).toEqual([
       "agent.tool_use",
       "agent.tool_result",
+      "session.warning",
     ]);
   });
 });

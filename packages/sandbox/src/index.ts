@@ -2,6 +2,7 @@ export type {
   AgentMachineBinding,
   ProcessHandle,
   SandboxBrowserEndpoint,
+  SandboxExecOptions,
   SandboxExecutor,
   SandboxExecutorCapabilities,
   SandboxFactory,

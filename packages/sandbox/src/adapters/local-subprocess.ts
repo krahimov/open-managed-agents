@@ -42,7 +42,7 @@ import {
   symlinkSync,
 } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import type { ProcessHandle, SandboxExecutor, SandboxFactory } from "../ports";
+import type { ProcessHandle, SandboxExecOptions, SandboxExecutor, SandboxFactory } from "../ports";
 import { getLogger } from "@open-managed-agents/observability";
 import { withSessionProxyContext } from "./outbound-proxy";
 
@@ -133,16 +133,27 @@ export class LocalSubprocessSandbox implements SandboxExecutor {
     mkdirSync(this.workdir, { recursive: true });
   }
 
-  async exec(command: string, timeout?: number): Promise<string> {
+  async exec(command: string, timeout?: number, opts?: SandboxExecOptions): Promise<string> {
     const timeoutMs = timeout ?? this.defaultTimeoutMs;
     const env = this.buildEnv();
+    const signal = opts?.signal;
+    if (signal?.aborted) return "[aborted: command not started]";
 
     return new Promise<string>((resolveExec) => {
+      // Own process group (detached) so a timeout / abort kills the whole
+      // tree — `sleep 30; touch x` must not finish after its shell dies.
       const child = spawn("/bin/sh", ["-c", command], {
         cwd: this.workdir,
         env,
         stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
       });
+      let aborted = false;
+      const onAbort = () => {
+        aborted = true;
+        terminateTree(child);
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
 
       let stdout = "";
       let stderr = "";
@@ -155,29 +166,28 @@ export class LocalSubprocessSandbox implements SandboxExecutor {
 
       const killer = setTimeout(() => {
         try {
-          child.kill("SIGTERM");
-          // Give SIGTERM a beat, then SIGKILL.
-          setTimeout(() => {
-            try { child.kill("SIGKILL"); } catch { /* already gone */ }
-          }, 1_000);
+          terminateTree(child);
         } catch (err) {
           this.logger.warn(`exec timeout-kill failed: ${(err as Error).message}`);
         }
       }, timeoutMs);
 
-      child.on("close", (code, signal) => {
+      child.on("close", (code, exitSignal) => {
         clearTimeout(killer);
-        const exit = signal ? `signal=${signal}` : `exit=${code}`;
+        signal?.removeEventListener("abort", onAbort);
+        const exit = exitSignal ? `signal=${exitSignal}` : `exit=${code}`;
         // Match @cloudflare/sandbox's behaviour: combined stdout+stderr,
         // newline-trimmed, plus an exit-code suffix the harness can parse.
         const combined =
           (stdout + (stderr ? `\n${stderr}` : "")).replace(/\s+$/, "") +
-          (code !== 0 ? `\n[exit ${exit}]` : "");
+          (code !== 0 ? `\n[exit ${exit}]` : "") +
+          (aborted ? "\n[aborted]" : "");
         resolveExec(combined);
       });
 
       child.on("error", (err) => {
         clearTimeout(killer);
+        signal?.removeEventListener("abort", onAbort);
         resolveExec(`[error: ${err.message}]`);
       });
     });
@@ -189,7 +199,9 @@ export class LocalSubprocessSandbox implements SandboxExecutor {
       cwd: this.workdir,
       env,
       stdio: ["ignore", "pipe", "pipe"],
-      detached: false,
+      // Own process group: kill() signals the whole tree (see
+      // BackgroundProcess.kill), so stopping a command stops its children.
+      detached: true,
     });
     if (!child.pid) return null;
     const id = `proc_${child.pid}_${Date.now()}`;
@@ -585,6 +597,33 @@ export function buildSandboxProcessEnv(opts: {
   return out;
 }
 
+/**
+ * Signal a child spawned with `detached: true` and everything in its
+ * process group (negative pid). Falls back to the child alone when the
+ * group is gone or group signalling isn't available.
+ */
+function signalTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  const pid = child.pid;
+  if (pid && process.platform !== "win32") {
+    try {
+      process.kill(-pid, signal);
+      return;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ESRCH") return; // already gone
+    }
+  }
+  child.kill(signal);
+}
+
+/** SIGTERM the process tree, then SIGKILL it after a short grace. */
+function terminateTree(child: ChildProcess, graceMs = 1_000): void {
+  signalTree(child, "SIGTERM");
+  const t = setTimeout(() => {
+    try { signalTree(child, "SIGKILL"); } catch { /* already gone */ }
+  }, graceMs);
+  t.unref?.();
+}
+
 class BackgroundProcess implements ProcessHandle {
   pid: number;
   private child: ChildProcess;
@@ -606,7 +645,7 @@ class BackgroundProcess implements ProcessHandle {
 
   async kill(signal: string): Promise<void> {
     try {
-      this.child.kill(signal as NodeJS.Signals);
+      signalTree(this.child, signal as NodeJS.Signals);
     } catch (err) {
       throw new Error(`kill failed: ${(err as Error).message}`);
     }

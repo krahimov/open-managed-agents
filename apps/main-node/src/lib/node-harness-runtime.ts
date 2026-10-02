@@ -137,7 +137,29 @@ export class NodeHarnessRuntime implements HarnessRuntime {
     if (this.persistError) throw this.persistError;
   }
 
+  /** Set by close(): the turn ended without waiting for the harness. */
+  private closed = false;
+
+  /**
+   * SessionStateMachine stopped waiting for this harness run (aborted
+   * turn that didn't unwind within its grace period) and is ending the
+   * turn itself. Any write the abandoned harness makes afterwards would
+   * land after the turn's session.status_idle and corrupt the history —
+   * drop it instead.
+   */
+  close(): void {
+    this.closed = true;
+    if (!this.abortController.signal.aborted) this.abortController.abort({ kind: "closed" });
+  }
+
   private enqueueWrite(event: SessionEvent): Promise<void> {
+    if (this.closed) {
+      log.warn(
+        { op: "node_harness.write_after_close", event_type: event.type },
+        "dropping event written by an abandoned harness run",
+      );
+      return Promise.reject(Object.assign(new Error("harness runtime closed"), { code: "runtime_closed" }));
+    }
     this.history.appendInPlace(event);
     const write = this.writeChain.then(async () => {
       if (this.persistError) throw this.persistError;

@@ -3673,6 +3673,7 @@ export class SessionDO extends DurableObject<Env> {
               type: "agent.tool_result",
               tool_use_id: pending.toolCallId,
               content: `Error: ${e instanceof Error ? e.message : String(e)}`,
+              is_error: true,
               parent_event_id: pending.toolCallId,
             };
             history.append(toolResultEvent);
@@ -3687,6 +3688,7 @@ export class SessionDO extends DurableObject<Env> {
         type: "agent.tool_result",
         tool_use_id: confirmation.tool_use_id,
         content: `Denied: ${denyMsg}`,
+        is_error: true,
         // v1-additive: matching agent.tool_use's EventBase.id IS the
         // tool_use_id the confirmation references.
         parent_event_id: confirmation.tool_use_id,

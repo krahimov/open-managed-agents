@@ -145,6 +145,11 @@ export interface SessionMachineDeps {
 
   /** Logger. Defaults to console. */
   logger?: { warn: (msg: string, ctx?: unknown) => void; log: (msg: string) => void };
+
+  /** After the turn's AbortSignal fires, how long to wait for the harness
+   *  to unwind before ending the turn without it (its later writes are
+   *  dropped via HarnessRuntime.close). Default 2000ms. */
+  abortGraceMs?: number;
 }
 
 export const SESSION_ERROR_EMITTED_MARKER = "__omaSessionErrorEmitted";
@@ -212,6 +217,9 @@ export interface TurnOptions {
 export interface TurnResult {
   status: "completed" | "interrupted";
   stopReason?: TurnStopReason;
+  /** The input's turn had already reached its terminal idle in an earlier
+   *  attempt (crash before queue acknowledgement); nothing was re-run. */
+  alreadyCompleted?: boolean;
 }
 
 /** Thrown when the turn lost its lease mid-flight; no events were written
@@ -247,6 +255,28 @@ interface AsyncEventLog {
 interface HarnessRuntimeView {
   flush?: () => Promise<void>;
   pendingConfirmations?: string[];
+  /** Stop accepting writes (the machine abandoned this harness run). */
+  close?: () => void;
+}
+
+/**
+ * Wait for `run` to settle, or — once `signal` aborts — at most `graceMs`
+ * more. Resolves true when the run was abandoned (still going).
+ */
+function waitOrAbandon(run: Promise<void>, signal: AbortSignal, graceMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const onAbort = () => {
+      timer = setTimeout(() => resolve(true), graceMs);
+    };
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+    void run.then(() => {
+      signal.removeEventListener("abort", onAbort);
+      if (timer) clearTimeout(timer);
+      resolve(false);
+    });
+  });
 }
 
 const RESUME_MESSAGE: UserMessageEvent = {
@@ -325,6 +355,28 @@ export class SessionStateMachine {
     // message isn't re-sent (docs/durable-execution.md).
     const alreadyPromoted = await this.findEventById(log, (event as { id: string }).id);
     const resuming = alreadyPromoted !== null;
+
+    // ...unless that earlier attempt already FINISHED the turn and only
+    // died afterwards (post-turn cleanup, before the queue acknowledged
+    // the item). The turn-ending session.status_idle is the durable
+    // completion marker: it is written last, after every turn event.
+    // Re-entering the harness here would call the model again and could
+    // repeat a side effect under a fresh tool-call id.
+    if (alreadyPromoted) {
+      const terminal = await this.findTurnTerminal(log, alreadyPromoted);
+      if (terminal) {
+        if (opts.recoverOrphans) await this.onWake(log, { deferIdempotent: false });
+        this.logger.log(
+          `turn for ${(event as { id: string }).id} already completed; acknowledging without re-running`,
+        );
+        return {
+          status: "completed",
+          alreadyCompleted: true,
+          ...(terminal.stop_reason ? { stopReason: terminal.stop_reason } : {}),
+        };
+      }
+    }
+
     if (opts.recoverOrphans) await this.onWake(log, { deferIdempotent: resuming });
 
     const agent = await this.deps.loadAgent(agentId);
@@ -567,10 +619,28 @@ export class SessionStateMachine {
     });
     const runtime = (ctx as { runtime?: HarnessRuntimeView } | null)?.runtime;
     let runErr: unknown = null;
+    let run: Promise<void>;
     try {
-      await this.deps.buildHarness().run(ctx);
+      run = this.deps.buildHarness().run(ctx).then(
+        () => {},
+        (err) => {
+          runErr = err ?? new Error("harness failed");
+        },
+      );
     } catch (err) {
+      run = Promise.resolve();
       runErr = err ?? new Error("harness failed");
+    }
+    // An aborted turn (interrupt / lease loss) must end promptly even if
+    // some tool ignores the signal: give the harness a short grace to
+    // unwind, then stop waiting and close its runtime so its late writes
+    // can't land after the turn-ending events.
+    const abandoned = await waitOrAbandon(run, abortSignal, this.deps.abortGraceMs ?? 2_000);
+    if (abandoned) {
+      this.logger.warn("harness did not unwind after abort; ending the turn without it");
+      runtime?.close?.();
+      await runtime?.flush?.().catch(() => {});
+      throw abortSignal.reason ?? new Error("aborted");
     }
     // A persistence failure wins over the harness's own error: the runtime
     // aborts the harness when a write fails, so runErr is then just the
@@ -591,7 +661,13 @@ export class SessionStateMachine {
   ): Promise<void> {
     const unresolved = findUnresolvedToolUses(before);
     if (event.type === "user.custom_tool_result") {
-      const use = unresolved.find((u) => u.id === event.custom_tool_use_id);
+      // Pair against the materialized agent.tool_result, not the client's
+      // input: on a resume `before` already holds this promoted input, and
+      // a crash between promotion and the result write must still produce
+      // the result (idempotent — skipped when the output exists).
+      const use = findUnresolvedToolUses(before, { clientInputResolves: false }).find(
+        (u) => u.id === event.custom_tool_use_id,
+      );
       if (!use) {
         this.logger.warn(`custom_tool_result for unknown/resolved call ${event.custom_tool_use_id}`);
         return;
@@ -693,6 +769,39 @@ export class SessionStateMachine {
     return stored;
   }
 
+  /**
+   * The session.status_idle that ended the turn driven by `promoted`, if
+   * one was written. Turns are serialized per session (one running work
+   * item, enforced by the queue), so the first idle on the input's thread
+   * after its promotion is that turn's terminal event. Recovery never
+   * writes session.status_idle, so an orphan reconciliation can't fake it.
+   */
+  private async findTurnTerminal(
+    log: EventLogRepo,
+    promoted: SessionEvent,
+  ): Promise<{ stop_reason?: TurnStopReason } | null> {
+    const id = (promoted as { id?: string }).id;
+    const seq = seqOf(promoted);
+    let after: SessionEvent[];
+    if (seq !== undefined) {
+      after = await this.readEvents(log, seq);
+    } else {
+      const all = await this.readEvents(log);
+      const idx = all.findIndex((e) => (e as { id?: string }).id === id);
+      if (idx < 0) return null;
+      after = all.slice(idx + 1);
+    }
+    const thread = (promoted as { session_thread_id?: string }).session_thread_id ?? "sthr_primary";
+    for (const e of after) {
+      if (e.type !== "session.status_idle") continue;
+      const t = (e as { session_thread_id?: string }).session_thread_id ?? "sthr_primary";
+      if (t !== thread) continue;
+      const stop = (e as { stop_reason?: TurnStopReason }).stop_reason;
+      return stop ? { stop_reason: stop } : {};
+    }
+    return null;
+  }
+
   private async findEventById(log: EventLogRepo, id: string): Promise<SessionEvent | null> {
     const lookup = (log as unknown as AsyncEventLog).findEventByIdAsync;
     return lookup ? lookup.call(log, id) : null;
@@ -727,13 +836,15 @@ export class SessionStateMachine {
     });
     await writes;
 
-    // Broadcast warnings so live SSE subscribers see what happened.
+    // Persist (then publish) warnings so they survive a refresh / replay,
+    // not just reach live SSE subscribers. Same durable session.warning
+    // the harness writes for tool_call_recovered.
     for (const w of report.warnings) {
-      this.deps.publish({
+      await this.appendAndPublish(log, {
+        ...w.details,
         type: "session.warning",
         source: w.source,
         message: w.message,
-        ...w.details,
       } as unknown as SessionEvent);
     }
 

@@ -1290,7 +1290,12 @@ const sessionWorkQueue = new NodeSessionWorkQueue({
   run: async (item, ctx) => {
     const entry = await sessionRegistry.getOrCreate(item.sessionId, item.tenantId);
     await entry.sandbox.setTurnActive?.(true);
+    let turnSettled = false;
     try {
+      // On a reclaimed item whose turn already ended (crash after the
+      // final session.status_idle, before markDone) the machine returns
+      // alreadyCompleted without calling the model; the queue then just
+      // acknowledges the item.
       await entry.machine.runTurn(item.agentId, item.event, {
         signal: ctx.signal,
         // Every event this turn writes is fenced on the lease epoch: once
@@ -1301,13 +1306,30 @@ const sessionWorkQueue = new NodeSessionWorkQueue({
         // leftover running turn marker is an orphan of a dead attempt.
         recoverOrphans: true,
       });
+      turnSettled = true;
     } finally {
+      // Post-turn cleanup. Once the turn has durably ended, a cleanup
+      // failure must not fail the item (that would append a misleading
+      // session.error after the turn's idle); log it and acknowledge.
       const browser = sessionBrowsers.get(item.sessionId);
       sessionBrowsers.delete(item.sessionId);
       try {
-        await browser?.dispose();
-      } finally {
-        await entry.sandbox.setTurnActive?.(false);
+        try {
+          await browser?.dispose();
+        } finally {
+          await entry.sandbox.setTurnActive?.(false);
+        }
+      } catch (cleanupErr) {
+        // Never mask the turn's own error, and never fail a finished turn.
+        logger.warn(
+          {
+            err: cleanupErr,
+            op: "work_queue.post_turn_cleanup_failed",
+            session_id: item.sessionId,
+            turn: turnSettled ? "completed" : "failed",
+          },
+          "post-turn cleanup failed",
+        );
       }
     }
     // Best-effort, never throws — a Slack hiccup must not fail the turn.

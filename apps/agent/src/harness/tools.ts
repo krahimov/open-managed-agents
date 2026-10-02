@@ -110,9 +110,25 @@ async function pollWithStrategies(
   proc: ProcessHandle,
   command: string,
   timeoutMs: number,
+  signal?: AbortSignal,
 ): Promise<string> {
-  return new Promise<string>((resolve) => {
+  return new Promise<string>((resolve, reject) => {
     let settled = false;
+
+    // Turn aborted (user.interrupt / lease loss): kill the process now —
+    // a Stop must not let the command run on and produce side effects —
+    // and settle as interrupted.
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      void killProcessOnAbort(proc).finally(() => reject(bashInterruptedError(command)));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    const done = (value: string) => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
 
     const timer = setTimeout(async () => {
       if (settled) return;
@@ -125,7 +141,7 @@ async function pollWithStrategies(
       } catch {}
 
       try { await proc.kill("SIGTERM"); } catch {}
-      resolve(truncateResult(
+      done(truncateResult(
         `exit=143\nCommand timed out after ${Math.round(timeoutMs / 1000)}s\n${partial}`.trim()
       ));
     }, timeoutMs);
@@ -170,7 +186,7 @@ async function pollWithStrategies(
                 : status === "killed" ? 137
                 : (status === "error" || status === "failed") ? 1
                 : 0;
-            resolve(truncateResult(`exit=${exitCode}\n${out}`));
+            done(truncateResult(`exit=${exitCode}\n${out}`));
             return;
           }
         } catch {}
@@ -178,8 +194,59 @@ async function pollWithStrategies(
       }
     };
     poll().catch(() => {
-      if (!settled) { settled = true; clearTimeout(timer); resolve("exit=1\nProcess polling failed"); }
+      if (!settled) { settled = true; clearTimeout(timer); done("exit=1\nProcess polling failed"); }
     });
+  });
+}
+
+/** Grace between SIGTERM and SIGKILL when a turn abort kills a process. */
+const ABORT_KILL_GRACE_MS = 1_000;
+
+/**
+ * Kill a process because its turn was aborted: SIGTERM, then SIGKILL if
+ * it's still alive after a short grace. Adapters that spawn into their own
+ * process group (LocalSubprocessSandbox) signal the whole group, so
+ * `sleep 30; touch marker` dies with its shell instead of finishing.
+ */
+async function killProcessOnAbort(proc: ProcessHandle): Promise<void> {
+  try { await proc.kill("SIGTERM"); } catch { /* already gone */ }
+  const deadline = Date.now() + ABORT_KILL_GRACE_MS;
+  while (Date.now() < deadline) {
+    let status = "";
+    try { status = await proc.getStatus(); } catch { return; }
+    if (status !== "running" && status !== "starting") return;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  try { await proc.kill("SIGKILL"); } catch { /* already gone */ }
+}
+
+function bashInterruptedError(command: string): Error {
+  const err = new Error(
+    `Command interrupted: the turn was stopped before \`${command.slice(0, 200)}\` finished; ` +
+      "the process was killed.",
+  );
+  err.name = "AbortError";
+  return err;
+}
+
+const ABORTED: unique symbol = Symbol("aborted");
+
+/** Resolve with `p`, or with ABORTED as soon as `signal` fires. */
+function raceAbort<T>(p: Promise<T>, signal: AbortSignal): Promise<T | typeof ABORTED> {
+  if (signal.aborted) {
+    p.catch(() => {});
+    return Promise.resolve(ABORTED);
+  }
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      p.catch(() => {});
+      resolve(ABORTED);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+    p.then(
+      (v) => { signal.removeEventListener("abort", onAbort); resolve(v); },
+      (e) => { signal.removeEventListener("abort", onAbort); reject(e); },
+    );
   });
 }
 
@@ -205,6 +272,9 @@ function safe<T>(
       if (typeof result === "string" && result.trim() === "") return "(completed with no output)";
       return result;
     } catch (err) {
+      // The turn was aborted (user.interrupt / lease loss): propagate so the
+      // call settles as a tool-error instead of a normal-looking result.
+      if (options?.abortSignal?.aborted) throw err;
       let msg = err instanceof Error ? err.message : String(err);
       // Include stack trace for better debugging
       if (err instanceof Error && err.stack) {
@@ -672,8 +742,13 @@ export async function buildTools(
           .optional()
           .describe("Timeout in milliseconds (default 120000, max 600000)"),
       }),
-      execute: safe(async ({ command, timeout }) => {
+      execute: safe(async ({ command, timeout }, options) => {
         const timeoutMs = Math.min(timeout || DEFAULT_BASH_TIMEOUT, MAX_BASH_TIMEOUT);
+        // Turn abort (user.interrupt / lease loss), from the AI SDK's
+        // execute options. On abort the process (group) is killed and the
+        // call settles as interrupted — no side effects after Stop.
+        const signal = options?.abortSignal;
+        if (signal?.aborted) throw bashInterruptedError(command);
 
         // Auto-background-on-timeout was REMOVED 2026-05-13. The
         // explicit `run_in_background` flag is gone too. Both surfaced
@@ -688,12 +763,22 @@ export async function buildTools(
         if (sandbox.startProcess) {
           const proc = await sandbox.startProcess(command);
           if (proc) {
-            return await pollWithStrategies(proc, command, timeoutMs);
+            if (signal?.aborted) {
+              await killProcessOnAbort(proc);
+              throw bashInterruptedError(command);
+            }
+            return await pollWithStrategies(proc, command, timeoutMs, signal);
           }
         }
 
-        // Fallback: simple exec (test env, no startProcess)
-        return truncateResult(await sandbox.exec(command, timeoutMs));
+        // Fallback: simple exec (test env, no startProcess). Backends that
+        // honor `signal` kill the command; for the rest, stop waiting so
+        // the turn can end promptly.
+        const execP = sandbox.exec(command, timeoutMs, signal ? { signal } : undefined);
+        if (!signal) return truncateResult(await execP);
+        const out = await raceAbort(execP, signal);
+        if (out === ABORTED) throw bashInterruptedError(command);
+        return truncateResult(out);
       }),
     });
   }

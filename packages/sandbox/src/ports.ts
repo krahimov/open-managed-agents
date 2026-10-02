@@ -23,8 +23,18 @@ export interface ProcessHandle {
   getStatus(): Promise<string>;
 }
 
+/** Per-call execution options. */
+export interface SandboxExecOptions {
+  /**
+   * Cancel the command (turn interrupt / lease loss). Backends that honor
+   * it kill the command's whole process tree and resolve promptly; others
+   * may ignore it (callers stop waiting on their own).
+   */
+  signal?: AbortSignal;
+}
+
 export interface SandboxExecutor {
-  exec(command: string, timeout?: number): Promise<string>;
+  exec(command: string, timeout?: number, opts?: SandboxExecOptions): Promise<string>;
   /** Start a process without blocking. Returns handle for kill/status/logs. */
   startProcess?(command: string): Promise<ProcessHandle | null>;
   /** Set global environment variables for all subsequent exec calls. */
