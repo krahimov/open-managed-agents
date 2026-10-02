@@ -111,6 +111,14 @@ describe('write-ahead tool execution', () => {
     expect(useA.model_request_start_id).toBe(firstMsg.model_request_start_id);
     expect(useB.model_request_start_id).toBe(useA.model_request_start_id);
 
+    // step_final: only the reply that ends the loop carries it — never the
+    // text written ahead of a tool call (PR #30 QA round 3, R1).
+    const msgsOut = events.filter((e) => e.type === 'agent.message');
+    expect(msgsOut.map((e) => [e.content[0].text, e.step_final === true])).toEqual([
+      ['Let me look.', false],
+      ['Done.', true],
+    ]);
+
     // History projection round-trip.
     const msgs = eventsToMessages(events as SessionEvent[]);
     expect(msgs.map((m) => m.role)).toEqual(['user', 'assistant', 'tool', 'assistant']);

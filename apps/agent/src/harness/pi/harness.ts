@@ -261,6 +261,16 @@ export class PiEventBridge {
         msg.stopReason === "aborted" ? "interrupted_mid_stream" : "stream_error",
       );
     } else {
+      // Reply that ends the loop: last non-empty text of a message with no
+      // tool calls (Pi only continues after tool calls). See step_final in
+      // api-types and docs/durable-execution.md.
+      const hasToolCalls = msg.content.some((b) => b.type === "toolCall");
+      let finalTextIdx = -1;
+      if (!hasToolCalls) {
+        msg.content.forEach((b, i) => {
+          if (b.type === "text" && b.text.trim()) finalTextIdx = i;
+        });
+      }
       for (let i = 0; i < msg.content.length; i++) {
         const block = msg.content[i];
         if (block.type === "thinking") {
@@ -291,6 +301,7 @@ export class PiEventBridge {
             message_id: sid ?? generateEventId(),
             content: [{ type: "text", text }],
             ...stepTag,
+            ...(i === finalTextIdx ? { step_final: true } : {}),
           } as SessionEvent);
         } else if (block.type === "toolCall") {
           const iid = this.toolInputIds.get(i);

@@ -568,7 +568,11 @@ export class DefaultHarness implements HarnessInterface {
         } as SessionEvent);
       };
 
-      const emitText = async (text: string, write: (e: SessionEvent) => Promise<void> | void) => {
+      const emitText = async (
+        text: string,
+        write: (e: SessionEvent) => Promise<void> | void,
+        extra?: { step_final?: boolean },
+      ) => {
         // Trim trailing whitespace at write time. Anthropic's @ai-sdk
         // provider trims the LAST text of the LAST assistant message
         // before sending; without our normalization, the same stored
@@ -584,6 +588,7 @@ export class DefaultHarness implements HarnessInterface {
           message_id: messageId,
           content: [{ type: "text", text: text.replace(/\s+$/, "") }],
           ...(stepStartId ? { model_request_start_id: stepStartId } : {}),
+          ...(extra?.step_final ? { step_final: true } : {}),
         } as SessionEvent);
         currentMessageId = null; // reset for next step
       };
@@ -862,7 +867,23 @@ export class DefaultHarness implements HarnessInterface {
         const broadcast = (e: SessionEvent) => runtime.broadcast(e);
         let reasoningSeen = 0;
         let textSeen = 0;
+        // The reply that ends the model loop: last text of a step that made
+        // no tool calls (the AI SDK only takes another step after tool
+        // calls). Empty text is never final — silent_stop must still fail
+        // the turn. Marked here, where the whole step is known, so the
+        // marker is committed in the same write as the reply itself.
+        const stepContent = step.content as ReadonlyArray<{ type: string; text?: string }>;
+        const stepHasToolCalls = stepContent.some((p) => p.type === "tool-call");
+        let lastTextIdx = -1;
+        stepContent.forEach((p, i) => { if (p.type === "text") lastTextIdx = i; });
+        const finalTextIdx =
+          !stepHasToolCalls && step.finishReason !== "tool-calls" && lastTextIdx >= 0
+          && (stepContent[lastTextIdx].text ?? "").trim().length > 0
+            ? lastTextIdx
+            : -1;
+        let partIdx = -1;
         for (const part of step.content as ReadonlyArray<ContentPart<any>>) {
+          partIdx++;
           switch (part.type) {
             case "reasoning": {
               if (reasoningSeen++ < stepFlushedReasoning) break;
@@ -881,7 +902,7 @@ export class DefaultHarness implements HarnessInterface {
             }
             case "text": {
               if (textSeen++ < stepFlushedText) break;
-              await emitText(part.text, broadcast);
+              await emitText(part.text, broadcast, partIdx === finalTextIdx ? { step_final: true } : undefined);
               break;
             }
             case "tool-call": {

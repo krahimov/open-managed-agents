@@ -293,6 +293,8 @@ describe("pi harness: run() against a faux pi-ai model", () => {
       [{ type: "text", text: "Listing." }],
       [{ type: "text", text: "Found a.txt" }],
     ]);
+    // Only the loop-ending reply is step_final (PR #30 QA round 3, R1).
+    expect(writes.filter((w) => w.event.type === "agent.message").map((w) => (w.event as { step_final?: boolean }).step_final === true)).toEqual([false, true]);
     const spanEnd = writes.find((w) => w.event.type === "span.model_request_end")!.event as Record<string, unknown>;
     expect(spanEnd).toMatchObject({ model_request_start_id: spanStart.id, finish_reason: "tool-calls", is_error: false });
     expect((spanEnd.model_usage as { input_tokens: number }).input_tokens).toBeGreaterThan(0);

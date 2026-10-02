@@ -377,6 +377,11 @@ export interface AgentMessageEvent extends EventBase {
   message_id?: string;
   /** See AgentToolUseEvent.model_request_start_id. */
   model_request_start_id?: string;
+  /** Set by the harness on the reply that ENDS its model loop: the last
+   *  text of a step with no tool calls, non-empty, written once the whole
+   *  step is known. Crash recovery finalizes a turn from the log only when
+   *  this is present (docs/durable-execution.md). Absent = not known final. */
+  step_final?: boolean;
 }
 
 export interface AgentMessageStreamStartEvent extends EventBase {

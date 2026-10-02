@@ -206,6 +206,7 @@ import {
 import { resolveMaxAgentsPerTenant, buildAgentPreCreateGate } from "./lib/agent-limits";
 import { NodeAmbientDispatcher } from "./lib/node-ambient-dispatch";
 import { NodeSlackReplyBridge } from "./lib/node-slack-reply-bridge";
+import { parseVerifyExec, wrapVerifyCommand } from "./lib/verify-exec";
 import { Cron } from "croner";
 import { SessionRegistry } from "./registry.js";
 
@@ -891,10 +892,7 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
     runExec: async (tenantId, sessionId, cmd, timeoutMs): Promise<{ exit_code: number; output: string }> => {
       const entry: { sandbox: { exec(cmd: string, timeoutMs?: number): Promise<string> } } =
         await sessionRegistry.getOrCreate(sessionId, tenantId);
-      const raw: string = await entry.sandbox.exec(cmd, timeoutMs);
-      // sandbox.exec returns "exit=N\n<merged-output>"
-      const m = raw.match(/^exit=(-?\d+)\n([\s\S]*)$/);
-      return m ? { exit_code: parseInt(m[1], 10), output: m[2] } : { exit_code: -1, output: raw };
+      return parseVerifyExec(await entry.sandbox.exec(wrapVerifyCommand(cmd), timeoutMs));
     },
   }),
   buildModel: async (agent, tenantId) => {

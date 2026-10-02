@@ -918,11 +918,13 @@ export class SessionStateMachine {
 
 /**
  * Did the harness's model loop already finish, judging from the turn's
- * persisted events? True when the last model-step output on the thread is
- * an agent.message whose step (model_request_start_id) issued no tool
- * calls and nothing is left unresolved: the AI SDK / Pi loops only take
- * another step after tool calls, so a text-only step is the final one.
- * Events without a step id are inconclusive → false (re-run, as before).
+ * persisted events? Only when the harness SAID so: the last model output
+ * on the thread is an agent.message carrying `step_final` (written once
+ * the whole step was known to have no tool calls and non-empty text) and
+ * nothing is left unresolved. Inferring completion from a partially
+ * persisted step is unsafe — text before a tool call is written ahead of
+ * the tool_use, and empty replies are written before silent_stop fails the
+ * turn (PR #30 QA round 3, R1/R2). No marker → resume, as before.
  */
 const STEP_OUTPUT_TYPES = new Set([
   "agent.message",
@@ -932,7 +934,6 @@ const STEP_OUTPUT_TYPES = new Set([
   "agent.tool_result",
   "agent.mcp_tool_result",
 ]);
-const TOOL_USE_TYPES = new Set(["agent.tool_use", "agent.custom_tool_use", "agent.mcp_tool_use"]);
 
 export function modelLoopFinished(turnEvents: SessionEvent[], threadId?: string): boolean {
   const thread = threadId ?? "sthr_primary";
@@ -942,12 +943,7 @@ export function modelLoopFinished(turnEvents: SessionEvent[], threadId?: string)
   const outputs = onThread.filter((e) => STEP_OUTPUT_TYPES.has(e.type));
   const last = outputs[outputs.length - 1];
   if (!last || last.type !== "agent.message") return false;
-  const step = (last as { model_request_start_id?: string }).model_request_start_id;
-  if (!step) return false;
-  const stepCalledTools = outputs.some(
-    (e) => TOOL_USE_TYPES.has(e.type) && (e as { model_request_start_id?: string }).model_request_start_id === step,
-  );
-  if (stepCalledTools) return false;
+  if ((last as { step_final?: boolean }).step_final !== true) return false;
   return findUnresolvedToolUses(onThread).length === 0;
 }
 

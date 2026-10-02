@@ -355,8 +355,13 @@ describe("recovery warnings are persisted, not just published", () => {
 // ── Round 2 (QA_REPORT_v2.md) ───────────────────────────────────────────
 
 describe("N1: crash after the final reply but before idle doesn't call the model again", () => {
-  const msg = (text: string, step?: string) =>
-    ({ type: "agent.message", content: [{ type: "text", text }], ...(step ? { model_request_start_id: step } : {}) }) as unknown as SessionEvent;
+  const msg = (text: string, step?: string, final = false) =>
+    ({
+      type: "agent.message",
+      content: [{ type: "text", text }],
+      ...(step ? { model_request_start_id: step } : {}),
+      ...(final ? { step_final: true } : {}),
+    }) as unknown as SessionEvent;
 
   it("finalizes from the log when the last step was text-only", async () => {
     const f = createMachine(async () => {});
@@ -367,7 +372,7 @@ describe("N1: crash after the final reply but before idle doesn't call the model
     f.log.append({ type: "session.status_running" } as SessionEvent);
     f.log.append({ type: "agent.tool_use", id: "t1", name: "bash", input: {}, model_request_start_id: "s1" } as unknown as SessionEvent);
     f.log.append({ type: "agent.tool_result", tool_use_id: "t1", content: "ok" } as unknown as SessionEvent);
-    f.log.append(msg("all done", "s2"));
+    f.log.append(msg("all done", "s2", true));
 
     const result = await f.machine.runTurn("agent_qa", event, { recoverOrphans: true });
 
@@ -384,6 +389,28 @@ describe("N1: crash after the final reply but before idle doesn't call the model
     f.log.append({ type: "agent.tool_use", id: "t1", name: "read", input: {}, model_request_start_id: "s1" } as unknown as SessionEvent);
     f.log.append({ type: "agent.tool_result", tool_use_id: "t1", content: "ok" } as unknown as SessionEvent);
     f.log.append(msg("let me check", "s1"));
+
+    await f.machine.runTurn("agent_qa", event, { recoverOrphans: true });
+    expect(f.harnessRuns()).toBe(1);
+  });
+
+  it("R1: text written ahead of a tool call that never got saved is NOT final", async () => {
+    // Write-ahead persists a step's leading text before its tool_use; a
+    // crash in between leaves text with no tool_use and no marker.
+    const f = createMachine(async () => {});
+    const event = { type: "user.message", id: "prefix", content: [] } as unknown as UserMessageEvent;
+    f.log.append({ ...event, processed_at: "x" } as unknown as SessionEvent);
+    f.log.append(msg("I will check with a tool.", "s1"));
+
+    await f.machine.runTurn("agent_qa", event, { recoverOrphans: true });
+    expect(f.harnessRuns()).toBe(1);
+  });
+
+  it("R2: an empty reply is never treated as final (silent_stop must still run)", async () => {
+    const f = createMachine(async () => {});
+    const event = { type: "user.message", id: "empty", content: [] } as unknown as UserMessageEvent;
+    f.log.append({ ...event, processed_at: "x" } as unknown as SessionEvent);
+    f.log.append(msg("", "s1"));
 
     await f.machine.runTurn("agent_qa", event, { recoverOrphans: true });
     expect(f.harnessRuns()).toBe(1);

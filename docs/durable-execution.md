@@ -102,6 +102,23 @@ When it did anything, it emits a `session.warning` (`source: "tool_call_recovere
   leased work queue re-runs the interrupted work item. Because the harness
   derives context from the log, that re-run resumes from the last durable
   step.
+- **Turn already finished.** A reclaimed work item is not re-run when its turn
+  already ended. If a `session.status_idle` follows the input, the item is
+  acknowledged with the original outcome; an error idle (no `stop_reason`)
+  re-raises the recorded failure. If the crash came after the final reply but
+  before the idle, the turn is finalized from the log without another model
+  call. That happens **only** when the last model output is an `agent.message`
+  marked `step_final`. Without that marker, the turn resumes as usual.
+
+### `step_final` (contract for harness authors)
+
+A harness sets `step_final: true` on the `agent.message` that ends its model
+loop. That is the last non-empty text of a step that made no tool calls,
+written once the whole step is known, in the same write as the reply. Never
+set it on text that precedes a tool call (write-ahead persists that text
+before the tool_use), and never on empty output (the `silent_stop` check must
+still fail the turn). If a harness omits the marker, crash recovery just
+re-runs the model.
 
 ## Idempotency-key contract (for tool authors)
 
@@ -140,6 +157,7 @@ durability isn't guaranteed.
 - On tool_use events: `idempotency_key`, `execution_class`,
   `model_request_start_id`.
 - On `agent.message` and `agent.thinking`: `model_request_start_id`.
+- On `agent.message`: `step_final` (see above).
 - On `agent.tool_result`: `is_error`.
 - New internal pending-queue event: `system.turn_resume`. It isn't in the
   Anthropic spec set, is hidden from wire-compat SSE, and the console ignores
