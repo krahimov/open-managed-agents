@@ -47,7 +47,25 @@ jobs:
 
   test-packages:
     # Node-pool suites (better-sqlite3, child processes, Node-only adapters).
+    # The Postgres service enables the PG_TEST_URL-gated tests (queue, work
+    # queue ownership, better-auth, fanout) — they used to be skipped
+    # everywhere, which hid a double-encoded jsonb bug in the PG queue.
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: oma
+          POSTGRES_PASSWORD: oma
+          POSTGRES_DB: oma_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U oma"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PG_TEST_URL: postgres://oma:oma@localhost:5432/oma_test
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

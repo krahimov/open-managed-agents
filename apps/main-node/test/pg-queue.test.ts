@@ -62,6 +62,33 @@ d("PG queue — SKIP LOCKED concurrency", () => {
     expect(intersect).toEqual([]);
   });
 
+  it("messages are stored as JSON objects, and legacy double-encoded rows still decode", async () => {
+    const name = `test-json-${Date.now()}`;
+    const queue = createPgQueue<{ id: string }>({ name, sql, workerId: "J", pollIntervalMs: 50 });
+    await queue.enqueue({ id: "fresh" });
+    const stored = await sql
+      .prepare(`SELECT jsonb_typeof(payload) AS t FROM queue_messages WHERE queue_name = ?`)
+      .bind(name)
+      .first<{ t: string }>();
+    // Was 'string': ?::jsonb made postgres.js JSON-encode the body twice.
+    expect(stored?.t).toBe("object");
+
+    // A row written by the old code (payload is a JSON string).
+    await sql
+      .prepare(
+        `INSERT INTO queue_messages (id, queue_name, payload, attempts, next_visible_at, status, enqueued_at)
+         VALUES (?, ?, to_jsonb(?::text), 0, 0, 'pending', ?)`,
+      )
+      .bind(`qm_legacy_${Date.now()}`, name, JSON.stringify({ id: "legacy" }), Date.now())
+      .run();
+
+    const seen: unknown[] = [];
+    const stop = queue.subscribe(async (msg) => { seen.push(msg.body); });
+    await waitFor(() => seen.length === 2, 5000);
+    await Promise.resolve(stop());
+    expect(seen).toEqual(expect.arrayContaining([{ id: "fresh" }, { id: "legacy" }]));
+  });
+
   it("failed messages reach status='dlq' after maxRetries", async () => {
     const name = `test-dlq-${Date.now()}`;
     const queue = createPgQueue<{ msg: string }>({
