@@ -123,6 +123,15 @@ export interface SessionRegistryDeps {
     abortSignal?: AbortSignal;
   }): Promise<unknown>;
 
+  /** Optional model-usage backfill (docs/budgets.md), bound to the session's
+   *  tenant. See SessionMachineDeps.reconcileUsage. */
+  reconcileUsage?(input: {
+    tenantId: string;
+    sessionId: string;
+    agentId: string;
+    events: SessionEvent[];
+  }): Promise<void>;
+
   /** Optional outcome supervisor hook (user.define_outcome), bound to the
    *  session's tenant. See SessionMachineDeps.runOutcome. */
   runOutcome?(
@@ -721,6 +730,9 @@ export class SessionRegistry {
           }),
         ...(this.deps.runOutcome
           ? { runOutcome: (input) => this.deps.runOutcome!({ ...input, tenantId, sessionId }) }
+          : {}),
+        ...(this.deps.reconcileUsage
+          ? { reconcileUsage: (input) => this.deps.reconcileUsage!({ ...input, tenantId, sessionId }) }
           : {}),
         publish: (event: SessionEvent) => {
           this.deps.hub.publish(sessionId, event);

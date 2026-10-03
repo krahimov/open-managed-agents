@@ -16,7 +16,8 @@
 // `tool_use_id` (user.custom_tool_result by `custom_tool_use_id`);
 // agent.mcp_tool_result closes agent.mcp_tool_use by `mcp_tool_use_id`.
 
-import type { AgentConfig, SessionEvent } from "@open-managed-agents/shared";
+import type { AgentConfig, BudgetExhaustedStopReason, SessionEvent } from "@open-managed-agents/shared";
+import { budgetStopFromEvents } from "./budget";
 
 export type ToolUseEventType =
   | "agent.tool_use"
@@ -41,7 +42,8 @@ export type TurnStopReason =
       type: "requires_action";
       action_type: "tool_confirmation" | "custom_tool_result";
       event_ids: string[];
-    };
+    }
+  | BudgetExhaustedStopReason;
 
 /**
  * Tool uses in `events` with no matching result, in log order.
@@ -123,10 +125,16 @@ export function outstandingRequiredActions(events: SessionEvent[]): string[] {
  * harness left without a result (HarnessRuntime.pendingConfirmations);
  * when the harness doesn't report them we fall back to the calls that are
  * structurally waiting on the client (custom tools, `ask`-gated tools).
+ *
+ * With nothing owed by the client, a `budget_exhausted` marker the harness
+ * left in `events` (docs/budgets.md) ends the turn as budget_exhausted.
+ * Calls still waiting on the client win: the client must resolve them
+ * before anything else can happen.
  */
 export function computeStopReason(
   events: SessionEvent[],
   pendingIds?: string[] | null,
+  opts: { threadId?: string } = {},
 ): TurnStopReason {
   const unresolved = findUnresolvedToolUses(events);
   const waiting = pendingIds
@@ -134,7 +142,7 @@ export function computeStopReason(
     : unresolved.filter(
         (u) => u.type === "agent.custom_tool_use" || u.evaluated_permission === "ask",
       );
-  if (waiting.length === 0) return { type: "end_turn" };
+  if (waiting.length === 0) return budgetStopFromEvents(events, opts.threadId) ?? { type: "end_turn" };
   return {
     type: "requires_action",
     action_type: waiting.some((u) => u.type === "agent.custom_tool_use")

@@ -108,7 +108,9 @@ When it did anything, it emits a `session.warning` (`source: "tool_call_recovere
   re-raises the recorded failure. If the crash came after the final reply but
   before the idle, the turn is finalized from the log without another model
   call. That happens **only** when the last model output is an `agent.message`
-  marked `step_final`. Without that marker, the turn resumes as usual.
+  marked `step_final`. Without that marker, the turn resumes as usual. Both
+  paths backfill missing model usage rows from the log
+  (`SessionMachineDeps.reconcileUsage`), since the harness isn't run.
 
 ### `step_final` (contract for harness authors)
 
@@ -168,5 +170,25 @@ in one assistant message. That matters when results were persisted between
 the step's parallel tool calls. Legacy events that don't have the field keep
 the old grouping.
 
+- On `span.model_request_end`: `cost_usd` (estimated, [budgets.md](budgets.md)).
+  The span is persisted as soon as the provider response completes. In the
+  default loop that is before the step's tools start (they are gated on
+  it); in Pi it is before the step's output. Either way it comes before the
+  `step_final` reply.
+- On `span.compaction_summarize_end`: `model_request_start_id` (pairs it
+  with `span.compaction_summarize_start.id`) and `cost_usd`. The call is
+  metered like a model call.
+
+**Budget stops** ([budgets.md](budgets.md)) end the model loop only at a
+step boundary, where every tool call already has a result. The harness
+persists a `session.warning` (`source: "budget_exhausted"`) as the durable
+marker, and the runtime turns it into
+`stop_reason: { type: "budget_exhausted" }`. A resumed turn derives its
+usage from the log, so it stops at the same point and doesn't reset the
+budget. The wall-clock budget uses the interrupt path. Cut-off tool calls
+get an error result, and the turn ends with the budget stop instead of
+`end_turn`.
+
 In-turn compaction (`prepareStep`) is not implemented. Compaction still runs
-only at turn start.
+only at turn start. Its summarize call is budget-checked and metered
+([budgets.md](budgets.md)).

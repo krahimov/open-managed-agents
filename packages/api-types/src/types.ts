@@ -552,11 +552,77 @@ export interface SessionTerminatedEvent extends EventBase {
 export interface SessionStatusEvent extends EventBase {
   type: "session.status_idle";
   stop_reason?: {
-    type: "end_turn" | "requires_action";
+    type: "end_turn" | "requires_action" | "budget_exhausted";
     event_ids?: string[];
     // requires_action sub-type for SDK routing
     action_type?: "tool_confirmation" | "custom_tool_result";
+    /** budget_exhausted only (OMA extension, docs/budgets.md): which
+     *  limit stopped the turn, its configured value and the amount used. */
+    budget?: BudgetName;
+    limit?: number;
+    used?: number;
   };
+}
+
+// --- Budgets (docs/budgets.md) ---
+
+/**
+ * Per-agent usage limits, stored at `agent.metadata.budget` (versioned with
+ * the agent, pinned into the session's agent snapshot). Every field is
+ * optional; an absent field means "no limit". A call's token count is
+ * `input_tokens + output_tokens` (input includes cached input). Checked
+ * before every model call by the default and Pi harnesses.
+ */
+export interface AgentBudget {
+  /** Tokens across the model calls of one turn. */
+  max_tokens_per_turn?: number;
+  /** Tokens across every model call of the session (all turns, all threads). */
+  max_tokens_per_session?: number;
+  /** Estimated USD cost of the session (pricing table; unpriced models add 0). */
+  max_cost_usd_per_session?: number;
+  /** Wall-clock seconds a turn may run before it is aborted. */
+  max_turn_wall_clock_seconds?: number;
+  /** Model calls per turn. Replaces the built-in cap of 100 when set. */
+  max_steps_per_turn?: number;
+}
+
+/** A limit that can stop a turn: an AgentBudget field or a tenant daily cap. */
+export type BudgetName =
+  | keyof AgentBudget
+  | "tenant_daily_tokens"
+  | "tenant_daily_cost_usd";
+
+/** `session.status_idle.stop_reason` when a budget ended the turn. */
+export interface BudgetExhaustedStopReason {
+  type: "budget_exhausted";
+  budget: BudgetName;
+  limit: number;
+  used: number;
+}
+
+/** Token / cost totals over a set of model calls (usage API). */
+export interface ModelUsageTotals {
+  model_calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_input_tokens: number;
+  cache_creation_input_tokens: number;
+  /** input_tokens + output_tokens. */
+  total_tokens: number;
+  /** Sum of the estimated cost of priced calls; null when no call had a price. */
+  cost_usd: number | null;
+  /** Calls whose model had no known price (not included in cost_usd). */
+  unpriced_calls: number;
+}
+
+/** GET /v1/sessions/:id/usage and GET /v1/agents/:id/usage. */
+export interface ModelUsageReport {
+  type: "model_usage";
+  scope: { session_id?: string; agent_id?: string; since?: string };
+  totals: ModelUsageTotals;
+  by_model: Array<ModelUsageTotals & { model: string }>;
+  /** Budget configured on the agent (for a session: its pinned snapshot). */
+  budget?: AgentBudget | null;
 }
 
 export interface AgentMcpToolUseEvent extends EventBase {
@@ -791,6 +857,9 @@ export interface SpanModelRequestEndEvent extends EventBase {
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;
   };
+  /** OMA extension: estimated USD cost of this call from the pricing table
+   *  (docs/budgets.md). null / absent when the model has no known price. */
+  cost_usd?: number | null;
   /** Why the model stopped: "stop" | "length" | "content-filter" | "tool-calls" | "error" | "aborted" | "other".
    *  Surfaces silent terminations (e.g. provider returns finish_reason="stop"
    *  with empty text mid-task) for debugging incomplete agent runs. */
@@ -834,12 +903,19 @@ export interface SpanCompactionSummarizeStartEvent extends EventBase {
 export interface SpanCompactionSummarizeEndEvent extends EventBase {
   type: "span.compaction_summarize_end";
   model?: string;
+  /** OMA extension (docs/budgets.md): the id of the matching
+   *  span.compaction_summarize_start. When present, the call is metered like
+   *  a model call — one model_usage_events row keyed by this id — and counts
+   *  toward token / cost budgets (not toward max_steps_per_turn). */
+  model_request_start_id?: string;
   model_usage?: {
     input_tokens: number;
     output_tokens: number;
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;
   };
+  /** OMA extension: estimated USD cost of the summarize call (null: unpriced). */
+  cost_usd?: number | null;
   finish_reason?: string;
   final_text_length?: number;
 }

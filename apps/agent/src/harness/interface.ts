@@ -1,6 +1,7 @@
 import type { ModelMessage, LanguageModel } from "ai";
 import type { AgentConfig, SessionEvent, UserMessageEvent } from "@open-managed-agents/shared";
 import type { FileResolver } from "../runtime/history";
+import type { HarnessBudgetContext } from "@open-managed-agents/session-runtime";
 
 // SandboxExecutor + ProcessHandle live in @open-managed-agents/sandbox so
 // non-CF runtimes (apps/main-node, future deployments) can implement the
@@ -240,6 +241,14 @@ export interface HarnessContext {
    * derive layer emits a placeholder block so the turn keeps running.
    */
   fileFetcher?: FileResolver;
+
+  /**
+   * Runtime-supplied budget inputs (docs/budgets.md): tenant daily caps
+   * with today's usage, pricing overrides, or a budget that overrides
+   * `agent.metadata.budget`. Optional — without it the harness enforces
+   * `agent.metadata.budget` with the built-in pricing table.
+   */
+  budget?: HarnessBudgetContext;
 
   env: {
     ANTHROPIC_API_KEY: string;

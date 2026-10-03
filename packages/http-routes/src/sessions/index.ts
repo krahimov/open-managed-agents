@@ -37,6 +37,7 @@ import {
   SessionResourceNotFoundError,
 } from "@open-managed-agents/sessions-store";
 import type { SessionRouter, SessionInitParams } from "@open-managed-agents/session-runtime";
+import { SqlModelUsageStore, agentBudgetOf } from "@open-managed-agents/session-runtime";
 import type { RouteServices, RouteServicesArg } from "../types";
 import { resolveServices } from "../types";
 
@@ -1091,6 +1092,25 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
     });
     if (!sess) return c.json({ error: "Session not found" }, 404);
     return openSse(c, router, id);
+  });
+
+  // ── Model usage (docs/budgets.md) ─────────────────────────────────────
+  // GET /v1/sessions/:id/usage — per-model-call token usage + estimated
+  // cost, aggregated, from model_usage_events. `budget` is the agent
+  // budget pinned in the session's agent snapshot.
+  app.get("/:id/usage", async (c) => {
+    const services = resolveServices(deps.services, c);
+    const tenantId = c.var.tenant_id;
+    const id = c.req.param("id");
+    const sess = await services.sessions.get({ tenantId, sessionId: id });
+    if (!sess) return c.json({ error: "Session not found" }, 404);
+    const snapshot = (sess as unknown as { agent_snapshot?: AgentConfig | null }).agent_snapshot ?? null;
+    const report = await new SqlModelUsageStore(services.sql).sessionReport(
+      tenantId,
+      id,
+      agentBudgetOf(snapshot),
+    );
+    return c.json(report);
   });
 
   // ── Trajectory ────────────────────────────────────────────────────────

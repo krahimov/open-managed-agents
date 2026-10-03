@@ -17,10 +17,14 @@ describe("Telegram migration upgrades", () => {
     const db = drizzle(sqlite);
     try {
       mkdirSync(join(dir, "meta"));
-      const entries = journal.entries.filter((entry: { tag: string }) =>
-        version === "main" ? !entry.tag.includes("telegram") :
-        version === "onboarding" ? !entry.tag.endsWith("telegram_setup") : true,
-      ).map((entry: { idx: number; tag: string }) => ({
+      // A release is a journal PREFIX (drizzle applies by timestamp, so a
+      // simulated older install must not contain later migrations).
+      const firstIdx = (pred: (tag: string) => boolean) =>
+        journal.entries.find((entry: { tag: string }) => pred(entry.tag))?.idx ?? Infinity;
+      const cut =
+        version === "main" ? firstIdx((t) => t.includes("telegram")) :
+        version === "onboarding" ? firstIdx((t) => t.endsWith("telegram_setup")) : Infinity;
+      const entries = journal.entries.filter((entry: { idx: number }) => entry.idx < cut).map((entry: { idx: number; tag: string }) => ({
         ...entry,
         // Earlier test releases included an unrelated migration before Telegram.
         idx: version === "legacy-test" && entry.tag.includes("telegram") ? entry.idx + 1 : entry.idx,

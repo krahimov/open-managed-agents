@@ -195,6 +195,7 @@ import {
 } from "./lib/event-stream-hub";
 import { PgEventStreamHub } from "./lib/pg-event-stream-hub";
 import { NodeHarnessRuntime } from "./lib/node-harness-runtime";
+import { NodeModelUsage, resolveNodeBudgetConfig, type ModelUsageRunHooks } from "./lib/node-model-usage";
 import { NodeSessionWakeups } from "./lib/node-session-wakeups";
 import {
   resolveClerkConfig,
@@ -858,6 +859,9 @@ function outputsPathFor(
 
 const sessionBrowsers = new Map<string, ReturnType<typeof createSandboxBrowserHarness>>();
 
+// Per-model-call usage rows + tenant daily caps (docs/budgets.md).
+const nodeModelUsage = new NodeModelUsage(sql, resolveNodeBudgetConfig(process.env));
+
 const sessionRegistry: SessionRegistry = new SessionRegistry({
   sql,
   hub,
@@ -1184,6 +1188,10 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
       },
     };
   },
+  // Turns finalized from the log (no harness run) still backfill usage rows.
+  reconcileUsage: async (input) => {
+    await nodeModelUsage.reconcile(input);
+  },
   buildHarnessContext: async (input) => {
     const harness = input.agent.harness ?? process.env.OMA_DEFAULT_HARNESS;
     if (input.sandbox.sandboxCapabilities?.().scope === "agent" &&
@@ -1191,14 +1199,25 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
       throw new Error("Agent computers support default and codex-sdk harnesses. Claude SDK host tools cannot use an agent computer yet.");
     }
     const creds = await resolveNodeModelCredentials(input.agent, input.tenantId);
+    // Model usage rows + budget inputs (docs/budgets.md). The hook is bound
+    // once the run's turn id is known (after the history refresh below).
+    let usageHooks: ModelUsageRunHooks | null = null;
     const runtime = new NodeHarnessRuntime({
       sessionId: input.sessionId,
       log: input.eventLog,
       hub,
       sandbox: input.sandbox,
       abortSignal: input.abortSignal,
+      onPersisted: (stored) => usageHooks?.onPersisted(stored),
     });
     await runtime.refreshHistory();
+    usageHooks = await nodeModelUsage.prepareRun({
+      tenantId: input.tenantId,
+      sessionId: input.sessionId,
+      agentId: input.agent.id ?? null,
+      events: runtime.history.getEvents(),
+      threadId: (input.userMessage as { session_thread_id?: string }).session_thread_id,
+    });
     // Setup sessions replace the agent's own system prompt with the setup
     // preamble (config-designer mode) — mirrors the SDK harness. Tools are
     // swapped by the buildTools hook above; both key off metadata.oma_setup.
@@ -1242,6 +1261,7 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
         ANTHROPIC_BASE_URL: creds.apiCompat.startsWith("ant") ? creds.baseURL : undefined,
         memoryStoreIds: memoryContext.storeIds,
       },
+      budget: usageHooks.budget,
       runtime,
     } satisfies HarnessContext;
   },

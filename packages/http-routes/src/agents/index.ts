@@ -25,6 +25,7 @@ import {
   AgentVersionMismatchError,
   AmbientRuleNotFoundError,
 } from "@open-managed-agents/agents-store";
+import { SqlModelUsageStore, agentBudgetOf, parseAgentBudget } from "@open-managed-agents/session-runtime";
 import type { RouteServicesArg } from "../types";
 import { resolveServices } from "../types";
 
@@ -182,6 +183,15 @@ function invalidReasoningLevel(value: unknown): string | null {
   return `reasoning_level must be one of ${REASONING_LEVELS.join("|")}`;
 }
 
+/** Validate `metadata.budget` (docs/budgets.md). `null` / `""` clear it on
+ *  update (metadata per-key merge semantics). */
+function invalidBudget(metadata: Record<string, unknown> | undefined): string | null {
+  if (!metadata || !("budget" in metadata)) return null;
+  const raw = metadata.budget;
+  if (raw === null || raw === "" || raw === undefined) return null;
+  return parseAgentBudget(raw).error ?? null;
+}
+
 export interface AgentRoutesDeps extends AmbientWebhookDeps {
   services: RouteServicesArg;
   /** Optional model card validation. CF passes a function backed by
@@ -249,6 +259,8 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
 
     const rlError = invalidReasoningLevel(raw._oma?.reasoning_level);
     if (rlError) return c.json({ error: rlError }, 400);
+    const budgetError = invalidBudget(raw.metadata);
+    if (budgetError) return c.json({ error: budgetError }, 400);
 
     const body = {
       ...raw,
@@ -613,6 +625,32 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
     }
   });
 
+  // GET /v1/agents/:id/usage — model token usage + estimated cost across
+  // the agent's sessions (docs/budgets.md). `?since=<ISO|ms>` bounds it;
+  // `?days=N` is shorthand for the last N days.
+  app.get("/:id/usage", async (c) => {
+    const services = resolveServices(deps.services, c);
+    const tenantId = c.var.tenant_id;
+    const row = await services.agents.get({ tenantId, agentId: c.req.param("id") });
+    if (!row) return c.json({ error: "Agent not found" }, 404);
+    let sinceMs = 0;
+    const since = c.req.query("since");
+    const days = c.req.query("days");
+    if (since) {
+      sinceMs = /^\d+$/.test(since) ? Number(since) : Date.parse(since);
+      if (!Number.isFinite(sinceMs)) return c.json({ error: "since must be an ISO timestamp or epoch ms" }, 400);
+    } else if (days) {
+      const n = Number(days);
+      if (!Number.isFinite(n) || n <= 0) return c.json({ error: "days must be a positive number" }, 400);
+      sinceMs = Date.now() - n * 86_400_000;
+    }
+    const report = await new SqlModelUsageStore(services.sql).agentReport(tenantId, row.id, {
+      sinceMs,
+      budget: agentBudgetOf(row),
+    });
+    return c.json(report);
+  });
+
   // GET /v1/agents/:id — get
   app.get("/:id", async (c) => {
     const services = resolveServices(deps.services, c);
@@ -665,6 +703,8 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
 
     const rlError = invalidReasoningLevel(raw._oma?.reasoning_level);
     if (rlError) return c.json({ error: rlError }, 400);
+    const budgetError = invalidBudget(raw.metadata);
+    if (budgetError) return c.json({ error: budgetError }, 400);
 
     const body = {
       ...raw,

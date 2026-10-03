@@ -1,18 +1,26 @@
 import { streamText, stepCountIs, wrapLanguageModel } from "ai";
-import type { ContentPart, ModelMessage, LanguageModel, SystemModelMessage } from "ai";
+import type { ContentPart, ModelMessage, LanguageModel, LanguageModelMiddleware, SystemModelMessage } from "ai";
 import type { HarnessInterface, HarnessContext, HarnessRuntime, FileResolver } from "./interface";
 import type { SessionEvent, ContentBlock, AgentToolUseEvent } from "@open-managed-agents/shared";
 import { generateEventId, classifyExternalError, ModelError } from "@open-managed-agents/shared";
 import { eventsToMessagesAsync } from "../runtime/history";
 import { SummarizeCompactionStrategy, resolveCompactionStrategy } from "./compaction";
-import type { CompactionStrategy } from "./compaction";
+import type { CompactionMeter, CompactionStrategy } from "./compaction";
 import { ALL_TOOLS } from "./tools";
 import { llmLoggingMiddleware, llmLogKey } from "./llm-logging-middleware";
+import { isWrappableModel, usageObserverMiddleware, type CallUsageInfo } from "./usage-middleware";
 import { isOpenAiCompatModel, sanitizeOpenAiToolNames, reasoningProviderOptions } from "./provider";
 import type { ToolSet } from "ai";
 import { OPENAI_MAX_TOOLS, SEARCH_TOOL_NAME, CALL_TOOL_NAME, applyToolBudget } from "./tool-budget";
-import { classifyTool, idempotencyKeyFor } from "@open-managed-agents/session-runtime";
-import type { ToolExecutionClass } from "@open-managed-agents/shared";
+import {
+  BudgetTracker,
+  budgetStopFromEvents,
+  budgetWarningEvent,
+  classifyTool,
+  idempotencyKeyFor,
+  type ModelCallUsage,
+} from "@open-managed-agents/session-runtime";
+import type { BudgetExhaustedStopReason, ToolExecutionClass } from "@open-managed-agents/shared";
 import {
   ToolUseGates,
   wrapToolsWriteAhead,
@@ -34,6 +42,21 @@ const isMcpTool = (name: string) => name.startsWith("mcp_");
 // filters, billing dashboards) split on those event types.
 export const isBuiltinTool = (name: string): boolean =>
   BUILTIN_TOOLS.has(name) || isMcpTool(name) || name.startsWith("call_agent_");
+
+/** AI SDK step usage → the `span.model_request_end.model_usage` shape
+ *  (input_tokens = total input incl. cache). */
+function modelUsageOf(usage: {
+  inputTokens?: number;
+  outputTokens?: number;
+  inputTokenDetails?: { cacheReadTokens?: number; cacheWriteTokens?: number };
+} | undefined): ModelCallUsage {
+  return {
+    input_tokens: usage?.inputTokens ?? 0,
+    output_tokens: usage?.outputTokens ?? 0,
+    cache_read_input_tokens: usage?.inputTokenDetails?.cacheReadTokens ?? 0,
+    cache_creation_input_tokens: usage?.inputTokenDetails?.cacheWriteTokens ?? 0,
+  };
+}
 
 
 /**
@@ -374,6 +397,32 @@ export class DefaultHarness implements HarnessInterface {
       } as SessionEvent);
     }
 
+    // Budgets (docs/budgets.md). Usage so far comes from the log (crash-
+    // consistent: a resumed turn sees the same totals); this run's calls
+    // are added as they finish. Checked before the first model call here
+    // and before every further call in stopWhen below. The orphan pass
+    // above already closed every tool call, so stopping now leaves none
+    // unresolved.
+    const budgetThread = turnThread ?? "sthr_primary";
+    const budget = BudgetTracker.forRun({
+      agent,
+      events: runtime.history.getEvents(),
+      threadId: budgetThread,
+      context: ctx.budget,
+      pricingModel: (model as { modelId?: string }).modelId,
+    });
+    const persistBudgetStop = async (stop: BudgetExhaustedStopReason) => {
+      // A resumed turn that already recorded its budget stop doesn't add a second one.
+      if (budgetStopFromEvents(runtime.history.getEvents(), budgetThread)) return;
+      await persist(budgetWarningEvent(stop, budgetThread));
+    };
+    const preStop = budget.check();
+    if (preStop) {
+      await persistBudgetStop(preStop);
+      return;
+    }
+    let budgetStop: BudgetExhaustedStopReason | null = null;
+
     // --- Harness decides HOW to deliver context to the model ---
 
     // 1. Compaction check: ask the harness's own shouldCompact + compact
@@ -381,15 +430,31 @@ export class DefaultHarness implements HarnessInterface {
     // compact() persists its product as a agent.thread_context_compacted
     // event with summary — derive() then sees the boundary and serves the
     // summarized view from this turn forward (NOT recomputed per turn).
+    //
+    // The summarize call is a model call like any other (docs/budgets.md):
+    // the budget check above already ran before it, its usage span is
+    // persisted (one usage row), and the tracker counts its tokens + cost.
+    // It is not a loop step, so it doesn't count toward max_steps_per_turn.
+    // If it used up the budget, the turn stops before the main call.
     const allEvents = runtime.history.getEvents();
     const ctxWindow = resolveContextWindowTokens(model);
     if (this.shouldCompact && this.compact && this.shouldCompact(allEvents, { contextWindowTokens: ctxWindow })) {
+      const meter: CompactionMeter = {
+        costOf: (u) => budget.costOf(u),
+        onUsage: (u) => budget.record(u, { kind: "compaction" }),
+        maxOutputTokens: budget.remainingOutputTokens(),
+      };
       try {
-        await this.compact(allEvents, runtime, { model, systemPrompt, tools });
+        await this.compact(allEvents, runtime, { model, systemPrompt, tools, meter });
       } catch (err) {
         // Compaction is best-effort. Log and continue — the next turn will
         // try again. Don't fail the whole turn over a summarize error.
         console.warn(`[compact] failed: ${(err as Error).message}`);
+      }
+      const postCompactionStop = budget.check();
+      if (postCompactionStop) {
+        await persistBudgetStop(postCompactionStop);
+        return;
       }
     }
 
@@ -533,6 +598,75 @@ export class DefaultHarness implements HarnessInterface {
       const writeAheadToolUses = new Set<string>();
       const persistedResults = new Set<string>();
       const gates = new ToolUseGates();
+
+      // ── Per-call usage (docs/budgets.md) ─────────────────────────────
+      //
+      // A provider call's usage is made durable the moment its response
+      // completes: the usage observer middleware sees the provider's
+      // finish part while the step's tools are still gated, persists the
+      // span.model_request_end (usage + cost) and records it in the budget
+      // tracker. The step's tools only start once that span is durable, and
+      // the step's final reply (onStepFinish) is written after it. So an
+      // abort or crash during a tool, or right after the final reply, can't
+      // lose a call that completed. Exactly once: one span per
+      // model_request_start_id (usageRecorded), and the usage table is
+      // unique on it.
+      const llmLogCtx = ctx.env.llmLog;
+      const usageObserved = isWrappableModel(model);
+      const usageRecorded = new Set<string>();
+      type UsageGate = { promise: Promise<void>; resolve: () => void; reject: (err: unknown) => void };
+      const usageGates = new Map<string, UsageGate>();
+      const usageGate = (id: string): UsageGate => {
+        let g = usageGates.get(id);
+        if (!g) {
+          let settled = false;
+          let res!: () => void;
+          let rej!: (err: unknown) => void;
+          const promise = new Promise<void>((resolve, reject) => {
+            res = resolve;
+            rej = reject;
+          });
+          promise.catch(() => {});
+          g = {
+            promise,
+            resolve: () => {
+              if (!settled) { settled = true; res(); }
+            },
+            reject: (err) => {
+              if (!settled) { settled = true; rej(err); }
+            },
+          };
+          usageGates.set(id, g);
+        }
+        return g;
+      };
+      const recordCallUsage = async (id: string, info: CallUsageInfo): Promise<void> => {
+        if (usageRecorded.has(id)) return;
+        usageRecorded.add(id);
+        const bodyKey = llmLogCtx ? llmLogKey(llmLogCtx.tenant_id, llmLogCtx.session_id, id) : undefined;
+        try {
+          await persist({
+            type: "span.model_request_end",
+            model: modelId,
+            model_request_start_id: id,
+            provider_response_id: info.providerResponseId,
+            model_usage: info.usage,
+            // Estimated from the pricing table (docs/budgets.md); null = unpriced model.
+            ...(info.usage ? { cost_usd: budget.costOf(info.usage) } : {}),
+            finish_reason: info.finishReason,
+            final_text_length: info.finalTextLength,
+            is_error: false,
+            ...(bodyKey ? { body_r2_key: bodyKey } : {}),
+          } as SessionEvent);
+        } catch (err) {
+          // Not durable → the step's tools must not run (same rule as the
+          // write-ahead tool_use).
+          usageGate(id).reject(err);
+          throw err;
+        }
+        budget.record(info.usage);
+        usageGate(id).resolve();
+      };
       const finalTools = (cached.tools ?? {}) as Record<string, any>;
       const lookupTool = (name: string) => finalTools[name] ?? tools[name];
 
@@ -616,7 +750,18 @@ export class DefaultHarness implements HarnessInterface {
             await persist(e);
           }
           writeAheadToolUses.add(part.toolCallId);
-          gates.open(part.toolCallId);
+          // The tool runs once the step's usage span is durable too (see
+          // recordCallUsage). Not awaited here: the provider's finish part
+          // is still on its way through the middleware.
+          const stepId = stepStartId;
+          if (usageObserved && stepId) {
+            usageGate(stepId).promise.then(
+              () => gates.open(part.toolCallId),
+              (err) => gates.fail(part.toolCallId, err),
+            );
+          } else {
+            gates.open(part.toolCallId);
+          }
         } catch (err) {
           // Intent could not be made durable → the tool must not run.
           gates.fail(part.toolCallId, err);
@@ -780,17 +925,45 @@ export class DefaultHarness implements HarnessInterface {
       // (not the LanguageModel union which includes string ids). All
       // resolveModel returns are V3 instances; cast through unknown to
       // satisfy the wrapper's narrower type without runtime conversion.
-      const llmLogCtx = ctx.env.llmLog;
-      const wrappedModel: LanguageModel = llmLogCtx
+      //
+      // The usage observer (usage-middleware.ts) goes outermost: it records
+      // each call's usage as soon as the provider response completes and
+      // caps maxOutputTokens to the remaining token budget. Only V3 models
+      // can be wrapped; anything else falls back to recording usage in
+      // onStepFinish, with no output cap.
+      const middlewares: LanguageModelMiddleware[] = [];
+      if (usageObserved) {
+        middlewares.push(
+          usageObserverMiddleware({
+            spanIdResolver: () => stepStartId,
+            onFinish: recordCallUsage,
+            // Stream errored / was cancelled before a durable usage span:
+            // the step's tools must not run. A plain end without a finish
+            // part keeps the old behaviour (tools run; onStepFinish records).
+            onEnd: (id, err) => {
+              if (err) usageGate(id).reject(err);
+              else usageGate(id).resolve();
+            },
+            outputTokenRoom: () => budget.remainingOutputTokens(),
+            providerClampsMaxOutput: String((model as { provider?: string }).provider ?? "").startsWith("anthropic"),
+          }),
+        );
+      }
+      if (llmLogCtx) {
+        middlewares.push(
+          llmLoggingMiddleware({
+            tenant_id: llmLogCtx.tenant_id,
+            session_id: llmLogCtx.session_id,
+            r2: llmLogCtx.r2,
+            spanIdResolver: () => stepStartId,
+          }),
+        );
+      }
+      const wrappedModel: LanguageModel = middlewares.length > 0
         ? (wrapLanguageModel({
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             model: model as any,
-            middleware: llmLoggingMiddleware({
-              tenant_id: llmLogCtx.tenant_id,
-              session_id: llmLogCtx.session_id,
-              r2: llmLogCtx.r2,
-              spanIdResolver: () => stepStartId,
-            }),
+            middleware: middlewares,
           }) as unknown as LanguageModel)
         : model;
 
@@ -819,7 +992,18 @@ export class DefaultHarness implements HarnessInterface {
         agent.reasoning_level,
         Object.keys(cached.tools ?? {}).length > 0,
       ),
-      stopWhen: stepCountIs(100),
+      // Evaluated before every further model call (after a step whose tool
+      // calls all have results). Budgets first, then the step cap
+      // (max_steps_per_turn, default 100). Every finished call is already
+      // in the tracker (recordCallUsage, at the latest from onStepFinish,
+      // which the SDK awaits before evaluating stopWhen).
+      stopWhen: [
+        () => {
+          budgetStop ??= budget.check();
+          return budgetStop !== null;
+        },
+        stepCountIs(budget.maxSteps),
+      ],
       abortSignal: runtime.abortSignal,
 
       // Ordered stream observer (replaces onChunk): live chunk streaming
@@ -962,22 +1146,34 @@ export class DefaultHarness implements HarnessInterface {
         const bodyR2Key = llmLogCtx
           ? llmLogKey(llmLogCtx.tenant_id, llmLogCtx.session_id, stepStartId ?? "")
           : undefined;
-        runtime.broadcast({
-          type: "span.model_request_end",
-          model: modelId,
-          model_request_start_id: stepStartId ?? undefined,
-          provider_response_id: providerResponseId,
-          model_usage: step.usage ? {
-            input_tokens: step.usage.inputTokens ?? 0,
-            output_tokens: step.usage.outputTokens ?? 0,
-            cache_read_input_tokens: step.usage.inputTokenDetails?.cacheReadTokens ?? 0,
-            cache_creation_input_tokens: step.usage.inputTokenDetails?.cacheWriteTokens ?? 0,
-          } : undefined,
-          finish_reason: step.finishReason,
-          final_text_length: stepText.length,
-          is_error: false,
-          ...(bodyR2Key ? { body_r2_key: bodyR2Key } : {}),
-        });
+        const stepUsage = step.usage ? modelUsageOf(step.usage) : undefined;
+        if (stepStartId && usageObserved) {
+          // Normally recorded by the usage observer already (no-op then);
+          // covers a provider stream that ended without a finish part.
+          await recordCallUsage(stepStartId, {
+            usage: stepUsage,
+            finishReason: step.finishReason,
+            providerResponseId,
+            finalTextLength: stepText.length,
+          });
+        } else if (!stepStartId || !usageRecorded.has(stepStartId)) {
+          // Model not wrappable: record from the step (after its tools).
+          if (stepStartId) usageRecorded.add(stepStartId);
+          budget.record(stepUsage);
+          runtime.broadcast({
+            type: "span.model_request_end",
+            model: modelId,
+            model_request_start_id: stepStartId ?? undefined,
+            provider_response_id: providerResponseId,
+            model_usage: stepUsage,
+            // Estimated from the pricing table (docs/budgets.md); null = unpriced model.
+            ...(stepUsage ? { cost_usd: budget.costOf(stepUsage) } : {}),
+            finish_reason: step.finishReason,
+            final_text_length: stepText.length,
+            is_error: false,
+            ...(bodyR2Key ? { body_r2_key: bodyR2Key } : {}),
+          });
+        }
         // Clear so onError / onAbort don't double-close.
         stepStartId = null;
       },
@@ -1022,6 +1218,9 @@ export class DefaultHarness implements HarnessInterface {
         // No open span (error before the first step start, or a late error
         // after onStepFinish closed it) — the message is captured above for
         // the finishReason==="error" throw; there's just no span to close.
+        // A call whose response completed was already closed WITH its usage
+        // (the error came later) — no second end.
+        if (stepStartId && usageRecorded.has(stepStartId)) stepStartId = null;
         if (!stepStartId) return;
         runtime.broadcast({
           type: "span.model_request_end",
@@ -1041,7 +1240,10 @@ export class DefaultHarness implements HarnessInterface {
       onAbort: () => {
         // User interrupt or AbortSignal trip. Same dangling-start problem as
         // onError. is_error stays false — abort is a normal control flow,
-        // not a model failure.
+        // not a model failure. A call whose response completed was already
+        // closed WITH its usage (recordCallUsage), e.g. an abort while its
+        // tools ran, so it gets no second, usage-less end.
+        if (stepStartId && usageRecorded.has(stepStartId)) stepStartId = null;
         if (!stepStartId) return;
         runtime.broadcast({
           type: "span.model_request_end",
@@ -1206,6 +1408,11 @@ export class DefaultHarness implements HarnessInterface {
     })();
 
 
+    // 7b. A budget ended the loop before its next model call: leave the
+    //     durable marker the runtime turns into stop_reason budget_exhausted.
+    //     Every tool call of the last step already has its result.
+    if (budgetStop) await persistBudgetStop(budgetStop);
+
     // 8. Detect pending tool confirmations and custom tool results
     if (result.toolCalls?.length) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1273,7 +1480,7 @@ export class DefaultHarness implements HarnessInterface {
   async compact(
     events: SessionEvent[],
     runtime: HarnessRuntime,
-    ctx: { model: LanguageModel; systemPrompt: string; tools: Record<string, any> },
+    ctx: { model: LanguageModel; systemPrompt: string; tools: Record<string, any>; meter?: CompactionMeter },
   ): Promise<void> {
     const ctxWindow = resolveContextWindowTokens(ctx.model);
     const result = await this.compactionStrategy.compact(events, {
@@ -1283,6 +1490,7 @@ export class DefaultHarness implements HarnessInterface {
       tools: ctx.tools,
       applyCacheStrategy: (sys, tls, msgs) => applyProviderCacheStrategy(ctx.model, sys, tls, msgs),
       runtime,
+      meter: ctx.meter,
     });
     if (!result) return;
 
