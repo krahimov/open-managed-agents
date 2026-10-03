@@ -1188,6 +1188,10 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
       },
     };
   },
+  // Turns finalized from the log (no harness run) still backfill usage rows.
+  reconcileUsage: async (input) => {
+    await nodeModelUsage.reconcile(input);
+  },
   buildHarnessContext: async (input) => {
     const harness = input.agent.harness ?? process.env.OMA_DEFAULT_HARNESS;
     if (input.sandbox.sandboxCapabilities?.().scope === "agent" &&

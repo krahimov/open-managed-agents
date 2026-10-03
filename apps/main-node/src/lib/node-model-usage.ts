@@ -13,6 +13,7 @@ import type { SessionEvent } from "@open-managed-agents/shared";
 import {
   SqlModelUsageStore,
   currentTurnIdOf,
+  isUsageSpanEvent,
   parseModelPricingOverrides,
   startOfUtcDayMs,
   usageRowFromEvent,
@@ -61,6 +62,37 @@ export class NodeModelUsage {
     this.store = new SqlModelUsageStore(sql);
   }
 
+  /**
+   * Backfill: insert every usage row the log implies that the table lacks
+   * (crash between a usage span's persist and its row insert). Idempotent;
+   * never throws. Runs at the start of every harness run (prepareRun) and
+   * from SessionStateMachine.reconcileUsage when a turn is finalized from
+   * the log without running the harness.
+   */
+  async reconcile(input: {
+    tenantId: string;
+    sessionId: string;
+    agentId: string | null;
+    events: SessionEvent[];
+  }): Promise<number> {
+    try {
+      if (!input.events.some(isUsageSpanEvent)) return 0;
+      const n = await this.store.recordFromEvents(input.events, {
+        tenantId: input.tenantId,
+        sessionId: input.sessionId,
+        agentId: input.agentId,
+        pricing: this.config.pricing,
+      });
+      if (n > 0) {
+        log.info({ op: "model_usage.backfill", session_id: input.sessionId, rows: n }, "backfilled model usage rows");
+      }
+      return n;
+    } catch (err) {
+      log.warn({ err, op: "model_usage.backfill_failed", session_id: input.sessionId }, "model usage backfill failed");
+      return 0;
+    }
+  }
+
   async prepareRun(input: {
     tenantId: string;
     sessionId: string;
@@ -75,16 +107,7 @@ export class NodeModelUsage {
       agentId: input.agentId,
       pricing: this.config.pricing,
     };
-    try {
-      if (input.events.some((e) => e.type === "span.model_request_end")) {
-        const n = await this.store.recordFromEvents(input.events, ctx);
-        if (n > 0) {
-          log.info({ op: "model_usage.backfill", session_id: input.sessionId, rows: n }, "backfilled model usage rows");
-        }
-      }
-    } catch (err) {
-      log.warn({ err, op: "model_usage.backfill_failed", session_id: input.sessionId }, "model usage backfill failed");
-    }
+    await this.reconcile(input);
     const turnId = currentTurnIdOf(input.events, input.threadId ?? "sthr_primary");
 
     let tenant: HarnessBudgetContext["tenant"] = null;
@@ -104,7 +127,7 @@ export class NodeModelUsage {
 
     return {
       onPersisted: async (stored) => {
-        if (stored.type !== "span.model_request_end") return;
+        if (!isUsageSpanEvent(stored)) return;
         const row = usageRowFromEvent(stored, { ...ctx, turnId });
         if (row) await this.store.record(row);
       },

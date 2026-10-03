@@ -655,12 +655,14 @@ budget of the agent version they started with. Full details are in
 | `max_tokens_per_turn` | integer | Tokens (input + output) across one turn's model calls |
 | `max_tokens_per_session` | integer | Tokens across every turn and thread of the session |
 | `max_cost_usd_per_session` | number | Estimated USD cost of the session, from the model price table |
-| `max_turn_wall_clock_seconds` | number | The turn is aborted after this long |
+| `max_turn_wall_clock_seconds` | number | The turn is aborted after this long (at most 604800, 7 days) |
 | `max_steps_per_turn` | integer | Model calls per turn (replaces the default cap of 100) |
 
 - **Enforcement.** The default and Pi harnesses check token, cost and step
-  limits before every model call. The runtime enforces the wall-clock
-  limit through the interrupt path.
+  limits before every model call, compaction summarize calls included
+  (those count toward tokens and cost, not steps). With a token limit, each
+  call's output is capped to the remaining budget; input can't be capped.
+  The runtime enforces the wall-clock limit through the interrupt path.
 - **Stop.** When a limit would be exceeded, the turn ends with
   `session.status_idle` and
   `stop_reason: { type: "budget_exhausted", budget, limit, used }`. A

@@ -16,6 +16,9 @@ import {
   budgetStopFromEvents,
   budgetWarningEvent,
   computeStopReason,
+  MAX_TIMER_DELAY_MS,
+  MAX_TURN_WALL_CLOCK_SECONDS,
+  setLongTimeout,
   estimateCostUsd,
   parseAgentBudget,
   parseModelPricingOverrides,
@@ -64,6 +67,59 @@ describe("parseAgentBudget", () => {
   });
 });
 
+describe("wall-clock limits", () => {
+  it("validation caps max_turn_wall_clock_seconds at 7 days", () => {
+    expect(MAX_TURN_WALL_CLOCK_SECONDS).toBe(604_800);
+    expect(parseAgentBudget({ max_turn_wall_clock_seconds: 604_800 }).budget).toEqual({ max_turn_wall_clock_seconds: 604_800 });
+    expect(parseAgentBudget({ max_turn_wall_clock_seconds: 604_801 }).error).toMatch(/at most 604800/);
+    expect(parseAgentBudget({ max_turn_wall_clock_seconds: 2_592_000 }).error).toMatch(/max_turn_wall_clock_seconds/);
+  });
+
+  it("setLongTimeout re-arms in chunks no longer than the timer limit and fires once at the deadline", () => {
+    let now = 0;
+    const pending: Array<{ at: number; cb: () => void; id: number }> = [];
+    let ids = 0;
+    const delays: number[] = [];
+    const port = {
+      now: () => now,
+      setTimeout: (cb: () => void, ms: number) => {
+        delays.push(ms);
+        const t = { at: now + ms, cb, id: ++ids };
+        pending.push(t);
+        return t.id;
+      },
+      clearTimeout: (h: unknown) => {
+        const i = pending.findIndex((t) => t.id === h);
+        if (i >= 0) pending.splice(i, 1);
+      },
+    };
+    const runNext = () => {
+      pending.sort((a, b) => a.at - b.at);
+      const t = pending.shift()!;
+      now = t.at;
+      t.cb();
+    };
+    const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+    let fired = 0;
+    setLongTimeout(() => fired++, thirtyDays, port);
+    expect(delays[0]).toBe(MAX_TIMER_DELAY_MS);
+    runNext();
+    expect(fired).toBe(0);
+    expect(delays[1]).toBe(thirtyDays - MAX_TIMER_DELAY_MS);
+    runNext();
+    expect(fired).toBe(1);
+    expect(now).toBe(thirtyDays);
+    expect(pending).toHaveLength(0);
+
+    // Cancel stops a pending chain.
+    now = 0;
+    const cancel = setLongTimeout(() => fired++, thirtyDays, port);
+    cancel();
+    expect(pending).toHaveLength(0);
+    expect(fired).toBe(1);
+  });
+});
+
 describe("pricing", () => {
   it("resolves decorated / dated ids to the family price and prices cache reads", () => {
     expect(resolveModelPricing("anthropic/claude-sonnet-4.6")).toMatchObject({ input_per_mtok: 3, output_per_mtok: 15 });
@@ -91,6 +147,54 @@ describe("usage derived from the log", () => {
     expect(snap.session.tokens).toBe(330);
     expect(snap.turn).toMatchObject({ tokens: 220, steps: 1 });
     expect(snap.last_call?.tokens).toBe(220);
+  });
+});
+
+describe("metered compaction calls", () => {
+  const compaction = (id: string | undefined, input: number, output: number) =>
+    ({
+      type: "span.compaction_summarize_end",
+      model: "claude-sonnet-4-6",
+      ...(id ? { model_request_start_id: id } : {}),
+      model_usage: { input_tokens: input, output_tokens: output },
+    }) as unknown as SessionEvent;
+
+  it("count toward tokens and cost but not steps or the next-call projection; legacy spans stay uncounted", () => {
+    const events = [user("u1"), span("m1", 1000, 100), compaction("c1", 500, 50), compaction(undefined, 9999, 9999)];
+    const snap = usageSnapshotFromEvents(events, { costOf: () => 0.001 });
+    expect(snap.turn).toEqual({ tokens: 1650, cost_usd: 0.002, steps: 1 });
+    expect(snap.last_call?.tokens).toBe(1100);
+    const rows = usageRowsFromEvents(events, { tenantId: "t", sessionId: "s" });
+    expect(rows.map((r) => [r.model_request_start_id, r.input_tokens + r.output_tokens])).toEqual([
+      ["m1", 1100],
+      ["c1", 550],
+    ]);
+  });
+
+  it("BudgetTracker.record(kind: compaction) matches the log view", () => {
+    const t = BudgetTracker.forRun({ agent: agent({ max_tokens_per_session: 3000, max_steps_per_turn: 1 }), events: [user("u1")] });
+    t.record({ input_tokens: 1000, output_tokens: 100 });
+    t.record({ input_tokens: 500, output_tokens: 50 }, { kind: "compaction" });
+    expect(t.usage.turn.steps).toBe(1);
+    expect(t.usage.session.tokens).toBe(1650);
+    expect(t.usage.last_call?.tokens).toBe(1100);
+  });
+});
+
+describe("remainingOutputTokens (provider output cap)", () => {
+  it("is the smallest limit - used - projected input over the token limits, at least 1", () => {
+    expect(BudgetTracker.forRun({ agent: agent({ max_cost_usd_per_session: 1 }), events: [] }).remainingOutputTokens()).toBeNull();
+    const t = BudgetTracker.forRun({
+      agent: agent({ max_tokens_per_turn: 3000, max_tokens_per_session: 10_000 }),
+      events: [user("u0"), span("m0", 4000, 400), user("u1")],
+      context: { tenant: { limits: { daily_tokens: 20_000 }, used: { tokens: 0, cost_usd: 0 } } },
+    });
+    // turn: 3000 - 0 - 4400 → floor 1; session: 10000 - 4400 - 4400 = 1200
+    expect(t.remainingOutputTokens()).toBe(1);
+    const fresh = BudgetTracker.forRun({ agent: agent({ max_tokens_per_turn: 3000 }), events: [user("u1")] });
+    expect(fresh.remainingOutputTokens()).toBe(3000);
+    fresh.record({ input_tokens: 1000, output_tokens: 100 });
+    expect(fresh.remainingOutputTokens()).toBe(800); // 3000 - 1100 - 1100
   });
 });
 
@@ -167,7 +271,10 @@ describe("stop marker → stop_reason", () => {
 });
 
 describe("SessionStateMachine wall-clock budget", () => {
-  function setup(run: (ctx: { abortSignal: AbortSignal; eventLog: InMemoryEventLog }) => Promise<void>) {
+  function setup(
+    run: (ctx: { abortSignal: AbortSignal; eventLog: InMemoryEventLog }) => Promise<void>,
+    budget: Record<string, number> = { max_turn_wall_clock_seconds: 0.2 },
+  ) {
     const log = new InMemoryEventLog(() => {});
     const sandbox: SandboxExecutor = { exec: async () => "", readFile: async () => "", writeFile: async () => "" };
     const adapter: RuntimeAdapter = {
@@ -185,7 +292,7 @@ describe("SessionStateMachine wall-clock budget", () => {
       tenantId: "t",
       adapter,
       sandbox,
-      loadAgent: async () => agent({ max_turn_wall_clock_seconds: 0.2 }),
+      loadAgent: async () => agent(budget),
       buildTools: async () => ({}),
       buildModel: async () => ({}) as LanguageModel,
       buildHarness: () => ({ run: (ctx) => run(ctx as never) }),
@@ -217,6 +324,29 @@ describe("SessionStateMachine wall-clock budget", () => {
     const idle = events.filter((e) => e.type === "session.status_idle").at(-1)!;
     expect(idle.stop_reason).toMatchObject({ type: "budget_exhausted", budget: "max_turn_wall_clock_seconds" });
     expect(events.some((e) => e.type === "session.error")).toBe(false);
+  });
+
+  it("a wall-clock budget above the 2^31-1 ms timer limit doesn't abort the turn (QA finding 4)", async () => {
+    // 30 days: rejected by validation now, but agentBudgetOf stays lenient
+    // for rows saved before the cap, so the timer itself must not overflow.
+    const warn = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+    try {
+      const { machine, log } = setup(
+        async ({ eventLog }) => {
+          await new Promise((r) => setTimeout(r, 100));
+          eventLog.append({ type: "agent.message", content: [{ type: "text", text: "done" }] } as SessionEvent);
+        },
+        { max_turn_wall_clock_seconds: 30 * 24 * 60 * 60 },
+      );
+      const result = await machine.runTurn("a", { type: "user.message", content: [{ type: "text", text: "go" }] } as UserMessageEvent);
+      expect(result.stopReason).toEqual({ type: "end_turn" });
+      const events = log.getEvents() as Array<Record<string, unknown>>;
+      expect(events.some((e) => e.type === "session.warning")).toBe(false);
+      expect(events.some((e) => e.type === "agent.message")).toBe(true);
+      expect(warn.mock.calls.some((c) => String(c[0]).includes("TimeoutOverflow") || String(c[1]).includes("TimeoutOverflow"))).toBe(false);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("a harness-written budget marker becomes the turn's stop_reason", async () => {

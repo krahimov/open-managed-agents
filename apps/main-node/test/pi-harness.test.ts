@@ -260,18 +260,21 @@ describe("pi harness: run() against a faux pi-ai model", () => {
     expect(types).toEqual([
       "span.model_request_start",
       "span.model_first_token",
+      // Usage first (docs/budgets.md): the completed call's usage span is
+      // durable before the step's output, its tools and its final reply.
+      "span.model_request_end",
       "agent.thinking",
       "agent.message",
       "agent.tool_use",
-      "span.model_request_end",
       "agent.tool_result",
       "span.model_request_start",
       "span.model_first_token",
-      "agent.message",
       "span.model_request_end",
+      "agent.message",
     ]);
     // Write-ahead: the durable tool_use landed before execute ran.
     expect(writesAtExecute).toContain("persist:agent.tool_use");
+    expect(writesAtExecute).toContain("persist:span.model_request_end");
     expect(writesAtExecute).not.toContain("persist:agent.tool_result");
 
     const toolUse = writes.find((w) => w.event.type === "agent.tool_use")!;

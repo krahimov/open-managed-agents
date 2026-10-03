@@ -1,6 +1,8 @@
 import { generateText } from "ai";
 import type { ModelMessage, LanguageModel } from "ai";
 import type { ContentBlock, SessionEvent } from "@open-managed-agents/shared";
+import { generateEventId } from "@open-managed-agents/shared";
+import type { ModelCallUsage } from "@open-managed-agents/session-runtime";
 import { eventsToMessages } from "../runtime/history";
 import { isOpenAiCompatModel, sanitizeOpenAiToolNames, reasoningProviderOptions } from "./provider";
 import type { HarnessRuntime } from "./interface";
@@ -52,8 +54,83 @@ export interface CompactionStrategy {
        * from the main agent's calls.
        */
       runtime?: HarnessRuntime;
+      /**
+       * Budget hooks (docs/budgets.md). The summarize call is always metered
+       * — its span.compaction_summarize_end carries model_request_start_id +
+       * model_usage and is persisted, so it gets a usage row — and the
+       * harness passes these to price it and add it to its budget tracker.
+       */
+      meter?: CompactionMeter;
     },
   ): Promise<CompactionResult | null>;
+}
+
+/** Budget hooks for the summarize call (see CompactionStrategy.compact). */
+export interface CompactionMeter {
+  /** Estimated USD cost (stamped as cost_usd on the end span); null = unpriced. */
+  costOf?(usage: ModelCallUsage): number | null;
+  /** The call finished and its usage span is durable. */
+  onUsage?(usage: ModelCallUsage): void;
+  /** Output-token allowance left under the token budgets (caps the summary). */
+  maxOutputTokens?: number | null;
+}
+
+function summaryTokenCap(configured: number | undefined, meter: CompactionMeter | undefined): number {
+  const cap = configured ?? 2000;
+  const room = meter?.maxOutputTokens;
+  return typeof room === "number" && room > 0 ? Math.min(cap, room) : cap;
+}
+
+/**
+ * Open the summarize call's span. The id pairs it with the end span and is
+ * the call's usage key (model_usage_events is unique on
+ * session + model_request_start_id).
+ */
+function openCompactionSpan(runtime: HarnessRuntime | undefined, modelId: string): { id: string; modelId: string } {
+  const id = generateEventId();
+  runtime?.broadcast({ type: "span.compaction_summarize_start", id, model: modelId } as SessionEvent);
+  return { id, modelId };
+}
+
+/**
+ * Close the summarize span with its usage + estimated cost, durably (the
+ * persist path when the runtime has one) BEFORE the strategy returns, so
+ * the call is accounted even if the turn dies right after.
+ */
+async function closeCompactionSpan(
+  runtime: HarnessRuntime | undefined,
+  span: { id: string; modelId: string },
+  result: {
+    usage?: {
+      inputTokens?: number;
+      outputTokens?: number;
+      inputTokenDetails?: { cacheReadTokens?: number; cacheWriteTokens?: number };
+    };
+    finishReason?: string;
+    text?: unknown;
+  },
+  meter: CompactionMeter | undefined,
+): Promise<void> {
+  const usage: ModelCallUsage | undefined = result.usage
+    ? {
+        input_tokens: result.usage.inputTokens ?? 0,
+        output_tokens: result.usage.outputTokens ?? 0,
+        cache_read_input_tokens: result.usage.inputTokenDetails?.cacheReadTokens ?? 0,
+        cache_creation_input_tokens: result.usage.inputTokenDetails?.cacheWriteTokens ?? 0,
+      }
+    : undefined;
+  const event = {
+    type: "span.compaction_summarize_end",
+    model: span.modelId,
+    model_request_start_id: span.id,
+    model_usage: usage,
+    ...(usage && meter?.costOf ? { cost_usd: meter.costOf(usage) } : {}),
+    finish_reason: result.finishReason,
+    final_text_length: typeof result.text === "string" ? result.text.length : 0,
+  } as SessionEvent;
+  if (runtime?.persist) await runtime.persist(event);
+  else runtime?.broadcast(event);
+  if (usage) meter?.onUsage?.(usage);
 }
 
 export interface CacheStrategyApplied {
@@ -142,7 +219,7 @@ export class SummarizeCompactionStrategy implements CompactionStrategy {
 
   async compact(
     events: SessionEvent[],
-    { model, systemPrompt, tools, applyCacheStrategy, runtime }: {
+    { model, systemPrompt, tools, applyCacheStrategy, runtime, meter }: {
       model: LanguageModel;
       contextWindowTokens: number;
       systemPrompt: string;
@@ -155,6 +232,7 @@ export class SummarizeCompactionStrategy implements CompactionStrategy {
         messages: ModelMessage[],
       ) => CacheStrategyApplied;
       runtime?: HarnessRuntime;
+      meter?: CompactionMeter;
     },
   ): Promise<CompactionResult | null> {
     const messages = eventsToMessages(events);
@@ -181,7 +259,7 @@ export class SummarizeCompactionStrategy implements CompactionStrategy {
     };
 
     const modelId = (model as { modelId?: string })?.modelId ?? "unknown";
-    runtime?.broadcast({ type: "span.compaction_summarize_start", model: modelId });
+    const span = openCompactionSpan(runtime, modelId);
 
     const result = await generateText({
       model,
@@ -193,7 +271,7 @@ export class SummarizeCompactionStrategy implements CompactionStrategy {
       // Per Anthropic docs, tool_choice is NOT in the cache key — safe.
       toolChoice: "none",
       messages: [...cached.messages, summarizeRequest],
-      maxOutputTokens: this.opts.maxSummaryTokens ?? 2000,
+      maxOutputTokens: summaryTokenCap(this.opts.maxSummaryTokens, meter),
       // Same floor as the main loop: OpenAI reasoning models on
       // chat/completions 400 when tools ride along without
       // reasoning_effort:'none' — tool_choice doesn't exempt them. Level
@@ -208,18 +286,7 @@ export class SummarizeCompactionStrategy implements CompactionStrategy {
       ),
     });
 
-    runtime?.broadcast({
-      type: "span.compaction_summarize_end",
-      model: modelId,
-      model_usage: result.usage ? {
-        input_tokens: result.usage.inputTokens ?? 0,
-        output_tokens: result.usage.outputTokens ?? 0,
-        cache_read_input_tokens: result.usage.inputTokenDetails?.cacheReadTokens ?? 0,
-        cache_creation_input_tokens: result.usage.inputTokenDetails?.cacheWriteTokens ?? 0,
-      } : undefined,
-      finish_reason: result.finishReason,
-      final_text_length: typeof result.text === "string" ? result.text.length : 0,
-    });
+    await closeCompactionSpan(runtime, span, result, meter);
 
     return {
       summary: [{ type: "text", text: result.text }],
@@ -342,7 +409,7 @@ export class CCStyleCompactionStrategy implements CompactionStrategy {
 
   async compact(
     events: SessionEvent[],
-    { model, runtime }: {
+    { model, runtime, meter }: {
       model: LanguageModel;
       contextWindowTokens: number;
       systemPrompt: string;
@@ -355,6 +422,7 @@ export class CCStyleCompactionStrategy implements CompactionStrategy {
         messages: ModelMessage[],
       ) => CacheStrategyApplied;
       runtime?: HarnessRuntime;
+      meter?: CompactionMeter;
     },
   ): Promise<CompactionResult | null> {
     const allMessages = eventsToMessages(events);
@@ -372,7 +440,7 @@ export class CCStyleCompactionStrategy implements CompactionStrategy {
     };
 
     const modelId = (model as { modelId?: string })?.modelId ?? "unknown";
-    runtime?.broadcast({ type: "span.compaction_summarize_start", model: modelId });
+    const span = openCompactionSpan(runtime, modelId);
 
     // Note what we are NOT passing:
     //   - The main agent's system prompt (we use our own short one)
@@ -388,21 +456,10 @@ export class CCStyleCompactionStrategy implements CompactionStrategy {
       model,
       system: CC_STYLE_SYSTEM_PROMPT,
       messages: [...safeMessages, summarizeRequest],
-      maxOutputTokens: this.opts.maxSummaryTokens ?? 2000,
+      maxOutputTokens: summaryTokenCap(this.opts.maxSummaryTokens, meter),
     });
 
-    runtime?.broadcast({
-      type: "span.compaction_summarize_end",
-      model: modelId,
-      model_usage: result.usage ? {
-        input_tokens: result.usage.inputTokens ?? 0,
-        output_tokens: result.usage.outputTokens ?? 0,
-        cache_read_input_tokens: result.usage.inputTokenDetails?.cacheReadTokens ?? 0,
-        cache_creation_input_tokens: result.usage.inputTokenDetails?.cacheWriteTokens ?? 0,
-      } : undefined,
-      finish_reason: result.finishReason,
-      final_text_length: typeof result.text === "string" ? result.text.length : 0,
-    });
+    await closeCompactionSpan(runtime, span, result, meter);
 
     // Empty-summary defense: if the model returned no text (provider quirk,
     // policy refusal, or the conversation was too short to summarize), do
@@ -463,7 +520,7 @@ export class OpenCodeStyleCompactionStrategy implements CompactionStrategy {
 
   async compact(
     events: SessionEvent[],
-    { model, runtime }: {
+    { model, runtime, meter }: {
       model: LanguageModel;
       contextWindowTokens: number;
       systemPrompt: string;
@@ -476,6 +533,7 @@ export class OpenCodeStyleCompactionStrategy implements CompactionStrategy {
         messages: ModelMessage[],
       ) => CacheStrategyApplied;
       runtime?: HarnessRuntime;
+      meter?: CompactionMeter;
     },
   ): Promise<CompactionResult | null> {
     const allMessages = eventsToMessages(events);
@@ -489,27 +547,16 @@ export class OpenCodeStyleCompactionStrategy implements CompactionStrategy {
     };
 
     const modelId = (model as { modelId?: string })?.modelId ?? "unknown";
-    runtime?.broadcast({ type: "span.compaction_summarize_start", model: modelId });
+    const span = openCompactionSpan(runtime, modelId);
 
     const result = await generateText({
       model,
       system: OPENCODE_STYLE_SYSTEM_PROMPT,
       messages: [...cleanedMessages, summarizeRequest],
-      maxOutputTokens: this.opts.maxSummaryTokens ?? 2000,
+      maxOutputTokens: summaryTokenCap(this.opts.maxSummaryTokens, meter),
     });
 
-    runtime?.broadcast({
-      type: "span.compaction_summarize_end",
-      model: modelId,
-      model_usage: result.usage ? {
-        input_tokens: result.usage.inputTokens ?? 0,
-        output_tokens: result.usage.outputTokens ?? 0,
-        cache_read_input_tokens: result.usage.inputTokenDetails?.cacheReadTokens ?? 0,
-        cache_creation_input_tokens: result.usage.inputTokenDetails?.cacheWriteTokens ?? 0,
-      } : undefined,
-      finish_reason: result.finishReason,
-      final_text_length: typeof result.text === "string" ? result.text.length : 0,
-    });
+    await closeCompactionSpan(runtime, span, result, meter);
 
     if (typeof result.text !== "string" || result.text.trim().length === 0) {
       return null;

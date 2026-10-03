@@ -31,6 +31,7 @@ import { SETUP_KICKOFF_NEW, setupPath, startSetupSession } from "./setup-session
 import {
   BudgetFields,
   EMPTY_BUDGET_DRAFT,
+  budgetDraftErrorSummary,
   budgetFromDraft,
   draftFromBudget,
   type BudgetDraft,
@@ -1028,10 +1029,9 @@ export function AgentFormDialog({
     }
   };
 
-  const budgetError = (): string | null => {
-    const errs = Object.keys(budgetFromDraft(form.budget).errors);
-    return errs.length ? `Budget: invalid ${errs.join(", ")}` : null;
-  };
+  // Invalid budget input blocks the save (a bad entry must never be saved
+  // as "no limit"); the field shows the inline error too.
+  const budgetError = (): string | null => budgetDraftErrorSummary(form.budget);
 
   const create = async () => {
     setCreateError("");

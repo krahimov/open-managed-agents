@@ -272,6 +272,32 @@ export class PiEventBridge {
     this.usage.input += msg.usage.input + msg.usage.cacheRead + msg.usage.cacheWrite;
     this.usage.output += msg.usage.output;
 
+    // Usage first (docs/budgets.md): the provider response is complete, so
+    // make its usage durable BEFORE the step's output — before any tool can
+    // run and before the step_final reply that crash recovery finalizes
+    // from. An abort during a tool or a crash after the reply can't lose
+    // the call. One span per model_request_start_id; the usage table is
+    // unique on it.
+    if (this.spanId) {
+      // Same semantics as default-loop (AI SDK inputTokens = total incl. cache).
+      const modelUsage = piUsageToModelUsage(msg.usage);
+      await persist({
+        type: "span.model_request_end",
+        model: this.opts.modelLabel,
+        model_request_start_id: this.spanId,
+        provider_response_id: msg.responseId,
+        model_usage: modelUsage,
+        ...(this.opts.costOf ? { cost_usd: this.opts.costOf(modelUsage) } : {}),
+        finish_reason: finishReasonOf(msg.stopReason),
+        final_text_length: msg.content
+          .filter((c) => c.type === "text")
+          .reduce((n, c) => n + (c as { text: string }).text.length, 0),
+        is_error: msg.stopReason === "error",
+        ...(msg.errorMessage ? { error_message: msg.errorMessage.slice(0, 500) } : {}),
+      } as SessionEvent);
+      this.spanId = null;
+    }
+
     if (msg.stopReason === "error" || msg.stopReason === "aborted") {
       // Partial output of a failed/aborted request is not committed as
       // canonical events: broadcastStreamEnd("aborted") lets the runtime
@@ -337,25 +363,6 @@ export class PiEventBridge {
       await this.closeLiveStreams("aborted");
     }
 
-    if (this.spanId) {
-      // Same semantics as default-loop (AI SDK inputTokens = total incl. cache).
-      const modelUsage = piUsageToModelUsage(msg.usage);
-      rt.broadcast({
-        type: "span.model_request_end",
-        model: this.opts.modelLabel,
-        model_request_start_id: this.spanId,
-        provider_response_id: msg.responseId,
-        model_usage: modelUsage,
-        ...(this.opts.costOf ? { cost_usd: this.opts.costOf(modelUsage) } : {}),
-        finish_reason: finishReasonOf(msg.stopReason),
-        final_text_length: msg.content
-          .filter((c) => c.type === "text")
-          .reduce((n, c) => n + (c as { text: string }).text.length, 0),
-        is_error: msg.stopReason === "error",
-        ...(msg.errorMessage ? { error_message: msg.errorMessage.slice(0, 500) } : {}),
-      } as SessionEvent);
-      this.spanId = null;
-    }
   }
 
   /**
@@ -491,8 +498,17 @@ export class PiHarness implements HarnessInterface {
 
     // 1. Compaction — reuse the platform strategies (they summarize with
     //    ctx.model via the AI SDK and persist agent.thread_context_compacted,
-    //    which the history projection below honors).
-    await this.#maybeCompact(ctx, resolved.model.contextWindow);
+    //    which the history projection below honors). Metered like default-
+    //    loop: the summarize call's usage is recorded and counted toward the
+    //    token / cost budgets (not toward max_steps_per_turn); if it used
+    //    the budget up, the turn stops before the first loop call.
+    if (await this.#maybeCompact(ctx, resolved.model.contextWindow, budget)) {
+      const postCompactionStop = budget.check();
+      if (postCompactionStop) {
+        await persistBudgetStop(postCompactionStop);
+        return;
+      }
+    }
 
     // 2. OpenAI's 128-tool cap — same budget default-loop applies.
     if (resolved.openAiToolNames && Object.keys(omaTools).length > OPENAI_MAX_TOOLS) {
@@ -546,6 +562,14 @@ export class PiHarness implements HarnessInterface {
     const maxSteps = budget.budget?.max_steps_per_turn ?? this.opts.maxSteps ?? budget.maxSteps;
     const streamFn: StreamFn = (model, context, options) => {
       bridge.onRequestStart();
+      // Token budget output cap (docs/budgets.md): a call may not produce
+      // more output than the budgets have room for. Input can't be capped.
+      const room = budget.remainingOutputTokens();
+      if (room !== null) {
+        const configured = options?.maxTokens ?? model.maxTokens;
+        const maxTokens = typeof configured === "number" && configured > 0 ? Math.min(configured, room) : room;
+        return resolved.streamFn(model, context, { ...options, maxTokens });
+      }
       return resolved.streamFn(model, context, options);
     };
     const config: AgentLoopConfig = {
@@ -560,6 +584,9 @@ export class PiHarness implements HarnessInterface {
       finishTurn: ({ message }) => {
         budget.record(piUsageToModelUsage(message.usage));
         if (message.stopReason === "error" || message.stopReason === "aborted") return undefined;
+        // Aborted while the tools ran (interrupt / wall-clock budget): don't
+        // start another model request just to have it cancelled.
+        if (runtime.abortSignal?.aborted) return { action: "end" };
         if (bridge.pendingThisTurn > 0) {
           bridge.pendingThisTurn = 0;
           return { action: "end" };
@@ -610,7 +637,8 @@ export class PiHarness implements HarnessInterface {
     }
   }
 
-  async #maybeCompact(ctx: HarnessContext, contextWindowTokens: number): Promise<void> {
+  /** Runs compaction when due; true when a summarize call was attempted. */
+  async #maybeCompact(ctx: HarnessContext, contextWindowTokens: number, budget: BudgetTracker): Promise<boolean> {
     const meta = (ctx.agent.metadata ?? {}) as Record<string, unknown>;
     const num = (k: string) => (typeof meta[k] === "number" ? (meta[k] as number) : undefined);
     const strategy = resolveCompactionStrategy(
@@ -623,7 +651,7 @@ export class PiHarness implements HarnessInterface {
       },
     );
     const events = ctx.runtime.history.getEvents();
-    if (!strategy.shouldCompact(events, { contextWindowTokens })) return;
+    if (!strategy.shouldCompact(events, { contextWindowTokens })) return false;
     try {
       const result = await strategy.compact(events, {
         model: ctx.model,
@@ -632,11 +660,16 @@ export class PiHarness implements HarnessInterface {
         tools: ctx.tools,
         applyCacheStrategy: (system, tools, messages) => ({ system, tools, messages }),
         runtime: ctx.runtime,
+        meter: {
+          costOf: (u) => budget.costOf(u),
+          onUsage: (u) => budget.record(u, { kind: "compaction" }),
+          maxOutputTokens: budget.remainingOutputTokens(),
+        },
       });
       const hasContent = result?.summary?.some(
         (b) => (b.type === "text" && b.text.trim().length > 0) || b.type === "image" || b.type === "document",
       );
-      if (!result || !hasContent) return;
+      if (!result || !hasContent) return true;
       ctx.runtime.broadcast({
         type: "agent.thread_context_compacted",
         original_message_count: result.original_message_count,
@@ -648,5 +681,6 @@ export class PiHarness implements HarnessInterface {
     } catch (err) {
       console.warn(`[pi compact] failed: ${(err as Error).message}`);
     }
+    return true;
   }
 }

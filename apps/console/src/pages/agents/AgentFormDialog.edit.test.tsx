@@ -71,7 +71,7 @@ afterEach(() => {
   fetchMock.mockReset();
 });
 
-function renderEdit(props: { onSaved?: () => void; onOpenSetup?: () => void } = {}) {
+function renderEdit(props: { onSaved?: () => void; onOpenSetup?: () => void; editAgent?: AgentRecord } = {}) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
@@ -79,7 +79,7 @@ function renderEdit(props: { onSaved?: () => void; onOpenSetup?: () => void } = 
         <AgentFormDialog
           open
           onClose={() => {}}
-          editAgent={agent}
+          editAgent={props.editAgent ?? agent}
           onSaved={props.onSaved}
           onOpenSetup={props.onOpenSetup}
           allAgents={[]}
@@ -149,5 +149,59 @@ describe("AgentFormDialog edit mode", () => {
     renderEdit({ onOpenSetup });
     fireEvent.click(screen.getByRole("button", { name: "Setup chat" }));
     expect(onOpenSetup).toHaveBeenCalledOnce();
+  });
+});
+
+describe("AgentFormDialog budget fields (QA finding 3)", () => {
+  const budgeted: AgentRecord = {
+    ...agent,
+    metadata: { ...agent.metadata, budget: { max_tokens_per_session: 2500, max_steps_per_turn: 10 } },
+  };
+  const postCalls = () =>
+    fetchMock.mock.calls.filter(([u, init]) => String(u).endsWith("/v1/agents/agent_1") && init?.method === "POST");
+
+  async function ready() {
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/v1/environments"))).toBe(true),
+    );
+    return screen.getByLabelText("Tokens per session") as HTMLInputElement;
+  }
+
+  it("non-numeric input blocks the save with an inline error instead of removing the limit", async () => {
+    const onSaved = vi.fn();
+    renderEdit({ onSaved, editAgent: budgeted });
+    const field = await ready();
+    expect(field.value).toBe("2500");
+    fireEvent.change(field, { target: { value: "e" } });
+    // The raw text stays visible and the field reports it.
+    expect(field.value).toBe("e");
+    expect(field).toHaveAttribute("aria-invalid", "true");
+    expect(screen.getByRole("alert")).toHaveTextContent(/Not a number/);
+
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByText(/Budget: Tokens per session: Not a number/)).toBeInTheDocument();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(postCalls()).toHaveLength(0);
+    expect(onSaved).not.toHaveBeenCalled();
+  });
+
+  it("rejects a wall-clock limit above 7 days", async () => {
+    renderEdit({ editAgent: budgeted });
+    await ready();
+    const wall = screen.getByLabelText("Turn wall-clock (seconds)");
+    fireEvent.change(wall, { target: { value: "2592000" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByText(/Turn wall-clock \(seconds\): Must be at most 604,800/)).toBeInTheDocument();
+    expect(postCalls()).toHaveLength(0);
+  });
+
+  it("an intentionally cleared field removes only that limit", async () => {
+    const onSaved = vi.fn();
+    renderEdit({ onSaved, editAgent: budgeted });
+    const field = await ready();
+    fireEvent.change(field, { target: { value: "" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    expect((savedBody().metadata as Record<string, unknown>).budget).toEqual({ max_steps_per_turn: 10 });
   });
 });

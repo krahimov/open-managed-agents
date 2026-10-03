@@ -44,7 +44,7 @@ import type {
 import type { LanguageModel } from "ai";
 import type { EventLogRepo } from "@open-managed-agents/event-log";
 import { recoverInterruptedState } from "./recovery";
-import { agentBudgetOf, budgetWarningEvent, turnDeadlineMs } from "./budget";
+import { agentBudgetOf, budgetWarningEvent, setLongTimeout, turnDeadlineMs } from "./budget";
 import { buildInterruptedToolResult, classifyTool, type ToolExecutionClass } from "./tool-classification";
 import type { OrphanTurn, RuntimeAdapter, TurnId } from "./ports";
 import type { SandboxExecutor } from "@open-managed-agents/sandbox";
@@ -139,6 +139,15 @@ export interface SessionMachineDeps {
     publish(event: SessionEvent): void;
     runHarnessTurn(msg: UserMessageEvent): Promise<void>;
   }): Promise<void>;
+
+  /** Optional model-usage reconcile (docs/budgets.md): insert the usage rows
+   *  the log implies but the usage table lacks. buildHarnessContext does this
+   *  on every harness run; the machine calls it on the paths that finish a
+   *  turn WITHOUT running the harness (turn already finalized, or finalized
+   *  from the log after a crash), so a crash between a usage span and its
+   *  row insert is repaired there too. Must be idempotent; failures are
+   *  logged, never fail the turn. */
+  reconcileUsage?(input: { agentId: string; events: SessionEvent[] }): Promise<void>;
 
   /** Publish a synthetic event to the hub (e.g. session.error,
    *  session.status_idle on recovery). The shell wires this with the
@@ -384,6 +393,7 @@ export class SessionStateMachine {
       }
       if (terminal) {
         if (opts.recoverOrphans) await this.onWake(log, { deferIdempotent: false });
+        await this.reconcileUsage(log, agentId);
         this.logger.log(
           `turn for ${(event as { id: string }).id} already completed; acknowledging without re-running`,
         );
@@ -421,7 +431,7 @@ export class SessionStateMachine {
     const promotedAt = Date.parse(String((alreadyPromoted as { processed_at?: string } | null)?.processed_at ?? ""));
     const turnStartedAt = Number.isFinite(promotedAt) ? promotedAt : Date.now();
     const deadline = turnDeadlineMs(budget, turnStartedAt);
-    let wallClockTimer: ReturnType<typeof setTimeout> | null = null;
+    let cancelWallClock: (() => void) | null = null;
     if (deadline !== null) {
       const fire = () =>
         controller.abort({
@@ -434,8 +444,9 @@ export class SessionStateMachine {
           },
         } satisfies TurnAbortReason);
       const ms = deadline - Date.now();
+      // setLongTimeout: a plain setTimeout above 2^31-1 ms fires after ~1 ms.
       if (ms <= 0) fire();
-      else wallClockTimer = setTimeout(fire, ms);
+      else cancelWallClock = setLongTimeout(fire, ms);
     }
 
     let ending: "completed" | "interrupted" | "budget" | "failed" | "silent" = "completed";
@@ -514,6 +525,10 @@ export class SessionStateMachine {
           this.logger.log(
             `turn for ${(event as { id: string }).id} already has its final model step; finalizing without a model call`,
           );
+          // The harness (whose context build backfills usage rows) isn't
+          // run, so reconcile here: the final step's usage span may be in
+          // the log without its row.
+          await this.reconcileUsage(log, agentId);
         } else {
           const userMessage = event.type === "user.message" ? event : RESUME_MESSAGE;
           pending = await this.runHarnessOnce(agent, tools, userMessage, controller.signal, log);
@@ -597,7 +612,7 @@ export class SessionStateMachine {
       }
     } finally {
       opts.signal?.removeEventListener("abort", onExternalAbort);
-      if (wallClockTimer) clearTimeout(wallClockTimer);
+      cancelWallClock?.();
       this.activeTurnId = null;
       if (this.activeController === controller) this.activeController = null;
       if (ending !== "silent") {
@@ -667,6 +682,16 @@ export class SessionStateMachine {
   }
 
   // ── helpers ─────────────────────────────────────────────────────────
+
+  /** deps.reconcileUsage over the whole log; best effort. */
+  private async reconcileUsage(log: EventLogRepo, agentId: string): Promise<void> {
+    if (!this.deps.reconcileUsage) return;
+    try {
+      await this.deps.reconcileUsage({ agentId, events: await this.readEvents(log) });
+    } catch (err) {
+      this.logger.warn(`model usage reconcile failed: ${errorMessage(err)}`);
+    }
+  }
 
   /**
    * One harness run. Waits for the harness runtime's queued writes

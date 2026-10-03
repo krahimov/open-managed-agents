@@ -903,12 +903,19 @@ export interface SpanCompactionSummarizeStartEvent extends EventBase {
 export interface SpanCompactionSummarizeEndEvent extends EventBase {
   type: "span.compaction_summarize_end";
   model?: string;
+  /** OMA extension (docs/budgets.md): the id of the matching
+   *  span.compaction_summarize_start. When present, the call is metered like
+   *  a model call — one model_usage_events row keyed by this id — and counts
+   *  toward token / cost budgets (not toward max_steps_per_turn). */
+  model_request_start_id?: string;
   model_usage?: {
     input_tokens: number;
     output_tokens: number;
     cache_read_input_tokens?: number;
     cache_creation_input_tokens?: number;
   };
+  /** OMA extension: estimated USD cost of the summarize call (null: unpriced). */
+  cost_usd?: number | null;
   finish_reason?: string;
   final_text_length?: number;
 }

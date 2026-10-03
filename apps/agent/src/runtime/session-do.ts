@@ -48,6 +48,8 @@ import {
   budgetStopFromEvents,
   budgetWarningEvent,
   findUnresolvedToolUses,
+  isUsageSpanEvent,
+  setLongTimeout,
   toolResultEventFor,
   turnDeadlineMs,
   usageRowFromEvent,
@@ -3403,8 +3405,10 @@ export class SessionDO extends DurableObject<Env> {
    * emitted exactly once per LLM step.
    */
   private maybeCreditCacheTokens(threadId: string, event: SessionEvent): void {
+    // Metered compaction calls (span.compaction_summarize_end with an id)
+    // get a usage row too; cache crediting below stays main-loop only.
+    if (isUsageSpanEvent(event)) this.maybeRecordModelUsage(threadId, event);
     if (event.type !== "span.model_request_end") return;
-    this.maybeRecordModelUsage(threadId, event);
     const usage = (event as unknown as {
       model_usage?: {
         cache_creation_input_tokens?: number;
@@ -3469,7 +3473,7 @@ export class SessionDO extends DurableObject<Env> {
       const tenantId = this.state.tenant_id;
       const sessionId = this.state.session_id;
       if (!tenantId || !sessionId) return;
-      if (!events.some((e) => e.type === "span.model_request_end")) return;
+      if (!events.some(isUsageSpanEvent)) return;
       const store = await this.modelUsageStore();
       await store?.recordFromEvents(events, { tenantId, sessionId, agentId: this.state.agent_id || null });
     } catch (err) {
@@ -4681,9 +4685,10 @@ export class SessionDO extends DurableObject<Env> {
     const turnBudget = agentBudgetOf(agent);
     const turnStartedAt = Date.now();
     const turnDeadline = turnDeadlineMs(turnBudget, turnStartedAt);
-    const wallClockTimer =
+    // setLongTimeout: a plain setTimeout above 2^31-1 ms fires after ~1 ms.
+    const cancelWallClock =
       turnDeadline !== null
-        ? setTimeout(() => {
+        ? setLongTimeout(() => {
             abortController.abort({
               kind: "budget",
               stop: {
@@ -5098,7 +5103,7 @@ export class SessionDO extends DurableObject<Env> {
       // The sandbox is still alive (container persists independently).
       // Client can send a new user.message to retry.
     } finally {
-      if (wallClockTimer) clearTimeout(wallClockTimer);
+      cancelWallClock?.();
       // Only delete if it's still ours — a sub-agent run within the same
       // thread may have temporarily replaced it. Same-thread re-entry is
       // mutex'd by _draining so this is theoretical safety only.
@@ -6069,6 +6074,16 @@ export class SessionDO extends DurableObject<Env> {
     }
     if (flushed > 0 || ended > 0) {
       console.log(`[finalize-stale] ended ${ended} stale turns, resume=${resume ? resume.attempt : "no"}`);
+    }
+    // A turn ended here never reaches the next turn-start reconcile on its
+    // own: backfill usage rows the log has but the tenant table lacks
+    // (eviction between a usage span and its row insert).
+    if (ended > 0) {
+      try {
+        await this.reconcileModelUsage(this.runtimeAdapter.eventLog.getEvents());
+      } catch (err) {
+        console.warn(`[finalize-stale] usage reconcile failed:`, err);
+      }
     }
 
     // After flipping any stale rows to idle, kick the queue. Without this

@@ -3,7 +3,9 @@
 //
 // Everything here is pure: usage is DERIVED from the session event log
 // (`span.model_request_end.model_usage`, one per model call, keyed by
-// `model_request_start_id`) plus the calls the current harness run made.
+// `model_request_start_id`; metered compaction calls use
+// `span.compaction_summarize_end` with the same key) plus the calls the
+// current harness run made.
 // That keeps enforcement crash-consistent — a resumed turn rebuilds the
 // same totals from the log, and nothing is double counted.
 //
@@ -29,6 +31,9 @@ export const BUDGET_WARNING_SOURCE = "budget_exhausted";
 export const DEFAULT_MAX_STEPS_PER_TURN = 100;
 
 const INTEGER_FIELDS = ["max_tokens_per_turn", "max_tokens_per_session", "max_steps_per_turn"] as const;
+/** Upper bound for `max_turn_wall_clock_seconds` (7 days). Longer values are
+ *  rejected rather than handed to a runtime timer. */
+export const MAX_TURN_WALL_CLOCK_SECONDS = 7 * 24 * 60 * 60;
 const NUMBER_FIELDS = ["max_cost_usd_per_session", "max_turn_wall_clock_seconds"] as const;
 export const AGENT_BUDGET_FIELDS: ReadonlyArray<keyof AgentBudget> = [...INTEGER_FIELDS, ...NUMBER_FIELDS];
 
@@ -56,6 +61,12 @@ export function parseAgentBudget(raw: unknown): { budget: AgentBudget | null; er
     }
     if ((INTEGER_FIELDS as readonly string[]).includes(key) && !Number.isInteger(value)) {
       return { budget: null, error: `metadata.budget.${key} must be a positive integer` };
+    }
+    if (key === "max_turn_wall_clock_seconds" && value > MAX_TURN_WALL_CLOCK_SECONDS) {
+      return {
+        budget: null,
+        error: `metadata.budget.${key} must be at most ${MAX_TURN_WALL_CLOCK_SECONDS} (7 days)`,
+      };
     }
     out[key as keyof AgentBudget] = value;
   }
@@ -229,9 +240,32 @@ export interface UsageSnapshot {
   last_call: UsageTotals | null;
 }
 
-/** Usage carried by one `span.model_request_end` event, or null. */
-export function spanUsageOf(e: SessionEvent): (ModelCallUsage & { model?: string; cost_usd?: number | null; model_request_start_id?: string }) | null {
-  if (e.type !== "span.model_request_end") return null;
+/** What a metered call was for. Compaction calls count toward token / cost
+ *  budgets but not toward `max_steps_per_turn` or the next-call projection. */
+export type MeteredCallKind = "model" | "compaction";
+
+/**
+ * Is `e` an event that records one metered model call? Every
+ * `span.model_request_end`, plus `span.compaction_summarize_end` events that
+ * carry a `model_request_start_id` (metered compaction calls; older
+ * compaction spans without an id were never counted and stay uncounted).
+ */
+export function isUsageSpanEvent(e: SessionEvent): boolean {
+  if (e.type === "span.model_request_end") return true;
+  return (
+    (e.type as string) === "span.compaction_summarize_end" &&
+    typeof (e as { model_request_start_id?: unknown }).model_request_start_id === "string"
+  );
+}
+
+/** Usage carried by one usage span event (see isUsageSpanEvent), or null. */
+export function spanUsageOf(e: SessionEvent): (ModelCallUsage & {
+  model?: string;
+  cost_usd?: number | null;
+  model_request_start_id?: string;
+  kind: MeteredCallKind;
+}) | null {
+  if (!isUsageSpanEvent(e)) return null;
   const ev = e as {
     model_usage?: ModelCallUsage;
     model?: string;
@@ -247,6 +281,7 @@ export function spanUsageOf(e: SessionEvent): (ModelCallUsage & { model?: string
     ...(ev.model ? { model: ev.model } : {}),
     ...(ev.cost_usd !== undefined ? { cost_usd: ev.cost_usd } : {}),
     ...(ev.model_request_start_id ? { model_request_start_id: ev.model_request_start_id } : {}),
+    kind: e.type === "span.model_request_end" ? "model" : "compaction",
   };
 }
 
@@ -270,7 +305,7 @@ export function usageSnapshotFromEvents(
       snap.turn = { tokens: 0, cost_usd: 0, steps: 0 };
       continue;
     }
-    if (e.type !== "span.model_request_end") continue;
+    if (!isUsageSpanEvent(e)) continue;
     const id = (e as { model_request_start_id?: string }).model_request_start_id;
     if (id) {
       if (seen.has(id)) continue;
@@ -278,7 +313,8 @@ export function usageSnapshotFromEvents(
     }
     const u = spanUsageOf(e);
     const onThread = threadOf(e) === thread;
-    if (onThread) snap.turn.steps++;
+    const compaction = e.type !== "span.model_request_end";
+    if (onThread && !compaction) snap.turn.steps++;
     if (!u) continue;
     const tokens = callTokens(u);
     const cost = typeof u.cost_usd === "number" ? u.cost_usd : (opts.costOf?.(u, u.model) ?? 0);
@@ -287,7 +323,7 @@ export function usageSnapshotFromEvents(
     if (onThread) {
       snap.turn.tokens += tokens;
       snap.turn.cost_usd += cost;
-      snap.last_call = { tokens, cost_usd: cost };
+      if (!compaction) snap.last_call = { tokens, cost_usd: cost };
     }
   }
   return snap;
@@ -363,9 +399,14 @@ export class BudgetTracker {
     return estimateCostUsd(u, this.pricing);
   }
 
-  /** Account one finished model call of this run. */
-  record(u: ModelCallUsage | null | undefined): void {
-    this.snap.turn.steps++;
+  /**
+   * Account one finished model call of this run. A `compaction` call adds
+   * tokens and cost but is not a loop step and doesn't change the next-call
+   * projection (the compacted prompt is smaller, not larger).
+   */
+  record(u: ModelCallUsage | null | undefined, opts: { kind?: MeteredCallKind } = {}): void {
+    const compaction = opts.kind === "compaction";
+    if (!compaction) this.snap.turn.steps++;
     if (!u) return;
     const tokens = callTokens(u);
     const cost = this.costOf(u) ?? 0;
@@ -373,7 +414,7 @@ export class BudgetTracker {
     this.snap.session.cost_usd += cost;
     this.snap.turn.tokens += tokens;
     this.snap.turn.cost_usd += cost;
-    this.snap.last_call = { tokens, cost_usd: cost };
+    if (!compaction) this.snap.last_call = { tokens, cost_usd: cost };
     if (this.tenant) {
       this.tenant = {
         ...this.tenant,
@@ -402,6 +443,28 @@ export class BudgetTracker {
     });
     for (const c of calls) copy.record(c);
     return copy.check();
+  }
+
+  /**
+   * Output-token allowance for the next call under the token budgets, or
+   * null when no token budget applies: the smallest
+   * `limit - used - projected input` over the per-turn, per-session and
+   * tenant-daily token limits. The projected input is the previous call's
+   * input + output, the least the next prompt sends again. Never below 1,
+   * because check() already refuses a call once a limit is reached. Input
+   * tokens can't be capped, so a call can still overshoot by however much
+   * its prompt grew beyond the projection.
+   */
+  remainingOutputTokens(): number | null {
+    const b = this.budget ?? {};
+    const projected = this.snap.last_call?.tokens ?? 0;
+    const room: number[] = [];
+    if (typeof b.max_tokens_per_turn === "number") room.push(b.max_tokens_per_turn - this.snap.turn.tokens);
+    if (typeof b.max_tokens_per_session === "number") room.push(b.max_tokens_per_session - this.snap.session.tokens);
+    const daily = this.tenant?.limits.daily_tokens;
+    if (this.tenant && typeof daily === "number") room.push(daily - this.tenant.used.tokens);
+    if (room.length === 0) return null;
+    return Math.max(1, Math.floor(Math.min(...room) - projected));
   }
 
   /**
@@ -504,6 +567,49 @@ export function budgetStopFromEvents(turnEvents: SessionEvent[], threadId?: stri
     };
   }
   return null;
+}
+
+/** Largest delay setTimeout accepts (2^31 - 1 ms, about 24.8 days). Node and
+ *  Workers turn anything larger into a ~1 ms timeout. */
+export const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+export interface TimerPort {
+  setTimeout(cb: () => void, ms: number): unknown;
+  clearTimeout(handle: unknown): void;
+  now(): number;
+}
+
+const SYSTEM_TIMERS: TimerPort = {
+  setTimeout: (cb, ms) => setTimeout(cb, ms),
+  clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+  now: () => Date.now(),
+};
+
+/**
+ * setTimeout for any delay: waits in chunks of at most MAX_TIMER_DELAY_MS
+ * and re-arms until the deadline (measured with `now()`, so chunks don't
+ * drift). Returns a cancel function.
+ */
+export function setLongTimeout(fn: () => void, delayMs: number, timers: TimerPort = SYSTEM_TIMERS): () => void {
+  const deadline = timers.now() + Math.max(0, delayMs);
+  let handle: unknown = null;
+  let cancelled = false;
+  const arm = () => {
+    handle = null;
+    if (cancelled) return;
+    const left = deadline - timers.now();
+    if (left <= 0) {
+      fn();
+      return;
+    }
+    handle = timers.setTimeout(arm, Math.min(left, MAX_TIMER_DELAY_MS));
+  };
+  arm();
+  return () => {
+    cancelled = true;
+    if (handle !== null) timers.clearTimeout(handle);
+    handle = null;
+  };
 }
 
 /** Wall-clock deadline (ms epoch) for a turn that started at `startedAtMs`. */
