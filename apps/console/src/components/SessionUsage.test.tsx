@@ -1,6 +1,6 @@
 import { beforeEach, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { BudgetStopNotice, SessionUsageBadge, formatTokens, formatUsd } from "./SessionUsage";
+import { BudgetStopNotice, SessionUsageBadge, formatTokens, formatUsd, usageRefreshKey } from "./SessionUsage";
 import { budgetFromDraft, draftFromBudget, EMPTY_BUDGET_DRAFT } from "../pages/agents/BudgetFields";
 
 const api = vi.hoisted(() => vi.fn());
@@ -80,4 +80,19 @@ it("agent form budget draft round-trips and validates", () => {
   expect(budget).toEqual({ max_tokens_per_turn: 5000, max_cost_usd_per_session: 1.5 });
   expect(errors).toEqual({ max_steps_per_turn: "Must be a whole number" });
   expect(draftFromBudget({ max_tokens_per_turn: 5000 })).toEqual({ ...EMPTY_BUDGET_DRAFT, max_tokens_per_turn: "5000" });
+});
+
+it("refreshes on compaction-only budget stops and when the panel opens (budgets QA r2)", async () => {
+  // A turn can stop on its budget right after a metered compaction call,
+  // with no further span.model_request_end — the key must still change.
+  const before = [{ type: "span.model_request_end" }, { type: "span.model_request_end" }];
+  const after = [...before, { type: "span.compaction_summarize_end" }, { type: "session.status_idle" }];
+  expect(usageRefreshKey(after)).toBeGreaterThan(usageRefreshKey(before));
+
+  api.mockResolvedValue(report);
+  render(<SessionUsageBadge sessionId="sess_1" refreshKey={1} />);
+  const badge = await screen.findByRole("button", { name: "12k tokens · $0.03" });
+  const calls = api.mock.calls.length;
+  fireEvent.click(badge);
+  await waitFor(() => expect(api.mock.calls.length).toBe(calls + 1));
 });

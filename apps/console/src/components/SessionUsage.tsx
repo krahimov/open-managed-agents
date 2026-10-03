@@ -49,18 +49,38 @@ export function budgetLabel(name: string): string {
   return BUDGET_LABELS[name as BudgetName]?.label ?? name;
 }
 
+/**
+ * Refresh key for SessionUsageBadge: changes whenever metered usage may have
+ * changed. Main model calls (span.model_request_end), metered compaction
+ * calls (span.compaction_summarize_end) and turn ends (session.status_idle)
+ * all count — a turn can stop on its budget right after a compaction call,
+ * with no further model_request_end to trigger a refetch (budgets QA r2).
+ */
+const USAGE_REFRESH_TYPES = new Set([
+  "span.model_request_end",
+  "span.compaction_summarize_end",
+  "session.status_idle",
+]);
+
+export function usageRefreshKey(events: ReadonlyArray<{ type: string }>): number {
+  let n = 0;
+  for (const e of events) if (USAGE_REFRESH_TYPES.has(e.type)) n++;
+  return n;
+}
+
 export function SessionUsageBadge({
   sessionId,
   refreshKey,
 }: {
   sessionId: string;
-  /** Changes whenever a model call finished (e.g. count of
-   *  span.model_request_end events) — triggers a refetch. */
+  /** Changes whenever metered usage may have changed (see
+   *  usageRefreshKey) — triggers a refetch. */
   refreshKey?: number | string;
 }) {
   const { api } = useApi();
   const [report, setReport] = useState<ModelUsageReport | null>(null);
   const [open, setOpen] = useState(false);
+  const [openedAt, setOpenedAt] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -76,14 +96,18 @@ export function SessionUsageBadge({
     return () => {
       cancelled = true;
     };
-  }, [api, sessionId, refreshKey]);
+  }, [api, sessionId, refreshKey, openedAt]);
 
   if (!report || (report.totals.model_calls === 0 && !report.budget)) return null;
   const t = report.totals;
   const label = `${formatTokens(t.total_tokens)} tokens${t.cost_usd !== null ? ` · ${formatUsd(t.cost_usd)}` : ""}`;
   return (
     <span className="relative">
-      <Badge label={label} title="Model token usage and estimated cost" onClick={() => setOpen((v) => !v)} />
+      <Badge label={label} title="Model token usage and estimated cost" onClick={() => {
+          // Opening the panel always refetches, so it can't show stale totals.
+          if (!open) setOpenedAt(Date.now());
+          setOpen((v) => !v);
+        }} />
       {open && (
         <div
           role="dialog"

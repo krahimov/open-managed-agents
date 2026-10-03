@@ -12,7 +12,7 @@ import { AccessRequestCard } from "../components/AccessRequestCard";
 import { grantedRequestIdsOf } from "./agents/SessionChat";
 import { AmbientRuleCard } from "../components/AmbientRuleCard";
 import { SkillRequestCard } from "../components/SkillRequestCard";
-import { BudgetStopNotice, SessionUsageBadge } from "../components/SessionUsage";
+import { BudgetStopNotice, SessionUsageBadge, usageRefreshKey } from "../components/SessionUsage";
 import { Button } from "@/components/ui/button";
 import { AgentIcon, ClockIcon, DurationIcon, EnvIcon, VaultIcon } from "../components/icons";
 import { FilesPanel, ResourcePanel } from "./session-detail/Panels";
@@ -840,7 +840,7 @@ export function SessionDetail() {
           {id && (
             <SessionUsageBadge
               sessionId={id}
-              refreshKey={events.filter((e) => e.type === "span.model_request_end").length}
+              refreshKey={usageRefreshKey(events)}
             />
           )}
           {sessionMeta.createdAt && <RelativeTimeBadge iso={sessionMeta.createdAt} />}
