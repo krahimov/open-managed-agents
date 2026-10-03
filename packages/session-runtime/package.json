@@ -9,7 +9,9 @@
     "./tool-classification": "./src/tool-classification.ts",
     "./ports": "./src/ports.ts",
     "./adapter": "./src/adapter.ts",
-    "./machine": "./src/machine.ts"
+    "./machine": "./src/machine.ts",
+    "./budget": "./src/budget.ts",
+    "./usage-store": "./src/usage-store.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

@@ -38,7 +38,15 @@ import type { AgentEvent, AgentLoopConfig, AgentMessage, StreamFn } from "@earen
 import type { ToolSet } from "ai";
 import type { AgentConfig, SessionEvent } from "@open-managed-agents/shared";
 import { classifyExternalError, generateEventId, ModelError, OmaError } from "@open-managed-agents/shared";
-import { classifyTool, idempotencyKeyFor } from "@open-managed-agents/session-runtime";
+import {
+  BudgetTracker,
+  budgetStopFromEvents,
+  budgetWarningEvent,
+  classifyTool,
+  idempotencyKeyFor,
+  type ModelCallUsage,
+} from "@open-managed-agents/session-runtime";
+import type { BudgetExhaustedStopReason } from "@open-managed-agents/shared";
 import type { HarnessContext, HarnessInterface, HarnessRuntime } from "../interface";
 import { eventsToMessagesAsync } from "../../runtime/history";
 import { toolCallEvents, toolResultEvents } from "../default-loop";
@@ -104,6 +112,18 @@ export interface PiEventBridgeOptions {
   /** OMA tool lookup, for execution-class classification. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   omaTools: Record<string, any>;
+  /** Estimated cost of one call (stamped as span.model_request_end.cost_usd). */
+  costOf?: (usage: ModelCallUsage) => number | null;
+}
+
+/** pi usage → the span.model_request_end.model_usage shape (input incl. cache). */
+export function piUsageToModelUsage(u: AssistantMessage["usage"]): ModelCallUsage {
+  return {
+    input_tokens: u.input + u.cacheRead + u.cacheWrite,
+    output_tokens: u.output,
+    cache_read_input_tokens: u.cacheRead,
+    cache_creation_input_tokens: u.cacheWrite,
+  };
 }
 
 /**
@@ -318,18 +338,15 @@ export class PiEventBridge {
     }
 
     if (this.spanId) {
+      // Same semantics as default-loop (AI SDK inputTokens = total incl. cache).
+      const modelUsage = piUsageToModelUsage(msg.usage);
       rt.broadcast({
         type: "span.model_request_end",
         model: this.opts.modelLabel,
         model_request_start_id: this.spanId,
         provider_response_id: msg.responseId,
-        model_usage: {
-          // Same semantics as default-loop (AI SDK inputTokens = total incl. cache).
-          input_tokens: msg.usage.input + msg.usage.cacheRead + msg.usage.cacheWrite,
-          output_tokens: msg.usage.output,
-          cache_read_input_tokens: msg.usage.cacheRead,
-          cache_creation_input_tokens: msg.usage.cacheWrite,
-        },
+        model_usage: modelUsage,
+        ...(this.opts.costOf ? { cost_usd: this.opts.costOf(modelUsage) } : {}),
         finish_reason: finishReasonOf(msg.stopReason),
         final_text_length: msg.content
           .filter((c) => c.type === "text")
@@ -449,6 +466,29 @@ export class PiHarness implements HarnessInterface {
           hasTools: Object.keys(omaTools).length > 0,
         });
 
+    // Budgets (docs/budgets.md) — same contract as default-loop: usage so
+    // far from the log, this run's calls recorded in finishTurn, checked
+    // before the first call and before every further one. Orphans were
+    // reconciled above, so stopping here leaves no tool call unresolved.
+    const budgetThread = turnThread ?? "sthr_primary";
+    const budget = BudgetTracker.forRun({
+      agent,
+      events: runtime.history.getEvents(),
+      threadId: budgetThread,
+      context: ctx.budget,
+      pricingModel: resolved.model.id,
+    });
+    const persistBudgetStop = async (stop: BudgetExhaustedStopReason) => {
+      if (budgetStopFromEvents(runtime.history.getEvents(), budgetThread)) return;
+      await persist(budgetWarningEvent(stop, budgetThread));
+    };
+    const preStop = budget.check();
+    if (preStop) {
+      await persistBudgetStop(preStop);
+      return;
+    }
+    let budgetStop: BudgetExhaustedStopReason | null = null;
+
     // 1. Compaction — reuse the platform strategies (they summarize with
     //    ctx.model via the AI SDK and persist agent.thread_context_compacted,
     //    which the history projection below honors).
@@ -485,6 +525,7 @@ export class PiHarness implements HarnessInterface {
       persist,
       gates,
       omaTools: omaTools as never,
+      costOf: (u) => budget.costOf(u),
     });
 
     // 4. Transcript — rebuilt from the event log every turn.
@@ -502,7 +543,7 @@ export class PiHarness implements HarnessInterface {
     const messages: AgentMessage[] = system ? [system, ...transcript] : transcript;
 
     // 5. Run pi's agent loop.
-    const maxSteps = this.opts.maxSteps ?? 100;
+    const maxSteps = budget.budget?.max_steps_per_turn ?? this.opts.maxSteps ?? budget.maxSteps;
     const streamFn: StreamFn = (model, context, options) => {
       bridge.onRequestStart();
       return resolved.streamFn(model, context, options);
@@ -517,10 +558,17 @@ export class PiHarness implements HarnessInterface {
       convertToLlm: (msgs) => msgs as Message[],
       toolExecution: "parallel",
       finishTurn: ({ message }) => {
+        budget.record(piUsageToModelUsage(message.usage));
         if (message.stopReason === "error" || message.stopReason === "aborted") return undefined;
         if (bridge.pendingThisTurn > 0) {
           bridge.pendingThisTurn = 0;
           return { action: "end" };
+        }
+        // Only a message with tool calls leads to another model call; its
+        // tool results are already in (finishTurn runs after execution).
+        if (message.content.some((b) => b.type === "toolCall")) {
+          budgetStop ??= budget.check();
+          if (budgetStop) return { action: "end" };
         }
         if (bridge.steps >= maxSteps) return { action: "end" };
         return undefined;
@@ -537,6 +585,7 @@ export class PiHarness implements HarnessInterface {
     }
 
     // 6. Outcome handling (mirrors default-loop).
+    if (budgetStop && !signal?.aborted) await persistBudgetStop(budgetStop);
     if (bridge.pending.length > 0 && runtime.pendingConfirmations) {
       runtime.pendingConfirmations.push(...bridge.pending);
     }

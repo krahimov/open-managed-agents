@@ -136,6 +136,7 @@ A **vault** is a secure credential store. Credentials in vaults are **never expo
 | `aux_model_card_id` | string | No | Companion to `aux_model` — explicit model card binding when needed |
 | `harness` | string | No | Harness implementation to use (default: `"default"`) |
 | `metadata` | object | No | Arbitrary key-value metadata |
+| `metadata.budget` | object | No | Usage limits checked before every model call (see [Budgets](#budgets)) |
 
 ---
 
@@ -635,6 +636,43 @@ Reference in agent config:
 ```
 
 Supported providers: `anthropic`, `openai`, `custom`.
+
+---
+
+## Budgets
+
+Set usage limits on an agent with `metadata.budget`. Sessions keep the
+budget of the agent version they started with. Full details are in
+[docs/budgets.md](docs/budgets.md).
+
+```json
+{ "metadata": { "budget": { "max_tokens_per_session": 2000000, "max_cost_usd_per_session": 5,
+                            "max_turn_wall_clock_seconds": 900 } } }
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `max_tokens_per_turn` | integer | Tokens (input + output) across one turn's model calls |
+| `max_tokens_per_session` | integer | Tokens across every turn and thread of the session |
+| `max_cost_usd_per_session` | number | Estimated USD cost of the session, from the model price table |
+| `max_turn_wall_clock_seconds` | number | The turn is aborted after this long |
+| `max_steps_per_turn` | integer | Model calls per turn (replaces the default cap of 100) |
+
+- **Enforcement.** The default and Pi harnesses check token, cost and step
+  limits before every model call. The runtime enforces the wall-clock
+  limit through the interrupt path.
+- **Stop.** When a limit would be exceeded, the turn ends with
+  `session.status_idle` and
+  `stop_reason: { type: "budget_exhausted", budget, limit, used }`. A
+  `session.warning` with `source: "budget_exhausted"` is written first,
+  and the console shows it.
+- **Usage.** Every model call's tokens and estimated cost are stored in
+  `model_usage_events`, keyed by `model_request_start_id`, so crash
+  recovery never double counts. Read them with `GET /v1/sessions/:id/usage`
+  or `GET /v1/agents/:id/usage`.
+- **Self-host tenant caps (Node).** Set `OMA_TENANT_DAILY_TOKEN_LIMIT`,
+  `OMA_TENANT_DAILY_COST_USD_LIMIT` and `OMA_MODEL_PRICING` (price
+  overrides).
 
 ---
 

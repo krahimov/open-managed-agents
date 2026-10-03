@@ -12,6 +12,7 @@ import { AccessRequestCard } from "../components/AccessRequestCard";
 import { grantedRequestIdsOf } from "./agents/SessionChat";
 import { AmbientRuleCard } from "../components/AmbientRuleCard";
 import { SkillRequestCard } from "../components/SkillRequestCard";
+import { BudgetStopNotice, SessionUsageBadge } from "../components/SessionUsage";
 import { Button } from "@/components/ui/button";
 import { AgentIcon, ClockIcon, DurationIcon, EnvIcon, VaultIcon } from "../components/icons";
 import { FilesPanel, ResourcePanel } from "./session-detail/Panels";
@@ -836,6 +837,12 @@ export function SessionDetail() {
             />
           ))}
           <SessionDurationBadge events={events} />
+          {id && (
+            <SessionUsageBadge
+              sessionId={id}
+              refreshKey={events.filter((e) => e.type === "span.model_request_end").length}
+            />
+          )}
           {sessionMeta.createdAt && <RelativeTimeBadge iso={sessionMeta.createdAt} />}
           <div className="ml-auto flex items-center gap-2">
             {/* Stop / Interrupt — only while the session is actively running.
@@ -1853,6 +1860,7 @@ function EventRender({
       );
 
     case "session.warning":
+      if (event.source === "budget_exhausted") return <BudgetStopNotice event={event} />;
       return (
         <div className="max-w-2xl bg-warning-subtle rounded-lg px-4 py-2.5 text-sm text-warning">
           <div className="font-medium mb-0.5">Warning ({String(event.source ?? "")})</div>

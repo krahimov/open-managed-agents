@@ -28,6 +28,13 @@ import {
 } from "@open-managed-agents/acp-runtime/known-agents";
 import type { AgentRecord as Agent } from "../../types/agent";
 import { SETUP_KICKOFF_NEW, setupPath, startSetupSession } from "./setup-session";
+import {
+  BudgetFields,
+  EMPTY_BUDGET_DRAFT,
+  budgetFromDraft,
+  draftFromBudget,
+  type BudgetDraft,
+} from "./BudgetFields";
 import { BRAND_NAME } from "../../lib/brand";
 import {
   AMBIENT_WAKE_MODES,
@@ -198,6 +205,8 @@ const INITIAL_FORM = {
   name: "",
   model: "",
   reasoningLevel: "instant" as ReasoningLevelValue,
+  // metadata.budget as editable strings (BudgetFields.tsx).
+  budget: EMPTY_BUDGET_DRAFT as BudgetDraft,
   system: "",
   description: "",
   modelCardId: "",
@@ -1019,8 +1028,18 @@ export function AgentFormDialog({
     }
   };
 
+  const budgetError = (): string | null => {
+    const errs = Object.keys(budgetFromDraft(form.budget).errors);
+    return errs.length ? `Budget: invalid ${errs.join(", ")}` : null;
+  };
+
   const create = async () => {
     setCreateError("");
+    const bErr = budgetError();
+    if (bErr) {
+      setCreateError(bErr);
+      return;
+    }
     try {
       const ambientRuleBody = form.ambientEnabled ? buildAmbientRuleBody(form) : null;
       const defaultVaultIds = await ensureComposioCredentialForAgent();
@@ -1043,6 +1062,8 @@ export function AgentFormDialog({
       if (form.composioToolkits.length > 0) {
         metadata.composio_toolkits = form.composioToolkits;
       }
+      const createBudget = budgetFromDraft(form.budget).budget;
+      if (createBudget) metadata.budget = createBudget;
       if (Object.keys(metadata).length > 0) payload.metadata = metadata;
       if (form.enableGeneralSubagent) {
         payload.enable_general_subagent = true;
@@ -1123,6 +1144,11 @@ export function AgentFormDialog({
   const save = async () => {
     if (!editAgent) return;
     setCreateError("");
+    const bErr = budgetError();
+    if (bErr) {
+      setCreateError(bErr);
+      return;
+    }
     setSaving(true);
     try {
       const ambientRuleBody = form.ambientEnabled ? buildAmbientRuleBody(form) : null;
@@ -1153,6 +1179,7 @@ export function AgentFormDialog({
         default_environment_id: form.environmentId || null,
         default_vault_ids: defaultVaultIds.length ? defaultVaultIds : null,
         composio_toolkits: form.composioToolkits.length ? form.composioToolkits : null,
+        budget: budgetFromDraft(form.budget).budget,
       };
       const metaPatch: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(desiredMeta)) {
@@ -1287,6 +1314,8 @@ export function AgentFormDialog({
     if (form.environmentId) metadata.default_environment_id = form.environmentId;
     if (form.defaultVaultIds.length > 0) metadata.default_vault_ids = form.defaultVaultIds;
     if (form.composioToolkits.length > 0) metadata.composio_toolkits = form.composioToolkits;
+    const configBudget = budgetFromDraft(form.budget).budget;
+    if (configBudget) metadata.budget = configBudget;
     if (Object.keys(metadata).length > 0) config.metadata = metadata;
     if (form.enableGeneralSubagent) {
       config.enable_general_subagent = true;
@@ -1917,6 +1946,7 @@ function configToForm(parsed: Record<string, unknown>): FormState {
       : [],
     environmentId:
       typeof metadata.default_environment_id === "string" ? metadata.default_environment_id : "",
+    budget: draftFromBudget(metadata.budget),
     skills: Array.isArray(parsed.skills)
       ? (parsed.skills as SkillEntry[]).map((sk) => ({ ...sk }))
       : [],
@@ -2232,6 +2262,13 @@ function BasicTab({
           Model is determined by the ACP child on the runtime ({form.acpAgentId || "—"}) — it
           uses its own LLM credentials.
         </p>
+      )}
+      {!form.runtimeId && (
+        <BudgetFields
+          value={form.budget}
+          onChange={(budget) => setForm({ ...form, budget })}
+          inputClassName={inputCls}
+        />
       )}
       <div>
         <label htmlFor="agent-description" className="text-sm text-fg-muted block mb-1">

@@ -64,6 +64,10 @@ export interface NodeHarnessRuntimeOptions {
   sandbox: SandboxExecutor;
   /** Turn abort (user.interrupt / lease loss) from SessionStateMachine. */
   abortSignal?: AbortSignal;
+  /** Tap on every event once it is durably stored (e.g. model usage rows,
+   *  docs/budgets.md). Awaited inside the write chain so it completes
+   *  before the turn ends; failures are logged, never fail the turn. */
+  onPersisted?: (stored: SessionEvent) => void | Promise<void>;
 }
 
 export class NodeHarnessRuntime implements HarnessRuntime {
@@ -167,6 +171,13 @@ export class NodeHarnessRuntime implements HarnessRuntime {
       const seq = (stored as { seq?: number }).seq;
       if (seq !== undefined) (event as { seq?: number }).seq = seq;
       this.opts.hub.publish(this.opts.sessionId, stored);
+      if (this.opts.onPersisted) {
+        try {
+          await this.opts.onPersisted(stored);
+        } catch (err) {
+          log.warn({ err, op: "node_harness.on_persisted_failed", event_type: event.type }, "post-persist hook failed");
+        }
+      }
     });
     this.writeChain = write.catch((err) => {
       if (this.persistError) return;

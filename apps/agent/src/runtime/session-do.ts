@@ -42,6 +42,17 @@ import {
   RuntimeAdapterImpl,
   type RuntimeAdapter,
 } from "@open-managed-agents/session-runtime";
+import {
+  SqlModelUsageStore,
+  agentBudgetOf,
+  budgetStopFromEvents,
+  budgetWarningEvent,
+  findUnresolvedToolUses,
+  toolResultEventFor,
+  turnDeadlineMs,
+  usageRowFromEvent,
+} from "@open-managed-agents/session-runtime";
+import type { BudgetExhaustedStopReason } from "@open-managed-agents/shared";
 import { CfD1SqlClient } from "@open-managed-agents/sql-client/adapters/cf-d1";
 import { cfWorkersAiToMarkdown } from "@open-managed-agents/markdown";
 import { isSpecEvent } from "@open-managed-agents/api-types";
@@ -378,6 +389,11 @@ export class SessionDO extends DurableObject<Env> {
    * key shape.
    */
   private _threadAbortControllers = new Map<string, AbortController>();
+
+  /** Current turn's input event id per thread — stamped on model usage rows. */
+  private _turnInputIds = new Map<string, string>();
+  /** Lazily-resolved per-tenant model usage store (docs/budgets.md). */
+  private _modelUsageStore: Promise<SqlModelUsageStore | null> | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -3388,6 +3404,7 @@ export class SessionDO extends DurableObject<Env> {
    */
   private maybeCreditCacheTokens(threadId: string, event: SessionEvent): void {
     if (event.type !== "span.model_request_end") return;
+    this.maybeRecordModelUsage(threadId, event);
     const usage = (event as unknown as {
       model_usage?: {
         cache_creation_input_tokens?: number;
@@ -3404,6 +3421,90 @@ export class SessionDO extends DurableObject<Env> {
       cache_creation_input_tokens: cc,
       cache_read_input_tokens: cr,
     });
+  }
+
+  /** Per-tenant model_usage_events store (tenant D1). Null when unavailable. */
+  private modelUsageStore(): Promise<SqlModelUsageStore | null> {
+    this._modelUsageStore ??= (async () => {
+      const tenantId = this.state.tenant_id;
+      if (!tenantId) return null;
+      const db = await buildCfTenantDbProvider(this.env).resolve(tenantId);
+      return db ? new SqlModelUsageStore(new CfD1SqlClient(db)) : null;
+    })().catch((err) => {
+      console.warn(`[model_usage] store unavailable: ${(err as Error)?.message ?? err}`);
+      this._modelUsageStore = null;
+      return null;
+    });
+    return this._modelUsageStore;
+  }
+
+  /**
+   * Persist one model call's token usage + estimated cost as a durable
+   * model_usage_events row (docs/budgets.md). Idempotent on
+   * (session_id, model_request_start_id); best effort — a failed write is
+   * backfilled from the event log by reconcileModelUsage on the next turn.
+   */
+  private maybeRecordModelUsage(threadId: string, event: SessionEvent): void {
+    const tenantId = this.state.tenant_id;
+    const sessionId = this.state.session_id;
+    if (!tenantId || !sessionId) return;
+    const row = usageRowFromEvent(
+      { ...event, session_thread_id: (event as { session_thread_id?: string }).session_thread_id ?? threadId } as SessionEvent,
+      {
+        tenantId,
+        sessionId,
+        agentId: this.state.agent_id || null,
+        turnId: this._turnInputIds.get(threadId) ?? null,
+      },
+    );
+    if (!row) return;
+    void this.modelUsageStore()
+      .then((store) => store?.record(row))
+      .catch((err) => console.warn(`[model_usage] record failed: ${(err as Error)?.message ?? err}`));
+  }
+
+  /** Backfill usage rows whose live write was lost (eviction mid-write). */
+  private async reconcileModelUsage(events: SessionEvent[]): Promise<void> {
+    try {
+      const tenantId = this.state.tenant_id;
+      const sessionId = this.state.session_id;
+      if (!tenantId || !sessionId) return;
+      if (!events.some((e) => e.type === "span.model_request_end")) return;
+      const store = await this.modelUsageStore();
+      await store?.recordFromEvents(events, { tenantId, sessionId, agentId: this.state.agent_id || null });
+    } catch (err) {
+      console.warn(`[model_usage] reconcile failed: ${(err as Error)?.message ?? err}`);
+    }
+  }
+
+  /**
+   * End a turn the wall-clock budget aborted: close the tool calls the
+   * abort cut off (so the next model call keeps a valid tool_use /
+   * tool_result pairing), leave the budget marker, then the terminal idle
+   * with stop_reason budget_exhausted.
+   */
+  private finishBudgetAbortedTurn(
+    history: { append(e: SessionEvent): void; getEvents(): SessionEvent[] },
+    threadId: string,
+    stop: BudgetExhaustedStopReason,
+  ): void {
+    const threadField = threadId !== "sthr_primary" ? { session_thread_id: threadId } : {};
+    const onThread = history
+      .getEvents()
+      .filter((e) => ((e as { session_thread_id?: string }).session_thread_id ?? "sthr_primary") === threadId);
+    const cut = findUnresolvedToolUses(onThread).filter(
+      (u) => u.type !== "agent.custom_tool_use" && u.evaluated_permission !== "ask",
+    );
+    const emit = (e: SessionEvent) => {
+      const ev = { ...e, ...threadField } as SessionEvent;
+      history.append(ev);
+      this.broadcastEvent(ev);
+    };
+    for (const use of cut) {
+      emit(toolResultEventFor(use, "(stopped: the turn's wall-clock budget was exhausted)", true));
+    }
+    emit(budgetWarningEvent(stop, threadId));
+    emit({ type: "session.status_idle", stop_reason: stop } as SessionEvent);
   }
 
   /**
@@ -4574,6 +4675,33 @@ export class SessionDO extends DurableObject<Env> {
     this._threadAbortControllers.set(turnThreadId, abortController);
     const effectiveAbortSignal = abortController.signal;
 
+    // Wall-clock budget (docs/budgets.md): abort this turn's controller
+    // with a budget-tagged reason; the catch below ends the turn with
+    // stop_reason budget_exhausted instead of treating it as a failure.
+    const turnBudget = agentBudgetOf(agent);
+    const turnStartedAt = Date.now();
+    const turnDeadline = turnDeadlineMs(turnBudget, turnStartedAt);
+    const wallClockTimer =
+      turnDeadline !== null
+        ? setTimeout(() => {
+            abortController.abort({
+              kind: "budget",
+              stop: {
+                type: "budget_exhausted",
+                budget: "max_turn_wall_clock_seconds",
+                limit: turnBudget!.max_turn_wall_clock_seconds!,
+                used: Math.round((Date.now() - turnStartedAt) / 100) / 10,
+              } satisfies BudgetExhaustedStopReason,
+            });
+          }, Math.max(0, turnDeadline - turnStartedAt))
+        : null;
+
+    // Model usage rows (docs/budgets.md): remember the turn input for the
+    // span hook, and backfill rows a previous incarnation lost.
+    const turnInputId = (userMessage as { id?: string }).id;
+    if (turnInputId) this._turnInputIds.set(turnThreadId, turnInputId);
+    void this.reconcileModelUsage(history.getEvents());
+
     // Build the final system prompt: agent.system + platform guidance +
     // every platformReminder wrapped in a <source name="...">…</source>
     // block. Done HERE (after all reminder collection) so the prompt
@@ -4869,7 +4997,10 @@ export class SessionDO extends DurableObject<Env> {
           event_ids: pendingConfirmations,
         };
       } else {
-        stopReason = { type: "end_turn" as const };
+        // A budget stop (docs/budgets.md) leaves a durable marker in this
+        // turn's events; nothing owed by the client → it ends the turn.
+        stopReason =
+          budgetStopFromEvents(history.getEvents(), turnThreadId) ?? { type: "end_turn" as const };
       }
 
       const idleEvent: SessionEvent = {
@@ -4881,6 +5012,17 @@ export class SessionDO extends DurableObject<Env> {
       idleEmitted = true;
     } catch (err) {
       const errorMessage = this.describeError(err);
+
+      // Wall-clock budget abort: a clean, terminal turn end — not a failure,
+      // not retried.
+      const abortReason = effectiveAbortSignal.reason as
+        | { kind?: string; stop?: BudgetExhaustedStopReason }
+        | undefined;
+      if (effectiveAbortSignal.aborted && abortReason?.kind === "budget" && abortReason.stop) {
+        this.finishBudgetAbortedTurn(history, turnThreadId, abortReason.stop);
+        idleEmitted = true;
+        return;
+      }
 
       // Don't retry if aborted
       if (err instanceof Error && err.name === "AbortError") {
@@ -4956,6 +5098,7 @@ export class SessionDO extends DurableObject<Env> {
       // The sandbox is still alive (container persists independently).
       // Client can send a new user.message to retry.
     } finally {
+      if (wallClockTimer) clearTimeout(wallClockTimer);
       // Only delete if it's still ours — a sub-agent run within the same
       // thread may have temporarily replaced it. Same-thread re-entry is
       // mutex'd by _draining so this is theoretical safety only.

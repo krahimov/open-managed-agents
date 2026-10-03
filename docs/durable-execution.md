@@ -168,5 +168,17 @@ in one assistant message. That matters when results were persisted between
 the step's parallel tool calls. Legacy events that don't have the field keep
 the old grouping.
 
+- On `span.model_request_end`: `cost_usd` (estimated, [budgets.md](budgets.md)).
+
+**Budget stops** ([budgets.md](budgets.md)) end the model loop only at a
+step boundary, where every tool call already has a result. The harness
+persists a `session.warning` (`source: "budget_exhausted"`) as the durable
+marker, and the runtime turns it into
+`stop_reason: { type: "budget_exhausted" }`. A resumed turn derives its
+usage from the log, so it stops at the same point and doesn't reset the
+budget. The wall-clock budget uses the interrupt path. Cut-off tool calls
+get an error result, and the turn ends with the budget stop instead of
+`end_turn`.
+
 In-turn compaction (`prepareStep`) is not implemented. Compaction still runs
 only at turn start.

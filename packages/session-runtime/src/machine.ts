@@ -35,6 +35,7 @@ import { nanoid } from "nanoid";
 import { generateEventId } from "@open-managed-agents/shared";
 import type {
   AgentConfig,
+  BudgetExhaustedStopReason,
   SessionEvent,
   UserCustomToolResultEvent,
   UserMessageEvent,
@@ -43,6 +44,7 @@ import type {
 import type { LanguageModel } from "ai";
 import type { EventLogRepo } from "@open-managed-agents/event-log";
 import { recoverInterruptedState } from "./recovery";
+import { agentBudgetOf, budgetWarningEvent, turnDeadlineMs } from "./budget";
 import { buildInterruptedToolResult, classifyTool, type ToolExecutionClass } from "./tool-classification";
 import type { OrphanTurn, RuntimeAdapter, TurnId } from "./ports";
 import type { SandboxExecutor } from "@open-managed-agents/sandbox";
@@ -193,6 +195,9 @@ export type TurnInputEvent =
  */
 export type TurnAbortReason =
   | { kind: "user_interrupt" }
+  /** A budget (max_turn_wall_clock_seconds) ended the turn: it closes like
+   *  an interrupt but with stop_reason budget_exhausted (docs/budgets.md). */
+  | { kind: "budget"; stop: BudgetExhaustedStopReason }
   | { kind: "lease_lost" }
   | { kind: "shutdown" }
   | { kind: "destroyed" };
@@ -239,7 +244,7 @@ export function isTurnLeaseLost(err: unknown): boolean {
 
 function abortKind(signal: AbortSignal): TurnAbortReason["kind"] {
   const kind = (signal.reason as { kind?: unknown } | undefined)?.kind;
-  return kind === "lease_lost" || kind === "shutdown" || kind === "destroyed"
+  return kind === "lease_lost" || kind === "shutdown" || kind === "destroyed" || kind === "budget"
     ? kind
     : "user_interrupt";
 }
@@ -407,7 +412,33 @@ export class SessionStateMachine {
 
     const threadId = (event as { session_thread_id?: string }).session_thread_id;
     const threadField = threadId ? { session_thread_id: threadId } : {};
-    let ending: "completed" | "interrupted" | "failed" | "silent" = "completed";
+
+    // Wall-clock budget (docs/budgets.md): abort the turn through the same
+    // path as user.interrupt, tagged with the budget so it ends with
+    // stop_reason budget_exhausted. A resumed turn keeps its original start
+    // (the promoted input's processed_at), so a crash doesn't reset it.
+    const budget = agentBudgetOf(agent);
+    const promotedAt = Date.parse(String((alreadyPromoted as { processed_at?: string } | null)?.processed_at ?? ""));
+    const turnStartedAt = Number.isFinite(promotedAt) ? promotedAt : Date.now();
+    const deadline = turnDeadlineMs(budget, turnStartedAt);
+    let wallClockTimer: ReturnType<typeof setTimeout> | null = null;
+    if (deadline !== null) {
+      const fire = () =>
+        controller.abort({
+          kind: "budget",
+          stop: {
+            type: "budget_exhausted",
+            budget: "max_turn_wall_clock_seconds",
+            limit: budget!.max_turn_wall_clock_seconds!,
+            used: Math.round((Date.now() - turnStartedAt) / 100) / 10,
+          },
+        } satisfies TurnAbortReason);
+      const ms = deadline - Date.now();
+      if (ms <= 0) fire();
+      else wallClockTimer = setTimeout(fire, ms);
+    }
+
+    let ending: "completed" | "interrupted" | "budget" | "failed" | "silent" = "completed";
     let stopReason: TurnStopReason = { type: "end_turn" };
     let turnFromSeq: number | undefined;
     try {
@@ -439,6 +470,7 @@ export class SessionStateMachine {
         type: "session.status_running",
         ...threadField,
       } as SessionEvent);
+      if (controller.signal.aborted) throw controller.signal.reason ?? new Error("aborted");
 
       // Memory store mounts: optional adapter step, runs once per turn
       // so a session newly bound to a store picks it up on the next
@@ -467,7 +499,7 @@ export class SessionStateMachine {
           // resuming now would send the model an incomplete tool_result
           // set. Hand control back with the remaining ids.
           runHarness = false;
-          stopReason = computeStopReason(after, remaining);
+          stopReason = computeStopReason(after, remaining, { threadId });
         }
       }
 
@@ -487,7 +519,7 @@ export class SessionStateMachine {
           pending = await this.runHarnessOnce(agent, tools, userMessage, controller.signal, log);
           if (controller.signal.aborted) throw controller.signal.reason ?? new Error("aborted");
         }
-        stopReason = computeStopReason(await this.readEvents(log, turnFromSeq), pending);
+        stopReason = computeStopReason(await this.readEvents(log, turnFromSeq), pending, { threadId });
 
         // Outcome supervisor (user.define_outcome): grade the finished
         // turn and drive revision turns until a terminal verdict. Only on
@@ -504,29 +536,46 @@ export class SessionStateMachine {
             },
           });
           if (controller.signal.aborted) throw controller.signal.reason ?? new Error("aborted");
-          stopReason = computeStopReason(await this.readEvents(log, turnFromSeq), []);
+          stopReason = computeStopReason(await this.readEvents(log, turnFromSeq), [], { threadId });
         }
       }
     } catch (err) {
       const aborted = controller.signal.aborted ? abortKind(controller.signal) : null;
-      if (isTurnLeaseLost(err) || (aborted && aborted !== "user_interrupt")) {
+      if (isTurnLeaseLost(err) || (aborted && aborted !== "user_interrupt" && aborted !== "budget")) {
         // Someone else owns (or nobody should continue) this turn. Writing
         // turn-end events would race the new owner — unwind silently.
         ending = "silent";
         throw isTurnLeaseLost(err) ? err : new TurnLeaseLostError(`turn aborted: ${aborted}`);
       }
-      if (aborted === "user_interrupt") {
-        ending = "interrupted";
+      if (aborted === "user_interrupt" || aborted === "budget") {
+        const budgetStop =
+          aborted === "budget" ? (controller.signal.reason as { stop: BudgetExhaustedStopReason }).stop : null;
+        ending = budgetStop ? "budget" : "interrupted";
         // Close tool calls the abort cut off mid-execution so the next
         // model call sees a valid tool_use/tool_result pairing.
         try {
           const cut = findUnresolvedToolUses(await this.readEvents(log, turnFromSeq))
             .filter((u) => u.type !== "agent.custom_tool_use" && u.evaluated_permission !== "ask");
           for (const use of cut) {
-            await this.appendAndPublish(log, toolResultEventFor(use, "(interrupted by user)", true));
+            await this.appendAndPublish(
+              log,
+              toolResultEventFor(
+                use,
+                budgetStop ? "(stopped: the turn's wall-clock budget was exhausted)" : "(interrupted by user)",
+                true,
+              ),
+            );
           }
         } catch (fixErr) {
           this.logger.warn(`interrupt fixup failed: ${errorMessage(fixErr)}`);
+        }
+        if (budgetStop) {
+          stopReason = budgetStop;
+          try {
+            await this.appendAndPublish(log, budgetWarningEvent(budgetStop, threadId));
+          } catch (emitErr) {
+            this.logger.warn(`budget warning emit failed: ${errorMessage(emitErr)}`);
+          }
         }
       } else {
         ending = "failed";
@@ -548,6 +597,7 @@ export class SessionStateMachine {
       }
     } finally {
       opts.signal?.removeEventListener("abort", onExternalAbort);
+      if (wallClockTimer) clearTimeout(wallClockTimer);
       this.activeTurnId = null;
       if (this.activeController === controller) this.activeController = null;
       if (ending !== "silent") {

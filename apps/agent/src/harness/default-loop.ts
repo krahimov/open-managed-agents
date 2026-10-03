@@ -11,8 +11,15 @@ import { llmLoggingMiddleware, llmLogKey } from "./llm-logging-middleware";
 import { isOpenAiCompatModel, sanitizeOpenAiToolNames, reasoningProviderOptions } from "./provider";
 import type { ToolSet } from "ai";
 import { OPENAI_MAX_TOOLS, SEARCH_TOOL_NAME, CALL_TOOL_NAME, applyToolBudget } from "./tool-budget";
-import { classifyTool, idempotencyKeyFor } from "@open-managed-agents/session-runtime";
-import type { ToolExecutionClass } from "@open-managed-agents/shared";
+import {
+  BudgetTracker,
+  budgetStopFromEvents,
+  budgetWarningEvent,
+  classifyTool,
+  idempotencyKeyFor,
+  type ModelCallUsage,
+} from "@open-managed-agents/session-runtime";
+import type { BudgetExhaustedStopReason, ToolExecutionClass } from "@open-managed-agents/shared";
 import {
   ToolUseGates,
   wrapToolsWriteAhead,
@@ -34,6 +41,21 @@ const isMcpTool = (name: string) => name.startsWith("mcp_");
 // filters, billing dashboards) split on those event types.
 export const isBuiltinTool = (name: string): boolean =>
   BUILTIN_TOOLS.has(name) || isMcpTool(name) || name.startsWith("call_agent_");
+
+/** AI SDK step usage → the `span.model_request_end.model_usage` shape
+ *  (input_tokens = total input incl. cache). */
+function modelUsageOf(usage: {
+  inputTokens?: number;
+  outputTokens?: number;
+  inputTokenDetails?: { cacheReadTokens?: number; cacheWriteTokens?: number };
+} | undefined): ModelCallUsage {
+  return {
+    input_tokens: usage?.inputTokens ?? 0,
+    output_tokens: usage?.outputTokens ?? 0,
+    cache_read_input_tokens: usage?.inputTokenDetails?.cacheReadTokens ?? 0,
+    cache_creation_input_tokens: usage?.inputTokenDetails?.cacheWriteTokens ?? 0,
+  };
+}
 
 
 /**
@@ -373,6 +395,32 @@ export class DefaultHarness implements HarnessInterface {
         details: { reexecuted: reconciled.reexecuted, injected: reconciled.injected },
       } as SessionEvent);
     }
+
+    // Budgets (docs/budgets.md). Usage so far comes from the log (crash-
+    // consistent: a resumed turn sees the same totals); this run's calls
+    // are added as they finish. Checked before the first model call here
+    // and before every further call in stopWhen below. The orphan pass
+    // above already closed every tool call, so stopping now leaves none
+    // unresolved.
+    const budgetThread = turnThread ?? "sthr_primary";
+    const budget = BudgetTracker.forRun({
+      agent,
+      events: runtime.history.getEvents(),
+      threadId: budgetThread,
+      context: ctx.budget,
+      pricingModel: (model as { modelId?: string }).modelId,
+    });
+    const persistBudgetStop = async (stop: BudgetExhaustedStopReason) => {
+      // A resumed turn that already recorded its budget stop doesn't add a second one.
+      if (budgetStopFromEvents(runtime.history.getEvents(), budgetThread)) return;
+      await persist(budgetWarningEvent(stop, budgetThread));
+    };
+    const preStop = budget.check();
+    if (preStop) {
+      await persistBudgetStop(preStop);
+      return;
+    }
+    let budgetStop: BudgetExhaustedStopReason | null = null;
 
     // --- Harness decides HOW to deliver context to the model ---
 
@@ -819,7 +867,16 @@ export class DefaultHarness implements HarnessInterface {
         agent.reasoning_level,
         Object.keys(cached.tools ?? {}).length > 0,
       ),
-      stopWhen: stepCountIs(100),
+      // Evaluated before every further model call (after a step whose tool
+      // calls all have results). Budgets first, then the step cap
+      // (max_steps_per_turn, default 100).
+      stopWhen: [
+        ({ steps }) => {
+          budgetStop ??= budget.checkAfter(steps.map((s) => modelUsageOf(s.usage)));
+          return budgetStop !== null;
+        },
+        stepCountIs(budget.maxSteps),
+      ],
       abortSignal: runtime.abortSignal,
 
       // Ordered stream observer (replaces onChunk): live chunk streaming
@@ -962,17 +1019,15 @@ export class DefaultHarness implements HarnessInterface {
         const bodyR2Key = llmLogCtx
           ? llmLogKey(llmLogCtx.tenant_id, llmLogCtx.session_id, stepStartId ?? "")
           : undefined;
+        const stepUsage = step.usage ? modelUsageOf(step.usage) : undefined;
         runtime.broadcast({
           type: "span.model_request_end",
           model: modelId,
           model_request_start_id: stepStartId ?? undefined,
           provider_response_id: providerResponseId,
-          model_usage: step.usage ? {
-            input_tokens: step.usage.inputTokens ?? 0,
-            output_tokens: step.usage.outputTokens ?? 0,
-            cache_read_input_tokens: step.usage.inputTokenDetails?.cacheReadTokens ?? 0,
-            cache_creation_input_tokens: step.usage.inputTokenDetails?.cacheWriteTokens ?? 0,
-          } : undefined,
+          model_usage: stepUsage,
+          // Estimated from the pricing table (docs/budgets.md); null = unpriced model.
+          ...(stepUsage ? { cost_usd: budget.costOf(stepUsage) } : {}),
           finish_reason: step.finishReason,
           final_text_length: stepText.length,
           is_error: false,
@@ -1205,6 +1260,11 @@ export class DefaultHarness implements HarnessInterface {
       }
     })();
 
+
+    // 7b. A budget ended the loop before its next model call: leave the
+    //     durable marker the runtime turns into stop_reason budget_exhausted.
+    //     Every tool call of the last step already has its result.
+    if (budgetStop) await persistBudgetStop(budgetStop);
 
     // 8. Detect pending tool confirmations and custom tool results
     if (result.toolCalls?.length) {
