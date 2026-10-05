@@ -35,7 +35,7 @@ on both backends regardless.
 ## Quickstart (Docker, SQLite)
 
 ```bash
-git clone https://github.com/open-ma/open-managed-agents.git
+git clone https://github.com/krahimov/open-managed-agents.git
 cd open-managed-agents
 cp .env.example .env
 
@@ -46,7 +46,14 @@ cp .env.example .env
 $EDITOR .env
 # BETTER_AUTH_SECRET=$(openssl rand -hex 32)
 # PLATFORM_ROOT_SECRET=$(openssl rand -base64 32)
-# ANTHROPIC_API_KEY is optional — in production, prefer a per-tenant Model Card.
+# Local smoke test only: bypass auth so the curl commands below work.
+# Never use this on a shared or Internet-facing deployment.
+# AUTH_DISABLED=1
+#
+# Configure one model provider. The example turn below uses OpenAI:
+# OPENAI_API_KEY=<disposable low-limit key>
+# OPENAI_MODEL=gpt-5.4-mini
+# Or set ANTHROPIC_API_KEY and use claude-sonnet-4-6 below.
 
 # First time builds the image; subsequent runs skip --build
 docker compose up -d --build
@@ -60,15 +67,18 @@ curl localhost:8787/health
 open http://localhost:8787
 ```
 
-Drive the harness end-to-end:
+Drive the harness end-to-end. These requests intentionally omit authentication because the local smoke-test configuration above sets `AUTH_DISABLED=1`. If auth is enabled, sign in through the Console and add a real tenant `x-api-key` to every request.
 
 ```bash
-AID=$(curl -s -X POST localhost:8787/v1/agents -H 'content-type: application/json' \
-  -d '{"name":"hello","model":"claude-sonnet-4-6","tools":[{"type":"agent_toolset_20260401"}]}' \
+MODEL=gpt-5.4-mini
+AID=$(curl --fail --silent -X POST localhost:8787/v1/agents -H 'content-type: application/json' \
+  -d "{\"name\":\"hello\",\"model\":\"$MODEL\",\"tools\":[{\"type\":\"agent_toolset_20260401\"}]}" \
   | jq -r .id)
+test -n "$AID" && test "$AID" != null
 
-SID=$(curl -s -X POST localhost:8787/v1/sessions -H 'content-type: application/json' \
+SID=$(curl --fail --silent -X POST localhost:8787/v1/sessions -H 'content-type: application/json' \
   -d "{\"agent\":\"$AID\"}" | jq -r .id)
+test -n "$SID" && test "$SID" != null
 
 curl -N localhost:8787/v1/sessions/$SID/events/stream &
 
@@ -122,8 +132,9 @@ The agent's `bash` / `read` / `write` / etc. tools execute in a sandbox.
 | `daytona` | Production / untrusted code | `SANDBOX_PROVIDER=daytona DAYTONA_API_KEY=...` (+ optional `DAYTONA_API_URL`, `SANDBOX_IMAGE`, `DAYTONA_BOOTSTRAP_TOOLS`). Daytona-managed Linux VMs, one per session. Defaults to a Node 22 Debian image plus a Python/Git/curl/jq/ripgrep/build-tools bootstrap in `/workspace`. |
 | `e2b` | E2B SaaS / E2B Infra self-host / Aliyun Agent Sandbox (e2b-compatible) | `SANDBOX_PROVIDER=e2b E2B_API_KEY=...` (+ optional `E2B_API_URL` for non-default endpoint). Firecracker microVMs. |
 
-**Remote sandboxes** (Daytona, E2B, BoxRun) sharing memory mounts use
-`MEMORY_S3_*` env (any S3-compatible store — AWS / R2 / OSS / MinIO).
+<Aside type="caution" title="Remote memory stores require shared object storage">
+  Daytona, E2B, and BoxRun cannot use the Node host's local memory-blob directory. Before attaching a memory store to a remote-sandbox session, configure the `MEMORY_S3_*` variables for an S3-compatible store (AWS, R2, OSS, or MinIO). Missing shared storage can surface as a stalled or failed turn rather than an obvious mount error. Local `subprocess` sessions use `./data/memory-blobs` and do not need S3.
+</Aside>
 
 ## Vault sidecar (outbound credential injection)
 
