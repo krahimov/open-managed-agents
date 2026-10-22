@@ -1,4 +1,5 @@
 import { ConnectionConsent } from "./lib/connection-consent.js";
+import { graftComposioToolkit } from "./lib/composio-graft.js";
 import { serviceDisplayName } from "@open-managed-agents/api-types";
 import { buildTelegramConnectRoutes } from "./lib/telegram-connect-routes.js";
 import { TelegramOnboarding } from "./lib/telegram-onboarding.js";
@@ -1834,135 +1835,39 @@ v1.get("/agents/:id/evidence/capability", async (c) => {
 const composioGraftRoutes = new Hono<{ Variables: { tenant_id: string; user_id?: string } }>();
 composioGraftRoutes.post("/:id/composio/graft", async (c) => {
   const tenantId = c.var.tenant_id;
-  const sessionId = c.req.param("id");
   const body = await c.req
-    .json<{ toolkit?: string; vault_id?: string }>()
-    .catch(() => ({}) as { toolkit?: string; vault_id?: string });
-  const toolkit = (body.toolkit ?? "").trim().toLowerCase();
-  const vaultId = (body.vault_id ?? "").trim();
-  if (!toolkit || !vaultId) {
-    return c.json({ error: "toolkit and vault_id are required" }, 400);
-  }
-  const session = await sessionsService.get({ tenantId, sessionId });
-  if (!session?.agent_id) return c.json({ error: "Session has no agent" }, 404);
-  const agent = await agentsService.get({ tenantId, agentId: session.agent_id });
-  if (!agent) return c.json({ error: "Agent not found" }, 404);
-
-  const metadata = { ...((agent.metadata as Record<string, unknown> | null) ?? {}) };
-  const priorToolkits = Array.isArray(metadata.composio_toolkits)
-    ? metadata.composio_toolkits.filter((t): t is string => typeof t === "string")
-    : [];
-  const toolkits = [...new Set([...priorToolkits, toolkit])];
-
-  // Vault: (re)provision the tool-router credential, binding the toolkits'
-  // ACTIVE connected accounts. Always re-provision after a grant: a session
-  // created before the OAuth completed (the link route re-provisions at
-  // LINK time, minutes before the popup finishes) treats the toolkit as
-  // unconnected forever — observed live: linkedin account ACTIVE, yet the
-  // router session reported "no active LinkedIn authentication".
-  const key = await composioKeyForTenant(tenantId).catch(() => null);
-  if (!key) {
-    return c.json({ error: "No Composio API key configured for this workspace" }, 503);
-  }
-  const creds = await credentialService.list({ tenantId, vaultId });
-  const active = creds.find(
-    (cr) =>
-      !cr.archived_at &&
-      (cr as unknown as { auth?: { type?: string } }).auth?.type === "composio_mcp",
-  );
-  const activeAuth = active
-    ? (active as unknown as {
-        auth: { composio_user_id?: string; composio_toolkits?: string[] };
-      }).auth
-    : null;
-  const composioUserId = activeAuth?.composio_user_id || `oma:${tenantId}:${vaultId}`;
-  const allToolkits = [
-    ...new Set([
-      ...(activeAuth?.composio_toolkits ?? []).map((t) => t.toLowerCase()),
-      ...toolkits,
-    ]),
-  ];
-  const accountList = await listComposioConnectedAccounts(
-    { apiKey: key.apiKey },
-    { userId: composioUserId },
-  ).catch(() => ({ items: [] as Array<never> }));
-  const connectedAccounts: Record<string, string> = {};
-  for (const acct of accountList.items as Array<{
-    id: string;
-    status?: string;
-    toolkit?: { slug?: string };
-  }>) {
-    const slug = (acct.toolkit?.slug ?? "").toLowerCase();
-    // Newest-first listing: keep the first ACTIVE account per toolkit.
-    if (slug && acct.status === "ACTIVE" && allToolkits.includes(slug) && !connectedAccounts[slug]) {
-      connectedAccounts[slug] = acct.id;
-    }
-  }
-  if (!connectedAccounts[toolkit]) {
-    return c.json({ error: `No active ${toolkit} account was found in this vault. Complete provider authorization and retry.` }, 409);
-  }
-  const routerSession = await createComposioToolRouterSession(
-    { apiKey: key.apiKey },
+    .json<{ toolkit?: string; vault_id?: string; connected_account_id?: string }>()
+    .catch(() => ({}) as { toolkit?: string; vault_id?: string; connected_account_id?: string });
+  const result = await graftComposioToolkit(
     {
-      user_id: composioUserId,
-      toolkits: { enable: allToolkits },
-      ...(Object.keys(connectedAccounts).length > 0
-        ? { connected_accounts: connectedAccounts }
+      // Same order as the vault link route: workspace key → operator key →
+      // a key stored in this vault.
+      resolveKey: async (t, vaultId) => {
+        const key = await composioKeyForTenant(t);
+        if (key) return key;
+        const creds = await credentialService.list({ tenantId: t, vaultId }).catch(() => []);
+        for (const cr of creds) {
+          const auth = (cr as unknown as { auth?: { type?: string; api_key?: string } }).auth;
+          if (!cr.archived_at && auth?.type === "composio_mcp" && auth.api_key) return { apiKey: auth.api_key, source: "vault" };
+        }
+        return null;
+      },
+      credentials: credentialService as never,
+      sessions: sessionsService as never,
+      agents: agentsService as never,
+    },
+    {
+      tenantId,
+      sessionId: c.req.param("id"),
+      toolkit: (body.toolkit ?? "").trim(),
+      vaultId: (body.vault_id ?? "").trim(),
+      ...(typeof body.connected_account_id === "string" && body.connected_account_id
+        ? { connectedAccountId: body.connected_account_id }
         : {}),
     },
   );
-  await credentialService.create({
-    tenantId,
-    vaultId,
-    displayName: active?.display_name ?? `Composio Tool Router (${agent.name})`,
-    auth: {
-      type: "composio_mcp",
-      mcp_server_url: routerSession.mcp.url,
-      // Same shape the composio_tool_router_session route stores: env
-      // pointer for the platform key, raw key for a tenant-level one.
-      ...(key.source === "platform"
-        ? { api_key_env: "COMPOSIO_API_KEY" }
-        : { api_key: key.apiKey }),
-      composio_user_id: composioUserId,
-      composio_session_id: routerSession.session_id,
-      composio_toolkits: allToolkits,
-      ...(Object.keys(connectedAccounts).length > 0
-        ? { composio_connected_account_ids: Object.values(connectedAccounts) }
-        : {}),
-    },
-  });
-  if (active) {
-    await credentialService
-      .archive({ tenantId, vaultId, credentialId: active.id })
-      .catch(() => {});
-  }
-  const credentialCreated = true;
-
-  // Agent: tool-router mcp_server + vault link + toolkit list.
-  const servers = [...(agent.mcp_servers ?? [])];
-  const hasComposio = servers.some(
-    (s) => typeof s?.url === "string" && s.url.includes("composio.dev/tool_router"),
-  );
-  if (!hasComposio) {
-    servers.push({ name: "composio", type: "url", url: COMPOSIO_TOOL_ROUTER_URL });
-  }
-  const vaultIds = Array.isArray(metadata.default_vault_ids)
-    ? metadata.default_vault_ids.filter((v): v is string => typeof v === "string")
-    : [];
-  metadata.default_vault_ids = [...new Set([...vaultIds, vaultId])];
-  metadata.composio_toolkits = allToolkits;
-  await agentsService.update({
-    tenantId,
-    agentId: agent.id,
-    input: { mcp_servers: servers, metadata },
-  });
-  return c.json({
-    ok: true,
-    attached_server: !hasComposio,
-    credential_created: credentialCreated,
-    toolkits: allToolkits,
-    connected_accounts: connectedAccounts,
-  });
+  if (!result.ok) return c.json({ error: result.error }, result.status);
+  return c.json(result);
 });
 
 v1.route("/sessions", composioGraftRoutes);

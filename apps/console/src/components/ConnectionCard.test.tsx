@@ -130,28 +130,30 @@ describe("ConnectionCard", () => {
     expect(screen.getByText("karim@serousal.com · Serousal")).toBeInTheDocument();
   });
 
-  it("Use stays disabled while the account is being checked", async () => {
+  it("shows one 'checking' line instead of unusable rows while accounts are looked up", async () => {
     server({ connections: [saved] });
     let release!: (v: unknown) => void;
     const original = api.getMockImplementation()!;
     api.mockImplementation((path: string, init?: unknown) =>
       path.endsWith("/identify") ? new Promise((r) => { release = r; }) : original(path, init));
     mount();
-    expect(await screen.findByText("Checking account…")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Use" })).toBeDisabled();
+    expect(await screen.findByText("Checking your saved Linear accounts…")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Use" })).not.toBeInTheDocument();
     await act(async () => release(karim));
     expect(screen.getByRole("button", { name: "Use" })).toBeEnabled();
   });
 
-  it("a saved account that no longer works can't be used and says so", async () => {
+  it("sign-ins that no longer work are tucked away, not offered", async () => {
     server({ connections: [saved] });
     const original = api.getMockImplementation()!;
     api.mockImplementation(async (path: string, init?: unknown) =>
       path.endsWith("/identify") ? { status: "unverified", message: "Authentication could not be verified. No access was granted. Reconnect or retry." } : original(path, init));
     mount();
-    expect(await screen.findByText(/Authentication could not be verified/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Use" })).toBeDisabled();
-    expect(screen.getByText("Linear (OAuth)")).toBeInTheDocument();
+    const details = await screen.findByTestId("broken-signins");
+    expect(details).toHaveTextContent("1 older sign-in no longer works");
+    expect(details).not.toHaveAttribute("open");
+    expect(screen.queryByRole("button", { name: "Use" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Connect Linear" })).toBeInTheDocument();
   });
 
   it("uses cached identity from the server without re-checking", async () => {
@@ -161,19 +163,42 @@ describe("ConnectionCard", () => {
     expect(api).not.toHaveBeenCalledWith(`${BASE}/identify`, expect.anything());
   });
 
-  it("a row that failed its check offers Retry, and recovers", async () => {
+  it("a sign-in that failed its check offers Retry, and recovers", async () => {
     server({ connections: [saved] });
     const original = api.getMockImplementation()!;
     let down = true;
     api.mockImplementation(async (path: string, init?: unknown) =>
       path.endsWith("/identify") && down ? { status: "unverified", message: "Authentication could not be verified." } : original(path, init));
     mount();
-    expect(await screen.findByText(/Authentication could not be verified/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Use" })).toBeDisabled();
+    fireEvent.click(within(await screen.findByTestId("broken-signins")).getByText(/no longer works/));
     down = false;
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(await screen.findByText("karim@serousal.com · Serousal")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Use" })).toBeEnabled();
+    expect(screen.queryByTestId("broken-signins")).not.toBeInTheDocument();
+  });
+
+  it("many old sign-ins of the same account collapse into one row, dead ones tucked away, 3 checks at a time", async () => {
+    const many = Array.from({ length: 7 }, (_, i) => ({ ...saved, credential_id: `cred-${i}`, vault_id: `vault-${i}`, label: "linear (OAuth)" }));
+    server({ connections: many });
+    const original = api.getMockImplementation()!;
+    let inFlight = 0;
+    let maxInFlight = 0;
+    api.mockImplementation(async (path: string, init?: { body?: string }) => {
+      if (!path.endsWith("/identify")) return original(path, init);
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 5));
+      inFlight--;
+      const id = JSON.parse(init!.body!).credential_id as string;
+      return id === "cred-5" || id === "cred-6" ? { status: "unverified", message: "Authentication could not be verified." } : { ...karim, version: `v-${id}` };
+    });
+    mount();
+    await waitFor(() => expect(screen.getByTestId("broken-signins")).toHaveTextContent("2 older sign-ins no longer work"));
+    expect(screen.getAllByRole("button", { name: "Use" })).toHaveLength(1);
+    expect(screen.getAllByText("karim@serousal.com · Serousal")).toHaveLength(1);
+    expect(screen.queryByText(/Checking/)).not.toBeInTheDocument();
+    expect(maxInFlight).toBeLessThanOrEqual(3);
   });
 
   it("when the account changed since it was shown, Use refuses and the row is re-checked", async () => {

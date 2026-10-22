@@ -346,7 +346,18 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     const tokens = await readTokenResponse(tokenRes);
     if (!tokens.access_token) {
       await deps.services.kv.delete(stateKey);
-      return c.html(popupError("Token exchange failed", "Provider did not return an access token."), 502);
+      // Slack answers token errors with HTTP 200 + {ok:false, error} — show
+      // its code (invalid_code, bad_redirect_uri, …), not a generic line.
+      const providerError = (tokens as { error?: unknown }).error;
+      return c.html(
+        popupError(
+          "Token exchange failed",
+          typeof providerError === "string"
+            ? htmlEscape(`Provider error: ${providerError}`)
+            : "Provider did not return an access token.",
+        ),
+        502,
+      );
     }
 
     const expiresAt = tokens.expires_in
@@ -888,7 +899,7 @@ function presetForIssuer(issuer: string): OAuthPreset | null {
       setupSteps: (cb) => [
         "Open api.slack.com/apps → Create New App → From a manifest, pick your workspace and paste the manifest below (it already contains the callback URL and every user scope Slack's MCP server advertises).",
         "In the app: OAuth & Permissions → opt in to Proof Key for Code Exchange (PKCE).",
-        "In the app: Agents & AI Apps → toggle on Model Context Protocol.",
+        "In the app: Agents & AI Apps → check Model Context Protocol is on (the manifest turns it on; without it Slack answers \"App is not enabled for Slack MCP server access\").",
         "Basic Information → App Credentials: copy the Client ID and Client Secret (not the bot/app tokens) and paste them below.",
         `If you edit the redirect URL by hand it must be exactly ${cb}.`,
       ],
@@ -903,6 +914,10 @@ function presetForIssuer(issuer: string): OAuthPreset | null {
           scopes: { bot: ["users:read"], user: SLACK_MCP_USER_SCOPES },
         },
         settings: {
+          // Agents & AI Apps → Model Context Protocol. Without it mcp.slack.com
+          // rejects the token ("App is not enabled for Slack MCP server
+          // access") — same flag as packages/slack/src/oauth/manifest.ts.
+          is_mcp_enabled: true,
           org_deploy_enabled: false,
           socket_mode_enabled: false,
           token_rotation_enabled: false,
@@ -944,7 +959,15 @@ function envValue(env: Record<string, string | undefined> | undefined, key: stri
 async function readTokenResponse(res: Response): Promise<TokenResponse> {
   const text = await res.text();
   try {
-    return JSON.parse(text) as TokenResponse;
+    const parsed = JSON.parse(text) as TokenResponse & {
+      authed_user?: { access_token?: string; refresh_token?: string; expires_in?: number; token_type?: string };
+    };
+    // Slack's oauth.v2.access puts the USER token (the one mcp.slack.com
+    // takes) under authed_user.
+    if (!parsed.access_token && parsed.authed_user?.access_token) {
+      return { ...parsed, ...parsed.authed_user, access_token: parsed.authed_user.access_token };
+    }
+    return parsed;
   } catch {
     const params = new URLSearchParams(text);
     return {

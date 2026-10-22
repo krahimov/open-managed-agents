@@ -21,6 +21,7 @@ export {
   listComposioToolkits,
   createComposioToolRouterSession,
   listComposioConnectedAccounts,
+  normalizeComposioToolkitSlug,
 } from "./vaults";
 export type { VaultRoutesDeps } from "./vaults";
 

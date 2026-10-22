@@ -536,3 +536,64 @@ describe("resolveProxyTargetByTenant — Composio MCP", () => {
     expect(new URL(calls[0].url).searchParams.get("toolkit_slug")).toBe("slack");
   });
 });
+
+describe("Composio link: same project and user as the post-sign-in graft", () => {
+  function linkHarness(opts: { platformKey?: string; tenantKey?: string }) {
+    const calls: Array<{ url: string; key: string | null; body: any }> = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const req = input instanceof Request ? input : new Request(input as never, init);
+      const body = req.method === "POST" ? await req.json() : null;
+      calls.push({ url: req.url, key: req.headers.get("x-api-key"), body });
+      if (req.url.includes("/api/v3.1/auth_configs?")) return Response.json({ items: [{ id: "acfg_drive", toolkit: { slug: "googledrive" } }] });
+      if (req.url.endsWith("/api/v3.1/connected_accounts/link")) {
+        return Response.json({ redirect_url: "https://accounts.composio.dev/link/x", connected_account_id: "ca_drive" }, { status: 201 });
+      }
+      return new Response("not found", { status: 404 });
+    };
+    const { service: vaultService } = createInMemoryVaultService();
+    const { service: credService } = createInMemoryCredentialService();
+    const app = new Hono<{ Variables: { tenant_id: string } }>();
+    app.use("*", async (c, next) => { c.set("tenant_id", TENANT); await next(); });
+    app.route("/", buildVaultRoutes({
+      services: { vaults: vaultService, credentials: credService } as unknown as Services,
+      composio: { apiKey: opts.platformKey, fetcher, resolveApiKey: async () => opts.tenantKey ?? null },
+    }));
+    const link = (vaultId: string, toolkit = "google-drive") => app.request(`/${vaultId}/credentials/composio_accounts/link`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ toolkit }),
+    });
+    return { calls, vaultService, credService, link };
+  }
+
+  it("uses the workspace's own Composio key before the operator key (the graft's order)", async () => {
+    const h = linkHarness({ platformKey: "cmp_operator", tenantKey: "cmp_workspace" });
+    const vault = await h.vaultService.create({ tenantId: TENANT, name: "Connected Apps" });
+    expect((await h.link(vault.id)).status).toBe(201);
+    expect(new Set(h.calls.map((c) => c.key))).toEqual(new Set(["cmp_workspace"]));
+  });
+
+  it("falls back to the operator key when the workspace has none", async () => {
+    const h = linkHarness({ platformKey: "cmp_operator" });
+    const vault = await h.vaultService.create({ tenantId: TENANT, name: "Connected Apps" });
+    expect((await h.link(vault.id)).status).toBe(201);
+    expect(new Set(h.calls.map((c) => c.key))).toEqual(new Set(["cmp_operator"]));
+  });
+
+  it("creates the account under the Composio user the vault's tool router already uses", async () => {
+    const h = linkHarness({ platformKey: "cmp_operator" });
+    const vault = await h.vaultService.create({ tenantId: TENANT, name: "Connected Apps" });
+    await h.credService.create({
+      tenantId: TENANT, vaultId: vault.id, displayName: "Composio Tool Router",
+      auth: { type: "composio_mcp", mcp_server_url: "https://backend.composio.dev/tool_router/trs_1/mcp", api_key_env: "COMPOSIO_API_KEY", composio_user_id: "custom-user-7", composio_toolkits: ["googledrive"] },
+    });
+    expect((await h.link(vault.id)).status).toBe(201);
+    const linkCall = h.calls.find((c) => c.url.endsWith("/connected_accounts/link"))!;
+    expect(linkCall.body.user_id).toBe("custom-user-7");
+  });
+
+  it("defaults the Composio user to the vault when it has no tool router yet", async () => {
+    const h = linkHarness({ platformKey: "cmp_operator" });
+    const vault = await h.vaultService.create({ tenantId: TENANT, name: "Connected Apps" });
+    await h.link(vault.id);
+    expect(h.calls.find((c) => c.url.endsWith("/connected_accounts/link"))!.body.user_id).toBe(`oma:${TENANT}:${vault.id}`);
+  });
+});

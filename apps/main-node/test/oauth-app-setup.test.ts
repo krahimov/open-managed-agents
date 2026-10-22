@@ -70,7 +70,7 @@ describe("one-time OAuth app setup", () => {
       label: string;
       callback_uri: string;
       setup_steps: string[];
-      manifest?: { oauth_config?: { redirect_urls?: string[]; scopes?: { user?: string[] } } };
+      manifest?: { oauth_config?: { redirect_urls?: string[]; scopes?: { user?: string[] } }; settings?: { is_mcp_enabled?: boolean } };
       env: { client_id: string };
     };
     expect(body.required).toBe(true);
@@ -81,6 +81,8 @@ describe("one-time OAuth app setup", () => {
     expect(body.manifest?.oauth_config?.redirect_urls).toEqual(["https://orrery.test/v1/oauth/callback"]);
     expect(body.manifest?.oauth_config?.scopes?.user).toContain("search:read.public");
     expect(body.env.client_id).toBe("SLACK_OAUTH_CLIENT_ID");
+    // Without it Slack rejects the token: "App is not enabled for Slack MCP server access".
+    expect(body.manifest?.settings?.is_mcp_enabled).toBe(true);
   });
 
   it("authorize without an app returns the structured oauth_app_required error", async () => {

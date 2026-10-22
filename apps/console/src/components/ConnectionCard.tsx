@@ -178,13 +178,17 @@ export function ConnectionCard({
 
   // Look up who each saved account is (provider identity, read-only) so the
   // user can tell them apart before choosing.
+  // A few at a time: a workspace can hold many old sign-ins for one service.
   useEffect(() => {
     if (!state) return;
+    let inFlight = Object.values(identities).filter((v) => v === "checking").length;
     for (const conn of state.connections) {
+      if (inFlight >= 3) break;
       if (conn.identity || identifyStarted.current.has(conn.credential_id)) continue;
       identify(conn);
+      inFlight++;
     }
-  }, [state, identify]);
+  }, [state, identities, identify]);
 
   const finish = useCallback(
     async (result: ConnectResult) => {
@@ -361,6 +365,26 @@ export function ConnectionCard({
   const needsAppSetup = !isApiKey && !!appReq?.required && !appReq.configured;
   const showChooser = !gone && (!connected || choosing);
   const saved = (state?.connections ?? []).filter((c) => !(connected && c.credential_id === state?.current?.credential_id));
+  // Sort saved sign-ins into: usable accounts (one row per real account —
+  // repeated sign-ins of the same account collapse), still being checked,
+  // and ones that no longer work (tucked away, not a wall of rows).
+  const rows = saved.map((conn) => {
+    const looked = identities[conn.credential_id];
+    // A fresh local check wins over the server's cached identity.
+    const identity = (looked && looked !== "checking" ? looked : undefined) ?? conn.identity ?? undefined;
+    return { conn, identity, checking: looked === "checking" || (!identity && looked === undefined) };
+  });
+  const seenAccounts = new Set<string>();
+  const good = rows.filter((r) => {
+    if (r.checking || r.identity?.status !== "verified") return false;
+    const key = r.identity.account || r.identity.workspace_id ? `${r.identity.account ?? ""}|${r.identity.workspace_id ?? ""}` : null;
+    if (!key) return true;
+    if (seenAccounts.has(key)) return false;
+    seenAccounts.add(key);
+    return true;
+  });
+  const checkingCount = rows.filter((r) => r.checking).length;
+  const broken = rows.filter((r) => !r.checking && r.identity && r.identity.status !== "verified");
 
   const subtitle = gone
     ? "Removed from this agent"
@@ -417,61 +441,63 @@ export function ConnectionCard({
 
       {showChooser && state && (
         <div className="border-t border-border px-4 py-3 space-y-3">
-          {saved.length > 0 && (
+          {good.length > 0 && (
             <div className="space-y-1.5">
               <div className="text-[11px] font-medium uppercase tracking-wider text-fg-subtle">
                 Saved {name} accounts
               </div>
               <ul className="divide-y divide-border rounded-md border border-border bg-bg">
-                {saved.map((conn) => {
-                  const looked = identities[conn.credential_id];
-                  // A fresh local check wins over the server's cached identity.
-                  const identity = (looked && looked !== "checking" ? looked : undefined) ?? conn.identity ?? undefined;
-                  const checking = looked === "checking";
-                  const verified = identity?.status === "verified";
-                  const title = verified ? who(identity?.account, identity?.workspace) || conn.label : conn.label;
-                  return (
-                    <li key={conn.credential_id} className="flex items-center gap-3 px-3 py-2">
-                      <div className="min-w-0 flex-1">
-                        <div className="text-sm text-fg truncate">{title}</div>
-                        <div className="text-xs text-fg-subtle truncate">
-                          {checking ? (
-                            <span className="inline-flex items-center gap-1">
-                              <Spinner className="size-3" /> Checking account…
-                            </span>
-                          ) : verified ? (
-                            identity?.account || identity?.workspace
-                              ? conn.label
-                              : `Signed in · ${name} doesn't share account details`
-                          ) : identity ? (
-                            <span className="text-danger">
-                              {identity.message ?? "This sign-in no longer works."}
-                            </span>
-                          ) : (
-                            conn.label
-                          )}
-                        </div>
+                {good.map(({ conn, identity }) => (
+                  <li key={conn.credential_id} className="flex items-center gap-3 px-3 py-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm text-fg truncate">{who(identity?.account, identity?.workspace) || conn.label}</div>
+                      <div className="text-xs text-fg-subtle truncate">
+                        {identity?.account || identity?.workspace
+                          ? conn.label
+                          : `Signed in · ${name} doesn't share account details`}
                       </div>
-                      {identity && !verified && !checking && (
-                        <Button variant="ghost" size="sm" onClick={() => identify(conn)}>
-                          Retry
-                        </Button>
-                      )}
-                      <Button
-                        size="sm"
-                        variant={verified ? "default" : "outline"}
-                        disabled={!verified || !identity?.version || !!busy || signingIn}
-                        loading={busy === conn.credential_id}
-                        loadingLabel="Connecting…"
-                        onClick={() => void use(conn, identity)}
-                      >
-                        Use
-                      </Button>
-                    </li>
-                  );
-                })}
+                    </div>
+                    <Button
+                      size="sm"
+                      disabled={!identity?.version || !!busy || signingIn}
+                      loading={busy === conn.credential_id}
+                      loadingLabel="Connecting…"
+                      onClick={() => void use(conn, identity)}
+                    >
+                      Use
+                    </Button>
+                  </li>
+                ))}
               </ul>
             </div>
+          )}
+          {checkingCount > 0 && (
+            <div className="flex items-center gap-1.5 text-xs text-fg-subtle">
+              <Spinner className="size-3" />
+              {good.length > 0
+                ? `Checking ${checkingCount} more saved sign-in${checkingCount === 1 ? "" : "s"}…`
+                : `Checking your saved ${name} accounts…`}
+            </div>
+          )}
+          {broken.length > 0 && (
+            <details className="text-xs text-fg-subtle" data-testid="broken-signins">
+              <summary className="cursor-pointer select-none">
+                {broken.length} older sign-in{broken.length === 1 ? "" : "s"} no longer work{broken.length === 1 ? "s" : ""}
+              </summary>
+              <ul className="mt-1.5 divide-y divide-border rounded-md border border-border bg-bg">
+                {broken.map(({ conn, identity }) => (
+                  <li key={conn.credential_id} className="flex items-center gap-3 px-3 py-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm text-fg truncate">{conn.label}</div>
+                      <div className="text-xs text-danger truncate">{identity?.message ?? "This sign-in no longer works."}</div>
+                    </div>
+                    <Button variant="ghost" size="sm" onClick={() => identify(conn)}>
+                      Retry
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            </details>
           )}
 
           {isApiKey ? (
@@ -501,7 +527,7 @@ export function ConnectionCard({
             <div className="flex items-center gap-2">
               <Button
                 size="sm"
-                variant={saved.length > 0 ? "outline" : "default"}
+                variant={good.length > 0 ? "outline" : "default"}
                 disabled={!!busy}
                 onClick={() => void signIn()}
               >
@@ -509,7 +535,7 @@ export function ConnectionCard({
                   <>
                     <Spinner className="size-3.5" /> Waiting for {name}…
                   </>
-                ) : saved.length > 0 ? (
+                ) : good.length > 0 ? (
                   <>
                     <PlusIcon className="size-3.5" aria-hidden /> Sign in with another {name} account
                   </>

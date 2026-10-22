@@ -185,3 +185,30 @@ describe("Telegram MCP OAuth completion receipts", () => {
     expect(f.kv.has("telegram_oauth:trusted-flow")).toBe(false);
   });
 });
+
+describe("token responses from Slack", () => {
+  function stubToken(body: unknown) {
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.endsWith("/oauth/token")) return Response.json(body);
+      return new Response("{}", { status: 200 });
+    }));
+  }
+  it("shows Slack's own error code (HTTP 200 + ok:false) instead of a generic failure", async () => {
+    stubToken({ ok: false, error: "invalid_code" });
+    const f = fakeServices(baseState);
+    const app = new Hono().route("/v1/oauth", buildNodeOAuthRoutes({ services: f.services as never }));
+    const res = await app.request("https://api.example/v1/oauth/callback?code=abc&state=st1");
+    expect(res.status).toBe(502);
+    expect(await res.text()).toContain("Provider error: invalid_code");
+    expect(f.created).toHaveLength(0);
+  });
+  it("accepts the user token Slack nests under authed_user", async () => {
+    stubToken({ ok: true, authed_user: { access_token: "xoxp-user", refresh_token: "xoxe-r", expires_in: 3600 } });
+    const f = fakeServices(baseState);
+    const app = new Hono().route("/v1/oauth", buildNodeOAuthRoutes({ services: f.services as never }));
+    const res = await app.request("https://api.example/v1/oauth/callback?code=abc&state=st1");
+    expect(res.status).toBe(200);
+    expect((f.created[0] as { auth: { access_token: string; refresh_token: string } }).auth).toMatchObject({ access_token: "xoxp-user", refresh_token: "xoxe-r" });
+  });
+});

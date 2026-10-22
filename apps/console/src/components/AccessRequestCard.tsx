@@ -100,82 +100,92 @@ function LegacyAccessRequestCard({
     setStatus("connected");
   }, [granted]);
 
-  useEffect(() => {
-    if (status !== "connecting") return;
-    const complete = async (opts: { grantRecorded?: boolean } = {}) => {
-      if (notifiedRef.current) return;
-      notifiedRef.current = true;
-      // Graft the connection onto the session's AGENT (tool-router
-      // mcp_server + vault link + toolkit list). Without this, an agent
-      // created with no Composio wiring never sees the toolkit's tools —
-      // in this session or any future one, scheduled sessions included.
-      // Verify the active provider account before reporting the connection.
-      let attachedServer = false;
-      if (!isMcpOauth && vaultIdRef.current) {
-        try {
-          const graft = await api<{ attached_server?: boolean }>(
-            `/v1/sessions/${sessionId}/composio/graft`,
-            {
-              method: "POST",
-              body: JSON.stringify({ toolkit: service, vault_id: vaultIdRef.current }),
-              silentErrors: true,
-            },
-          );
-          attachedServer = graft.attached_server === true;
-        } catch (err) {
-          notifiedRef.current = false;
-          setStatus("error");
-          setError(err instanceof Error ? err.message : "Connection could not be verified. Please retry.");
-          return;
-        }
-      }
-      setStatus("connected");
-      if (opts.grantRecorded) {
-        // The OAuth callback already appended system.access_granted + the
-        // "[access granted]" nudge server-side — posting again would wake
-        // the agent twice with a duplicate message.
-        toast.success(`${service} connected.`);
+  const accountIdRef = useRef<string | null>(null);
+  const [graftFailed, setGraftFailed] = useState(false);
+  const completeRef = useRef<(opts?: { grantRecorded?: boolean }) => Promise<void>>(async () => {});
+  completeRef.current = async (opts: { grantRecorded?: boolean } = {}) => {
+    if (notifiedRef.current) return;
+    notifiedRef.current = true;
+    // Graft the connection onto the session's AGENT (tool-router
+    // mcp_server + vault link + toolkit list). Without this, an agent
+    // created with no Composio wiring never sees the toolkit's tools —
+    // in this session or any future one, scheduled sessions included.
+    // Verify the active provider account before reporting the connection.
+    let attachedServer = false;
+    if (!isMcpOauth && vaultIdRef.current) {
+      try {
+        const graft = await api<{ attached_server?: boolean }>(
+          `/v1/sessions/${sessionId}/composio/graft`,
+          {
+            method: "POST",
+            body: JSON.stringify({ toolkit: service, vault_id: vaultIdRef.current }),
+            silentErrors: true,
+          },
+        );
+        attachedServer = graft.attached_server === true;
+      } catch (err) {
+        notifiedRef.current = false;
+        setStatus("error");
+        setError(err instanceof Error ? err.message : "Connection could not be verified. Please retry.");
         return;
       }
-      // Tell the agent — a plain user.message wakes the turn loop the same
-      // way a typed reply would, so it picks the task back up.
-      void api(`/v1/sessions/${sessionId}/events`, {
-        method: "POST",
-        body: JSON.stringify({
-          events: [
-            {
-              type: "user.message",
-              content: [
-                {
-                  type: "text",
-                  // Composio grants change the tool surface mid-session
-                  // (the tool router's SEARCH_TOOLS results now include the
-                  // new toolkit) — without an explicit nudge, agents reason
-                  // from their earlier "no tools found" and give up
-                  // (observed: post-grant, an agent searched GitHub code
-                  // for a Drive upload instead of re-querying Composio).
-                  text: isMcpOauth
-                    ? `[access granted] ${service} is now connected — continue where you left off.`
-                    : attachedServer
-                      ? `[access granted] ${service} is now connected and its toolkit was attached to this agent. This running session may not expose the new tools yet — NEW sessions of this agent (including scheduled ones) will have them. Re-run COMPOSIO_SEARCH_TOOLS for ${service} to check what's visible here, then continue where you left off.`
-                      : `[access granted] ${service} is now connected. Your available actions have changed: re-run COMPOSIO_SEARCH_TOOLS for ${service} to discover its tools (do not assume earlier "no tools found" results still hold), then continue where you left off.`,
-                },
-              ],
-            },
-          ],
-        }),
-      }).catch(() => {
-        toast.error("Connected, but failed to notify the agent — send it a message to continue.");
-      });
+    }
+    setStatus("connected");
+    setGraftFailed(false);
+    if (opts.grantRecorded) {
+      // The OAuth callback already appended system.access_granted + the
+      // "[access granted]" nudge server-side — posting again would wake
+      // the agent twice with a duplicate message.
       toast.success(`${service} connected.`);
-    };
+      return;
+    }
+    // Tell the agent — a plain user.message wakes the turn loop the same
+    // way a typed reply would, so it picks the task back up.
+    void api(`/v1/sessions/${sessionId}/events`, {
+      method: "POST",
+      body: JSON.stringify({
+        events: [
+          {
+            type: "user.message",
+            content: [
+              {
+                type: "text",
+                // Composio grants change the tool surface mid-session
+                // (the tool router's SEARCH_TOOLS results now include the
+                // new toolkit) — without an explicit nudge, agents reason
+                // from their earlier "no tools found" and give up
+                // (observed: post-grant, an agent searched GitHub code
+                // for a Drive upload instead of re-querying Composio).
+                text: isMcpOauth
+                  ? `[access granted] ${service} is now connected — continue where you left off.`
+                  : attachedServer
+                    ? `[access granted] ${service} is now connected and its toolkit was attached to this agent. This running session may not expose the new tools yet — NEW sessions of this agent (including scheduled ones) will have them. Re-run COMPOSIO_SEARCH_TOOLS for ${service} to check what's visible here, then continue where you left off.`
+                    : `[access granted] ${service} is now connected. Your available actions have changed: re-run COMPOSIO_SEARCH_TOOLS for ${service} to discover its tools (do not assume earlier "no tools found" results still hold), then continue where you left off.`,
+              },
+            ],
+          },
+        ],
+      }),
+    }).catch(() => {
+      toast.error("Connected, but failed to notify the agent — send it a message to continue.");
+    });
+    toast.success(`${service} connected.`);
+  };
+
+  useEffect(() => {
+    if (status !== "connecting") return;
+    const complete = (opts: { grantRecorded?: boolean } = {}) => completeRef.current(opts);
     const handle = (e: MessageEvent) => {
       if (e.origin && e.origin !== window.location.origin) return;
       const data = (
         e as MessageEvent<{ type?: string; toolkit?: string; service?: string }>
       ).data;
       if (data?.type === "composio_auth_complete") {
-        if (data.toolkit && data.toolkit.toLowerCase() !== service) return;
+        // Same slug normalization as the server ("google-drive" = "googledrive").
+        const slug = (v: string) => v.toLowerCase().replace(/[-_.\s]+/g, "");
+        if (data.toolkit && slug(data.toolkit) !== slug(service)) return;
+        const accountId = (data as { connected_account_id?: string }).connected_account_id;
+        if (accountId) accountIdRef.current = accountId;
         const providerError = (data as { error?: string }).error;
         if (providerError) { setStatus("error"); setError(providerError); return; }
         void complete();
@@ -382,6 +392,24 @@ function LegacyAccessRequestCard({
           </Button>
         ) : needsAppSetup ? (
           <span className="text-xs font-medium text-warning whitespace-nowrap">Setup required</span>
+        ) : graftFailed && status === "error" ? (
+          // Signed in, but the account wasn't found active yet: check again
+          // rather than starting a second sign-in (which piles up accounts).
+          <div className="flex items-center gap-2">
+            <Button
+              size="sm"
+              onClick={() => {
+                setError(null);
+                setStatus("connecting");
+                void completeRef.current();
+              }}
+            >
+              Check again
+            </Button>
+            <Button variant="ghost" size="sm" onClick={connect}>
+              Sign in again
+            </Button>
+          </div>
         ) : (
           <Button size="sm" onClick={connect} disabled={status === "connecting"}>
             {status === "connecting" ? "Waiting for provider…" : `Connect ${serviceDisplayName(service, ev.mcp_server_url)}`}

@@ -180,7 +180,7 @@ interface ResolvedComposioDeps {
 const COMPOSIO_NOT_CONNECTED =
   "Composio is not connected — configure COMPOSIO_API_KEY on the API server.";
 
-function normalizeComposioToolkitSlug(slug: string): string {
+export function normalizeComposioToolkitSlug(slug: string): string {
   // Composio toolkit slugs are bare alphanumerics ("googledrive",
   // "googlecalendar"). Agents and users write human variants
   // ("google-drive", "Google Drive", "google_drive") — strip separators so
@@ -232,12 +232,16 @@ async function resolveComposioForVault(input: {
   const explicitKey = normalizeComposioApiKey(input.explicitApiKey);
   if (explicitKey) return makeResolved(explicitKey, "request");
 
-  const platformKey = normalizeComposioApiKey(base.apiKey);
-  if (platformKey) return makeResolved(platformKey, "platform");
-
+  // Managed-first: the workspace's own key wins over the operator env key —
+  // the same order the post-OAuth graft resolves (main-node composioKeyFor).
+  // With the orders disagreeing, the account was created in one Composio
+  // project and looked up in the other ("No active <toolkit> account").
   const tenantKey =
     (await base.resolveApiKey?.(input.tenantId).catch(() => null)) ?? null;
   if (tenantKey) return makeResolved(tenantKey, "tenant");
+
+  const platformKey = normalizeComposioApiKey(base.apiKey);
+  if (platformKey) return makeResolved(platformKey, "platform");
 
   const current = await input.services.credentials.list({
     tenantId: input.tenantId,
@@ -784,7 +788,15 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
       api_key?: string;
     }>();
     if (!body.toolkit) return c.json({ error: "toolkit is required" }, 400);
-    const userId = body.user_id || `oma:${tenantId}:${vaultId}`;
+    // Create the account under the Composio user this vault's tool-router
+    // credential already uses — the graft looks it up there.
+    const vaultCreds = await services.credentials.list({ tenantId, vaultId }).catch(() => []);
+    const existingUserId = vaultCreds
+      .filter((cr) => !cr.archived_at)
+      .map((cr) => (cr as unknown as CredentialConfig).auth as CredentialAuth)
+      .find((a) => a.type === "composio_mcp" && typeof a.composio_user_id === "string" && a.composio_user_id)
+      ?.composio_user_id;
+    const userId = body.user_id || existingUserId || `oma:${tenantId}:${vaultId}`;
     try {
       const composio = await resolveComposioForVault({
         routeDeps: deps.composio,
