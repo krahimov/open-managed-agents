@@ -311,9 +311,11 @@ export class ConnectionConsent {
   private async label(tenantId: string, vaultId: string, credential: CredentialRow, request: AccessRequest, result: ConnectResult & { status: "connected" }) {
     const service = serviceDisplayName(request.service, request.mcp_server_url);
     const who = [result.account, result.workspace].filter(Boolean).join(" · ");
-    if (!who) return;
-    await this.deps.services.credentials.update({ tenantId, vaultId, credentialId: credential.id, displayName: `${service} · ${who}` }).catch(() => {});
-    await this.deps.services.vaults.update({ tenantId, vaultId, name: `${service} · ${result.workspace ?? result.account}` }).catch(() => {});
+    // Providers that don't reveal identity: tell accounts apart by when they
+    // were connected.
+    const name = who || `account connected ${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC`;
+    await this.deps.services.credentials.update({ tenantId, vaultId, credentialId: credential.id, displayName: `${service} · ${name}` }).catch(() => {});
+    await this.deps.services.vaults.update({ tenantId, vaultId, name: `${service} · ${result.workspace ?? result.account ?? "connection"}` }).catch(() => {});
   }
 
   routes() {

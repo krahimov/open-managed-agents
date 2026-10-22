@@ -211,6 +211,15 @@ describe("connect card: new sign-in", () => {
     expect(f.vaults.find(v => v.id === vault.id)?.name).toBe("Slack · Acme");
   });
 
+  it("connectNew names identity-less accounts by when they were connected", async () => {
+    const f = fixture();
+    const vault = await f.services.vaults.create({ name: "Slack connection" });
+    const cred = await f.services.credentials.create({ vaultId: vault.id, displayName: "Slack (OAuth)", auth: { type: "mcp_oauth", access_token: "x", mcp_server_url: SLACK } });
+    f.verify.mockResolvedValueOnce({ status: "verified", message: "Service access verified." } as never);
+    expect((await f.consent.connectNew({ tenantId: "tenant", sessionId: "session", requestId: "request", vaultId: vault.id, credentialId: cred.id })).status).toBe("connected");
+    expect(f.credentials.find(c => c.id === cred.id)?.display_name).toMatch(/^Slack · account connected \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC$/);
+  });
+
   it("connectNew refuses unverifiable accounts and foreign sessions without throwing", async () => {
     const f = fixture();
     const vault = await f.services.vaults.create({ name: "Slack connection" });

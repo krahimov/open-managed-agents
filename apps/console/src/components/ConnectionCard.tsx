@@ -346,7 +346,7 @@ export function ConnectionCard({
   const subtitle = gone
     ? "Removed from this agent"
     : connected
-      ? who(state?.current?.account, state?.current?.workspace) || "Connected"
+      ? who(state?.current?.account, state?.current?.workspace) || state?.current?.label || "Connected"
       : state?.broken
         ? "The account this agent used was removed. Choose another one."
         : state === null

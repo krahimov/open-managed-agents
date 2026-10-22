@@ -300,6 +300,17 @@ export function SessionChat({
           {events.map((ev, i) => {
             const key = ev.seq != null ? `seq:${ev.seq}` : ev.id ?? `i${i}`;
             if (ev.type === "user.message") {
+              // Platform nudges ("[access granted] Linear is connected…") are
+              // not the user talking — show them as a quiet status line.
+              const text = eventText(ev);
+              if (/^\[access granted\]/.test(text)) {
+                return (
+                  <div key={key} className="self-center text-xs text-fg-subtle inline-flex items-center gap-1.5" data-testid="access-granted-note">
+                    <span className="text-success" aria-hidden>✓</span>
+                    {text.replace(/^\[access granted\]\s*/, "").replace(/\s*Continue where you left off\.?$/, "")}
+                  </div>
+                );
+              }
               return (
                 <Message from="user" key={key}>
                   <MessageContent>{eventText(ev)}</MessageContent>
