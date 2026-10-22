@@ -321,3 +321,23 @@ describe("ConnectionCard loading", () => {
     expect(await screen.findByRole("button", { name: "Connect Linear" })).toBeInTheDocument();
   });
 });
+
+describe("ConnectionCard switching", () => {
+  const current = { credential_id: "cred-1", vault_id: "vault-1", label: "Slack", account: "keryabakugan", workspace: "Erandry" };
+  it("a connected card can always switch: Change shows other accounts, a new sign-in, and how to pick another workspace", async () => {
+    server({ approved: true, current, connections: [{ ...saved, identity: { ...karim, account: "keryabakugan", workspace: "Erandry" } }] });
+    mount();
+    fireEvent.click(await screen.findByRole("button", { name: "Change" }));
+    expect(screen.getByRole("button", { name: /Sign in with a different Linear account/ })).toBeInTheDocument();
+    expect(screen.getByTestId("switch-hint")).toHaveTextContent("switch to it (or sign out) at linear.app first");
+  });
+
+  it("a switch request from the agent opens straight on the choices", async () => {
+    server({ approved: true, current, connections: [] });
+    render(<MemoryRouter><ConnectionCard request={{ ...request, switch_account: true }} sessionId="session" /></MemoryRouter>);
+    expect(await screen.findByRole("button", { name: /Sign in with a different Linear account/ })).toBeInTheDocument();
+    expect(screen.getByText("keryabakugan · Erandry")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.getByRole("button", { name: "Change" })).toBeInTheDocument();
+  });
+});

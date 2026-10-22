@@ -445,3 +445,24 @@ describe("agent connection overview", () => {
     expect((await f.app.request("/access/agent/nope/status")).status).toBe(404);
   });
 });
+
+describe("switching and removing", () => {
+  it("droppedMcpUrls finds servers an update removed, ignoring trailing slashes and stdio", async () => {
+    const { droppedMcpUrls } = await import("../src/lib/connection-consent");
+    expect(droppedMcpUrls(
+      [{ type: "url", url: "https://mcp.linear.app/mcp" }, { type: "url", url: SLACK }, { type: "stdio", url: "x" }],
+      [{ type: "url", url: "https://mcp.linear.app/mcp/" }],
+    )).toEqual([SLACK]);
+    expect(droppedMcpUrls(undefined, [])).toEqual([]);
+  });
+
+  it("revoke forgets the agent's account; re-adding the server starts over", async () => {
+    const f = fixture();
+    await f.pick("shared", "chosen");
+    expect((await f.bound())?.id).toBe("chosen");
+    await f.consent.revoke("tenant", "agent", SLACK);
+    expect(await f.bound()).toBeNull();
+    expect(await f.consent.hasApproval("tenant", "agent", SLACK)).toBe(false);
+    expect((await f.state())).toMatchObject({ approved: false, broken: false });
+  });
+});

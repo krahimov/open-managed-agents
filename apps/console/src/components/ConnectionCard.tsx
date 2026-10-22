@@ -28,6 +28,8 @@ export interface ConnectionRequest {
   mcp_server_url: string;
   auth_kind?: string;
   oauth_app?: OAuthAppRequirement;
+  /** The agent asked for a different account: open on the choices. */
+  switch_account?: boolean;
 }
 
 interface Identity {
@@ -124,7 +126,7 @@ export function ConnectionCard({
   const [gone, setGone] = useState<string | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [identities, setIdentities] = useState<Record<string, Identity | "checking">>({});
-  const [choosing, setChoosing] = useState(false);
+  const [choosing, setChoosing] = useState(request.switch_account === true);
   const [busy, setBusy] = useState<string | null>(null);
   const [signingIn, setSigningIn] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -500,6 +502,14 @@ export function ConnectionCard({
             </details>
           )}
 
+          {connected && !isApiKey && (
+            <p className="text-xs text-fg-muted" data-testid="switch-hint">
+              {name} signs you in as whoever your browser is logged into. For a different account or
+              workspace, switch to it (or sign out) at {knownMcpServerForUrl(request.mcp_server_url)?.domain ?? name} first,
+              then sign in here. Your current account stays connected until you pick another.
+            </p>
+          )}
+
           {isApiKey ? (
             <form
               className="flex items-center gap-2"
@@ -535,9 +545,9 @@ export function ConnectionCard({
                   <>
                     <Spinner className="size-3.5" /> Waiting for {name}…
                   </>
-                ) : good.length > 0 ? (
+                ) : good.length > 0 || connected ? (
                   <>
-                    <PlusIcon className="size-3.5" aria-hidden /> Sign in with another {name} account
+                    <PlusIcon className="size-3.5" aria-hidden /> Sign in with {connected ? "a different" : "another"} {name} account
                   </>
                 ) : (
                   `Connect ${name}`

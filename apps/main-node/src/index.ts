@@ -1,4 +1,4 @@
-import { ConnectionConsent } from "./lib/connection-consent.js";
+import { ConnectionConsent, droppedMcpUrls } from "./lib/connection-consent.js";
 import { graftComposioToolkit } from "./lib/composio-graft.js";
 import { serviceDisplayName } from "@open-managed-agents/api-types";
 import { buildTelegramConnectRoutes } from "./lib/telegram-connect-routes.js";
@@ -922,12 +922,7 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
     });
     if (sessRow?.metadata?.oma_setup === true) {
       return buildSetupTools(agent, context.sessionId, {
-        updateAgent: (patch) =>
-          agentsService.update({
-            tenantId: context.tenantId,
-            agentId: agent.id,
-            input: patch,
-          }),
+        updateAgent: (patch) => updateAgentFromSetup(context.tenantId, agent.id, patch),
         appendEvent: (event): Promise<unknown> =>
           sessionRouter.appendEvent(context.sessionId, event),
         requestAccess: (a) =>
@@ -1098,9 +1093,7 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
       patchSessionMetadata: async (tenantId, sessionId, patch) => {
         await sessionsService.update({ tenantId, sessionId, metadata: patch });
       },
-      updateAgent: async (tenantId, agentId, patch) => {
-        return await agentsService.update({ tenantId, agentId, input: patch });
-      },
+      updateAgent: (tenantId, agentId, patch) => updateAgentFromSetup(tenantId, agentId, patch),
       // request_access + create_ambient_rule on the SDK harness — same event
       // pipeline as the DefaultHarness buildTools hooks.
       requestServiceAccess: (tenantId, sessionId, a) =>
@@ -1119,9 +1112,7 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
       memory: sdkMemoryPort,
       readSessionMetadata: async (tenantId, sessionId) =>
         (await sessionsService.get({ tenantId, sessionId }))?.metadata ?? null,
-      updateAgent: async (tenantId, agentId, patch) => {
-        return await agentsService.update({ tenantId, agentId, input: patch });
-      },
+      updateAgent: (tenantId, agentId, patch) => updateAgentFromSetup(tenantId, agentId, patch),
       requestServiceAccess: (tenantId, sessionId, a) =>
         postAccessRequest(tenantId, sessionId, a),
       isConnectionApproved: async (tenantId, agentId, url) => !!await connectionConsent.authorizedCredential(tenantId, agentId, url),
@@ -2105,7 +2096,7 @@ async function probeMcpAuthKind(url: string): Promise<"mcp_oauth" | "mcp_api_key
 async function postAccessRequest(
   tenantId: string,
   sessionId: string,
-  args: { service: string; reason: string; mcp_server_url?: string },
+  args: { service: string; reason: string; mcp_server_url?: string; switch_account?: boolean },
   suppliedRequestId?: string,
 ): Promise<{ request_id: string; status: string; note?: string }> {
   const service = args.service.trim().toLowerCase();
@@ -2143,11 +2134,15 @@ async function postAccessRequest(
     reason: args.reason,
     auth_kind: authKind,
     ...(mcpServerUrl ? { mcp_server_url: mcpServerUrl } : {}),
+    // The user asked for a different account: the card opens on the choices.
+    ...(args.switch_account === true && mcpServerUrl ? { switch_account: true } : {}),
     ...(authKind === "composio" ? { composio_configured: !!key } : {}),
     ...(oauthApp?.required ? { oauth_app: oauthApp } : {}),
   } as SessionEvent);
   const note =
-    authKind === "llm_provider"
+    args.switch_account === true && mcpServerUrl && authKind !== "llm_provider"
+      ? `Card posted open on the account choices for "${service}": the user picks another saved account or signs in with a different one. The current account stays connected until they choose; you'll receive an "[access granted]" message naming the new account and workspace.`
+      : authKind === "llm_provider"
       ? `"${service}" is a model provider, not a connectable app — its key belongs in Console → Model Cards, and the user has been pointed there. Don't wait on an OAuth grant; continue other work.`
       : authKind === "mcp_api_key"
         ? `"${service}" authenticates with an API key, not OAuth. The user is being asked to paste the key into the credential vault (it never enters this conversation) — you'll receive a message when it's saved.`
@@ -2469,6 +2464,27 @@ const connectionConsent = new ConnectionConsent({
   },
 });
 v1.route("/connection-access", connectionConsent.routes());
+
+/**
+ * update_harness on every harness. A server the agent drops from its harness
+ * also loses its connection, so removing and re-adding a server really
+ * starts over (seen live 2026-10-22: the agent removed and re-added Slack to
+ * let the user pick another workspace, and the old approval came back).
+ */
+async function updateAgentFromSetup(
+  tenantId: string,
+  agentId: string,
+  patch: { mcp_servers?: unknown } & object,
+): Promise<Awaited<ReturnType<typeof agentsService.update>>> {
+  const before = patch.mcp_servers !== undefined ? await agentsService.get({ tenantId, agentId }).catch(() => null) : null;
+  const updated = await agentsService.update({ tenantId, agentId, input: patch as never });
+  if (before) {
+    for (const url of droppedMcpUrls(before.mcp_servers, updated.mcp_servers)) {
+      await connectionConsent.revoke(tenantId, agentId, url).catch(() => {});
+    }
+  }
+  return updated;
+}
 
 type SetupAccessRecord = {
   consent_version: 2;

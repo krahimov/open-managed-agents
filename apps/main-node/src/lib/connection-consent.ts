@@ -35,6 +35,19 @@ export function credentialGeneration(credential: CredentialRow): string {
   return credential.auth.connected_at ?? credential.created_at;
 }
 
+/** URL servers in `before` that `after` no longer has (compared like
+ *  bindings are keyed), e.g. the ones an update_harness call dropped. */
+export function droppedMcpUrls(before: unknown, after: unknown): string[] {
+  const urls = (list: unknown) =>
+    (Array.isArray(list) ? list : [])
+      .map((s) => s as { type?: string; url?: unknown })
+      .filter((s) => s.type !== "stdio" && typeof s.url === "string" && s.url)
+      .map((s) => s.url as string);
+  const key = (u: string) => { try { return connectionUrl(u); } catch { return u; } };
+  const kept = new Set(urls(after).map(key));
+  return urls(before).filter((u) => !kept.has(key(u)));
+}
+
 export function connectionBindingKey(tenantId: string, agentId: string, url: string): string {
   return `connection_consent:${encodeURIComponent(tenantId)}:${encodeURIComponent(agentId)}:${encodeURIComponent(connectionUrl(url))}`;
 }
@@ -184,6 +197,11 @@ export class ConnectionConsent {
 
   async hasApproval(tenantId: string, agentId: string, url: string): Promise<boolean> {
     return !!await this.deps.services.kv.get(connectionBindingKey(tenantId, agentId, url));
+  }
+
+  /** Forget which account the agent uses for `url` (server removed). */
+  async revoke(tenantId: string, agentId: string, url: string): Promise<void> {
+    await this.deps.services.kv.delete(connectionBindingKey(tenantId, agentId, url));
   }
 
   async binding(tenantId: string, agentId: string, url: string): Promise<ConnectionBinding | null> {

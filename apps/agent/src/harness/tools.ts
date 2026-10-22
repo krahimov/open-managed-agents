@@ -699,6 +699,7 @@ export async function buildTools(
     requestServiceAccess?: (args: {
       service: string;
       reason: string;
+      switch_account?: boolean;
     }) => Promise<{ request_id: string; status: string; note?: string }>;
     /** Search the tenant skill store + curated catalog by keyword — the
      *  discovery half of agent-initiated skill acquisition. */
@@ -1357,6 +1358,7 @@ export async function buildTools(
           .min(1)
           .max(300)
           .describe("One line shown to the user: what you need it for (e.g. \"to read this week's invoices\")"),
+        switch_account: z.boolean().optional().describe("Set true when the user wants a DIFFERENT account/workspace for a service this agent is already connected to: the card opens on the account choices (saved accounts + sign in with another) instead of showing it as connected."),
       }),
       execute: safe(async (args) => env.requestServiceAccess!(args)),
     });

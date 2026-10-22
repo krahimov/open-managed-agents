@@ -147,7 +147,7 @@ export interface ClaudeAgentSdkHarnessDeps {
   requestServiceAccess?: (
     tenantId: string,
     sessionId: string,
-    args: { service: string; reason: string; mcp_server_url?: string },
+    args: { service: string; reason: string; mcp_server_url?: string; switch_account?: boolean },
   ) => Promise<{ request_id: string; status: string; note?: string }>;
   isConnectionApproved?: (tenantId: string, agentId: string, url: string) => Promise<boolean>;
   /** Setup sessions: reconcile the servers already on the harness (cards /
@@ -381,9 +381,10 @@ export class ClaudeAgentSdkHarness {
         reason: z
           .string()
           .describe('One line shown to the user: what you need it for (e.g. "to read this week\'s invoices")'),
+        switch_account: z.boolean().optional().describe("Set true when the user wants a DIFFERENT account/workspace for a service this agent is already connected to: the card opens on the account choices (saved accounts + sign in with another) instead of showing it as connected."),
       } as unknown as SdkToolSchema,
       async (args) => {
-        const a = args as { service?: string; reason?: string };
+        const a = args as { service?: string; reason?: string; switch_account?: boolean };
         if (!a.service?.trim()) {
           return { content: [{ type: "text" as const, text: "service is required" }], isError: true };
         }
@@ -399,6 +400,7 @@ export class ClaudeAgentSdkHarness {
           service: a.service,
           reason: a.reason?.trim() || "The agent needs this service for the current task.",
           ...(matched?.url ? { mcp_server_url: matched.url } : {}),
+          ...(a.switch_account === true ? { switch_account: true } : {}),
         });
         return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
       },

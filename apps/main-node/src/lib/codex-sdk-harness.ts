@@ -130,7 +130,7 @@ export interface CodexSdkHarnessDeps {
   requestServiceAccess?: (
     tenantId: string,
     sessionId: string,
-    args: { service: string; reason: string; mcp_server_url?: string },
+    args: { service: string; reason: string; mcp_server_url?: string; switch_account?: boolean },
   ) => Promise<{ request_id: string; status: string; note?: string }>;
   /** True when the user already chose an account for this agent + URL
    *  (setup: skip that server's connect card). */
@@ -393,9 +393,10 @@ export class CodexSdkHarness {
           reason: z
             .string()
             .describe('One line shown to the user: what you need it for (e.g. "to read this week\'s invoices")'),
+          switch_account: z.boolean().optional().describe("Set true when the user wants a DIFFERENT account/workspace for a service this agent is already connected to: the card opens on the account choices (saved accounts + sign in with another) instead of showing it as connected."),
         },
         handler: async (args) => {
-          const a = args as { service?: string; reason?: string };
+          const a = args as { service?: string; reason?: string; switch_account?: boolean };
           if (!a.service?.trim()) return { text: "service is required", isError: true };
           // Requested service that names one of the agent's own URL MCP
           // servers → the card runs vault MCP OAuth against that URL rather
@@ -408,6 +409,7 @@ export class CodexSdkHarness {
             service: a.service,
             reason: a.reason?.trim() || "The agent needs this service for the current task.",
             ...(matched?.url ? { mcp_server_url: matched.url } : {}),
+            ...(a.switch_account === true ? { switch_account: true } : {}),
           });
           return { text: JSON.stringify(result) };
         },

@@ -93,6 +93,7 @@ export function buildSetupPrompt(
     "7. When the user is satisfied, confirm your harness is set and that you're ready to run — but ONLY once every MCP server you added is connected. You receive an \"[access granted] <name>\" message per server; until then, say which connections are still pending in the setup panel instead of claiming you're ready.",
     "",
     "Connections: each connect card lets the user pick the account this agent uses — one already saved in the workspace (shown with its account and workspace) or a new sign-in. A configured MCP URL is NOT a connection, and no saved account is shared with you until the user picks it on the card. Never claim a connection is ready based on its configuration; wait for the \"[access granted]\" message, which names the account and workspace the user chose.",
+    "Switching accounts: when the user wants a different account or workspace for a service that is already connected, call request_access for it with switch_account: true — the card opens on the account choices (or they can press Change on the existing card). The current account stays connected until they pick another. Removing a server from your harness disconnects it.",
     "Never invent credentials or secrets, and never ask the user to paste keys or tokens in chat. Never tell the user authentication will happen \"afterward\" — it happens right here in the cards, and you must wait for the grant messages. Don't remove a server just because it isn't connected yet.",
     ...(opts.accessStatus
       ? [
@@ -134,6 +135,7 @@ export interface SetupToolsDeps {
     service: string;
     reason: string;
     mcp_server_url?: string;
+    switch_account?: boolean;
   }) => Promise<{ request_id: string; status: string; note?: string }>;
   /** True only for a connection explicitly approved for this agent. */
   isConnectionApproved?: (mcpServerUrl: string) => Promise<boolean>;
@@ -424,8 +426,9 @@ export function buildSetupTools(
           .string()
           .optional()
           .describe("URL of the MCP server this request is for, when it's one you added via update_harness"),
+        switch_account: z.boolean().optional().describe("Set true when the user wants a DIFFERENT account/workspace for a service this agent is already connected to: the card opens on the account choices (saved accounts + sign in with another) instead of showing it as connected."),
       }),
-      execute: async (args: { service: string; reason: string; mcp_server_url?: string }) => {
+      execute: async (args: { service: string; reason: string; mcp_server_url?: string; switch_account?: boolean }) => {
         const res = await deps.requestAccess(args);
         return res.note ?? `Request ${res.request_id} posted (${res.status}).`;
       },
