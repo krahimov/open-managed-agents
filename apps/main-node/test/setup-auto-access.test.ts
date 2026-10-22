@@ -61,7 +61,7 @@ describe("autoRequestAccessForNewServers", () => {
     });
     expect(requested).toEqual(["slack"]);
     expect(r.connected).toEqual(["sentry"]);
-    expect(describeAutoAccess(r)).toContain("Already explicitly approved for this agent: sentry");
+    expect(describeAutoAccess(r)).toContain("Already connected for this agent: sentry");
   });
 
   it("reports servers whose card could not be posted instead of throwing", async () => {
@@ -99,7 +99,7 @@ describe("setup preamble connection status", () => {
       failed: ["github"],
     });
     expect(status.split("\n")).toEqual([
-      "- sentry: connected (explicitly approved for this agent)",
+      "- sentry: connected (the user chose the account for this agent)",
       "- slack: connect card posted — waiting for the user (needs a one-time app setup; the card guides them)",
       "- linear: connect card posted — waiting for the user",
       "- github: could not post a connect card — call request_access for it",
@@ -163,5 +163,86 @@ describe("setup toolset: create_ambient_rule", () => {
     const p = buildSetupPrompt(agent);
     expect(p).toContain("create_ambient_rule");
     expect(p).toContain("there is no toggle for it in the setup UI");
+  });
+});
+
+import { buildHarnessPatch, canonicalizeMcpServers } from "../src/lib/setup-harness";
+
+describe("recognizing services: canonical MCP servers", () => {
+  it("fills in the official URL and canonical name for a known service named by the agent", () => {
+    const { servers, notes } = canonicalizeMcpServers([{ name: "Linear" }, { name: "jira", type: "url" }]);
+    expect(servers).toEqual([
+      { name: "linear", type: "url", url: "https://mcp.linear.app/mcp" },
+      { name: "atlassian", type: "url", url: "https://mcp.atlassian.com/v1/mcp" },
+    ]);
+    expect(notes).toEqual([]);
+  });
+
+  it("names a server after the known service its URL points at", () => {
+    const { servers } = canonicalizeMcpServers([{ name: "my-tickets", url: "https://mcp.linear.app/mcp" }]);
+    expect(servers).toEqual([{ name: "linear", type: "url", url: "https://mcp.linear.app/mcp" }]);
+  });
+
+  it("replaces a guessed or third-party endpoint and the deprecated SSE endpoint, with a note", () => {
+    const { servers, notes } = canonicalizeMcpServers([
+      { name: "slack", type: "url", url: "https://slack-mcp.example.dev/mcp" },
+      { name: "linear", type: "url", url: "https://mcp.linear.app/sse" },
+    ]);
+    expect(servers).toEqual([
+      { name: "slack", type: "url", url: "https://mcp.slack.com/mcp" },
+      { name: "linear", type: "url", url: "https://mcp.linear.app/mcp" },
+    ]);
+    expect(notes.join(" ")).toContain("replaced https://slack-mcp.example.dev/mcp with the official endpoint");
+    expect(notes.join(" ")).toContain("SSE endpoint is deprecated");
+  });
+
+  it("keeps vendor URL variants and unknown servers as given, and drops duplicates", () => {
+    const { servers } = canonicalizeMcpServers([
+      { name: "github", type: "url", url: "https://api.githubcopilot.com/mcp/readonly" },
+      { name: "Retell", type: "url", url: "https://mcp.retellai.com/mcp" },
+      { name: "linear", url: "https://mcp.linear.app/mcp" },
+      { name: "Linear again", url: "https://mcp.linear.app/mcp/" },
+      { name: "local", type: "stdio", command: "foo" },
+    ]);
+    expect(servers).toEqual([
+      { name: "github", type: "url", url: "https://api.githubcopilot.com/mcp/readonly" },
+      { name: "retell", type: "url", url: "https://mcp.retellai.com/mcp" },
+      { name: "linear", type: "url", url: "https://mcp.linear.app/mcp" },
+      { name: "local", type: "stdio", command: "foo" },
+    ]);
+  });
+
+  it("skips an unknown server with no URL and says why", () => {
+    const { servers, notes } = canonicalizeMcpServers([{ name: "gmail" }]);
+    expect(servers).toEqual([]);
+    expect(notes[0]).toMatch(/Skipped "gmail": it has no url.*request_access/);
+  });
+
+  it("buildHarnessPatch canonicalizes mcp_servers and passes other fields through", () => {
+    const { patch, changed, notes } = buildHarnessPatch({ system: "Do retros.", mcp_servers: [{ name: "slack" }], ignored: 1 });
+    expect(changed).toEqual(["system", "mcp_servers"]);
+    expect(patch).toEqual({ system: "Do retros.", mcp_servers: [{ name: "slack", type: "url", url: "https://mcp.slack.com/mcp" }] });
+    expect(notes).toEqual([]);
+  });
+
+  it("buildHarnessPatch keeps a malformed URL for the agents service to reject", () => {
+    const { patch } = buildHarnessPatch({ mcp_servers: [{ name: "weird", url: "not a url" }] });
+    expect(patch.mcp_servers).toEqual([{ name: "weird", type: "url", url: "not a url" }]);
+  });
+
+  it("the setup prompt lists the known services with their exact URLs and the recognize-and-add rule", () => {
+    const prompt = buildSetupPrompt({ id: "a", name: "Retro" } as never);
+    expect(prompt).toContain('- Linear (issues, projects, cycles, comments): { "name": "linear", "type": "url", "url": "https://mcp.linear.app/mcp" }');
+    expect(prompt).toContain("also covers jira, confluence");
+    expect(prompt).toContain("add its MCP server with update_harness IN THE SAME TURN");
+    expect(prompt).not.toContain("Reuse this connection");
+  });
+
+  it("connect cards for new servers carry the canonical service and a readable reason", async () => {
+    const calls: Array<{ service: string; reason: string }> = [];
+    await autoRequestAccessForNewServers([], [{ name: "linear", type: "url", url: "https://mcp.linear.app/mcp" }], {
+      requestAccess: async (a) => { calls.push({ service: a.service, reason: a.reason }); return { request_id: "x", status: "pending" }; },
+    });
+    expect(calls).toEqual([{ service: "linear", reason: "Choose the Linear account this agent works in." }]);
   });
 });

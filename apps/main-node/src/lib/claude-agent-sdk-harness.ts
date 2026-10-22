@@ -45,6 +45,7 @@ import {
   buildSetupPrompt,
   harnessView,
   autoRequestAccessForNewServers,
+  buildHarnessPatch,
   describeAutoAccess,
 } from "./setup-harness.js";
 
@@ -299,22 +300,7 @@ export class ClaudeAgentSdkHarness {
         skills: z.array(z.any()).optional(),
       } as unknown as SdkToolSchema,
       async (args) => {
-        const patch: HarnessPatch = {};
-        const changed: string[] = [];
-        for (const key of [
-          "name",
-          "description",
-          "model",
-          "system",
-          "mcp_servers",
-          "skills",
-        ] as const) {
-          const value = (args as Record<string, unknown>)[key];
-          if (value !== undefined) {
-            (patch as Record<string, unknown>)[key] = value;
-            changed.push(key);
-          }
-        }
+        const { patch, changed, notes } = buildHarnessPatch(args as Record<string, unknown>);
         if (!this.#deps.updateAgent || changed.length === 0) {
           return {
             content: [
@@ -348,6 +334,7 @@ export class ClaudeAgentSdkHarness {
           },
         } as SessionEvent);
         let summary = `Updated: ${changed.join(", ")}.`;
+        if (notes.length > 0) summary += ` ${notes.join(" ")}`;
         // Newly added MCP servers get their connect cards posted right here —
         // deterministic, not left to the model (see setup-harness.ts).
         if (patch.mcp_servers !== undefined && this.#deps.requestServiceAccess) {

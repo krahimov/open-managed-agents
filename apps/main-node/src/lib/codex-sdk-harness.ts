@@ -60,7 +60,13 @@ import { generateId } from "@open-managed-agents/shared";
 import type { HarnessPatch, McpTarget } from "./claude-agent-sdk-harness.js";
 import { startMcpHttpBridge, type BridgeTool, type McpHttpBridge } from "./mcp-http-bridge.js";
 import { codexComputerTools, computerCodexEnv, COMPUTER_CODEX_FEATURES } from "./codex-computer-tools.js";
-import { buildSetupPrompt, harnessView } from "./setup-harness.js";
+import {
+  autoRequestAccessForNewServers,
+  buildHarnessPatch,
+  buildSetupPrompt,
+  describeAutoAccess,
+  harnessView,
+} from "./setup-harness.js";
 import {
   materializeMemory,
   writeBackMemory,
@@ -126,6 +132,9 @@ export interface CodexSdkHarnessDeps {
     sessionId: string,
     args: { service: string; reason: string; mcp_server_url?: string },
   ) => Promise<{ request_id: string; status: string; note?: string }>;
+  /** True when the user already chose an account for this agent + URL
+   *  (setup: skip that server's connect card). */
+  isConnectionApproved?: (tenantId: string, agentId: string, url: string) => Promise<boolean>;
   /** Standing ambient rule on the session's agent (`create_ambient_rule`). */
   createAmbientRule?: (
     tenantId: string,
@@ -330,15 +339,7 @@ export class CodexSdkHarness {
           skills: z.array(z.any()).optional(),
         },
         handler: async (args) => {
-          const patch: HarnessPatch = {};
-          const changed: string[] = [];
-          for (const key of ["name", "description", "model", "system", "mcp_servers", "skills"] as const) {
-            const value = args[key];
-            if (value !== undefined) {
-              (patch as Record<string, unknown>)[key] = value;
-              changed.push(key);
-            }
-          }
+          const { patch, changed, notes } = buildHarnessPatch(args as Record<string, unknown>);
           if (changed.length === 0) return { text: "No changes applied." };
           const before = lastHarnessViews.get(sessionId) ?? harnessView(ctx.agent);
           const updated = await deps.updateAgent!(tenantId, agentId, patch);
@@ -358,7 +359,20 @@ export class CodexSdkHarness {
               changed,
             },
           } as SessionEvent);
-          return { text: `Updated: ${changed.join(", ")}.` };
+          let summary = `Updated: ${changed.join(", ")}.`;
+          if (notes.length > 0) summary += ` ${notes.join(" ")}`;
+          // Same deterministic connect cards as the other harnesses.
+          if (patch.mcp_servers !== undefined && deps.requestServiceAccess) {
+            const auto = await autoRequestAccessForNewServers(before.mcp_servers, after.mcp_servers, {
+              requestAccess: (a) => deps.requestServiceAccess!(tenantId, sessionId, a),
+              isConnectionApproved: deps.isConnectionApproved
+                ? (url) => deps.isConnectionApproved!(tenantId, agentId, url)
+                : undefined,
+            });
+            const line = describeAutoAccess(auto);
+            if (line) summary += ` ${line}`;
+          }
+          return { text: summary };
         },
       });
     }

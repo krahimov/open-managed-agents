@@ -14,7 +14,7 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 async function begin() {
   render(<MemoryRouter><AccessRequestCard event={event} sessionId="session-one" vaultId="chosen-vault" /></MemoryRouter>);
-  fireEvent.click(screen.getByRole("button", { name: "Connect linear" }));
+  fireEvent.click(screen.getByRole("button", { name: "Connect Linear" }));
   await screen.findByRole("button", { name: "Waiting for provider…" });
   await waitFor(() => expect(api).toHaveBeenCalledWith("/v1/vaults/chosen-vault/credentials/composio_accounts/link", expect.anything()));
 }

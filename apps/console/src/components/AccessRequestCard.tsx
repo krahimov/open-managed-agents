@@ -1,4 +1,5 @@
-import { ConnectionConsentCard, type ConnectionRequest } from "./ConnectionConsentCard";
+import { ConnectionCard, ServiceIcon, type ConnectionRequest } from "./ConnectionCard";
+import { serviceDisplayName } from "@open-managed-agents/api-types";
 import { useEffect, useRef, useState } from "react";
 import { useParams, Link } from "react-router";
 import { toast } from "sonner";
@@ -28,7 +29,7 @@ import { OAuthAppSetupPanel, type OAuthAppRequirement } from "./OAuthAppSetupPan
 export function AccessRequestCard(props: { event: Event; sessionId?: string; vaultId?: string; granted?: boolean }) {
   const request = props.event as unknown as ConnectionRequest;
   if (request.mcp_server_url && request.request_id) {
-    return <ConnectionConsentCard request={request} sessionId={props.sessionId} granted={props.granted} />;
+    return <ConnectionCard request={request} sessionId={props.sessionId} granted={props.granted} />;
   }
   return <LegacyAccessRequestCard {...props} />;
 }
@@ -364,10 +365,9 @@ function LegacyAccessRequestCard({
   return (
     <div className="max-w-2xl border border-border rounded-lg bg-bg-surface px-4 py-3">
       <div className="flex items-center justify-between gap-3">
-        <div className="min-w-0">
-          <div className="text-sm font-medium">
-            Agent requests access to <span className="font-mono">{service}</span>
-          </div>
+        <ServiceIcon service={service} url={ev.mcp_server_url} />
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium">{serviceDisplayName(service, ev.mcp_server_url)}</div>
           {ev.reason && <div className="text-xs text-fg-subtle mt-0.5">{ev.reason}</div>}
         </div>
         {status === "connected" ? (
@@ -384,7 +384,7 @@ function LegacyAccessRequestCard({
           <span className="text-xs font-medium text-warning whitespace-nowrap">Setup required</span>
         ) : (
           <Button size="sm" onClick={connect} disabled={status === "connecting"}>
-            {status === "connecting" ? "Waiting for provider…" : `Connect ${service}`}
+            {status === "connecting" ? "Waiting for provider…" : `Connect ${serviceDisplayName(service, ev.mcp_server_url)}`}
           </Button>
         )}
       </div>

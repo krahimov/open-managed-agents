@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import type { CredentialAuth } from "@open-managed-agents/shared";
 import type { RouteServices } from "@open-managed-agents/http-routes";
+import { serviceDisplayName } from "@open-managed-agents/api-types";
 
 interface OAuthState {
   completion_key?: string;
@@ -88,6 +89,20 @@ export interface NodeOAuthRoutesDeps {
    *  session_id: records the grant on the session and wakes the agent.
    *  Failures are swallowed — the credential is already stored. */
   onGranted?: (grant: GrantNotification) => Promise<void>;
+  /** Called after a credential is persisted for a flow a connect card
+   *  started (session_id + request_id): verify the new account and bind it
+   *  to that card's agent. The result is shown in the popup and relayed to
+   *  the card. Throwing is treated as "not connected". */
+  onConnected?: (input: {
+    tenantId: string;
+    sessionId: string;
+    requestId: string;
+    vaultId: string;
+    credentialId: string;
+  }) => Promise<
+    | { status: "connected"; account?: string; workspace?: string; message?: string }
+    | { status: "unverified"; message: string }
+  >;
 }
 
 type NodeOAuthVars = {
@@ -386,7 +401,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
         const created = await deps.services.credentials.create({
           tenantId: oauthState.tenant_id,
           vaultId: oauthState.vault_id,
-          displayName: `${serverName} (OAuth)`,
+          displayName: `${serviceDisplayName(oauthState.service ?? serverName, oauthState.mcp_server_url)} (OAuth)`,
           auth: credAuth,
         });
         credentialId = created.id;
@@ -415,6 +430,24 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     // credential stored, agent still told "Sentry needs authorization").
     const grantService = oauthState.service ?? serverName;
     let grantRecorded = false;
+    let connectResult:
+      | { status: "connected"; account?: string; workspace?: string; message?: string }
+      | { status: "unverified"; message: string }
+      | null = null;
+    if (oauthState.session_id && oauthState.request_id && deps.onConnected && storedCredentialId) {
+      try {
+        connectResult = await deps.onConnected({
+          tenantId: oauthState.tenant_id,
+          sessionId: oauthState.session_id,
+          requestId: oauthState.request_id,
+          vaultId: oauthState.vault_id,
+          credentialId: storedCredentialId,
+        });
+      } catch {
+        connectResult = { status: "unverified", message: "Signed in, but the connection could not be checked. Retry from the card." };
+      }
+      grantRecorded = connectResult.status === "connected";
+    }
     if (oauthState.session_id && deps.onGranted && !oauthState.request_id) {
       try {
         await deps.onGranted({
@@ -437,9 +470,18 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     redirectUrl.searchParams.set("probe_ok", probeResult.ok ? "1" : "0");
     if (probeResult.message) redirectUrl.searchParams.set("probe_message", probeResult.message);
 
+    const displayService = serviceDisplayName(grantService, oauthState.mcp_server_url);
+    const who = connectResult?.status === "connected"
+      ? [connectResult.account, connectResult.workspace].filter(Boolean).join(" · ")
+      : "";
+    const pageText = !connectResult
+      ? `Connected to ${displayService}. Closing…`
+      : connectResult.status === "connected"
+        ? `${displayService} connected${who ? ` as ${who}` : ""}. Closing…`
+        : `Signed in to ${displayService}, but it isn't connected yet: ${connectResult.message}`;
     return c.html(`
-      <html><body>
-      <p>Account saved for ${htmlEscape(serverName)}. Return to setup to verify and approve access for your agent.</p>
+      <html><body style="font-family: system-ui, sans-serif; padding: 24px;">
+      <p>${htmlEscape(pageText)}</p>
       <script>
         (function(){
           var msg = ${JSON.stringify({
@@ -448,7 +490,11 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
             server_name: serverName,
             vault_id: oauthState.vault_id,
             credential_id: storedCredentialId,
-            requires_approval: !!oauthState.request_id,
+            // Card flows: did the new account get bound to the agent?
+            connected: connectResult ? connectResult.status === "connected" : null,
+            account: connectResult?.status === "connected" ? connectResult.account ?? null : null,
+            workspace: connectResult?.status === "connected" ? connectResult.workspace ?? null : null,
+            connect_error: connectResult?.status === "unverified" ? connectResult.message : null,
             request_id: oauthState.request_id ?? null,
             session_id: oauthState.session_id ?? null,
             // true → the server already appended the grant + nudge; the
@@ -470,7 +516,8 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
             bc.close();
             notified = true;
           } catch (e) {}
-          if (notified) window.close();
+          // A failed connect stays open so the user can read why.
+          if (notified) { if (${JSON.stringify(connectResult?.status !== "unverified")}) window.close(); }
           else window.location.href = ${JSON.stringify(redirectUrl.toString())};
         })();
       </script>

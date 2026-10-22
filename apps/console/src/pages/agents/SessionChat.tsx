@@ -88,6 +88,55 @@ function isRenderable(ev: Event): boolean {
   return false;
 }
 
+/** request_ids of connect cards a later card for the same server (or
+ *  service) replaces — only the newest card per server is drawn, so a
+ *  re-posted request never leaves two live cards fighting over one account. */
+export function supersededAccessRequestIdsOf(events: Event[]): Set<string> {
+  const latest = new Map<string, string>();
+  const all: Array<[string, string]> = [];
+  for (const ev of events) {
+    if (ev.type !== "system.access_request") continue;
+    const rid = (ev as { request_id?: unknown }).request_id;
+    if (typeof rid !== "string" || !rid) continue;
+    const url = (ev as { mcp_server_url?: unknown }).mcp_server_url;
+    const service = (ev as { service?: unknown }).service;
+    const key =
+      typeof url === "string" && url
+        ? `url:${url.replace(/\/+$/, "").toLowerCase()}`
+        : `service:${String(service ?? "").toLowerCase()}`;
+    latest.set(key, rid);
+    all.push([key, rid]);
+  }
+  const out = new Set<string>();
+  for (const [key, rid] of all) if (latest.get(key) !== rid) out.add(rid);
+  return out;
+}
+
+/** A model-provider failure in words the user can act on. The raw provider
+ *  text stays visible underneath for debugging. */
+export function describeModelFailure(cause: string | undefined): { title: string; hint?: string } {
+  const text = (cause ?? "").toLowerCase();
+  if (/no credits|insufficient_quota|exceeded your current quota|credit balance|billing|payment required|add credits/.test(text)) {
+    return {
+      title: "The model provider account is out of credits",
+      hint: "Add credits with the provider, or switch this agent to another model in Edit settings, then send your message again.",
+    };
+  }
+  if (/invalid[ _-]?api[ _-]?key|incorrect api key|authentication|unauthorized|\b401\b/.test(text)) {
+    return {
+      title: "The model provider rejected the API key",
+      hint: "Update the key in Model Cards, or pick another model in Edit settings, then send your message again.",
+    };
+  }
+  if (/rate limit|too many requests|\b429\b|overloaded|\b529\b/.test(text)) {
+    return { title: "The model provider is rate-limiting or overloaded", hint: "Wait a moment, then send your message again." };
+  }
+  if (/model.*(not found|does not exist)|unknown model|\b404\b/.test(text)) {
+    return { title: "The model isn't available", hint: "Pick another model in Edit settings, then send your message again." };
+  }
+  return { title: "Turn failed" };
+}
+
 /** request_ids the server has durably marked granted (system.access_granted). */
 export function grantedRequestIdsOf(events: Event[]): Set<string> {
   const out = new Set<string>();
@@ -236,6 +285,7 @@ export function SessionChat({
 
   const isEmpty = events.length === 0 && !pending;
   const grantedRequestIds = useMemo(() => grantedRequestIdsOf(events), [events]);
+  const supersededRequestIds = useMemo(() => supersededAccessRequestIdsOf(events), [events]);
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -270,6 +320,7 @@ export function SessionChat({
             }
             if (ev.type === "system.access_granted") return null;
             if (ev.type === "system.access_request") {
+              if (supersededRequestIds.has(String(ev.request_id ?? ""))) return null;
               return (
                 <AccessRequestCard
                   key={key}
@@ -311,17 +362,21 @@ export function SessionChat({
               </Message>
             ) : null,
           )}
-          {turnError && (
-            <div className="max-w-2xl bg-danger-subtle rounded-lg px-4 py-2.5 text-sm text-danger">
-              <div className="font-medium">Turn failed</div>
-              <div className="mt-0.5 text-[12px] opacity-90">{turnError.error}</div>
-              {turnError.cause && (
-                <div className="mt-1.5 pt-1.5 border-t border-danger/20 text-[12px] font-mono break-all opacity-90">
-                  {turnError.cause}
-                </div>
-              )}
-            </div>
-          )}
+          {turnError && (() => {
+            const failure = describeModelFailure(turnError.cause ?? turnError.error);
+            return (
+              <div role="alert" className="max-w-2xl bg-danger-subtle rounded-lg px-4 py-2.5 text-sm text-danger">
+                <div className="font-medium">{failure.title}</div>
+                <div className="mt-0.5 text-[12px] opacity-90">{failure.hint ?? turnError.error}</div>
+                {turnError.cause && (
+                  <details className="mt-1.5 pt-1.5 border-t border-danger/20 text-[12px] opacity-90">
+                    <summary className="cursor-pointer select-none">Provider response</summary>
+                    <div className="mt-1 font-mono break-all">{turnError.cause}</div>
+                  </details>
+                )}
+              </div>
+            );
+          })()}
           {status === "running" && Object.keys(streams).length === 0 && (
             <div className="text-xs text-fg-subtle">Working…</div>
           )}

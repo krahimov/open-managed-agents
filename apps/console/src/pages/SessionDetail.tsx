@@ -9,7 +9,7 @@ import { formatDuration, formatRelative, shortenId } from "../lib/format";
 import { Badge, StatusPill } from "../components/Badge";
 import { Modal } from "../components/Modal";
 import { AccessRequestCard } from "../components/AccessRequestCard";
-import { grantedRequestIdsOf } from "./agents/SessionChat";
+import { describeModelFailure, grantedRequestIdsOf, supersededAccessRequestIdsOf } from "./agents/SessionChat";
 import { AmbientRuleCard } from "../components/AmbientRuleCard";
 import { SkillRequestCard } from "../components/SkillRequestCard";
 import { Button } from "@/components/ui/button";
@@ -82,6 +82,7 @@ export function SessionDetail() {
   // Durable grants (system.access_granted) → matching connect cards render
   // "Connected" even after a reload; see AccessRequestCard.
   const grantedRequestIds = useMemo(() => grantedRequestIdsOf(events), [events]);
+  const supersededRequestIds = useMemo(() => supersededAccessRequestIdsOf(events), [events]);
   // Tool calls the client owes an answer for (requires_action idle). Drives
   // the header pill; per-card state is derived per thread at render time.
   const awaitingActions = useMemo(() => buildToolCallIndex(events).awaiting, [events]);
@@ -1125,6 +1126,7 @@ export function SessionDetail() {
                   return (
                     <EventRender
                       grantedRequestIds={grantedRequestIds}
+                      supersededRequestIds={supersededRequestIds}
                       key={stableKey}
                       event={e}
                       livePending={false}
@@ -1551,6 +1553,7 @@ function EventRender({
   modelErrorCause,
   onApproveEnvironmentYaml,
   grantedRequestIds,
+  supersededRequestIds,
 }: {
   event: Event;
   /** Derived lifecycle for tool-use events (lib/tool-status). Drives the
@@ -1561,6 +1564,8 @@ function EventRender({
   threadId?: string;
   /** request_ids with a server-recorded system.access_granted. */
   grantedRequestIds?: Set<string>;
+  /** Connect cards replaced by a newer card for the same server. */
+  supersededRequestIds?: Set<string>;
   /**
    * Caller-derived "no agent.* event has followed this user.* event
    * yet on the same thread" hint. The wire-level processed_at_ms
@@ -1828,10 +1833,20 @@ function EventRender({
       );
     }
 
-    case "session.error":
+    case "session.error": {
+      const failure = describeModelFailure(
+        modelErrorCause?.error ?? (event as { message?: string }).message ?? String(event.error ?? ""),
+      );
       return (
         <div className="max-w-2xl bg-danger-subtle rounded-lg px-4 py-2.5 text-sm text-danger">
-          <div>Error: {event.error}</div>
+          {failure.hint ? (
+            <>
+              <div className="font-medium">{failure.title}</div>
+              <div className="mt-0.5 text-[12px] opacity-90">{failure.hint}</div>
+            </>
+          ) : (
+            <div>Error: {event.error}</div>
+          )}
           {/* Server attaches the underlying failure as `message` (real DB /
               provider error) — surface it so turns are debuggable from the
               UI instead of server logs. */}
@@ -1851,6 +1866,7 @@ function EventRender({
           )}
         </div>
       );
+    }
 
     case "session.warning":
       return (
@@ -1861,6 +1877,7 @@ function EventRender({
       );
 
     case "system.access_request":
+      if (supersededRequestIds?.has(String(event.request_id ?? ""))) return null;
       return (
         <AccessRequestCard
           event={event}

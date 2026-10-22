@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import yaml from "js-yaml";
@@ -11,6 +11,7 @@ import { useApi } from "../../lib/api";
 import type { Event } from "../../lib/events";
 import { CodeBlock } from "../../components/ai-elements/code-block";
 import { SessionChat } from "./SessionChat";
+import { ConnectionsStrip, type ConnectionsStripHandle } from "./ConnectionsStrip";
 
 /**
  * Agent setup view. Spawned right after an agent is created from the form: the
@@ -71,6 +72,8 @@ export function AgentSetup() {
   const { api } = useApi();
   const [harness, setHarness] = useState<Harness>({});
   const [agentName, setAgentName] = useState("");
+  const stripRef = useRef<ConnectionsStripHandle>(null);
+  const stripTimer = useRef<number | null>(null);
 
   // Seed the harness pane from the agent's current config.
   useEffect(() => {
@@ -90,8 +93,13 @@ export function AgentSetup() {
     };
   }, [id, api]);
 
-  // Capture live harness refinements off the setup session's markers.
+  // Capture live harness refinements off the setup session's markers, and
+  // keep the connections overview in step with cards and grants.
   const handleEvent = useCallback((ev: Event) => {
+    if (ev.type === "system.access_request" || ev.type === "system.access_granted") {
+      if (stripTimer.current) window.clearTimeout(stripTimer.current);
+      stripTimer.current = window.setTimeout(() => stripRef.current?.refresh(), 400);
+    }
     const m = ev.metadata as
       | { harness?: string; kind?: string; harness_config?: Harness }
       | undefined;
@@ -101,6 +109,8 @@ export function AgentSetup() {
       m.harness_config
     ) {
       setHarness(m.harness_config);
+      if (stripTimer.current) window.clearTimeout(stripTimer.current);
+      stripTimer.current = window.setTimeout(() => stripRef.current?.refresh(), 400);
     }
   }, []);
 
@@ -160,6 +170,7 @@ export function AgentSetup() {
           />
         </div>
         <div className="flex w-1/2 min-w-0 flex-col">
+          <ConnectionsStrip agentId={id} ref={stripRef} />
           <div className="flex shrink-0 items-center border-b border-border px-3 py-2 text-xs font-medium text-fg-muted">
             Harness
           </div>

@@ -8,3 +8,4 @@
 
 export * from "./types";
 export * from "./policy";
+export * from "./known-mcp-servers";

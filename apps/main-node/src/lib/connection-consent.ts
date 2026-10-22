@@ -1,10 +1,11 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash } from "node:crypto";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { RouteServices } from "@open-managed-agents/http-routes";
 import type { CredentialRow } from "@open-managed-agents/credentials-store";
+import { serviceDisplayName } from "@open-managed-agents/api-types";
 import { refreshNodeMcpOAuthToken } from "./node-mcp-proxy.js";
 
 export function connectionUrl(raw: string): string {
@@ -117,10 +118,49 @@ interface Deps {
   onApproved: (input: { tenantId: string; sessionId: string; requestId: string; service: string; binding: ConnectionBinding }) => Promise<void>;
 }
 
-const fingerprint = (credential: CredentialRow) => createHash("sha256").update(JSON.stringify(credential.auth)).digest("hex");
-const verificationKey = (tenantId: string, id: string) => `connection_verification:${encodeURIComponent(tenantId)}:${id}`;
+/** Cached identity of one saved credential (no access granted by it). */
+export interface ConnectionIdentity {
+  status: "verified" | "unverified";
+  account?: string;
+  workspace?: string;
+  workspace_id?: string;
+  message?: string;
+  checked_at: number;
+}
 
-/** Bindings live in server-owned KV, not model-editable agent metadata. */
+export type ConnectResult =
+  | { status: "connected"; account?: string; workspace?: string; message?: string }
+  | { status: "unverified"; message: string };
+
+/** Identity is cached per credential and invalidated when its account
+ *  material changes (a reconnect or a refresh-token rotation). */
+const identityFingerprint = (credential: CredentialRow) => {
+  const auth = credential.auth as unknown as Record<string, unknown>;
+  return createHash("sha256")
+    .update(JSON.stringify([auth.mcp_server_url, auth.refresh_token ?? auth.access_token ?? auth.token ?? auth.bearer_token]))
+    .digest("hex");
+};
+const identityKey = (tenantId: string, credentialId: string) =>
+  `connection_identity:${encodeURIComponent(tenantId)}:${encodeURIComponent(credentialId)}`;
+const IDENTITY_TTL_SECONDS = 7 * 24 * 60 * 60;
+
+class ConnectError extends Error {
+  constructor(readonly status: 400 | 404 | 409, message: string) {
+    super(message);
+  }
+}
+
+/**
+ * Which saved account an agent may use, per MCP server. Bindings live in
+ * server-owned KV (not model-editable agent metadata): one credential for one
+ * agent and one server URL. The proxy reads them on every call.
+ *
+ * A binding is created only by an explicit user action on the connect card:
+ * clicking "Use" on a saved account (whose account/workspace the card shows),
+ * or completing a new sign-in started from that card. Either way the
+ * connection is verified (MCP handshake + provider identity) first, and an
+ * unverifiable connection is never bound.
+ */
 export class ConnectionConsent {
   constructor(private deps: Deps) {}
 
@@ -128,10 +168,19 @@ export class ConnectionConsent {
     return !!await this.deps.services.kv.get(connectionBindingKey(tenantId, agentId, url));
   }
 
-  async authorizedCredential(tenantId: string, agentId: string, url: string): Promise<CredentialRow | null> {
+  async binding(tenantId: string, agentId: string, url: string): Promise<ConnectionBinding | null> {
     const raw = await this.deps.services.kv.get(connectionBindingKey(tenantId, agentId, url));
     if (!raw) return null;
-    const binding = JSON.parse(raw) as ConnectionBinding;
+    try {
+      return JSON.parse(raw) as ConnectionBinding;
+    } catch {
+      return null;
+    }
+  }
+
+  async authorizedCredential(tenantId: string, agentId: string, url: string): Promise<CredentialRow | null> {
+    const binding = await this.binding(tenantId, agentId, url);
+    if (!binding) return null;
     const vault = await this.deps.services.vaults.get({ tenantId, vaultId: binding.vault_id });
     if (!vault || vault.archived_at) return null;
     const credential = await this.deps.services.credentials.get({ tenantId, vaultId: binding.vault_id, credentialId: binding.credential_id });
@@ -139,84 +188,287 @@ export class ConnectionConsent {
     return credential;
   }
 
+  /** Session + request + agent for a card, or a ConnectError. */
+  private async context(tenantId: string, sessionId: string, requestId: string) {
+    const session = await this.deps.services.sessions.get({ tenantId, sessionId });
+    if (!session || session.archived_at || !session.agent_id) throw new ConnectError(404, "Session not found");
+    const request = await this.deps.readRequest(sessionId, requestId);
+    if (!request?.mcp_server_url) throw new ConnectError(404, "Connection request not found");
+    const agent = await this.deps.services.agents.get({ tenantId, agentId: session.agent_id });
+    if (!agent || !agent.mcp_servers?.some(s => s.type !== "stdio" && s.url && connectionUrl(s.url) === connectionUrl(request.mcp_server_url!))) {
+      throw new ConnectError(409, `${serviceDisplayName(request.service, request.mcp_server_url)} is no longer configured on this agent`);
+    }
+    return { session, request, agentId: session.agent_id, url: request.mcp_server_url };
+  }
+
+  /** A credential of this tenant for exactly this server, or a ConnectError. */
+  private async candidate(tenantId: string, url: string, vaultId: string, credentialId: string) {
+    if (typeof vaultId !== "string" || typeof credentialId !== "string") throw new ConnectError(400, "Pick a connection first");
+    const vault = await this.deps.services.vaults.get({ tenantId, vaultId });
+    const credential = await this.deps.services.credentials.get({ tenantId, vaultId, credentialId });
+    if (!vault || vault.archived_at || !credential || credential.archived_at || !credential.auth.mcp_server_url || connectionUrl(credential.auth.mcp_server_url) !== connectionUrl(url)) {
+      throw new ConnectError(404, "That connection no longer exists");
+    }
+    return credential;
+  }
+
+  /** Refresh an OAuth token that is expired or about to be, so verification
+   *  doesn't report a perfectly good (refreshable) account as broken. */
+  private async fresh(tenantId: string, vaultId: string, credential: CredentialRow): Promise<CredentialRow> {
+    const auth = credential.auth;
+    if (auth.type !== "mcp_oauth" || !auth.refresh_token || !auth.token_endpoint || !auth.expires_at || Date.parse(auth.expires_at) > Date.now() + 60_000) {
+      return credential;
+    }
+    const refreshed = await refreshNodeMcpOAuthToken(
+      { refreshToken: auth.refresh_token, tokenEndpoint: auth.token_endpoint, clientId: auth.client_id, clientSecret: auth.client_secret },
+      (input, init) => fetch(input, { ...init, redirect: "error", signal: AbortSignal.timeout(8_000) }),
+    ).catch(() => null);
+    if (!refreshed) return credential;
+    await this.deps.services.credentials.refreshAuth({
+      tenantId, vaultId, credentialId: credential.id,
+      auth: {
+        access_token: refreshed.access_token,
+        refresh_token: refreshed.refresh_token,
+        expires_at: refreshed.expires_in ? new Date(Date.now() + refreshed.expires_in * 1000).toISOString() : undefined,
+      },
+    });
+    return (await this.deps.services.credentials.get({ tenantId, vaultId, credentialId: credential.id })) ?? credential;
+  }
+
+  private async cachedIdentity(tenantId: string, credential: CredentialRow): Promise<ConnectionIdentity | null> {
+    const raw = await this.deps.services.kv.get(identityKey(tenantId, credential.id)).catch(() => null);
+    if (!raw) return null;
+    try {
+      const cached = JSON.parse(raw) as ConnectionIdentity & { fingerprint?: string };
+      if (cached.fingerprint !== identityFingerprint(credential)) return null;
+      const { fingerprint: _f, ...identity } = cached;
+      return identity;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Verify one saved credential (handshake + provider identity) and cache
+   *  the result for the card. Reads only; grants nothing. */
+  async identify(tenantId: string, vaultId: string, credential: CredentialRow): Promise<ConnectionIdentity> {
+    const current = await this.fresh(tenantId, vaultId, credential);
+    const result = await (this.deps.verify ?? verifyConnection)(current);
+    const identity: ConnectionIdentity = { ...result, checked_at: Date.now() };
+    await this.deps.services.kv.put(
+      identityKey(tenantId, current.id),
+      JSON.stringify({ ...identity, fingerprint: identityFingerprint(current) }),
+      { expirationTtl: IDENTITY_TTL_SECONDS },
+    ).catch(() => {});
+    return identity;
+  }
+
+  /** Verify `credential` and, when it checks out, bind it to the agent and
+   *  record the grant on the session. */
+  private async bind(input: {
+    tenantId: string; sessionId: string; requestId: string; service: string; agentId: string; url: string;
+    vaultId: string; credential: CredentialRow; expectedWorkspaceId?: string;
+  }): Promise<ConnectResult> {
+    const identity = await this.identify(input.tenantId, input.vaultId, input.credential);
+    if (identity.status !== "verified") {
+      return { status: "unverified", message: identity.message ?? "The connection could not be verified. No access was granted." };
+    }
+    if (input.expectedWorkspaceId && identity.workspace_id && identity.workspace_id !== input.expectedWorkspaceId) {
+      return { status: "unverified", message: "This account now points at a different workspace than the one shown. Check it again before using it." };
+    }
+    const binding: ConnectionBinding = {
+      vault_id: input.vaultId, credential_id: input.credential.id, mcp_server_url: input.url,
+      account: identity.account, workspace: identity.workspace, workspace_id: identity.workspace_id, approved_at: Date.now(),
+    };
+    const key = connectionBindingKey(input.tenantId, input.agentId, input.url);
+    const existing = await this.binding(input.tenantId, input.agentId, input.url);
+    await this.deps.services.kv.put(key, JSON.stringify(binding));
+    // Re-picking the account that is already bound is a no-op for the agent.
+    if (!existing || existing.credential_id !== binding.credential_id || existing.vault_id !== binding.vault_id) {
+      await this.deps.onApproved({ tenantId: input.tenantId, sessionId: input.sessionId, requestId: input.requestId, service: input.service, binding });
+    }
+    this.deps.services.logger?.info({ op: "connection.approved", session_id: input.sessionId, credential_id: input.credential.id }, "connection chosen for agent");
+    return { status: "connected", account: identity.account, workspace: identity.workspace, ...(identity.message ? { message: identity.message } : {}) };
+  }
+
+  /** A new sign-in the card started (OAuth callback / API key): verify the
+   *  credential it produced and, if it checks out, bind it to the agent.
+   *  Starting the sign-in from this agent's card is the user's choice. */
+  async connectNew(input: { tenantId: string; sessionId: string; requestId: string; vaultId: string; credentialId: string }): Promise<ConnectResult> {
+    try {
+      const { request, agentId, url } = await this.context(input.tenantId, input.sessionId, input.requestId);
+      const credential = await this.candidate(input.tenantId, url, input.vaultId, input.credentialId);
+      const result = await this.bind({ ...input, service: request.service, agentId, url, credential });
+      if (result.status === "connected") await this.label(input.tenantId, input.vaultId, credential, request, result);
+      return result;
+    } catch (err) {
+      if (err instanceof ConnectError) return { status: "unverified", message: err.message };
+      throw err;
+    }
+  }
+
+  /** Give a freshly connected account a recognizable name in Credential
+   *  Vaults ("Linear · ana@acme.com · Acme") instead of "linear (OAuth)". */
+  private async label(tenantId: string, vaultId: string, credential: CredentialRow, request: AccessRequest, result: ConnectResult & { status: "connected" }) {
+    const service = serviceDisplayName(request.service, request.mcp_server_url);
+    const who = [result.account, result.workspace].filter(Boolean).join(" · ");
+    if (!who) return;
+    await this.deps.services.credentials.update({ tenantId, vaultId, credentialId: credential.id, displayName: `${service} · ${who}` }).catch(() => {});
+    await this.deps.services.vaults.update({ tenantId, vaultId, name: `${service} · ${result.workspace ?? result.account}` }).catch(() => {});
+  }
+
   routes() {
     const app = new Hono<{ Variables: { tenant_id: string } }>();
-    const context = async (tenantId: string, sessionId: string, requestId: string) => {
-      const session = await this.deps.services.sessions.get({ tenantId, sessionId });
-      if (!session || session.archived_at || !session.agent_id) throw new HTTPException(404, { message: "Session not found" });
-      const request = await this.deps.readRequest(sessionId, requestId);
-      if (!request?.mcp_server_url) throw new HTTPException(404, { message: "Connection request not found" });
-      const agent = await this.deps.services.agents.get({ tenantId, agentId: session.agent_id });
-      if (!agent || !agent.mcp_servers?.some(s => s.type !== "stdio" && s.url && connectionUrl(s.url) === connectionUrl(request.mcp_server_url!))) {
-        throw new HTTPException(409, { message: "This service is no longer configured on the agent" });
-      }
-      return { session, request };
-    };
-    const candidate = async (tenantId: string, url: string, vaultId: string, credentialId: string) => {
-      const vault = await this.deps.services.vaults.get({ tenantId, vaultId });
-      const credential = await this.deps.services.credentials.get({ tenantId, vaultId, credentialId });
-      if (!vault || vault.archived_at || !credential || credential.archived_at || !credential.auth.mcp_server_url || connectionUrl(credential.auth.mcp_server_url) !== connectionUrl(url)) {
-        throw new HTTPException(404, { message: "Matching connection not found" });
-      }
-      return credential;
-    };
+    // Card-facing errors as `{ error }` JSON (what the console's api() reads).
+    app.onError((err, c) => {
+      if (err instanceof ConnectError) return c.json({ error: err.message }, err.status);
+      if (err instanceof HTTPException) return c.json({ error: err.message }, err.status);
+      throw err;
+    });
+    const ids = (c: { req: { param: (k: string) => string } }) => ({ sessionId: c.req.param("sessionId"), requestId: c.req.param("requestId") });
+
+    // Per-agent overview for the setup page: every URL server on the agent
+    // and which account (if any) it is connected with. Bindings only — no
+    // provider calls.
+    app.get("/agent/:agentId/status", async c => {
+      const tenantId = c.get("tenant_id");
+      const agent = await this.deps.services.agents.get({ tenantId, agentId: c.req.param("agentId") });
+      if (!agent) throw new ConnectError(404, "Agent not found");
+      const servers = (agent.mcp_servers ?? []).filter(s => s.type !== "stdio" && typeof s.url === "string" && s.url);
+      const data = await Promise.all(servers.map(async s => {
+        const url = s.url!;
+        const binding = await this.binding(tenantId, agent.id, url);
+        const credential = binding ? await this.authorizedCredential(tenantId, agent.id, url) : null;
+        return {
+          name: s.name,
+          display_name: serviceDisplayName(s.name, url),
+          mcp_server_url: url,
+          status: credential ? "connected" : binding ? "broken" : "pending",
+          ...(credential && binding ? { account: binding.account, workspace: binding.workspace } : {}),
+        };
+      }));
+      return c.json({ data });
+    });
+
+    // Card state: is an account chosen for this agent, and which saved
+    // accounts could be. Display metadata + cached identity only — listing
+    // never touches a provider and grants nothing.
     app.get("/:sessionId/:requestId", async c => {
       const tenantId = c.get("tenant_id");
-      const { request, session } = await context(tenantId, c.req.param("sessionId"), c.req.param("requestId"));
+      const { sessionId, requestId } = ids(c);
+      const { request, agentId, url } = await this.context(tenantId, sessionId, requestId);
       const vaults = await this.deps.services.vaults.list({ tenantId, includeArchived: false });
       const groups = await this.deps.services.credentials.listByVaults({ tenantId, vaultIds: vaults.map(v => v.id) });
-      // Only display metadata. Listing does not probe, attach, refresh or authorize anything.
-      const approved = !!await this.authorizedCredential(tenantId, session.agent_id!, request.mcp_server_url!);
-      return c.json({ approved, connections: groups.flatMap(group => group.credentials.filter(cred =>
-        !cred.archived_at && cred.auth.mcp_server_url && connectionUrl(cred.auth.mcp_server_url) === connectionUrl(request.mcp_server_url!),
-      ).map(cred => ({ credential_id: cred.id, vault_id: group.vault_id, label: cred.display_name,
-        vault_name: vaults.find(v => v.id === group.vault_id)?.name, status: "unverified" }))) });
+      const binding = await this.binding(tenantId, agentId, url);
+      const bound = binding ? await this.authorizedCredential(tenantId, agentId, url) : null;
+      const rows = groups.flatMap(group => group.credentials
+        .filter(cred => !cred.archived_at && cred.auth.mcp_server_url && connectionUrl(cred.auth.mcp_server_url) === connectionUrl(url))
+        .map(cred => ({ cred, vault_id: group.vault_id })));
+      const connections = await Promise.all(rows.map(async ({ cred, vault_id }) => ({
+        credential_id: cred.id,
+        vault_id,
+        label: cred.display_name,
+        vault_name: vaults.find(v => v.id === vault_id)?.name,
+        updated_at: cred.updated_at ?? cred.created_at,
+        identity: await this.cachedIdentity(tenantId, cred),
+      })));
+      // One row per real account: the same verified account/workspace saved
+      // by several agents shows once (the bound one, else the newest copy).
+      connections.sort((a, b) =>
+        Number(b.credential_id === bound?.id) - Number(a.credential_id === bound?.id) ||
+        String(b.updated_at).localeCompare(String(a.updated_at)));
+      const seenAccounts = new Set<string>();
+      const unique = connections.filter(conn => {
+        const id = conn.identity?.status === "verified" && conn.identity.account && conn.identity.workspace_id
+          ? `${conn.identity.account}|${conn.identity.workspace_id}` : null;
+        if (!id) return true;
+        if (seenAccounts.has(id)) return false;
+        seenAccounts.add(id);
+        return true;
+      });
+      return c.json({
+        service: request.service,
+        display_name: serviceDisplayName(request.service, url),
+        mcp_server_url: url,
+        approved: !!bound,
+        // A chosen account that was since archived/removed: the agent has no
+        // access (the proxy refuses to fall back to another account).
+        broken: !!binding && !bound,
+        current: bound && binding ? {
+          credential_id: bound.id, vault_id: binding.vault_id, label: bound.display_name,
+          account: binding.account, workspace: binding.workspace,
+        } : null,
+        connections: unique.map(({ updated_at: _u, ...conn }) => conn),
+      });
     });
-    app.post("/:sessionId/:requestId/verify", async c => {
+
+    // Look up which account/workspace a saved connection belongs to.
+    app.post("/:sessionId/:requestId/identify", async c => {
       const tenantId = c.get("tenant_id");
-      const sessionId = c.req.param("sessionId"), requestId = c.req.param("requestId");
-      const { request } = await context(tenantId, sessionId, requestId);
-      const body = await c.req.json<{ vault_id: string; credential_id: string }>();
-      if (typeof body.vault_id !== "string" || typeof body.credential_id !== "string") return c.json({ error: "Select a connection first" }, 400);
-      let cred = await candidate(tenantId, request.mcp_server_url!, body.vault_id, body.credential_id);
-      const auth = cred.auth;
-      if (auth.type === "mcp_oauth" && auth.refresh_token && auth.token_endpoint && auth.expires_at && Date.parse(auth.expires_at) <= Date.now() + 60_000) {
-        const refreshed = await refreshNodeMcpOAuthToken({ refreshToken: auth.refresh_token, tokenEndpoint: auth.token_endpoint, clientId: auth.client_id, clientSecret: auth.client_secret }, (input, init) => fetch(input, { ...init, redirect: "error", signal: AbortSignal.timeout(8_000) }));
-        if (refreshed) {
-          await this.deps.services.credentials.refreshAuth({ tenantId, vaultId: body.vault_id, credentialId: cred.id,
-            auth: { access_token: refreshed.access_token, refresh_token: refreshed.refresh_token, expires_at: refreshed.expires_in ? new Date(Date.now() + refreshed.expires_in * 1000).toISOString() : undefined } });
-          cred = await candidate(tenantId, request.mcp_server_url!, body.vault_id, body.credential_id);
-        }
-      }
-      const result = await (this.deps.verify ?? verifyConnection)(cred);
-      this.deps.services.logger?.info({ op: "connection.verified", session_id: sessionId, credential_id: cred.id, status: result.status }, "connection verification completed without granting access");
-      if (result.status !== "verified") return c.json(result);
-      const id = randomUUID();
-      await this.deps.services.kv.put(verificationKey(tenantId, id), JSON.stringify({
-        ...result, sessionId, requestId, vaultId: body.vault_id, credentialId: cred.id,
-        fingerprint: fingerprint(cred), expiresAt: Date.now() + 300_000,
-      }), { expirationTtl: 300 });
-      return c.json({ ...result, verification_id: id });
+      const { sessionId, requestId } = ids(c);
+      const { url } = await this.context(tenantId, sessionId, requestId);
+      const body = await c.req.json<{ vault_id?: string; credential_id?: string }>().catch(() => ({} as { vault_id?: string; credential_id?: string }));
+      const credential = await this.candidate(tenantId, url, body.vault_id!, body.credential_id!);
+      const identity = await this.identify(tenantId, body.vault_id!, credential);
+      this.deps.services.logger?.info({ op: "connection.identified", session_id: sessionId, credential_id: credential.id, status: identity.status }, "connection identity checked (no access granted)");
+      return c.json(identity);
     });
-    app.post("/:sessionId/:requestId/approve", async c => {
-      const tenantId = c.get("tenant_id"), sessionId = c.req.param("sessionId"), requestId = c.req.param("requestId");
-      const { session, request } = await context(tenantId, sessionId, requestId);
-      const body = await c.req.json<{ verification_id?: string; confirmed?: boolean; workspace_id?: string }>();
-      if (body.confirmed !== true || typeof body.verification_id !== "string") return c.json({ error: "Explicit connection approval is required" }, 400);
-      const raw = await this.deps.services.kv.get(verificationKey(tenantId, body.verification_id));
-      if (!raw) return c.json({ error: "Verify the connection again" }, 409);
-      const verified = JSON.parse(raw);
-      if (verified.sessionId !== sessionId || verified.requestId !== requestId || verified.expiresAt < Date.now() || verified.workspace_id !== body.workspace_id) return c.json({ error: "Connection verification does not match this approval" }, 409);
-      const cred = await candidate(tenantId, request.mcp_server_url!, verified.vaultId, verified.credentialId);
-      if (fingerprint(cred) !== verified.fingerprint) return c.json({ error: "The connection changed. Verify it again before approving." }, 409);
-      const binding: ConnectionBinding = { vault_id: verified.vaultId, credential_id: cred.id, mcp_server_url: request.mcp_server_url!,
-        account: verified.account, workspace: verified.workspace, workspace_id: verified.workspace_id, approved_at: Date.now() };
-      const key = connectionBindingKey(tenantId, session.agent_id!, request.mcp_server_url!);
-      const existing = await this.deps.services.kv.get(key);
-      if (existing && JSON.parse(existing).verification_id === body.verification_id) return c.json({ status: "connected" });
-      await this.deps.services.kv.put(key, JSON.stringify({ ...binding, verification_id: body.verification_id }));
-      await this.deps.onApproved({ tenantId, sessionId, requestId, service: request.service, binding });
-      return c.json({ status: "connected", account: binding.account, workspace: binding.workspace });
+
+    // "Use this account": the explicit choice. Verifies again, then binds.
+    app.post("/:sessionId/:requestId/use", async c => {
+      const tenantId = c.get("tenant_id");
+      const { sessionId, requestId } = ids(c);
+      const { request, agentId, url } = await this.context(tenantId, sessionId, requestId);
+      const body = await c.req.json<{ vault_id?: string; credential_id?: string; expected_workspace_id?: string }>()
+        .catch(() => ({} as { vault_id?: string; credential_id?: string; expected_workspace_id?: string }));
+      const credential = await this.candidate(tenantId, url, body.vault_id!, body.credential_id!);
+      const result = await this.bind({
+        tenantId, sessionId, requestId, service: request.service, agentId, url,
+        vaultId: body.vault_id!, credential,
+        ...(typeof body.expected_workspace_id === "string" ? { expectedWorkspaceId: body.expected_workspace_id } : {}),
+      });
+      // 200 either way: "unverified" is an answer the card renders, not a fault.
+      return c.json(result);
+    });
+
+    // New sign-in: a fresh vault per account (an OAuth callback replaces the
+    // credential for the same server inside one vault, so sharing a vault
+    // would swap the account under another agent), and the authorize URL the
+    // popup should open. The callback binds the result to this agent.
+    app.post("/:sessionId/:requestId/start", async c => {
+      const tenantId = c.get("tenant_id");
+      const { sessionId, requestId } = ids(c);
+      const { request, url } = await this.context(tenantId, sessionId, requestId);
+      const display = serviceDisplayName(request.service, url);
+      const vault = await this.deps.services.vaults.create({ tenantId, name: `${display} connection` });
+      const params = new URLSearchParams({
+        mcp_server_url: url, vault_id: vault.id, service: request.service, session_id: sessionId, request_id: requestId,
+      });
+      const body = await c.req.json<{ redirect_uri?: string }>().catch(() => ({} as { redirect_uri?: string }));
+      if (typeof body.redirect_uri === "string" && body.redirect_uri) params.set("redirect_uri", body.redirect_uri);
+      return c.json({ vault_id: vault.id, authorize_url: `/v1/oauth/authorize?${params}` });
+    });
+
+    // API-key servers: store the key in its own vault, verify, bind.
+    app.post("/:sessionId/:requestId/api_key", async c => {
+      const tenantId = c.get("tenant_id");
+      const { sessionId, requestId } = ids(c);
+      const { request, url } = await this.context(tenantId, sessionId, requestId);
+      const body = await c.req.json<{ token?: string }>().catch(() => ({} as { token?: string }));
+      const token = typeof body.token === "string" ? body.token.trim() : "";
+      if (!token) return c.json({ error: "Paste the API key first" }, 400);
+      const display = serviceDisplayName(request.service, url);
+      const vault = await this.deps.services.vaults.create({ tenantId, name: `${display} connection` });
+      const credential = await this.deps.services.credentials.create({
+        tenantId, vaultId: vault.id, displayName: `${display} API key`,
+        auth: { type: "static_bearer", token, mcp_server_url: url },
+      });
+      const result = await this.connectNew({ tenantId, sessionId, requestId, vaultId: vault.id, credentialId: credential.id });
+      if (result.status !== "connected") {
+        // A key that doesn't work is not worth keeping around.
+        await this.deps.services.vaults.archive({ tenantId, vaultId: vault.id }).catch(() => {});
+        await this.deps.services.credentials.archiveByVault({ tenantId, vaultId: vault.id }).catch(() => {});
+      }
+      return c.json(result);
     });
     return app;
   }

@@ -18,8 +18,12 @@ import { tool } from "ai";
 import { z } from "zod";
 import { buildDefaultWebSearchTool } from "@open-managed-agents/agent/harness/tools";
 import {
+  KNOWN_MCP_SERVERS,
   OMA_SETUP_HARNESS,
   OMA_SETUP_KIND_HARNESS_UPDATED,
+  knownMcpServerForName,
+  knownMcpServerForUrl,
+  serviceDisplayName,
 } from "@open-managed-agents/api-types";
 import type { AgentConfig } from "@open-managed-agents/shared";
 import { generateEventId } from "@open-managed-agents/shared";
@@ -72,16 +76,24 @@ export function buildSetupPrompt(
     "- mcp_servers: external tool servers, e.g. [{ \"name\": \"notion\", \"type\": \"url\", \"url\": \"https://mcp.notion.com/mcp\" }].",
     "- skills: optional named skills.",
     "",
+    "Known services — use these exact names and URLs (never guess or web-search an endpoint for them):",
+    ...KNOWN_MCP_SERVERS.map(
+      (k) =>
+        `- ${k.name} (${k.summary}): { "name": "${k.id}", "type": "url", "url": "${k.url}" }${k.aliases.length > 1 ? ` — also covers ${k.aliases.filter((a) => a !== k.id && !a.includes(".")).join(", ")}` : ""}`,
+    ),
+    "For any other service, web_search for the vendor's OFFICIAL remote MCP endpoint (prefer the vendor's own domain). Services with no official MCP server (Gmail, Google Drive, Google Calendar, …) go through request_access with the service slug instead.",
+    "",
     "How to run setup:",
     "1. Open by briefly reflecting your current purpose, then ask what the user wants you to do (or do differently).",
-    "2. Ask ONE focused question at a time. After each answer, immediately call update_harness with what you can refine now — usually a sharper system prompt first, then name/description, then any MCP servers or skills.",
-    "3. Keep tightening your system prompt as you learn more.",
-    "4. Be concise. In a sentence, say what you just changed (e.g. \"I rewrote my system prompt around daily triage and added the Notion server\").",
-    "5. If your job is monitoring, polling, reporting or anything recurring, propose a cadence (e.g. every 15 minutes, every morning at 9:00 in the user's timezone), confirm it, then create the rule with create_ambient_rule before you declare yourself ready.",
-    "6. When the user is satisfied, confirm your harness is set and that you're ready to run — but ONLY once every MCP server you added is connected. You receive a \"[access granted] <name>\" message per server; until then, say which connections are still pending in the setup panel instead of claiming you're ready.",
+    "2. Recognize the tools the job needs. Whenever the user names a tool or the work clearly depends on one (\"triage our Linear tickets\", \"post a summary to Slack\", \"watch Sentry\"), add its MCP server with update_harness IN THE SAME TURN — don't ask permission to add it and don't ask for URLs. Each server you add gets a connect card in the setup panel automatically.",
+    "3. Ask ONE focused question at a time. After each answer, immediately call update_harness with what you can refine now — usually a sharper system prompt first, then name/description, then any MCP servers or skills.",
+    "4. Keep tightening your system prompt as you learn more. Mention the connected tools by name in it (\"use the Linear tools to…\").",
+    "5. Be concise. In a sentence, say what you just changed (e.g. \"I rewrote my system prompt around daily triage and added Linear and Slack — connect them in the cards below\").",
+    "6. If your job is monitoring, polling, reporting or anything recurring, propose a cadence (e.g. every 15 minutes, every morning at 9:00 in the user's timezone), confirm it, then create the rule with create_ambient_rule before you declare yourself ready.",
+    "7. When the user is satisfied, confirm your harness is set and that you're ready to run — but ONLY once every MCP server you added is connected. You receive an \"[access granted] <name>\" message per server; until then, say which connections are still pending in the setup panel instead of claiming you're ready.",
     "",
-    "A configured MCP URL or a saved workspace credential is NOT authorization. Only an explicit user approval grants this agent access. Never claim a connection is ready based on its configuration. Ask the user to verify the account/workspace shown on the connect card, then choose Reuse this connection or Connect another. Unverified connections have no approved access.",
-    "Never invent credentials or secrets, and never ask the user to paste keys or tokens in chat. Adding an MCP server with update_harness automatically posts its connect card in the setup panel; never tell the user authentication will happen \"afterward\" — it happens right here, and you must wait for the grant messages.",
+    "Connections: each connect card lets the user pick the account this agent uses — one already saved in the workspace (shown with its account and workspace) or a new sign-in. A configured MCP URL is NOT a connection, and no saved account is shared with you until the user picks it on the card. Never claim a connection is ready based on its configuration; wait for the \"[access granted]\" message, which names the account and workspace the user chose.",
+    "Never invent credentials or secrets, and never ask the user to paste keys or tokens in chat. Never tell the user authentication will happen \"afterward\" — it happens right here in the cards, and you must wait for the grant messages. Don't remove a server just because it isn't connected yet.",
     ...(opts.accessStatus
       ? [
           "",
@@ -96,7 +108,7 @@ export function buildSetupPrompt(
 /** Prompt block for the setup preamble: one line per server. */
 export function describeSetupAccessStatus(r: AutoAccessResult): string {
   const lines: string[] = [];
-  for (const name of r.connected) lines.push(`- ${name}: connected (explicitly approved for this agent)`);
+  for (const name of r.connected) lines.push(`- ${name}: connected (the user chose the account for this agent)`);
   for (const x of r.requested) lines.push(`- ${x.name}: connect card posted — waiting for the user${x.note && /one-time/i.test(x.note) ? " (needs a one-time app setup; the card guides them)" : ""}`);
   for (const name of r.failed) lines.push(`- ${name}: could not post a connect card — call request_access for it`);
   return lines.join("\n");
@@ -141,6 +153,90 @@ export interface SetupToolsDeps {
 
 type McpServerLike = { name?: string; type?: string; url?: string };
 
+/**
+ * Normalize the mcp_servers an update_harness call proposes, so "connect
+ * Linear" always lands on the same server the platform knows how to
+ * authenticate: known services get their canonical name and official URL
+ * (a guessed host, a missing url, or a deprecated /sse endpoint is replaced),
+ * `type` defaults to "url", and duplicates of one endpoint collapse into the
+ * first entry. Notes explain every rewrite so the agent can relay them.
+ */
+export function canonicalizeMcpServers(input: unknown[]): { servers: unknown[]; notes: string[] } {
+  const servers: unknown[] = [];
+  const notes: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of input) {
+    if (!raw || typeof raw !== "object") continue;
+    const entry = { ...(raw as Record<string, unknown>) };
+    if (entry.type === "stdio") {
+      servers.push(entry);
+      continue;
+    }
+    const name = typeof entry.name === "string" ? entry.name.trim() : "";
+    const url = typeof entry.url === "string" ? entry.url.trim() : "";
+    const byUrl = knownMcpServerForUrl(url);
+    const known = byUrl ?? knownMcpServerForName(name);
+    if (known) {
+      if (!url) {
+        entry.url = known.url;
+      } else if (!byUrl) {
+        entry.url = known.url;
+        notes.push(`${known.name}: replaced ${url} with the official endpoint ${known.url}.`);
+      } else if (/\/sse\/?$/i.test(new URL(url).pathname)) {
+        entry.url = known.url;
+        notes.push(`${known.name}: the SSE endpoint is deprecated — using ${known.url}.`);
+      } else {
+        entry.url = url;
+      }
+      entry.name = known.id;
+    } else {
+      if (!url) {
+        notes.push(`Skipped "${name || "unnamed server"}": it has no url. Find its official MCP endpoint first, or use request_access for apps without one.`);
+        continue;
+      }
+      entry.url = url;
+      entry.name = (name || new URL(url).hostname).toLowerCase();
+    }
+    entry.type = "url";
+    const key = normalizeMcpUrl(entry.url as string);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    servers.push(entry);
+  }
+  return { servers, notes };
+}
+
+const HARNESS_PATCH_KEYS = ["name", "description", "model", "system", "mcp_servers", "skills"] as const;
+
+/** update_harness arguments → the agent patch, the changed field list, and
+ *  any canonicalization notes. Shared by every harness's update_harness. */
+export function buildHarnessPatch(args: Record<string, unknown>): {
+  patch: HarnessPatch;
+  changed: string[];
+  notes: string[];
+} {
+  const patch: HarnessPatch = {};
+  const changed: string[] = [];
+  let notes: string[] = [];
+  for (const key of HARNESS_PATCH_KEYS) {
+    let value = args[key];
+    if (value === undefined) continue;
+    if (key === "mcp_servers" && Array.isArray(value)) {
+      try {
+        const canonical = canonicalizeMcpServers(value);
+        value = canonical.servers;
+        notes = canonical.notes;
+      } catch {
+        // A malformed URL (new URL threw) — keep the agent's value; the
+        // agents service validates it.
+      }
+    }
+    (patch as Record<string, unknown>)[key] = value;
+    changed.push(key);
+  }
+  return { patch, changed, notes };
+}
+
 function normalizeMcpUrl(raw: string): string {
   try {
     const u = new URL(raw);
@@ -168,7 +264,13 @@ export function newlyAddedMcpServers(
     const key = normalizeMcpUrl(s.url);
     if (seen.has(key) || emitted.has(key)) continue;
     emitted.add(key);
-    out.push({ name: (s.name ?? new URL(s.url).hostname).trim().toLowerCase(), url: s.url });
+    let fallback = s.url;
+    try {
+      fallback = new URL(s.url).hostname;
+    } catch {
+      // keep the raw url as the name
+    }
+    out.push({ name: (s.name ?? fallback).trim().toLowerCase(), url: s.url });
   }
   return out;
 }
@@ -176,14 +278,20 @@ export function newlyAddedMcpServers(
 export interface AutoAccessResult {
   /** Servers a connect card was posted for. */
   requested: Array<{ name: string; note?: string }>;
-  /** Servers explicitly approved for this agent. */
+  /** Servers the user already chose an account for (this agent). */
   connected: string[];
   /** Servers where posting the card itself failed. */
   failed: string[];
 }
 
-/** Post a card for every new server unless the user already approved a
- * credential for this exact agent. Saved workspace credentials alone grant nothing. */
+/**
+ * Deterministic companion to update_harness: every NEW url-type MCP server
+ * gets a connect card right now, unless the user already chose an account
+ * for this exact agent. Saved workspace credentials alone grant nothing —
+ * the card offers them, the user picks. (Posting used to be a prompt
+ * instruction the model could skip: 2026-09-02, four servers added, zero
+ * cards, agent said "ready to run".)
+ */
 export async function autoRequestAccessForNewServers(
   before: unknown,
   after: unknown,
@@ -198,7 +306,7 @@ export async function autoRequestAccessForNewServers(
       }
       const res = await deps.requestAccess({
         service: server.name,
-        reason: `Connect ${server.name} and approve the account/workspace this agent may use.`,
+        reason: `Choose the ${serviceDisplayName(server.name, server.url)} account this agent works in.`,
         mcp_server_url: server.url,
       });
       result.requested.push({ name: server.name, ...(res.note ? { note: res.note } : {}) });
@@ -221,7 +329,7 @@ export function describeAutoAccess(r: AutoAccessResult): string {
     }
   }
   if (r.connected.length > 0) {
-    parts.push(`Already explicitly approved for this agent: ${r.connected.join(", ")}.`);
+    parts.push(`Already connected for this agent: ${r.connected.join(", ")}.`);
   }
   if (r.failed.length > 0) {
     parts.push(`Could not post a connect card for: ${r.failed.join(", ")} — call request_access for these.`);
@@ -256,22 +364,7 @@ export function buildSetupTools(
         skills: z.array(z.any()).optional(),
       }),
       execute: async (args: Record<string, unknown>) => {
-        const patch: HarnessPatch = {};
-        const changed: string[] = [];
-        for (const key of [
-          "name",
-          "description",
-          "model",
-          "system",
-          "mcp_servers",
-          "skills",
-        ] as const) {
-          const value = args[key];
-          if (value !== undefined) {
-            (patch as Record<string, unknown>)[key] = value;
-            changed.push(key);
-          }
-        }
+        const { patch, changed, notes } = buildHarnessPatch(args);
         if (changed.length === 0) return "No changes applied.";
 
         const before = lastHarnessViews.get(sessionId) ?? harnessView(agent);
@@ -293,6 +386,7 @@ export function buildSetupTools(
           },
         } as SessionEvent);
         let summary = `Updated: ${changed.join(", ")}.`;
+        if (notes.length > 0) summary += ` ${notes.join(" ")}`;
         if (patch.mcp_servers !== undefined) {
           const auto = await autoRequestAccessForNewServers(before.mcp_servers, after.mcp_servers, deps);
           const line = describeAutoAccess(auto);

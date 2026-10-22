@@ -1,4 +1,5 @@
 import { ConnectionConsent } from "./lib/connection-consent.js";
+import { serviceDisplayName } from "@open-managed-agents/api-types";
 import { buildTelegramConnectRoutes } from "./lib/telegram-connect-routes.js";
 import { TelegramOnboarding } from "./lib/telegram-onboarding.js";
 import { DesktopGateway } from "./lib/desktop-gateway.js";
@@ -1122,6 +1123,7 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
       },
       requestServiceAccess: (tenantId, sessionId, a) =>
         postAccessRequest(tenantId, sessionId, a),
+      isConnectionApproved: async (tenantId, agentId, url) => !!await connectionConsent.authorizedCredential(tenantId, agentId, url),
       createAmbientRule: (tenantId, sessionId, agentId, a) =>
         createAmbientRuleFromSession(tenantId, agentId, sessionId, a),
       findSkills: (tenantId, query) => findSkillsForTenant(tenantId, query),
@@ -2525,7 +2527,13 @@ v1.route("/vaults", buildVaultRoutes({
 }));
 v1.route(
   "/oauth",
-  buildNodeOAuthRoutes({ services, env: process.env }),
+  buildNodeOAuthRoutes({
+    services,
+    env: process.env,
+    // A sign-in started from a connect card binds the new account to that
+    // card's agent (verified first) — see ConnectionConsent.connectNew.
+    onConnected: (input) => connectionConsent.connectNew(input),
+  }),
 );
 
 const connectionConsent = new ConnectionConsent({
@@ -2544,10 +2552,13 @@ const connectionConsent = new ConnectionConsent({
       type: "system.access_granted", id: generateEventId(), request_id: requestId,
       service, vault_id: binding.vault_id, mcp_server_url: binding.mcp_server_url,
     } as SessionEvent);
-    logger.info({ op: "connection.approved", session_id: sessionId, credential_id: binding.credential_id }, "connection explicitly approved");
+    const who = [
+      binding.account ? `account ${binding.account}` : null,
+      binding.workspace ? `workspace ${binding.workspace}` : null,
+    ].filter(Boolean).join(", ");
     await sessionRouter.appendEvent(sessionId, {
       type: "user.message", id: generateEventId(), content: [{ type: "text",
-        text: `[access granted] ${service} was explicitly approved for this agent. Account: ${binding.account ?? "identity unavailable"}. Workspace: ${binding.workspace ?? "identity unavailable"}. Confirm this matches the requested workspace before using it.`,
+        text: `[access granted] ${serviceDisplayName(service, binding.mcp_server_url)} is connected for this agent${who ? ` (${who})` : ""}. Continue where you left off.`,
       }],
     } as SessionEvent);
   },

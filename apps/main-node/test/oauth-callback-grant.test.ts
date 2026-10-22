@@ -62,27 +62,73 @@ const baseState = {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("oauth callback grant recording", () => {
-  it("stages session credentials for explicit approval instead of granting on OAuth completion", async () => {
+  it("binds the new account to the card's agent when the sign-in came from a connect card", async () => {
     stubUpstreams();
     const grants: GrantNotification[] = [];
+    const connects: unknown[] = [];
     const f = fakeServices({ ...baseState, session_id: "sess-1", request_id: "acreq-1", service: "sentry" });
     const app = new Hono().route(
       "/v1/oauth",
       buildNodeOAuthRoutes({
         services: f.services as never,
         onGranted: async (g) => void grants.push(g),
+        onConnected: async (input) => {
+          connects.push(input);
+          return { status: "connected", account: "ana@acme.com", workspace: "Acme" };
+        },
       }),
     );
     const res = await app.request("https://api.example/v1/oauth/callback?code=abc&state=st1");
     expect(res.status).toBe(200);
     const html = await res.text();
+    // The card path owns the grant; the legacy onGranted nudge must not double it.
     expect(grants).toEqual([]);
+    expect(connects).toEqual([{ tenantId: "t1", sessionId: "sess-1", requestId: "acreq-1", vaultId: "vlt-1", credentialId: "cred-new" }]);
     expect(f.created).toHaveLength(1);
-    expect(html).toContain('"grant_recorded":false');
-    expect(html).toContain('"requires_approval":true');
-    expect(html).toContain('"credential_id":"cred-new"');
+    expect(html).toContain('"grant_recorded":true');
+    expect(html).toContain('"connected":true');
+    expect(html).toContain('"account":"ana@acme.com"');
     expect(html).toContain('"request_id":"acreq-1"');
     expect(html).toContain('"service":"sentry"');
+    expect(html).toContain("Sentry connected as ana@acme.com · Acme");
+  });
+
+  it("keeps the popup open with the reason when the new account can't be verified", async () => {
+    stubUpstreams();
+    const f = fakeServices({ ...baseState, session_id: "sess-1", request_id: "acreq-1", service: "sentry" });
+    const app = new Hono().route(
+      "/v1/oauth",
+      buildNodeOAuthRoutes({
+        services: f.services as never,
+        onConnected: async () => ({ status: "unverified", message: "Authentication could not be verified." }),
+      }),
+    );
+    const html = await (await app.request("https://api.example/v1/oauth/callback?code=abc&state=st1")).text();
+    expect(html).toContain('"grant_recorded":false');
+    expect(html).toContain('"connected":false');
+    expect(html).toContain('"connect_error":"Authentication could not be verified."');
+    expect(html).toContain("isn&#39;t connected yet");
+    expect(html).toContain("if (false) window.close()");
+  });
+
+  it("treats a throwing onConnected as not connected — the credential is already stored", async () => {
+    stubUpstreams();
+    const f = fakeServices({ ...baseState, session_id: "sess-1", request_id: "acreq-1", service: "sentry" });
+    const app = new Hono().route(
+      "/v1/oauth",
+      buildNodeOAuthRoutes({
+        services: f.services as never,
+        onConnected: async () => {
+          throw new Error("router down");
+        },
+      }),
+    );
+    const res = await app.request("https://api.example/v1/oauth/callback?code=abc&state=st1");
+    expect(res.status).toBe(200);
+    expect(f.created).toHaveLength(1);
+    const html = await res.text();
+    expect(html).toContain('"grant_recorded":false');
+    expect(html).not.toContain("router down");
   });
 
   it("skips onGranted (grant_recorded:false) for flows started outside a session, e.g. the vault page", async () => {
@@ -99,23 +145,6 @@ describe("oauth callback grant recording", () => {
     expect(await res.text()).toContain('"grant_recorded":false');
   });
 
-  it("still completes (grant_recorded:false) when onGranted throws — the credential is already stored", async () => {
-    stubUpstreams();
-    const f = fakeServices({ ...baseState, session_id: "sess-1", request_id: "acreq-1", service: "sentry" });
-    const app = new Hono().route(
-      "/v1/oauth",
-      buildNodeOAuthRoutes({
-        services: f.services as never,
-        onGranted: async () => {
-          throw new Error("router down");
-        },
-      }),
-    );
-    const res = await app.request("https://api.example/v1/oauth/callback?code=abc&state=st1");
-    expect(res.status).toBe(200);
-    expect(f.created).toHaveLength(1);
-    expect(await res.text()).toContain('"grant_recorded":false');
-  });
 });
 
 describe("Telegram MCP OAuth completion receipts", () => {
