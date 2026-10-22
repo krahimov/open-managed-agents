@@ -336,7 +336,7 @@ describe("ConnectionCard switching", () => {
     server({ approved: true, current, connections: [] });
     render(<MemoryRouter><ConnectionCard request={{ ...request, switch_account: true }} sessionId="session" /></MemoryRouter>);
     expect(await screen.findByRole("button", { name: /Sign in with a different Linear account/ })).toBeInTheDocument();
-    expect(screen.getByText("keryabakugan · Erandry")).toBeInTheDocument();
+    expect(screen.getByText("Currently: keryabakugan · Erandry")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.getByRole("button", { name: "Change" })).toBeInTheDocument();
   });
