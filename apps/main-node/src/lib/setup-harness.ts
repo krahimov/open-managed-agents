@@ -200,8 +200,10 @@ export function canonicalizeMcpServers(input: unknown[]): { servers: unknown[]; 
       }
       entry.name = byUrl.id;
     } else if (byName && (!url || onVendorDomain(byName))) {
-      entry.url = byName.url;
-      if (url) notes.push(`${byName.name}: replaced ${url} with the official endpoint ${byName.url}.`);
+      const query = url ? new URL(url).search : "";
+      const official = new URL(byName.url);
+      entry.url = query ? `${official.origin}${official.pathname}${query}` : byName.url;
+      if (url) notes.push(`${byName.name}: replaced ${url} with the official endpoint ${entry.url}.`);
       entry.name = byName.id;
     } else {
       if (!url) {

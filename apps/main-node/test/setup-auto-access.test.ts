@@ -187,10 +187,12 @@ describe("recognizing services: canonical MCP servers", () => {
     const { servers, notes } = canonicalizeMcpServers([
       { name: "slack", type: "url", url: "https://slack.com/api/mcp" },
       { name: "linear", type: "url", url: "https://mcp.linear.app/sse?workspace=private" },
+      { name: "notion", type: "url", url: "https://notion.so/mcp?space=eng" },
     ]);
     expect(servers).toEqual([
       { name: "slack", type: "url", url: "https://mcp.slack.com/mcp" },
       { name: "linear", type: "url", url: "https://mcp.linear.app/mcp?workspace=private" },
+      { name: "notion", type: "url", url: "https://mcp.notion.com/mcp?space=eng" },
     ]);
     expect(notes.join(" ")).toContain("replaced https://slack.com/api/mcp with the official endpoint");
     expect(notes.join(" ")).toContain("SSE endpoint is deprecated");

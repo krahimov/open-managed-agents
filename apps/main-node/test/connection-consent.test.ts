@@ -242,6 +242,28 @@ describe("connect card: the account bound is the account shown", () => {
     expect(await f.bound()).toBeNull();
   });
 
+  it("a reconnect while the provider check runs never binds the unverified account", async () => {
+    const f = fixture();
+    const shown = await (await f.post("identify", { vault_id: "shared", credential_id: "chosen" })).json();
+    // The verifier sees Alice; meanwhile the credential is reconnected as Bob.
+    (f as any).verify.mockImplementationOnce(async () => {
+      Object.assign(f.credentials[0].auth, { token: "secret-bob", connected_at: "2026-10-22T22:00:00Z" });
+      return { status: "verified", account: "karim", workspace: "Serious AI", workspace_id: "T1" };
+    });
+    const result = await (await f.post("use", { vault_id: "shared", credential_id: "chosen", expected_version: shown.version, expected_account: "karim", expected_workspace_id: "T1" })).json();
+    expect(result.status).toBe("connected");
+    // Bound to the generation that was verified — Bob's doesn't match it.
+    expect(await f.bound()).toBeNull();
+  });
+
+  it("a pre-generation binding whose credential was reconnected after approval is not adopted", async () => {
+    const f = fixture();
+    f.kv.set(connectionBindingKey("tenant", "agent", SLACK), JSON.stringify({ vault_id: "shared", credential_id: "chosen", mcp_server_url: SLACK, account: "karim", approved_at: Date.parse("2026-10-01T00:00:00Z") }));
+    Object.assign(f.credentials[0].auth, { token: "secret-bob", connected_at: "2026-10-20T00:00:00Z" });
+    expect(await f.bound()).toBeNull();
+    expect(JSON.parse(f.kv.get(connectionBindingKey("tenant", "agent", SLACK))!).generation).toBeUndefined();
+  });
+
   it("a failed identity check isn't cached, so the account recovers once the provider does", async () => {
     const f = fixture();
     (f as any).verify.mockImplementationOnce(async () => ({ status: "unverified", message: "Authentication could not be verified." }));
@@ -343,6 +365,16 @@ describe("live protocol and workspace verification", () => {
       return Response.json({ jsonrpc: "2.0", id: body.id, result });
     });
   }
+  it("verifies Composio credentials with x-api-key, like the MCP proxy", async () => {
+    const fetchMock = protocolFetch({});
+    vi.stubGlobal("fetch", fetchMock);
+    const composio = { auth: { type: "composio_mcp", api_key: "ck_test", mcp_server_url: "https://backend.composio.dev/tool_router/mcp" } } as never;
+    expect((await verifyConnection(composio)).status).toBe("verified");
+    const headers = new Headers(fetchMock.mock.calls[0][1].headers);
+    expect(headers.get("x-api-key")).toBe("ck_test");
+    expect(headers.get("authorization")).toBeNull();
+  });
+
   it("verifies identity only after a valid MCP initialization and tools response", async () => {
     vi.stubGlobal("fetch", protocolFetch({ ok: true, user: "karim", team: "Serious AI", team_id: "T1" }));
     expect(await verifyConnection(credential)).toEqual({ status: "verified", account: "karim", workspace: "Serious AI", workspace_id: "T1" });

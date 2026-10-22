@@ -50,9 +50,15 @@ export interface ConnectionVerification {
 /** Only protocol discovery and fixed, read-only provider identity queries. */
 export async function verifyConnection(credential: CredentialRow): Promise<ConnectionVerification> {
   const auth = credential.auth as unknown as Record<string, string | undefined>;
-  const token = auth.access_token || auth.token || auth.bearer_token;
+  // Composio authenticates with x-api-key (inline or from the operator env),
+  // the same header the MCP proxy sends; everything else is a bearer token.
+  const composioKey = auth.type === "composio_mcp"
+    ? auth.api_key || process.env[auth.api_key_env || "COMPOSIO_API_KEY"] || undefined
+    : undefined;
+  const token = auth.type === "composio_mcp" ? composioKey : auth.access_token || auth.token || auth.bearer_token;
   const url = auth.mcp_server_url;
   if (!token || !url) return { status: "unverified", message: "This credential has no usable token." };
+  const authHeaders: Record<string, string> = composioKey ? { "x-api-key": composioKey } : { authorization: `Bearer ${token}` };
   const client = new Client({ name: "orrery-connection-verification", version: "1" });
   const boundedFetch: typeof fetch = (input, init) => fetch(input, {
     ...init, redirect: "error",
@@ -60,7 +66,7 @@ export async function verifyConnection(credential: CredentialRow): Promise<Conne
   });
   try {
     await client.connect(new StreamableHTTPClientTransport(new URL(url), {
-      requestInit: { headers: { authorization: `Bearer ${token}` } }, fetch: boundedFetch,
+      requestInit: { headers: authHeaders }, fetch: boundedFetch,
     }), { timeout: 10_000 });
     const toolList = await client.listTools({}, { timeout: 10_000 });
     const host = new URL(url).hostname;
@@ -198,8 +204,12 @@ export class ConnectionConsent {
     const credential = await this.deps.services.credentials.get({ tenantId, vaultId: binding.vault_id, credentialId: binding.credential_id });
     if (!credential || credential.archived_at || !credential.auth.mcp_server_url || connectionUrl(credential.auth.mcp_server_url) !== connectionUrl(url)) return null;
     if (binding.generation === undefined) {
-      // Bindings made before generations existed: pin the current one, so
-      // from now on a reconnect to another account cuts access.
+      // Bindings made before generations existed. A credential reconnected
+      // after the user approved it may be someone else now: refuse, the user
+      // picks again. Otherwise pin the current generation, so from now on a
+      // reconnect to another account cuts access.
+      const reconnectedAt = credential.auth.connected_at ? Date.parse(credential.auth.connected_at) : NaN;
+      if (Number.isFinite(reconnectedAt) && reconnectedAt >= binding.approved_at) return null;
       await this.deps.services.kv.put(
         connectionBindingKey(tenantId, agentId, url),
         JSON.stringify({ ...binding, generation: credentialGeneration(credential) }),
@@ -274,9 +284,17 @@ export class ConnectionConsent {
   /** Verify one saved credential (handshake + provider identity) and cache
    *  the result for the card. Reads only; grants nothing. */
   async identify(tenantId: string, vaultId: string, credential: CredentialRow): Promise<ConnectionIdentity> {
-    const current = await this.fresh(tenantId, vaultId, credential);
-    const result = await (this.deps.verify ?? verifyConnection)(current);
-    const identity: ConnectionIdentity = { ...result, checked_at: Date.now(), version: identityVersion(current) };
+    return (await this.verifySnapshot(tenantId, vaultId, credential)).identity;
+  }
+
+  /** identify + the exact credential snapshot that was verified. */
+  private async verifySnapshot(tenantId: string, vaultId: string, credential: CredentialRow): Promise<{ identity: ConnectionIdentity; verified: CredentialRow }> {
+    // Freeze what is being verified before the (slow) provider check, so the
+    // version/generation describe exactly this account.
+    const current = structuredClone(await this.fresh(tenantId, vaultId, credential));
+    const version = identityVersion(current);
+    const result = await (this.deps.verify ?? verifyConnection)(structuredClone(current));
+    const identity: ConnectionIdentity = { ...result, checked_at: Date.now(), version };
     // Only successes are cached: a provider blip must not mark a good
     // account unusable for days.
     if (identity.status === "verified") {
@@ -286,7 +304,7 @@ export class ConnectionConsent {
     } else {
       await this.deps.services.kv.delete(identityKey(tenantId, current.id)).catch(() => {});
     }
-    return identity;
+    return { identity, verified: current };
   }
 
   /** Verify `credential` and, when it checks out, bind it to the agent and
@@ -299,7 +317,7 @@ export class ConnectionConsent {
   }): Promise<ConnectResult> {
     const changed = { status: "unverified" as const, message: "This account changed since it was shown. Check the list again and pick it again." };
     if (input.expected && input.expected.version !== identityVersion(input.credential)) return changed;
-    const identity = await this.identify(input.tenantId, input.vaultId, input.credential);
+    const { identity, verified } = await this.verifySnapshot(input.tenantId, input.vaultId, input.credential);
     if (identity.status !== "verified") {
       return { status: "unverified", message: identity.message ?? "The connection could not be verified. No access was granted." };
     }
@@ -308,11 +326,13 @@ export class ConnectionConsent {
       if ((input.expected.account ?? "") !== (identity.account ?? "")) return changed;
       if ((input.expected.workspaceId ?? "") !== (identity.workspace_id ?? "")) return changed;
     }
-    const bound = (await this.deps.services.credentials.get({ tenantId: input.tenantId, vaultId: input.vaultId, credentialId: input.credential.id })) ?? input.credential;
+    // Pin the generation that was VERIFIED. If the credential was reconnected
+    // while the provider check ran, the binding is born mismatched, so it
+    // never authorizes the unverified account.
     const binding: ConnectionBinding = {
       vault_id: input.vaultId, credential_id: input.credential.id, mcp_server_url: input.url,
       account: identity.account, workspace: identity.workspace, workspace_id: identity.workspace_id, approved_at: Date.now(),
-      generation: credentialGeneration(bound),
+      generation: credentialGeneration(verified),
     };
     const key = connectionBindingKey(input.tenantId, input.agentId, input.url);
     const existing = await this.binding(input.tenantId, input.agentId, input.url);
