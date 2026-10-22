@@ -111,6 +111,22 @@ describe("oauth callback grant recording", () => {
     expect(html).toContain("if (false) window.close()");
   });
 
+  it("provider-controlled names can't break out of the callback page's script", async () => {
+    stubUpstreams();
+    const f = fakeServices({ ...baseState, session_id: "sess-1", request_id: "acreq-1", service: "sentry</script><script>alert(2)</script>" });
+    const app = new Hono().route(
+      "/v1/oauth",
+      buildNodeOAuthRoutes({
+        services: f.services as never,
+        onConnected: async () => ({ status: "connected", account: "a", workspace: "</script><script>alert(1)</script>" }),
+      }),
+    );
+    const html = await (await app.request("https://api.example/v1/oauth/callback?code=abc&state=st1")).text();
+    expect(html.match(/<\/script>/g)).toHaveLength(1);
+    expect(html).not.toContain("<script>alert");
+    expect(html).toContain("\\u003c/script\\u003e\\u003cscript\\u003ealert(1)");
+  });
+
   it("treats a throwing onConnected as not connected — the credential is already stored", async () => {
     stubUpstreams();
     const f = fakeServices({ ...baseState, session_id: "sess-1", request_id: "acreq-1", service: "sentry" });

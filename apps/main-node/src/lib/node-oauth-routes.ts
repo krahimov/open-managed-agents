@@ -484,7 +484,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       <p>${htmlEscape(pageText)}</p>
       <script>
         (function(){
-          var msg = ${JSON.stringify({
+          var msg = ${scriptJson({
             type: "oauth_complete",
             service: grantService,
             server_name: serverName,
@@ -517,8 +517,8 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
             notified = true;
           } catch (e) {}
           // A failed connect stays open so the user can read why.
-          if (notified) { if (${JSON.stringify(connectResult?.status !== "unverified")}) window.close(); }
-          else window.location.href = ${JSON.stringify(redirectUrl.toString())};
+          if (notified) { if (${scriptJson(connectResult?.status !== "unverified")}) window.close(); }
+          else window.location.href = ${scriptJson(redirectUrl.toString())};
         })();
       </script>
       </body></html>
@@ -998,7 +998,7 @@ async function probeMcpServer(
 function closeHtml(title: string, body: string, extra: Record<string, unknown> = {}): string {
   // body may carry markup for the page; the postMessage variant is plain text.
   const plain = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-  const msg = JSON.stringify({
+  const msg = scriptJson({
     type: "oauth_error",
     message: `${title}: ${plain}`.slice(0, 500),
     ...extra,
@@ -1013,6 +1013,16 @@ function closeHtml(title: string, body: string, extra: Record<string, unknown> =
     try { var bc = new BroadcastChannel("openma-oauth"); bc.postMessage(msg); bc.close(); } catch (e) {}
   })();
 </script></body></html>`;
+}
+
+/** JSON for inlining in a <script> block. Provider-controlled strings (a
+ *  workspace named "</script><script>…") must not end the script element. */
+function scriptJson(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
 }
 
 function htmlEscape(value: string): string {

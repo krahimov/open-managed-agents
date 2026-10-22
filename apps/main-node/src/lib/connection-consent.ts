@@ -441,13 +441,28 @@ export class ConnectionConsent {
       const { sessionId, requestId } = ids(c);
       const { request, url } = await this.context(tenantId, sessionId, requestId);
       const display = serviceDisplayName(request.service, url);
-      const vault = await this.deps.services.vaults.create({ tenantId, name: `${display} connection` });
+      // Retries from the same card reuse its still-empty vault instead of
+      // leaving one abandoned "<Service> connection" vault per click.
+      const startKey = `connection_start:${encodeURIComponent(tenantId)}:${encodeURIComponent(sessionId)}:${encodeURIComponent(requestId)}`;
+      let vaultId: string | null = null;
+      const previous = await this.deps.services.kv.get(startKey).catch(() => null);
+      if (previous) {
+        const vault = await this.deps.services.vaults.get({ tenantId, vaultId: previous }).catch(() => null);
+        const creds = vault && !vault.archived_at
+          ? await this.deps.services.credentials.listByVaults({ tenantId, vaultIds: [previous] }).catch(() => null)
+          : null;
+        if (creds && creds.every(g => g.credentials.every(cred => cred.archived_at))) vaultId = previous;
+      }
+      if (!vaultId) {
+        vaultId = (await this.deps.services.vaults.create({ tenantId, name: `${display} connection` })).id;
+        await this.deps.services.kv.put(startKey, vaultId, { expirationTtl: 24 * 60 * 60 }).catch(() => {});
+      }
       const params = new URLSearchParams({
-        mcp_server_url: url, vault_id: vault.id, service: request.service, session_id: sessionId, request_id: requestId,
+        mcp_server_url: url, vault_id: vaultId, service: request.service, session_id: sessionId, request_id: requestId,
       });
       const body = await c.req.json<{ redirect_uri?: string }>().catch(() => ({} as { redirect_uri?: string }));
       if (typeof body.redirect_uri === "string" && body.redirect_uri) params.set("redirect_uri", body.redirect_uri);
-      return c.json({ vault_id: vault.id, authorize_url: `/v1/oauth/authorize?${params}` });
+      return c.json({ vault_id: vaultId, authorize_url: `/v1/oauth/authorize?${params}` });
     });
 
     // API-key servers: store the key in its own vault, verify, bind.

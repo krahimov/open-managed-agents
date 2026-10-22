@@ -198,6 +198,17 @@ describe("connect card: new sign-in", () => {
     expect(await f.bound()).toBeNull();
   });
 
+  it("retrying a sign-in reuses the card's empty vault, but never one that holds an account", async () => {
+    const f = fixture();
+    const first = await (await f.post("start", {})).json();
+    const retry = await (await f.post("start", {})).json();
+    expect(retry.vault_id).toBe(first.vault_id);
+    await f.services.credentials.create({ vaultId: first.vault_id, displayName: "Slack (OAuth)", auth: { type: "mcp_oauth", access_token: "t", mcp_server_url: SLACK } });
+    const afterSignIn = await (await f.post("start", {})).json();
+    expect(afterSignIn.vault_id).not.toBe(first.vault_id);
+    expect(f.vaults.filter(v => v.name === "Slack connection")).toHaveLength(2);
+  });
+
   it("connectNew binds the verified new account and names it after who it is", async () => {
     const f = fixture();
     const vault = await f.services.vaults.create({ name: "Slack connection" });
