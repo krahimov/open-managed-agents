@@ -183,33 +183,40 @@ describe("recognizing services: canonical MCP servers", () => {
     expect(servers).toEqual([{ name: "linear", type: "url", url: "https://mcp.linear.app/mcp" }]);
   });
 
-  it("replaces a guessed or third-party endpoint and the deprecated SSE endpoint, with a note", () => {
+  it("replaces a guess on the vendor's own domain and the deprecated SSE path (keeping its query), with a note", () => {
     const { servers, notes } = canonicalizeMcpServers([
-      { name: "slack", type: "url", url: "https://slack-mcp.example.dev/mcp" },
-      { name: "linear", type: "url", url: "https://mcp.linear.app/sse" },
+      { name: "slack", type: "url", url: "https://slack.com/api/mcp" },
+      { name: "linear", type: "url", url: "https://mcp.linear.app/sse?workspace=private" },
     ]);
     expect(servers).toEqual([
       { name: "slack", type: "url", url: "https://mcp.slack.com/mcp" },
-      { name: "linear", type: "url", url: "https://mcp.linear.app/mcp" },
+      { name: "linear", type: "url", url: "https://mcp.linear.app/mcp?workspace=private" },
     ]);
-    expect(notes.join(" ")).toContain("replaced https://slack-mcp.example.dev/mcp with the official endpoint");
+    expect(notes.join(" ")).toContain("replaced https://slack.com/api/mcp with the official endpoint");
     expect(notes.join(" ")).toContain("SSE endpoint is deprecated");
   });
 
-  it("keeps vendor URL variants and unknown servers as given, and drops duplicates", () => {
-    const { servers } = canonicalizeMcpServers([
-      { name: "github", type: "url", url: "https://api.githubcopilot.com/mcp/readonly" },
-      { name: "Retell", type: "url", url: "https://mcp.retellai.com/mcp" },
-      { name: "linear", url: "https://mcp.linear.app/mcp" },
-      { name: "Linear again", url: "https://mcp.linear.app/mcp/" },
-      { name: "local", type: "stdio", command: "foo" },
+  it("keeps an explicit custom endpoint for a known service (company proxy, self-hosted bridge)", () => {
+    const { servers, notes } = canonicalizeMcpServers([
+      { name: "slack", type: "url", url: "https://our-proxy.example/slack/mcp" },
+      { name: "Linear", type: "url", url: "https://linear-bridge.internal.example/mcp" },
     ]);
     expect(servers).toEqual([
-      { name: "github", type: "url", url: "https://api.githubcopilot.com/mcp/readonly" },
-      { name: "retell", type: "url", url: "https://mcp.retellai.com/mcp" },
-      { name: "linear", type: "url", url: "https://mcp.linear.app/mcp" },
-      { name: "local", type: "stdio", command: "foo" },
+      { name: "slack", type: "url", url: "https://our-proxy.example/slack/mcp" },
+      { name: "linear", type: "url", url: "https://linear-bridge.internal.example/mcp" },
     ]);
+    expect(notes).toEqual([]);
+  });
+
+  it("keeps endpoints that differ only by query or path case", () => {
+    const { servers } = canonicalizeMcpServers([
+      { name: "a", url: "https://custom.example/mcp?workspace=A" },
+      { name: "b", url: "https://custom.example/mcp?workspace=B" },
+      { name: "c", url: "https://custom.example/Tenant/mcp" },
+      { name: "d", url: "https://custom.example/tenant/mcp" },
+      { name: "dupe", url: "https://CUSTOM.example/mcp/?workspace=A" },
+    ]);
+    expect(servers.map((x: any) => x.name)).toEqual(["a", "b", "c", "d"]);
   });
 
   it("skips an unknown server with no URL and says why", () => {

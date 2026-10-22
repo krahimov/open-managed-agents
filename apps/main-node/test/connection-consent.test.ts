@@ -59,8 +59,18 @@ function fixture(opts: { mcpServers?: Array<{ type: string; name: string; url: s
     method: "POST", headers: { "content-type": "application/json", "x-tenant": tenant }, body: JSON.stringify(body),
   });
   const state = async () => (await app.request("/access/session/request")).json() as Promise<any>;
+  /** What the card does: look the account up, then Use it with what it showed. */
+  const pick = async (vault_id: string, credential_id: string, override: Record<string, unknown> = {}) => {
+    const shown = await (await post("identify", { vault_id, credential_id })).json();
+    return (await post("use", {
+      vault_id, credential_id, expected_version: shown.version,
+      ...(shown.account ? { expected_account: shown.account } : {}),
+      ...(shown.workspace_id ? { expected_workspace_id: shown.workspace_id } : {}),
+      ...override,
+    })).json();
+  };
   const bound = () => consent.authorizedCredential("tenant", "agent", SLACK);
-  return { app, post, state, bound, kv, vaults, credentials, consent, verify, onApproved, services, agent };
+  return { app, post, state, pick, bound, kv, vaults, credentials, consent, verify, onApproved, services, agent };
 }
 
 describe("connect card: saved accounts", () => {
@@ -100,17 +110,17 @@ describe("connect card: saved accounts", () => {
     expect(body.connections).toHaveLength(1);
   });
 
-  it("re-checks identity once the saved account's token changes", async () => {
+  it("re-checks identity once the saved account is reconnected", async () => {
     const f = fixture();
     await f.post("identify", { vault_id: "shared", credential_id: "chosen" });
-    f.credentials[0].auth.token = "rotated-unknown";
+    Object.assign(f.credentials[0].auth, { token: "rotated-unknown", connected_at: "2026-10-22T20:00:00Z" });
     const body = await f.state();
     expect(body.connections.find((c: any) => c.credential_id === "chosen").identity).toBeNull();
   });
 
   it("Use binds exactly the chosen account to exactly this agent and tells the agent who it is", async () => {
     const f = fixture();
-    const result = await (await f.post("use", { vault_id: "shared", credential_id: "chosen", expected_workspace_id: "T1" })).json();
+    const result = await f.pick("shared", "chosen");
     expect(result).toEqual({ status: "connected", account: "karim", workspace: "Serious AI" });
     expect(f.onApproved).toHaveBeenCalledOnce();
     expect(f.onApproved.mock.calls[0][0]).toMatchObject({ sessionId: "session", requestId: "request", service: "slack", binding: { credential_id: "chosen", account: "karim", workspace: "Serious AI" } });
@@ -125,8 +135,8 @@ describe("connect card: saved accounts", () => {
 
   it("choosing the account that is already in use does not re-notify the agent", async () => {
     const f = fixture();
-    await f.post("use", { vault_id: "shared", credential_id: "chosen" });
-    await f.post("use", { vault_id: "shared", credential_id: "chosen" });
+    await f.pick("shared", "chosen");
+    await f.pick("shared", "chosen");
     expect(f.onApproved).toHaveBeenCalledOnce();
   });
 
@@ -135,8 +145,8 @@ describe("connect card: saved accounts", () => {
     f.verify.mockImplementation(async (cred: any) => cred.id === "copy"
       ? { status: "verified", account: "ana", workspace: "Erandry", workspace_id: "T2" }
       : { status: "verified", account: "karim", workspace: "Serious AI", workspace_id: "T1" });
-    await f.post("use", { vault_id: "shared", credential_id: "chosen" });
-    await f.post("use", { vault_id: "other", credential_id: "copy" });
+    await f.pick("shared", "chosen");
+    await f.pick("other", "copy");
     expect(f.onApproved).toHaveBeenCalledTimes(2);
     expect((await f.bound())?.id).toBe("copy");
   });
@@ -144,11 +154,11 @@ describe("connect card: saved accounts", () => {
   it("never binds an account that fails verification or changed workspace since it was shown", async () => {
     const f = fixture();
     f.credentials[0].auth.token = "broken";
-    const failed = await (await f.post("use", { vault_id: "shared", credential_id: "chosen" })).json();
+    const failed = await f.pick("shared", "chosen");
     expect(failed.status).toBe("unverified");
     expect(failed.message).toBeTruthy();
     f.credentials[0].auth.token = "secret-selected";
-    const moved = await (await f.post("use", { vault_id: "shared", credential_id: "chosen", expected_workspace_id: "T-other" })).json();
+    const moved = await f.pick("shared", "chosen", { expected_workspace_id: "T-other" });
     expect(moved.status).toBe("unverified");
     expect(f.onApproved).not.toHaveBeenCalled();
     expect(await f.bound()).toBeNull();
@@ -160,9 +170,11 @@ describe("connect card: saved accounts", () => {
     expect(foreign.status).toBe(404);
     expect(await foreign.json()).toEqual({ error: "Session not found" });
     expect((await f.app.request("/access/session/missing")).status).toBe(404);
-    expect((await f.post("use", { vault_id: "shared", credential_id: "sibling" })).status).toBe(404);
-    expect((await f.post("use", { vault_id: "shared", credential_id: "chosen" }, "other")).status).toBe(404);
+    expect((await f.post("use", { vault_id: "shared", credential_id: "sibling", expected_version: "x" })).status).toBe(404);
+    expect((await f.post("use", { vault_id: "shared", credential_id: "chosen", expected_version: "x" }, "other")).status).toBe(404);
     expect((await f.post("use", {})).status).toBe(400);
+    // Use without having looked the account up is refused.
+    expect((await f.post("use", { vault_id: "shared", credential_id: "chosen" })).status).toBe(400);
     expect(f.onApproved).not.toHaveBeenCalled();
   });
 
@@ -175,12 +187,74 @@ describe("connect card: saved accounts", () => {
 
   it("an archived chosen account cuts access instead of falling back to another", async () => {
     const f = fixture();
-    await f.post("use", { vault_id: "shared", credential_id: "chosen" });
+    await f.pick("shared", "chosen");
     f.credentials[0].archived_at = "2026-09-23";
     expect(await f.bound()).toBeNull();
     expect(await f.consent.hasApproval("tenant", "agent", SLACK)).toBe(true);
     const body = await f.state();
     expect(body).toMatchObject({ approved: false, broken: true, current: null });
+  });
+});
+
+describe("connect card: the account bound is the account shown", () => {
+  it("refuses Use when the credential was reconnected (maybe as someone else) after it was shown", async () => {
+    const f = fixture();
+    const shown = await (await f.post("identify", { vault_id: "shared", credential_id: "chosen" })).json();
+    // Reconnected to Bob in the same workspace before the click.
+    Object.assign(f.credentials[0].auth, { token: "secret-bob", connected_at: "2026-10-22T20:00:00Z" });
+    (f as any).verify.mockImplementation(async () => ({ status: "verified", account: "bob", workspace: "Serious AI", workspace_id: "T1" }));
+    const result = await (await f.post("use", { vault_id: "shared", credential_id: "chosen", expected_version: shown.version, expected_account: "karim", expected_workspace_id: "T1" })).json();
+    expect(result.status).toBe("unverified");
+    expect(result.message).toMatch(/changed since it was shown/);
+    expect(await f.bound()).toBeNull();
+    expect(f.onApproved).not.toHaveBeenCalled();
+  });
+
+  it("refuses Use when the provider now reports a different account for the same generation", async () => {
+    const f = fixture();
+    const shown = await (await f.post("identify", { vault_id: "shared", credential_id: "chosen" })).json();
+    (f as any).verify.mockImplementation(async () => ({ status: "verified", account: "bob", workspace: "Serious AI", workspace_id: "T1" }));
+    const result = await (await f.post("use", { vault_id: "shared", credential_id: "chosen", expected_version: shown.version, expected_account: "karim", expected_workspace_id: "T1" })).json();
+    expect(result.status).toBe("unverified");
+    expect(await f.bound()).toBeNull();
+  });
+
+  it("a credential reconnected elsewhere (e.g. the vault page) stops authorizing agents bound to it", async () => {
+    const f = fixture();
+    await f.pick("shared", "chosen");
+    expect((await f.bound())?.id).toBe("chosen");
+    // A token refresh keeps the account generation: still authorized.
+    f.credentials[0].auth.token = "secret-selected-refreshed";
+    expect((await f.bound())?.id).toBe("chosen");
+    // A reconnect starts a new generation: cut off until picked again.
+    f.credentials[0].auth.connected_at = "2026-10-22T21:00:00Z";
+    expect(await f.bound()).toBeNull();
+    expect(await f.consent.hasApproval("tenant", "agent", SLACK)).toBe(true);
+    expect((await f.state())).toMatchObject({ approved: false, broken: true });
+  });
+
+  it("pins the current generation on bindings made before generations existed", async () => {
+    const f = fixture();
+    f.kv.set(connectionBindingKey("tenant", "agent", SLACK), JSON.stringify({ vault_id: "shared", credential_id: "chosen", mcp_server_url: SLACK, approved_at: 1 }));
+    expect((await f.bound())?.id).toBe("chosen");
+    expect(JSON.parse(f.kv.get(connectionBindingKey("tenant", "agent", SLACK))!).generation).toBe("2026-09-01");
+    f.credentials[0].auth.connected_at = "2026-10-22T21:00:00Z";
+    expect(await f.bound()).toBeNull();
+  });
+
+  it("a failed identity check isn't cached, so the account recovers once the provider does", async () => {
+    const f = fixture();
+    (f as any).verify.mockImplementationOnce(async () => ({ status: "unverified", message: "Authentication could not be verified." }));
+    expect((await (await f.post("identify", { vault_id: "shared", credential_id: "chosen" })).json()).status).toBe("unverified");
+    expect((await f.state()).connections.find((c: any) => c.credential_id === "chosen").identity).toBeNull();
+    expect((await (await f.post("identify", { vault_id: "shared", credential_id: "chosen" })).json()).status).toBe("verified");
+  });
+
+  it("a lost agent notification doesn't undo a binding", async () => {
+    const f = fixture();
+    f.onApproved.mockRejectedValueOnce(new Error("router down"));
+    expect((await f.pick("shared", "chosen")).status).toBe("connected");
+    expect((await f.bound())?.id).toBe("chosen");
   });
 });
 
@@ -228,7 +302,7 @@ describe("connect card: new sign-in", () => {
     const cred = await f.services.credentials.create({ vaultId: vault.id, displayName: "Slack (OAuth)", auth: { type: "mcp_oauth", access_token: "x", mcp_server_url: SLACK } });
     f.verify.mockResolvedValueOnce({ status: "verified", message: "Service access verified." } as never);
     expect((await f.consent.connectNew({ tenantId: "tenant", sessionId: "session", requestId: "request", vaultId: vault.id, credentialId: cred.id })).status).toBe("connected");
-    expect(f.credentials.find(c => c.id === cred.id)?.display_name).toMatch(/^Slack · account connected \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC$/);
+    expect(f.credentials.find(c => c.id === cred.id)?.display_name).toMatch(/^Slack · account connected \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC · #\S{4}$/);
   });
 
   it("connectNew refuses unverifiable accounts and foreign sessions without throwing", async () => {
@@ -318,7 +392,7 @@ describe("agent connection overview", () => {
       { type: "url", name: "linear", url: "https://mcp.linear.app/mcp" },
       { type: "stdio", name: "local", url: "" },
     ] });
-    await f.post("use", { vault_id: "shared", credential_id: "chosen" });
+    await f.pick("shared", "chosen");
     f.verify.mockClear();
     const res = await f.app.request("/access/agent/agent/status");
     expect(res.status).toBe(200);

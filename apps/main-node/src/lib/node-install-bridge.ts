@@ -698,6 +698,7 @@ class InProcessVaultManager implements VaultManager {
       vaultId: input.vaultId,
       credentialId: target.id,
       auth: { token: input.newBearerToken },
+      sameAccount: true,
     });
     return true;
   }
@@ -720,6 +721,7 @@ class InProcessVaultManager implements VaultManager {
       vaultId: input.vaultId,
       credentialId: target.id,
       auth: { token: input.newToken },
+      sameAccount: true,
     });
     return true;
   }

@@ -36,6 +36,8 @@ interface Identity {
   workspace?: string;
   workspace_id?: string;
   message?: string;
+  /** Marks the credential generation this identity describes; Use echoes it. */
+  version?: string;
 }
 
 interface SavedConnection {
@@ -132,6 +134,26 @@ export function ConnectionCard({
   const popupRef = useRef<Window | null>(null);
   const identifyStarted = useRef(new Set<string>());
 
+  const identify = useCallback(
+    (conn: SavedConnection) => {
+      identifyStarted.current.add(conn.credential_id);
+      setIdentities((m) => ({ ...m, [conn.credential_id]: "checking" }));
+      api<Identity>(`${base}/identify`, {
+        method: "POST",
+        body: JSON.stringify({ vault_id: conn.vault_id, credential_id: conn.credential_id }),
+        silentErrors: true,
+      })
+        .then((identity) => setIdentities((m) => ({ ...m, [conn.credential_id]: identity })))
+        .catch(() =>
+          setIdentities((m) => ({
+            ...m,
+            [conn.credential_id]: { status: "unverified", message: "Couldn't check this account." },
+          })),
+        );
+    },
+    [api, base],
+  );
+
   const load = useCallback(async () => {
     try {
       const next = await api<CardState>(base, { silentErrors: true });
@@ -160,22 +182,9 @@ export function ConnectionCard({
     if (!state) return;
     for (const conn of state.connections) {
       if (conn.identity || identifyStarted.current.has(conn.credential_id)) continue;
-      identifyStarted.current.add(conn.credential_id);
-      setIdentities((m) => ({ ...m, [conn.credential_id]: "checking" }));
-      api<Identity>(`${base}/identify`, {
-        method: "POST",
-        body: JSON.stringify({ vault_id: conn.vault_id, credential_id: conn.credential_id }),
-        silentErrors: true,
-      })
-        .then((identity) => setIdentities((m) => ({ ...m, [conn.credential_id]: identity })))
-        .catch(() =>
-          setIdentities((m) => ({
-            ...m,
-            [conn.credential_id]: { status: "unverified", message: "Couldn't check this account." },
-          })),
-        );
+      identify(conn);
     }
-  }, [state, api, base]);
+  }, [state, identify]);
 
   const finish = useCallback(
     async (result: ConnectResult) => {
@@ -287,10 +296,20 @@ export function ConnectionCard({
         body: JSON.stringify({
           vault_id: conn.vault_id,
           credential_id: conn.credential_id,
+          expected_version: identity?.version,
+          ...(identity?.account ? { expected_account: identity.account } : {}),
           ...(identity?.workspace_id ? { expected_workspace_id: identity.workspace_id } : {}),
         }),
         silentErrors: true,
       });
+      if (result.status !== "connected") {
+        // Re-check who this row is now, so the user sees the current account.
+        setIdentities((m) => {
+          const { [conn.credential_id]: _dropped, ...rest } = m;
+          return rest;
+        });
+        identify(conn);
+      }
       await finish(result);
     } catch (err) {
       setError(errorMessage(err, "Couldn't connect this account. Try again."));
@@ -348,7 +367,7 @@ export function ConnectionCard({
     : connected
       ? who(state?.current?.account, state?.current?.workspace) || state?.current?.label || "Connected"
       : state?.broken
-        ? "The account this agent used was removed. Choose another one."
+        ? "The account this agent used was removed or reconnected. Choose it again."
         : state === null
           ? loadFailed
             ? "Couldn't load this connection"
@@ -406,8 +425,9 @@ export function ConnectionCard({
               <ul className="divide-y divide-border rounded-md border border-border bg-bg">
                 {saved.map((conn) => {
                   const looked = identities[conn.credential_id];
-                  const identity = conn.identity ?? (looked && looked !== "checking" ? looked : undefined);
-                  const checking = !conn.identity && looked === "checking";
+                  // A fresh local check wins over the server's cached identity.
+                  const identity = (looked && looked !== "checking" ? looked : undefined) ?? conn.identity ?? undefined;
+                  const checking = looked === "checking";
                   const verified = identity?.status === "verified";
                   const title = verified ? who(identity?.account, identity?.workspace) || conn.label : conn.label;
                   return (
@@ -432,10 +452,15 @@ export function ConnectionCard({
                           )}
                         </div>
                       </div>
+                      {identity && !verified && !checking && (
+                        <Button variant="ghost" size="sm" onClick={() => identify(conn)}>
+                          Retry
+                        </Button>
+                      )}
                       <Button
                         size="sm"
                         variant={verified ? "default" : "outline"}
-                        disabled={!verified || !!busy || signingIn}
+                        disabled={!verified || !identity?.version || !!busy || signingIn}
                         loading={busy === conn.credential_id}
                         loadingLabel="Connecting…"
                         onClick={() => void use(conn, identity)}

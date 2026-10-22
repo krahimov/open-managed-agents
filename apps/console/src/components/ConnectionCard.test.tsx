@@ -9,7 +9,7 @@ vi.mock("../lib/api", () => ({ useApi: () => ({ api }) }));
 const BASE = "/v1/connection-access/session/request";
 const request = { request_id: "request", service: "linear", mcp_server_url: "https://mcp.linear.app/mcp", auth_kind: "mcp_oauth" };
 const saved = { credential_id: "cred-1", vault_id: "vault-1", label: "Linear (OAuth)", vault_name: "Connected Apps", identity: null };
-const karim = { status: "verified", account: "karim@serousal.com", workspace: "Serousal", workspace_id: "W1" };
+const karim = { status: "verified", account: "karim@serousal.com", workspace: "Serousal", workspace_id: "W1", version: "v1" };
 
 function mount(props: Partial<Parameters<typeof ConnectionCard>[0]> = {}) {
   return render(<MemoryRouter><ConnectionCard request={request} sessionId="session" {...props} /></MemoryRouter>);
@@ -125,7 +125,7 @@ describe("ConnectionCard", () => {
     fireEvent.click(screen.getByRole("button", { name: "Use" }));
     await waitFor(() => expect(screen.getByTestId("connection-card")).toHaveAttribute("data-state", "connected"));
     expect(api).toHaveBeenCalledWith(`${BASE}/use`, expect.objectContaining({
-      body: JSON.stringify({ vault_id: "vault-1", credential_id: "cred-1", expected_workspace_id: "W1" }),
+      body: JSON.stringify({ vault_id: "vault-1", credential_id: "cred-1", expected_version: "v1", expected_account: "karim@serousal.com", expected_workspace_id: "W1" }),
     }));
     expect(screen.getByText("karim@serousal.com · Serousal")).toBeInTheDocument();
   });
@@ -161,6 +161,37 @@ describe("ConnectionCard", () => {
     expect(api).not.toHaveBeenCalledWith(`${BASE}/identify`, expect.anything());
   });
 
+  it("a row that failed its check offers Retry, and recovers", async () => {
+    server({ connections: [saved] });
+    const original = api.getMockImplementation()!;
+    let down = true;
+    api.mockImplementation(async (path: string, init?: unknown) =>
+      path.endsWith("/identify") && down ? { status: "unverified", message: "Authentication could not be verified." } : original(path, init));
+    mount();
+    expect(await screen.findByText(/Authentication could not be verified/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Use" })).toBeDisabled();
+    down = false;
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("karim@serousal.com · Serousal")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Use" })).toBeEnabled();
+  });
+
+  it("when the account changed since it was shown, Use refuses and the row is re-checked", async () => {
+    server({ connections: [{ ...saved, identity: karim }] });
+    const original = api.getMockImplementation()!;
+    const bob = { status: "verified", account: "bob@serousal.com", workspace: "Serousal", workspace_id: "W1", version: "v9" };
+    api.mockImplementation(async (path: string, init?: unknown) => {
+      if (path.endsWith("/use")) return { status: "unverified", message: "This account changed since it was shown. Check the list again and pick it again." };
+      if (path.endsWith("/identify")) return bob;
+      return original(path, init);
+    });
+    mount();
+    fireEvent.click(await screen.findByRole("button", { name: "Use" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("changed since it was shown");
+    expect(await screen.findByText("bob@serousal.com · Serousal")).toBeInTheDocument();
+    expect(screen.getByTestId("connection-card")).toHaveAttribute("data-state", "pending");
+  });
+
   it("Use that fails verification shows the server's reason", async () => {
     server({ connections: [{ ...saved, identity: karim }] });
     const original = api.getMockImplementation()!;
@@ -176,7 +207,7 @@ describe("ConnectionCard", () => {
     server({
       approved: true,
       current: { credential_id: "cred-1", vault_id: "vault-1", label: "Linear", account: "karim@serousal.com", workspace: "Serousal" },
-      connections: [{ ...saved, identity: karim }, { ...saved, credential_id: "cred-2", vault_id: "vault-2", identity: { status: "verified", account: "ana@acme.com", workspace: "Acme", workspace_id: "W2" } }],
+      connections: [{ ...saved, identity: karim }, { ...saved, credential_id: "cred-2", vault_id: "vault-2", identity: { status: "verified", account: "ana@acme.com", workspace: "Acme", workspace_id: "W2", version: "v2" } }],
     });
     mount();
     expect(await screen.findByText("karim@serousal.com · Serousal")).toBeInTheDocument();

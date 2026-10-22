@@ -506,7 +506,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
           var notified = false;
           try {
             if (window.opener && !window.opener.closed) {
-              window.opener.postMessage(msg, "*");
+              window.opener.postMessage(msg, window.location.origin);
               notified = true;
             }
           } catch (e) {}
@@ -1009,7 +1009,7 @@ function closeHtml(title: string, body: string, extra: Record<string, unknown> =
 <script>
   (function(){
     var msg = ${msg};
-    try { if (window.opener && !window.opener.closed) window.opener.postMessage(msg, "*"); } catch (e) {}
+    try { if (window.opener && !window.opener.closed) window.opener.postMessage(msg, window.location.origin); } catch (e) {}
     try { var bc = new BroadcastChannel("openma-oauth"); bc.postMessage(msg); bc.close(); } catch (e) {}
   })();
 </script></body></html>`;

@@ -1254,6 +1254,12 @@ export interface CredentialAuth {
   client_secret?: string;
   expires_at?: string;           // ISO 8601, when access_token expires
   authorization_server?: string; // cached OAuth authorization server URL
+  // Account generation: ISO time this credential's account was (re)connected.
+  // Set whenever its secret is rewritten (new sign-in, pasted token); NOT
+  // touched by token refreshes. Connection bindings pin it, so a credential
+  // reconnected to a different account stops authorizing agents until the
+  // user picks it again.
+  connected_at?: string;
   // static_bearer / cap_cli fields
   token?: string;
   // composio_mcp: Composio MCP uses x-api-key, while provider OAuth tokens

@@ -535,3 +535,29 @@ describe("CredentialService — CAS refresh (race-safe)", () => {
     expect(["tok_a", "tok_b"]).toContain(finalToken);
   });
 });
+
+describe("CredentialService — account generation (connected_at)", () => {
+  const oauth = { type: "mcp_oauth" as const, mcp_server_url: "https://mcp.linear.app/mcp", access_token: "a", refresh_token: "r" };
+
+  it("a rewritten secret starts a new generation; a refresh or a rename doesn't", async () => {
+    const { service } = createInMemoryCredentialService();
+    const cred = await service.create({ tenantId: TENANT, vaultId: VAULT, displayName: "Linear", auth: oauth });
+    expect(cred.auth.connected_at).toBeUndefined();
+
+    await service.update({ tenantId: TENANT, vaultId: VAULT, credentialId: cred.id, displayName: "Renamed" });
+    await service.refreshAuth({ tenantId: TENANT, vaultId: VAULT, credentialId: cred.id, auth: { access_token: "a2", refresh_token: "r2" } });
+    expect((await service.get({ tenantId: TENANT, vaultId: VAULT, credentialId: cred.id }))!.auth.connected_at).toBeUndefined();
+
+    const reconnected = await service.update({ tenantId: TENANT, vaultId: VAULT, credentialId: cred.id, auth: { access_token: "other-account" } });
+    expect(reconnected.auth.connected_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it("same-account rotations keep the generation", async () => {
+    const { service } = createInMemoryCredentialService();
+    const cred = await service.create({ tenantId: TENANT, vaultId: VAULT, displayName: "Bot", auth: { type: "static_bearer", token: "t1", mcp_server_url: "https://mcp.slack.com/mcp" } });
+    const rotated = await service.update({ tenantId: TENANT, vaultId: VAULT, credentialId: cred.id, auth: { token: "t2" }, sameAccount: true });
+    expect(rotated.auth.connected_at).toBeUndefined();
+    const unchanged = await service.update({ tenantId: TENANT, vaultId: VAULT, credentialId: cred.id, auth: { token: "t2" } });
+    expect(unchanged.auth.connected_at).toBeUndefined();
+  });
+});

@@ -23,6 +23,16 @@ export interface ConnectionBinding {
   workspace?: string;
   workspace_id?: string;
   approved_at: number;
+  /** Account generation of the credential when the user chose it (see
+   *  credentialGeneration). A credential later reconnected to another
+   *  account no longer matches, so it stops authorizing this agent. */
+  generation?: string;
+}
+
+/** Stable per-account marker of a credential: changes when its secret is
+ *  rewritten (new sign-in, pasted token), not when a token is refreshed. */
+export function credentialGeneration(credential: CredentialRow): string {
+  return credential.auth.connected_at ?? credential.created_at;
 }
 
 export function connectionBindingKey(tenantId: string, agentId: string, url: string): string {
@@ -126,20 +136,22 @@ export interface ConnectionIdentity {
   workspace_id?: string;
   message?: string;
   checked_at: number;
+  /** Opaque marker of the credential generation this identity describes.
+   *  "Use" must echo it, so the account bound is the account shown. */
+  version: string;
 }
 
 export type ConnectResult =
   | { status: "connected"; account?: string; workspace?: string; message?: string }
   | { status: "unverified"; message: string };
 
-/** Identity is cached per credential and invalidated when its account
- *  material changes (a reconnect or a refresh-token rotation). */
-const identityFingerprint = (credential: CredentialRow) => {
-  const auth = credential.auth as unknown as Record<string, unknown>;
-  return createHash("sha256")
-    .update(JSON.stringify([auth.mcp_server_url, auth.refresh_token ?? auth.access_token ?? auth.token ?? auth.bearer_token]))
-    .digest("hex");
-};
+/** Identity is cached per credential generation: a reconnect (possibly to
+ *  another account) invalidates it, a token refresh doesn't. */
+const identityVersion = (credential: CredentialRow) =>
+  createHash("sha256")
+    .update(JSON.stringify([credential.id, credential.auth.mcp_server_url, credentialGeneration(credential)]))
+    .digest("hex")
+    .slice(0, 24);
 const identityKey = (tenantId: string, credentialId: string) =>
   `connection_identity:${encodeURIComponent(tenantId)}:${encodeURIComponent(credentialId)}`;
 const IDENTITY_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -185,6 +197,18 @@ export class ConnectionConsent {
     if (!vault || vault.archived_at) return null;
     const credential = await this.deps.services.credentials.get({ tenantId, vaultId: binding.vault_id, credentialId: binding.credential_id });
     if (!credential || credential.archived_at || !credential.auth.mcp_server_url || connectionUrl(credential.auth.mcp_server_url) !== connectionUrl(url)) return null;
+    if (binding.generation === undefined) {
+      // Bindings made before generations existed: pin the current one, so
+      // from now on a reconnect to another account cuts access.
+      await this.deps.services.kv.put(
+        connectionBindingKey(tenantId, agentId, url),
+        JSON.stringify({ ...binding, generation: credentialGeneration(credential) }),
+      ).catch(() => {});
+      return credential;
+    }
+    // Reconnected since the user chose it — maybe as someone else. The user
+    // has to pick it again; never fall through to the new account.
+    if (binding.generation !== credentialGeneration(credential)) return null;
     return credential;
   }
 
@@ -239,10 +263,9 @@ export class ConnectionConsent {
     const raw = await this.deps.services.kv.get(identityKey(tenantId, credential.id)).catch(() => null);
     if (!raw) return null;
     try {
-      const cached = JSON.parse(raw) as ConnectionIdentity & { fingerprint?: string };
-      if (cached.fingerprint !== identityFingerprint(credential)) return null;
-      const { fingerprint: _f, ...identity } = cached;
-      return identity;
+      const cached = JSON.parse(raw) as ConnectionIdentity;
+      if (cached.version !== identityVersion(credential) || cached.status !== "verified") return null;
+      return cached;
     } catch {
       return null;
     }
@@ -253,12 +276,16 @@ export class ConnectionConsent {
   async identify(tenantId: string, vaultId: string, credential: CredentialRow): Promise<ConnectionIdentity> {
     const current = await this.fresh(tenantId, vaultId, credential);
     const result = await (this.deps.verify ?? verifyConnection)(current);
-    const identity: ConnectionIdentity = { ...result, checked_at: Date.now() };
-    await this.deps.services.kv.put(
-      identityKey(tenantId, current.id),
-      JSON.stringify({ ...identity, fingerprint: identityFingerprint(current) }),
-      { expirationTtl: IDENTITY_TTL_SECONDS },
-    ).catch(() => {});
+    const identity: ConnectionIdentity = { ...result, checked_at: Date.now(), version: identityVersion(current) };
+    // Only successes are cached: a provider blip must not mark a good
+    // account unusable for days.
+    if (identity.status === "verified") {
+      await this.deps.services.kv.put(identityKey(tenantId, current.id), JSON.stringify(identity), {
+        expirationTtl: IDENTITY_TTL_SECONDS,
+      }).catch(() => {});
+    } else {
+      await this.deps.services.kv.delete(identityKey(tenantId, current.id)).catch(() => {});
+    }
     return identity;
   }
 
@@ -266,25 +293,38 @@ export class ConnectionConsent {
    *  record the grant on the session. */
   private async bind(input: {
     tenantId: string; sessionId: string; requestId: string; service: string; agentId: string; url: string;
-    vaultId: string; credential: CredentialRow; expectedWorkspaceId?: string;
+    vaultId: string; credential: CredentialRow;
+    /** What the card showed (Use): the bound account must be that one. */
+    expected?: { version: string; account?: string; workspaceId?: string };
   }): Promise<ConnectResult> {
+    const changed = { status: "unverified" as const, message: "This account changed since it was shown. Check the list again and pick it again." };
+    if (input.expected && input.expected.version !== identityVersion(input.credential)) return changed;
     const identity = await this.identify(input.tenantId, input.vaultId, input.credential);
     if (identity.status !== "verified") {
       return { status: "unverified", message: identity.message ?? "The connection could not be verified. No access was granted." };
     }
-    if (input.expectedWorkspaceId && identity.workspace_id && identity.workspace_id !== input.expectedWorkspaceId) {
-      return { status: "unverified", message: "This account now points at a different workspace than the one shown. Check it again before using it." };
+    if (input.expected) {
+      if (identity.version !== input.expected.version) return changed;
+      if ((input.expected.account ?? "") !== (identity.account ?? "")) return changed;
+      if ((input.expected.workspaceId ?? "") !== (identity.workspace_id ?? "")) return changed;
     }
+    const bound = (await this.deps.services.credentials.get({ tenantId: input.tenantId, vaultId: input.vaultId, credentialId: input.credential.id })) ?? input.credential;
     const binding: ConnectionBinding = {
       vault_id: input.vaultId, credential_id: input.credential.id, mcp_server_url: input.url,
       account: identity.account, workspace: identity.workspace, workspace_id: identity.workspace_id, approved_at: Date.now(),
+      generation: credentialGeneration(bound),
     };
     const key = connectionBindingKey(input.tenantId, input.agentId, input.url);
     const existing = await this.binding(input.tenantId, input.agentId, input.url);
     await this.deps.services.kv.put(key, JSON.stringify(binding));
     // Re-picking the account that is already bound is a no-op for the agent.
-    if (!existing || existing.credential_id !== binding.credential_id || existing.vault_id !== binding.vault_id) {
-      await this.deps.onApproved({ tenantId: input.tenantId, sessionId: input.sessionId, requestId: input.requestId, service: input.service, binding });
+    if (!existing || existing.credential_id !== binding.credential_id || existing.vault_id !== binding.vault_id || existing.generation !== binding.generation) {
+      try {
+        await this.deps.onApproved({ tenantId: input.tenantId, sessionId: input.sessionId, requestId: input.requestId, service: input.service, binding });
+      } catch (err) {
+        // The binding stands (the card reads it); only the agent's nudge was lost.
+        this.deps.services.logger?.warn({ op: "connection.notify_failed", session_id: input.sessionId, err: err instanceof Error ? err.message : String(err) }, "connection bound but the session could not be notified");
+      }
     }
     this.deps.services.logger?.info({ op: "connection.approved", session_id: input.sessionId, credential_id: input.credential.id }, "connection chosen for agent");
     return { status: "connected", account: identity.account, workspace: identity.workspace, ...(identity.message ? { message: identity.message } : {}) };
@@ -313,7 +353,7 @@ export class ConnectionConsent {
     const who = [result.account, result.workspace].filter(Boolean).join(" · ");
     // Providers that don't reveal identity: tell accounts apart by when they
     // were connected.
-    const name = who || `account connected ${new Date().toISOString().slice(0, 16).replace("T", " ")} UTC`;
+    const name = who || `account connected ${new Date().toISOString().slice(0, 19).replace("T", " ")} UTC · #${credential.id.slice(-4)}`;
     await this.deps.services.credentials.update({ tenantId, vaultId, credentialId: credential.id, displayName: `${service} · ${name}` }).catch(() => {});
     await this.deps.services.vaults.update({ tenantId, vaultId, name: `${service} · ${result.workspace ?? result.account ?? "connection"}` }).catch(() => {});
   }
@@ -420,13 +460,21 @@ export class ConnectionConsent {
       const tenantId = c.get("tenant_id");
       const { sessionId, requestId } = ids(c);
       const { request, agentId, url } = await this.context(tenantId, sessionId, requestId);
-      const body = await c.req.json<{ vault_id?: string; credential_id?: string; expected_workspace_id?: string }>()
-        .catch(() => ({} as { vault_id?: string; credential_id?: string; expected_workspace_id?: string }));
+      type UseBody = { vault_id?: string; credential_id?: string; expected_version?: string; expected_account?: string; expected_workspace_id?: string };
+      const body = await c.req.json<UseBody>().catch(() => ({} as UseBody));
       const credential = await this.candidate(tenantId, url, body.vault_id!, body.credential_id!);
+      // The choice is tied to the identity the card displayed.
+      if (typeof body.expected_version !== "string" || !body.expected_version) {
+        throw new ConnectError(400, "Check who this account is before using it");
+      }
       const result = await this.bind({
         tenantId, sessionId, requestId, service: request.service, agentId, url,
         vaultId: body.vault_id!, credential,
-        ...(typeof body.expected_workspace_id === "string" ? { expectedWorkspaceId: body.expected_workspace_id } : {}),
+        expected: {
+          version: body.expected_version,
+          ...(typeof body.expected_account === "string" ? { account: body.expected_account } : {}),
+          ...(typeof body.expected_workspace_id === "string" ? { workspaceId: body.expected_workspace_id } : {}),
+        },
       });
       // 200 either way: "unverified" is an answer the card renders, not a fault.
       return c.json(result);

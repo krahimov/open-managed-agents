@@ -82,7 +82,7 @@ export function ConnectionsStrip({ agentId, ref }: { agentId: string; ref?: Ref<
                         {who || "Connected"}
                       </span>
                     ) : item.status === "broken" ? (
-                      "Account removed — reconnect"
+                      "Account changed — choose again"
                     ) : (
                       "Not connected"
                     )}

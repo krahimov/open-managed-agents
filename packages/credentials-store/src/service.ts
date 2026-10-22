@@ -92,6 +92,9 @@ export class CredentialService {
     displayName?: string;
     /** Partial auth update — merged into existing auth. */
     auth?: Partial<CredentialAuth>;
+    /** The new secret belongs to the SAME account (e.g. an install's token
+     *  rotation), so the account generation (`connected_at`) is kept. */
+    sameAccount?: boolean;
   }): Promise<CredentialRow> {
     const existing = await this.requireCredential(opts);
 
@@ -106,7 +109,16 @@ export class CredentialService {
 
     const update: CredentialUpdateFields = { updatedAt: this.clock.nowMs() };
     if (opts.displayName !== undefined) update.displayName = opts.displayName;
-    if (opts.auth !== undefined) update.auth = { ...existing.auth, ...opts.auth };
+    if (opts.auth !== undefined) {
+      update.auth = { ...existing.auth, ...opts.auth };
+      // A rewritten secret may be a different account: start a new
+      // generation so bindings to the old one stop authorizing.
+      const rewritesSecret = (["access_token", "refresh_token", "token", "api_key"] as const)
+        .some((k) => opts.auth![k] !== undefined && opts.auth![k] !== existing.auth[k]);
+      if (rewritesSecret && !opts.sameAccount && opts.auth.connected_at === undefined) {
+        update.auth.connected_at = new Date(this.clock.nowMs()).toISOString();
+      }
+    }
 
     return this.repo.update(opts.tenantId, opts.vaultId, opts.credentialId, update);
   }

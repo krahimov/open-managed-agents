@@ -88,6 +88,17 @@ function isRenderable(ev: Event): boolean {
   return false;
 }
 
+/** Same endpoint identity the server uses: host is case-insensitive and a
+ *  trailing slash is noise; path case and query select different servers. */
+function endpointKey(raw: string): string {
+  try {
+    const u = new URL(raw);
+    return `${u.origin}${u.pathname.replace(/\/+$/, "")}${u.search}`;
+  } catch {
+    return raw.trim().replace(/\/+$/, "");
+  }
+}
+
 /** request_ids of connect cards a later card for the same server (or
  *  service) replaces — only the newest card per server is drawn, so a
  *  re-posted request never leaves two live cards fighting over one account. */
@@ -102,7 +113,7 @@ export function supersededAccessRequestIdsOf(events: Event[]): Set<string> {
     const service = (ev as { service?: unknown }).service;
     const key =
       typeof url === "string" && url
-        ? `url:${url.replace(/\/+$/, "").toLowerCase()}`
+        ? `url:${endpointKey(url)}`
         : `service:${String(service ?? "").toLowerCase()}`;
     latest.set(key, rid);
     all.push([key, rid]);

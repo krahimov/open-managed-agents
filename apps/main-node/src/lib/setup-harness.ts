@@ -155,11 +155,16 @@ type McpServerLike = { name?: string; type?: string; url?: string };
 
 /**
  * Normalize the mcp_servers an update_harness call proposes, so "connect
- * Linear" always lands on the same server the platform knows how to
- * authenticate: known services get their canonical name and official URL
- * (a guessed host, a missing url, or a deprecated /sse endpoint is replaced),
- * `type` defaults to "url", and duplicates of one endpoint collapse into the
- * first entry. Notes explain every rewrite so the agent can relay them.
+ * Linear" lands on the server the platform knows how to authenticate:
+ *   - a known service named without a url gets its official endpoint;
+ *   - a url on the vendor's own domain that isn't the official endpoint (a
+ *     guess like https://linear.app/mcp) and the deprecated /sse path are
+ *     replaced (query kept);
+ *   - any other explicit url — a company proxy, a self-hosted bridge, a
+ *     query-scoped endpoint — is kept exactly as given;
+ *   - servers on a known host get the canonical name; `type` defaults to
+ *     "url"; exact duplicates collapse into the first entry.
+ * Notes explain every rewrite so the agent can relay them.
  */
 export function canonicalizeMcpServers(input: unknown[]): { servers: unknown[]; notes: string[] } {
   const servers: unknown[] = [];
@@ -175,20 +180,29 @@ export function canonicalizeMcpServers(input: unknown[]): { servers: unknown[]; 
     const name = typeof entry.name === "string" ? entry.name.trim() : "";
     const url = typeof entry.url === "string" ? entry.url.trim() : "";
     const byUrl = knownMcpServerForUrl(url);
-    const known = byUrl ?? knownMcpServerForName(name);
-    if (known) {
-      if (!url) {
-        entry.url = known.url;
-      } else if (!byUrl) {
-        entry.url = known.url;
-        notes.push(`${known.name}: replaced ${url} with the official endpoint ${known.url}.`);
-      } else if (/\/sse\/?$/i.test(new URL(url).pathname)) {
-        entry.url = known.url;
-        notes.push(`${known.name}: the SSE endpoint is deprecated — using ${known.url}.`);
+    const byName = byUrl ? undefined : knownMcpServerForName(name);
+    const onVendorDomain = (k: { domain: string }) => {
+      try {
+        const host = new URL(url).hostname.toLowerCase();
+        return host === k.domain || host.endsWith(`.${k.domain}`);
+      } catch {
+        return false;
+      }
+    };
+    if (byUrl) {
+      const parsed = new URL(url);
+      if (/\/sse\/?$/i.test(parsed.pathname)) {
+        const official = new URL(byUrl.url);
+        entry.url = `${official.origin}${official.pathname}${parsed.search}`;
+        notes.push(`${byUrl.name}: the SSE endpoint is deprecated — using ${entry.url}.`);
       } else {
         entry.url = url;
       }
-      entry.name = known.id;
+      entry.name = byUrl.id;
+    } else if (byName && (!url || onVendorDomain(byName))) {
+      entry.url = byName.url;
+      if (url) notes.push(`${byName.name}: replaced ${url} with the official endpoint ${byName.url}.`);
+      entry.name = byName.id;
     } else {
       if (!url) {
         notes.push(`Skipped "${name || "unnamed server"}": it has no url. Find its official MCP endpoint first, or use request_access for apps without one.`);
@@ -237,12 +251,15 @@ export function buildHarnessPatch(args: Record<string, unknown>): {
   return { patch, changed, notes };
 }
 
-function normalizeMcpUrl(raw: string): string {
+/** Identity of an MCP endpoint: scheme/host are case-insensitive, a trailing
+ *  slash is noise, but path case and the query (e.g. ?workspace=A vs B) can
+ *  select a different server and are kept. */
+export function normalizeMcpUrl(raw: string): string {
   try {
     const u = new URL(raw);
-    return `${u.origin}${u.pathname.replace(/\/+$/, "")}`.toLowerCase();
+    return `${u.origin}${u.pathname.replace(/\/+$/, "")}${u.search}`;
   } catch {
-    return raw.trim().replace(/\/+$/, "").toLowerCase();
+    return raw.trim().replace(/\/+$/, "");
   }
 }
 

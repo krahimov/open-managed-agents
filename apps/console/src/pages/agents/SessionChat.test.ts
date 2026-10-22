@@ -16,6 +16,16 @@ describe("supersededAccessRequestIdsOf", () => {
     expect([...supersededAccessRequestIdsOf(events)]).toEqual(["a"]);
   });
 
+  it("keeps cards for endpoints that differ by query or path case", () => {
+    const events = [
+      req("a", { mcp_server_url: "https://x.example/mcp?workspace=A" }),
+      req("b", { mcp_server_url: "https://x.example/mcp?workspace=B" }),
+      req("c", { mcp_server_url: "https://x.example/Tenant/mcp" }),
+      req("d", { mcp_server_url: "https://x.example/tenant/mcp" }),
+    ];
+    expect(supersededAccessRequestIdsOf(events).size).toBe(0);
+  });
+
   it("falls back to the service slug for cards without a URL (Composio)", () => {
     const events = [req("a", { service: "gmail" }), req("b", { service: "Gmail" }), req("c", { service: "drive" })];
     expect([...supersededAccessRequestIdsOf(events)]).toEqual(["a"]);
