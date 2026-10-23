@@ -59,6 +59,8 @@ export interface ComposioGraftDeps {
     listConnectedAccounts: typeof listComposioConnectedAccounts;
     createToolRouterSession: typeof createComposioToolRouterSession;
   };
+  /** Composio API origin override (e2e mocks). */
+  composioBaseUrl?: string;
   sleep?: (ms: number) => Promise<void>;
   /** How long to wait for a just-authorized account to turn ACTIVE. */
   activeWaitMs?: number;
@@ -100,6 +102,7 @@ export async function graftComposioToolkit(
     listConnectedAccounts: listComposioConnectedAccounts,
     createToolRouterSession: createComposioToolRouterSession,
   };
+  const composioCreds = { apiKey: key.apiKey, ...(deps.composioBaseUrl ? { baseUrl: deps.composioBaseUrl } : {}) };
   const sleep = deps.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
 
   const metadata = { ...((agent.metadata as Record<string, unknown> | null) ?? {}) };
@@ -120,7 +123,7 @@ export async function graftComposioToolkit(
   // OAuth completed treats the toolkit as unconnected forever.
   const findAccounts = async () => {
     const list = await api
-      .listConnectedAccounts({ apiKey: key.apiKey }, { userId: composioUserId })
+      .listConnectedAccounts(composioCreds, { userId: composioUserId })
       .catch(() => ({ items: [] as unknown[] }));
     const out: Record<string, string> = {};
     const items = list.items as Array<{ id: string; status?: string; toolkit?: { slug?: string } }>;
@@ -150,7 +153,7 @@ export async function graftComposioToolkit(
   }
 
   const routerSession = await api.createToolRouterSession(
-    { apiKey: key.apiKey },
+    composioCreds,
     { user_id: composioUserId, toolkits: { enable: allToolkits }, connected_accounts: connectedAccounts },
   );
   await deps.credentials.create({

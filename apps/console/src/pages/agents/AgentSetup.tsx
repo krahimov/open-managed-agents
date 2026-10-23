@@ -100,6 +100,13 @@ export function AgentSetup() {
       if (stripTimer.current) window.clearTimeout(stripTimer.current);
       stripTimer.current = window.setTimeout(() => stripRef.current?.refresh(), 400);
     }
+    // A grant through Composio swaps the provider's server for Composio's on
+    // the agent server-side: re-read it so the harness pane matches.
+    if (ev.type === "system.access_granted" && (ev as { via?: string }).via === "composio" && id) {
+      api<Record<string, unknown>>(`/v1/agents/${id}`, { silentErrors: true })
+        .then((a) => setHarness(toHarnessView(a)))
+        .catch(() => {});
+    }
     const m = ev.metadata as
       | { harness?: string; kind?: string; harness_config?: Harness }
       | undefined;
@@ -112,7 +119,7 @@ export function AgentSetup() {
       if (stripTimer.current) window.clearTimeout(stripTimer.current);
       stripTimer.current = window.setTimeout(() => stripRef.current?.refresh(), 400);
     }
-  }, []);
+  }, [api, id]);
 
   // The setup chat edits the agent server-side; drop cached agent-page data
   // so it shows the refined config on the way back.

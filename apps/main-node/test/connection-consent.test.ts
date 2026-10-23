@@ -1,10 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Hono } from "hono";
-import { ConnectionConsent, connectionBindingKey, verifyConnection } from "../src/lib/connection-consent";
+import { ConnectionConsent, connectionBindingKey, verifyConnection, type ComposioFallback } from "../src/lib/connection-consent";
 
 const SLACK = "https://mcp.slack.com/mcp";
 
-function fixture(opts: { mcpServers?: Array<{ type: string; name: string; url: string }> } = {}) {
+function fixture(opts: { mcpServers?: Array<{ type: string; name: string; url: string }>; composio?: ComposioFallback } = {}) {
   const kv = new Map<string, string>();
   const vaults: Array<{ id: string; name: string; archived_at?: string | null }> = [
     { id: "shared", name: "Existing vault" },
@@ -23,7 +23,9 @@ function fixture(opts: { mcpServers?: Array<{ type: string; name: string; url: s
   const verify = vi.fn(async (cred: { auth: Record<string, unknown> }) =>
     identities[String(cred.auth.token)] ?? { status: "unverified", message: "Authentication could not be verified." });
   const onApproved = vi.fn(async (_input: unknown) => {});
-  const agent = { id: "agent", mcp_servers: opts.mcpServers ?? [{ type: "url", name: "slack", url: SLACK }] };
+  const agent: { id: string; mcp_servers: Array<{ type: string; name: string; url: string }>; metadata: Record<string, unknown> } = {
+    id: "agent", mcp_servers: opts.mcpServers ?? [{ type: "url", name: "slack", url: SLACK }], metadata: {},
+  };
   const services = {
     kv: {
       get: async (key: string) => kv.get(key) ?? null,
@@ -50,6 +52,7 @@ function fixture(opts: { mcpServers?: Array<{ type: string; name: string; url: s
   };
   const consent = new ConnectionConsent({
     services: services as never, verify: verify as never, onApproved,
+    ...(opts.composio ? { composio: opts.composio } : {}),
     readRequest: async (_s, id) => id === "request" ? { request_id: id, service: "slack", mcp_server_url: SLACK } : null,
   });
   const app = new Hono<{ Variables: { tenant_id: string } }>();
@@ -464,5 +467,104 @@ describe("switching and removing", () => {
     expect(await f.bound()).toBeNull();
     expect(await f.consent.hasApproval("tenant", "agent", SLACK)).toBe(false);
     expect((await f.state())).toMatchObject({ approved: false, broken: false });
+  });
+});
+
+describe("connect card: Slack through Composio when the workspace has no Slack app", () => {
+  const COMPOSIO_ROUTER = "https://app.composio.dev/tool_router/v3/session/mcp";
+  function withComposio(opts: { available?: boolean; graft?: ComposioFallback["graft"] } = {}) {
+    let f!: ReturnType<typeof fixture>;
+    const composio = {
+      available: vi.fn(async () => opts.available ?? true),
+      // What graftComposioToolkit does to the agent: composio server + toolkit.
+      graft: vi.fn(opts.graft ?? (async () => {
+        if (!f.agent.mcp_servers.some(s => s.url === COMPOSIO_ROUTER)) f.agent.mcp_servers.push({ type: "url", name: "composio", url: COMPOSIO_ROUTER });
+        f.agent.metadata.composio_toolkits = ["slack"];
+        return { ok: true as const };
+      })),
+      removeServer: vi.fn(async (_t: string, _a: string, url: string) => {
+        f.agent.mcp_servers = f.agent.mcp_servers.filter(s => s.url !== url);
+      }),
+      onConnected: vi.fn(async (_input: unknown) => {}),
+    };
+    f = fixture({ composio });
+    return { ...f, composio };
+  }
+
+  it("offers Composio on a Slack card when the workspace can use it", async () => {
+    const f = withComposio();
+    expect((await f.state()).composio).toEqual({ toolkit: "slack", available: true });
+    const off = withComposio({ available: false });
+    expect((await off.state()).composio).toEqual({ toolkit: "slack", available: false });
+    expect((await (await off.post("composio/start", {})).json()).error).toMatch(/Composio isn't set up/);
+  });
+
+  it("connects through Composio: attaches the toolkit, swaps out mcp.slack.com, tells the agent", async () => {
+    const f = withComposio();
+    expect((await f.post("composio", { connected_account_id: "ca_1" })).status).toBe(409); // not started from this card
+    const started = await (await f.post("composio/start", {})).json();
+    expect(started.toolkit).toBe("slack");
+    expect(f.vaults.find(v => v.id === started.vault_id)?.name).toBe("Connected Apps");
+    const done = await f.post("composio", { connected_account_id: "ca_1", vault_id: "attacker-vault" });
+    expect(await done.json()).toMatchObject({ status: "connected", via: "composio" });
+    expect(f.composio.graft).toHaveBeenCalledWith({ tenantId: "tenant", sessionId: "session", toolkit: "slack", vaultId: started.vault_id, connectedAccountId: "ca_1" });
+    expect(f.composio.removeServer).toHaveBeenCalledWith("tenant", "agent", SLACK);
+    expect(f.composio.onConnected).toHaveBeenCalledOnce();
+    expect(f.composio.onConnected.mock.calls[0][0]).toMatchObject({ sessionId: "session", requestId: "request", service: "slack", connection: { via: "composio", toolkit: "slack" } });
+    expect(f.agent.mcp_servers.map(s => s.url)).toEqual([COMPOSIO_ROUTER]);
+    // The card still renders, as connected through Composio.
+    expect(await f.state()).toMatchObject({ approved: true, via: "composio", connections: [] });
+    // Actions on the removed server are refused.
+    expect((await f.post("start", {})).status).toBe(409);
+    expect((await f.post("identify", { vault_id: "shared", credential_id: "chosen" })).status).toBe(409);
+    // The strip shows Slack connected and hides the raw tool-router server.
+    const status = await (await f.app.request("/access/agent/agent/status")).json();
+    expect(status.data).toEqual([expect.objectContaining({ display_name: "Slack", status: "connected", via: "composio", mcp_server_url: "https://mcp.slack.com/mcp" })]);
+  });
+
+  it("the same popup reporting twice connects and notifies once", async () => {
+    const f = withComposio();
+    await f.post("composio/start", {});
+    await f.post("composio", { connected_account_id: "ca_1" });
+    expect(await (await f.post("composio", { connected_account_id: "ca_1" })).json()).toMatchObject({ status: "connected" });
+    expect(f.composio.graft).toHaveBeenCalledOnce();
+    expect(f.composio.onConnected).toHaveBeenCalledOnce();
+  });
+
+  it("a second sign-in (Change) re-attaches without removing anything again", async () => {
+    const f = withComposio();
+    await f.post("composio/start", {});
+    await f.post("composio", { connected_account_id: "ca_1" });
+    await f.post("composio/start", {});
+    expect(await (await f.post("composio", { connected_account_id: "ca_2" })).json()).toMatchObject({ status: "connected" });
+    expect(f.composio.removeServer).toHaveBeenCalledOnce();
+    expect(f.composio.graft.mock.calls[1][0]).toMatchObject({ connectedAccountId: "ca_2" });
+    expect(f.composio.onConnected).toHaveBeenCalledTimes(2);
+  });
+
+  it("an account Composio doesn't show as active yet changes nothing", async () => {
+    const f = withComposio({ graft: async () => ({ ok: false as const, status: 409, error: "Composio doesn't show an active slack connection yet." }) });
+    await f.post("composio/start", {});
+    const res = await f.post("composio", {});
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toMatch(/active slack connection/);
+    expect(f.composio.removeServer).not.toHaveBeenCalled();
+    expect(f.composio.onConnected).not.toHaveBeenCalled();
+    expect((await f.state()).approved).toBe(false);
+  });
+
+  it("forgets the Composio connection once the agent no longer carries the toolkit", async () => {
+    const f = withComposio();
+    await f.post("composio/start", {});
+    await f.post("composio", {});
+    f.agent.metadata.composio_toolkits = [];
+    const res = await f.app.request("/access/session/request");
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toMatch(/no longer configured/);
+  });
+
+  it("isn't offered when no Composio fallback is wired", async () => {
+    const f = fixture({ mcpServers: [{ type: "url", name: "slack", url: SLACK }] });
+    expect((await f.state()).composio).toBeUndefined(); // no composio dep wired
   });
 });

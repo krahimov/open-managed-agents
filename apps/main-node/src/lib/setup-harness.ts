@@ -94,6 +94,7 @@ export function buildSetupPrompt(
     "",
     "Connections: each connect card lets the user pick the account this agent uses — one already saved in the workspace (shown with its account and workspace) or a new sign-in. A configured MCP URL is NOT a connection, and no saved account is shared with you until the user picks it on the card. Never claim a connection is ready based on its configuration; wait for the \"[access granted]\" message, which names the account and workspace the user chose.",
     "Switching accounts: when the user wants a different account or workspace for a service that is already connected, call request_access for it with switch_account: true — the card opens on the account choices (or they can press Change on the existing card). The current account stays connected until they pick another. Removing a server from your harness disconnects it.",
+    "Slack and GitHub without the workspace's own app: their connect card connects through Composio in one click. When the \"[access granted]\" message says a service was connected through Composio, its MCP server has been swapped for the composio server — that is expected, don't add the original server back.",
     "Never invent credentials or secrets, and never ask the user to paste keys or tokens in chat. Never tell the user authentication will happen \"afterward\" — it happens right here in the cards, and you must wait for the grant messages. Don't remove a server just because it isn't connected yet.",
     ...(opts.accessStatus
       ? [
@@ -110,7 +111,7 @@ export function buildSetupPrompt(
 export function describeSetupAccessStatus(r: AutoAccessResult): string {
   const lines: string[] = [];
   for (const name of r.connected) lines.push(`- ${name}: connected (the user chose the account for this agent)`);
-  for (const x of r.requested) lines.push(`- ${x.name}: connect card posted — waiting for the user${x.note && /one-time/i.test(x.note) ? " (needs a one-time app setup; the card guides them)" : ""}`);
+  for (const x of r.requested) lines.push(`- ${x.name}: connect card posted — waiting for the user${x.note && /through Composio/i.test(x.note) ? " (no app of its own yet; the card connects it through Composio)" : x.note && /one-time/i.test(x.note) ? " (needs a one-time app setup; the card guides them)" : ""}`);
   for (const name of r.failed) lines.push(`- ${name}: could not post a connect card — call request_access for it`);
   return lines.join("\n");
 }
@@ -346,7 +347,7 @@ export function describeAutoAccess(r: AutoAccessResult): string {
       `Connect cards were posted automatically for: ${r.requested.map((x) => x.name).join(", ")} — the user authenticates in the setup panel; you'll receive an "[access granted] <name>" message per server. Do not tell the user you're ready until those arrive.`,
     );
     for (const x of r.requested) {
-      if (x.note && /one-time/i.test(x.note)) parts.push(`${x.name}: ${x.note}`);
+      if (x.note && /one-time|through Composio/i.test(x.note)) parts.push(`${x.name}: ${x.note}`);
     }
   }
   if (r.connected.length > 0) {

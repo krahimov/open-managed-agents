@@ -16,6 +16,10 @@ import { OAuthAppSetupPanel, type OAuthAppRequirement } from "./OAuthAppSetupPan
  *   - a new sign-in — "Connect Linear" opens the provider popup; the server
  *     verifies the account and connects it when the popup finishes.
  *
+ * Slack and GitHub only accept a registered OAuth app. Until the workspace has
+ * its own, the card connects through Composio's app instead (one click, any
+ * workspace) and keeps "use your own app" as an option.
+ *
  * Nothing is shared with the agent until one of those happens (server-side
  * bindings, see apps/main-node/src/lib/connection-consent.ts). Tokens never
  * reach the browser or the conversation.
@@ -56,6 +60,10 @@ interface CardState {
   broken?: boolean;
   current: { credential_id: string; vault_id: string; label: string; account?: string; workspace?: string } | null;
   connections: SavedConnection[];
+  /** Connected through Composio in place of the provider's own server. */
+  via?: "composio";
+  /** Composio can stand in for this provider (Slack, GitHub). */
+  composio?: { toolkit: string; available: boolean };
 }
 
 type ConnectResult =
@@ -134,6 +142,12 @@ export function ConnectionCard({
   const [appReq, setAppReq] = useState<OAuthAppRequirement | undefined>(request.oauth_app);
   const [savingApp, setSavingApp] = useState(false);
   const popupRef = useRef<Window | null>(null);
+  // Composio sign-in: "waiting" while its popup is open, "finishing" while the
+  // server attaches the account, "retry" when Composio hasn't shown it as
+  // active yet (check again instead of signing in twice).
+  const [composioStep, setComposioStep] = useState<"idle" | "waiting" | "finishing" | "retry">("idle");
+  const composioPopupRef = useRef<Window | null>(null);
+  const composioAccountRef = useRef<string | undefined>(undefined);
   const identifyStarted = useRef(new Set<string>());
 
   const identify = useCallback(
@@ -293,6 +307,99 @@ export function ConnectionCard({
     }
   };
 
+  const finishingRef = useRef(false);
+  const finishComposio = useCallback(async () => {
+    // The callback page reports on two channels (postMessage and
+    // BroadcastChannel); finish once.
+    if (finishingRef.current) return;
+    finishingRef.current = true;
+    setComposioStep("finishing");
+    setError(null);
+    try {
+      const result = await api<ConnectResult>(`${base}/composio`, {
+        method: "POST",
+        body: JSON.stringify(composioAccountRef.current ? { connected_account_id: composioAccountRef.current } : {}),
+        silentErrors: true,
+      });
+      setComposioStep("idle");
+      await finish(result);
+    } catch (err) {
+      setComposioStep("retry");
+      setError(errorMessage(err, "Composio didn't confirm the connection. Try again."));
+    } finally {
+      finishingRef.current = false;
+    }
+  }, [api, base, finish]);
+
+  // Composio popup completion (ComposioCallback page).
+  useEffect(() => {
+    if (composioStep !== "waiting") return;
+    const toolkit = state?.composio?.toolkit ?? "";
+    const slug = (v: string) => v.toLowerCase().replace(/[-_.\s]+/g, "");
+    const handle = (event: MessageEvent) => {
+      if (event.origin && event.origin !== window.location.origin) return;
+      const data = event.data as { type?: string; toolkit?: string; connected_account_id?: string; error?: string } | null;
+      if (data?.type !== "composio_auth_complete") return;
+      if (data.toolkit && slug(data.toolkit) !== slug(toolkit)) return;
+      if (finishingRef.current) return;
+      if (data.error) {
+        setComposioStep("idle");
+        setError(`Sign-in failed: ${data.error}`);
+        return;
+      }
+      composioAccountRef.current = data.connected_account_id || undefined;
+      void finishComposio();
+    };
+    window.addEventListener("message", handle);
+    let channel: BroadcastChannel | undefined;
+    try {
+      channel = new BroadcastChannel("openma-oauth");
+      channel.addEventListener("message", handle);
+    } catch {
+      // postMessage still works
+    }
+    // Closed without finishing: stop waiting (the user can try again).
+    const timer = window.setInterval(() => {
+      if (composioPopupRef.current && composioPopupRef.current.closed) {
+        window.clearInterval(timer);
+        window.setTimeout(() => setComposioStep((step) => (step === "waiting" ? "idle" : step)), 800);
+      }
+    }, 600);
+    return () => {
+      window.removeEventListener("message", handle);
+      channel?.close();
+      window.clearInterval(timer);
+    };
+  }, [composioStep, state?.composio?.toolkit, finishComposio]);
+
+  const connectComposio = async () => {
+    setError(null);
+    const popup = window.open("", `composio-${request.request_id}`, "width=600,height=720,popup=yes");
+    if (!popup) {
+      setError("Your browser blocked the sign-in window. Allow popups for this site and try again.");
+      return;
+    }
+    composioPopupRef.current = popup;
+    composioAccountRef.current = undefined;
+    setComposioStep("waiting");
+    try {
+      const started = await api<{ vault_id: string; toolkit: string }>(`${base}/composio/start`, {
+        method: "POST",
+        silentErrors: true,
+      });
+      const callbackUrl = `${window.location.origin}/composio/callback?toolkit=${encodeURIComponent(started.toolkit)}`;
+      const link = await api<{ redirect_url: string }>(
+        `/v1/vaults/${encodeURIComponent(started.vault_id)}/credentials/composio_accounts/link`,
+        { method: "POST", body: JSON.stringify({ toolkit: started.toolkit, callback_url: callbackUrl }), silentErrors: true },
+      );
+      popup.location.href = link.redirect_url;
+    } catch (err) {
+      popup.close();
+      setComposioStep("idle");
+      setError(errorMessage(err, "Couldn't start the sign-in. Try again."));
+    }
+  };
+
   const use = async (conn: SavedConnection, identity: Identity | undefined) => {
     setBusy(conn.credential_id);
     setError(null);
@@ -364,7 +471,10 @@ export function ConnectionCard({
   };
 
   const connected = !!state?.approved && !!state.current;
-  const needsAppSetup = !isApiKey && !!appReq?.required && !appReq.configured;
+  const viaComposio = state?.via === "composio";
+  const needsAppSetup = !isApiKey && !viaComposio && !!appReq?.required && !appReq.configured;
+  // No app of the workspace's own: lead with Composio's when it can be used.
+  const composioFirst = !!state?.composio?.available && (needsAppSetup || viaComposio);
   const showChooser = !gone && (!connected || choosing);
   const saved = (state?.connections ?? []).filter((c) => !(connected && c.credential_id === state?.current?.credential_id));
   // Sort saved sign-ins into: usable accounts (one row per real account —
@@ -391,7 +501,7 @@ export function ConnectionCard({
   const subtitle = gone
     ? "Removed from this agent"
     : connected
-      ? `${choosing ? "Currently: " : ""}${who(state?.current?.account, state?.current?.workspace) || state?.current?.label || "Connected"}`
+      ? `${choosing ? "Currently: " : ""}${viaComposio ? "Connected through Composio" : who(state?.current?.account, state?.current?.workspace) || state?.current?.label || "Connected"}`
       : state?.broken
         ? "The account this agent used was removed or reconnected. Choose it again."
         : state === null
@@ -531,9 +641,53 @@ export function ConnectionCard({
                 Connect
               </Button>
             </form>
+          ) : composioFirst ? (
+            <div className="space-y-2" data-testid="composio-connect">
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  disabled={!!busy || composioStep === "finishing"}
+                  onClick={() => (composioStep === "retry" ? void finishComposio() : void connectComposio())}
+                >
+                  {composioStep === "waiting" ? (
+                    <>
+                      <Spinner className="size-3.5" /> Waiting for {name}…
+                    </>
+                  ) : composioStep === "finishing" ? (
+                    <>
+                      <Spinner className="size-3.5" /> Connecting…
+                    </>
+                  ) : composioStep === "retry" ? (
+                    "Check again"
+                  ) : connected ? (
+                    <>
+                      <PlusIcon className="size-3.5" aria-hidden /> Sign in with a different {name} account
+                    </>
+                  ) : (
+                    `Connect ${name}`
+                  )}
+                </Button>
+                {(composioStep === "waiting" || composioStep === "retry") && (
+                  <Button variant="ghost" size="sm" onClick={() => void connectComposio()}>
+                    {composioStep === "retry" ? "Sign in again" : "Reopen window"}
+                  </Button>
+                )}
+              </div>
+              <p className="text-[11px] text-fg-subtle">
+                Connects through Composio's approved {name} app — no app setup needed.
+              </p>
+              {needsAppSetup && appReq && (
+                <details className="text-xs text-fg-subtle" data-testid="own-app-setup">
+                  <summary className="cursor-pointer select-none">Use your own {name} app instead (optional)</summary>
+                  <div className="mt-2">
+                    <OAuthAppSetupPanel requirement={appReq} saving={savingApp} onSave={saveOAuthApp} />
+                  </div>
+                </details>
+              )}
+            </div>
           ) : needsAppSetup && appReq ? (
             <OAuthAppSetupPanel requirement={appReq} saving={savingApp} onSave={saveOAuthApp} />
-          ) : (
+          ) : viaComposio ? null : (
             <div className="flex items-center gap-2">
               <Button
                 size="sm"

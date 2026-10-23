@@ -118,13 +118,18 @@ function LegacyAccessRequestCard({
           `/v1/sessions/${sessionId}/composio/graft`,
           {
             method: "POST",
-            body: JSON.stringify({ toolkit: service, vault_id: vaultIdRef.current }),
+            body: JSON.stringify({
+              toolkit: service,
+              vault_id: vaultIdRef.current,
+              ...(accountIdRef.current ? { connected_account_id: accountIdRef.current } : {}),
+            }),
             silentErrors: true,
           },
         );
         attachedServer = graft.attached_server === true;
       } catch (err) {
         notifiedRef.current = false;
+        setGraftFailed(true);
         setStatus("error");
         setError(err instanceof Error ? err.message : "Connection could not be verified. Please retry.");
         return;

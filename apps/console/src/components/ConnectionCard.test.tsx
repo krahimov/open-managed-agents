@@ -341,3 +341,105 @@ describe("ConnectionCard switching", () => {
     expect(screen.getByRole("button", { name: "Change" })).toBeInTheDocument();
   });
 });
+
+describe("ConnectionCard: Slack without an app of the workspace's own", () => {
+  const SLACK_BASE = "/v1/connection-access/session/slack-request";
+  const slackRequest = {
+    request_id: "slack-request", service: "slack", mcp_server_url: "https://mcp.slack.com/mcp", auth_kind: "mcp_oauth",
+    oauth_app: {
+      required: true, configured: false, issuer: "https://slack.com", label: "Slack", callback_url: "https://orrery.test/v1/oauth/callback",
+      env: { client_id: "SLACK_OAUTH_CLIENT_ID", client_secret: "SLACK_OAUTH_CLIENT_SECRET" }, setup_steps: ["Create the app"],
+    },
+  };
+  function slackServer(opts: { available?: boolean; finish?: () => unknown } = {}) {
+    const state: Record<string, unknown> = {
+      display_name: "Slack", approved: false, current: null, connections: [],
+      composio: { toolkit: "slack", available: opts.available ?? true },
+    };
+    api.mockImplementation(async (path: string, init?: { method?: string; body?: string }) => {
+      if (path === SLACK_BASE) return structuredClone(state);
+      if (path === `${SLACK_BASE}/composio/start`) return { vault_id: "vault-apps", toolkit: "slack" };
+      if (path === "/v1/vaults/vault-apps/credentials/composio_accounts/link") return { redirect_url: "https://backend.composio.dev/link/abc" };
+      if (path === `${SLACK_BASE}/composio`) {
+        if (opts.finish) return opts.finish();
+        Object.assign(state, { approved: true, via: "composio", current: { credential_id: "", vault_id: "vault-apps", label: "Slack through Composio", account: "Connected through Composio" } });
+        return { status: "connected", via: "composio" };
+      }
+      throw new Error(`unexpected ${init?.method ?? "GET"} ${path}`);
+    });
+    return state;
+  }
+  const mountSlack = () =>
+    render(<MemoryRouter><ConnectionCard request={slackRequest as never} sessionId="session" /></MemoryRouter>);
+  const composioDone = (data: Record<string, unknown> = {}) =>
+    act(() => {
+      window.dispatchEvent(new MessageEvent("message", {
+        origin: window.location.origin,
+        data: { type: "composio_auth_complete", toolkit: "slack", connected_account_id: "ca_1", ...data },
+      }));
+    });
+
+  it("leads with one-click Connect through Composio; the app setup is optional and folded away", async () => {
+    slackServer();
+    mountSlack();
+    expect(await screen.findByRole("button", { name: "Connect Slack" })).toBeInTheDocument();
+    expect(screen.getByText(/Composio's approved Slack app — no app setup needed/)).toBeInTheDocument();
+    const ownApp = screen.getByTestId("own-app-setup");
+    expect(ownApp).not.toHaveAttribute("open");
+    expect(within(ownApp).getByText("Use your own Slack app instead (optional)")).toBeInTheDocument();
+  });
+
+  it("connects through Composio and shows it as connected", async () => {
+    slackServer();
+    mountSlack();
+    fireEvent.click(await screen.findByRole("button", { name: "Connect Slack" }));
+    expect(window.open).toHaveBeenCalledWith("", "composio-slack-request", expect.any(String));
+    await waitFor(() => expect(popup.location.href).toBe("https://backend.composio.dev/link/abc"));
+    expect(api).toHaveBeenCalledWith(
+      "/v1/vaults/vault-apps/credentials/composio_accounts/link",
+      expect.objectContaining({ body: expect.stringContaining('"toolkit":"slack"') }),
+    );
+    // Another toolkit's popup doesn't finish this card.
+    composioDone({ toolkit: "gmail" });
+    expect(api).not.toHaveBeenCalledWith(`${SLACK_BASE}/composio`, expect.anything());
+    // The callback page reports on postMessage AND BroadcastChannel.
+    composioDone();
+    composioDone();
+    await waitFor(() => expect(screen.getByTestId("connection-card")).toHaveAttribute("data-state", "connected"));
+    expect(api.mock.calls.filter(([p]) => p === `${SLACK_BASE}/composio`)).toHaveLength(1);
+    expect(api).toHaveBeenCalledWith(`${SLACK_BASE}/composio`, expect.objectContaining({ body: JSON.stringify({ connected_account_id: "ca_1" }) }));
+    expect(screen.getByText("Connected through Composio")).toBeInTheDocument();
+    // Change offers a different Slack account through Composio again.
+    fireEvent.click(screen.getByRole("button", { name: "Change" }));
+    expect(screen.getByRole("button", { name: /Sign in with a different Slack account/ })).toBeInTheDocument();
+    expect(screen.queryByTestId("own-app-setup")).not.toBeInTheDocument();
+  });
+
+  it("when Composio hasn't activated the account yet, offers Check again instead of a second sign-in", async () => {
+    let attempts = 0;
+    slackServer({
+      finish: () => {
+        attempts++;
+        if (attempts === 1) throw new Error("Composio doesn't show an active slack connection yet.");
+        return { status: "connected", via: "composio" };
+      },
+    });
+    mountSlack();
+    fireEvent.click(await screen.findByRole("button", { name: "Connect Slack" }));
+    await waitFor(() => expect(popup.location.href).not.toBe(""));
+    composioDone();
+    expect(await screen.findByRole("alert")).toHaveTextContent(/active slack connection yet/);
+    vi.mocked(window.open).mockClear();
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(attempts).toBe(2));
+    expect(window.open).not.toHaveBeenCalled();
+  });
+
+  it("without Composio, falls back to the guided app setup", async () => {
+    slackServer({ available: false });
+    mountSlack();
+    await screen.findByText("Choose the account this agent works in");
+    expect(screen.queryByTestId("composio-connect")).not.toBeInTheDocument();
+    expect(screen.getByLabelText(/Client ID/i)).toBeInTheDocument();
+  });
+});

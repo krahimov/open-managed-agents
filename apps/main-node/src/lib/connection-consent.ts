@@ -5,7 +5,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { RouteServices } from "@open-managed-agents/http-routes";
 import type { CredentialRow } from "@open-managed-agents/credentials-store";
-import { serviceDisplayName } from "@open-managed-agents/api-types";
+import { KNOWN_MCP_SERVERS, knownMcpServerForUrl, serviceDisplayName } from "@open-managed-agents/api-types";
 import { refreshNodeMcpOAuthToken } from "./node-mcp-proxy.js";
 
 export function connectionUrl(raw: string): string {
@@ -140,12 +140,64 @@ export async function verifyConnection(credential: CredentialRow): Promise<Conne
 }
 
 type AccessRequest = { request_id: string; service: string; mcp_server_url?: string };
+
+/** A provider connected through Composio instead of its own MCP server. */
+export interface ComposioConnection {
+  via: "composio";
+  toolkit: string;
+  vault_id: string;
+  connected_account_id?: string;
+  connected_at: number;
+}
+
+/**
+ * Composio fallback for providers whose MCP server needs a one-time OAuth app
+ * (Slack, GitHub). Slack's MCP server only accepts Slack Marketplace apps or
+ * a workspace's own internal app, so without either the card offers
+ * Composio's already-approved app instead: one click, any workspace.
+ */
+export interface ComposioFallback {
+  /** A Composio key (workspace or operator) is available. */
+  available: (tenantId: string) => Promise<boolean>;
+  /** Attach the toolkit's ACTIVE account to the agent (graftComposioToolkit). */
+  graft: (input: {
+    tenantId: string;
+    sessionId: string;
+    toolkit: string;
+    vaultId: string;
+    connectedAccountId?: string;
+  }) => Promise<{ ok: true } | { ok: false; status: number; error: string }>;
+  /** Take the provider's own MCP server off the agent: without the app it
+   *  can never connect, and the agent would see a broken server. */
+  removeServer: (tenantId: string, agentId: string, url: string) => Promise<void>;
+  /** Record the grant on the session and tell the agent. */
+  onConnected: (input: { tenantId: string; sessionId: string; requestId: string; service: string; url: string; connection: ComposioConnection }) => Promise<void>;
+}
+
 interface Deps {
   services: RouteServices;
   readRequest: (sessionId: string, requestId: string) => Promise<AccessRequest | null>;
   verify?: typeof verifyConnection;
   onApproved: (input: { tenantId: string; sessionId: string; requestId: string; service: string; binding: ConnectionBinding }) => Promise<void>;
+  composio?: ComposioFallback;
 }
+
+export function composioConnectionKey(tenantId: string, agentId: string, url: string): string {
+  return `connection_via:${encodeURIComponent(tenantId)}:${encodeURIComponent(agentId)}:${encodeURIComponent(connectionUrl(url))}`;
+}
+
+/** The Composio toolkit standing in for a provider's MCP server, if any. */
+export function composioToolkitForUrl(url: string | undefined): string | undefined {
+  return knownMcpServerForUrl(url)?.composioToolkit;
+}
+
+type AgentLike = { mcp_servers?: Array<{ name?: string; type?: string; url?: string }> | null; metadata?: unknown };
+const agentToolkits = (agent: AgentLike): string[] => {
+  const raw = (agent.metadata as { composio_toolkits?: unknown } | null | undefined)?.composio_toolkits;
+  return Array.isArray(raw) ? raw.filter((t): t is string => typeof t === "string") : [];
+};
+const hasComposioServer = (agent: AgentLike) =>
+  (agent.mcp_servers ?? []).some(s => typeof s?.url === "string" && /composio\.dev\/tool_router/.test(s.url));
 
 /** Cached identity of one saved credential (no access granted by it). */
 export interface ConnectionIdentity {
@@ -240,17 +292,61 @@ export class ConnectionConsent {
     return credential;
   }
 
-  /** Session + request + agent for a card, or a ConnectError. */
+  /** The Composio connection standing in for `url` on this agent, while the
+   *  agent still carries that toolkit. */
+  async composioConnection(tenantId: string, agent: AgentLike & { id: string }, url: string): Promise<ComposioConnection | null> {
+    const raw = await this.deps.services.kv.get(composioConnectionKey(tenantId, agent.id, url)).catch(() => null);
+    if (!raw) return null;
+    try {
+      const conn = JSON.parse(raw) as ComposioConnection;
+      return conn.via === "composio" && agentToolkits(agent).includes(conn.toolkit) && hasComposioServer(agent) ? conn : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Session + request + agent for a card, or a ConnectError. A request whose
+   *  server was swapped for Composio stays reachable (`composio` set). */
   private async context(tenantId: string, sessionId: string, requestId: string) {
     const session = await this.deps.services.sessions.get({ tenantId, sessionId });
     if (!session || session.archived_at || !session.agent_id) throw new ConnectError(404, "Session not found");
     const request = await this.deps.readRequest(sessionId, requestId);
     if (!request?.mcp_server_url) throw new ConnectError(404, "Connection request not found");
     const agent = await this.deps.services.agents.get({ tenantId, agentId: session.agent_id });
-    if (!agent || !agent.mcp_servers?.some(s => s.type !== "stdio" && s.url && connectionUrl(s.url) === connectionUrl(request.mcp_server_url!))) {
-      throw new ConnectError(409, `${serviceDisplayName(request.service, request.mcp_server_url)} is no longer configured on this agent`);
+    const url = request.mcp_server_url;
+    const onAgent = !!agent?.mcp_servers?.some(s => s.type !== "stdio" && s.url && connectionUrl(s.url) === connectionUrl(url));
+    const composio = agent ? await this.composioConnection(tenantId, agent, url) : null;
+    if (!agent || (!onAgent && !composio)) {
+      throw new ConnectError(409, `${serviceDisplayName(request.service, url)} is no longer configured on this agent`);
     }
-    return { session, request, agentId: session.agent_id, url: request.mcp_server_url };
+    return { session, request, agent, agentId: session.agent_id, url, onAgent, composio };
+  }
+
+  /** context() for actions on the provider's own server: it must still be on
+   *  the agent. */
+  private async serverContext(tenantId: string, sessionId: string, requestId: string) {
+    const ctx = await this.context(tenantId, sessionId, requestId);
+    if (!ctx.onAgent) {
+      throw new ConnectError(409, `${serviceDisplayName(ctx.request.service, ctx.url)} is connected through Composio on this agent`);
+    }
+    return ctx;
+  }
+
+  /** The vault a Composio account for this agent lives in: the one already
+   *  holding the agent's Composio connections, else "Connected Apps". */
+  private async composioVault(tenantId: string, agent: AgentLike): Promise<string> {
+    const vaults = (await this.deps.services.vaults.list({ tenantId, includeArchived: false })).filter(v => !v.archived_at);
+    const defaults = (agent.metadata as { default_vault_ids?: unknown } | null | undefined)?.default_vault_ids;
+    const preferred = Array.isArray(defaults) ? defaults.filter((v): v is string => typeof v === "string") : [];
+    if (preferred.length > 0) {
+      const groups = await this.deps.services.credentials.listByVaults({ tenantId, vaultIds: preferred }).catch(() => []);
+      const withComposio = groups.find(g => vaults.some(v => v.id === g.vault_id) &&
+        g.credentials.some(cr => !cr.archived_at && (cr.auth as { type?: string }).type === "composio_mcp"));
+      if (withComposio) return withComposio.vault_id;
+    }
+    const named = vaults.find(v => v.name === "Connected Apps");
+    if (named) return named.id;
+    return (await this.deps.services.vaults.create({ tenantId, name: "Connected Apps" })).id;
   }
 
   /** A credential of this tenant for exactly this server, or a ConnectError. */
@@ -373,7 +469,7 @@ export class ConnectionConsent {
    *  Starting the sign-in from this agent's card is the user's choice. */
   async connectNew(input: { tenantId: string; sessionId: string; requestId: string; vaultId: string; credentialId: string }): Promise<ConnectResult> {
     try {
-      const { request, agentId, url } = await this.context(input.tenantId, input.sessionId, input.requestId);
+      const { request, agentId, url } = await this.serverContext(input.tenantId, input.sessionId, input.requestId);
       const credential = await this.candidate(input.tenantId, url, input.vaultId, input.credentialId);
       const result = await this.bind({ ...input, service: request.service, agentId, url, credential });
       if (result.status === "connected") await this.label(input.tenantId, input.vaultId, credential, request, result);
@@ -413,7 +509,16 @@ export class ConnectionConsent {
       const tenantId = c.get("tenant_id");
       const agent = await this.deps.services.agents.get({ tenantId, agentId: c.req.param("agentId") });
       if (!agent) throw new ConnectError(404, "Agent not found");
-      const servers = (agent.mcp_servers ?? []).filter(s => s.type !== "stdio" && typeof s.url === "string" && s.url);
+      const servers = (agent.mcp_servers ?? []).filter(s => s.type !== "stdio" && typeof s.url === "string" && s.url && !/composio\.dev\//.test(s.url));
+      const listed = new Set(servers.map(s => knownMcpServerForUrl(s.url)?.id).filter(Boolean));
+      // Services connected through Composio in place of their own server.
+      const viaComposio = hasComposioServer(agent)
+        ? KNOWN_MCP_SERVERS.filter(k => k.composioToolkit && agentToolkits(agent).includes(k.composioToolkit) && !listed.has(k.id))
+        : [];
+      const composioRows = (await Promise.all(viaComposio.map(async k =>
+        await this.composioConnection(tenantId, agent, k.url)
+          ? { name: k.id, display_name: k.name, mcp_server_url: k.url, status: "connected" as const, via: "composio" as const, account: "through Composio" }
+          : null))).filter(Boolean);
       const data = await Promise.all(servers.map(async s => {
         const url = s.url!;
         const binding = await this.binding(tenantId, agent.id, url);
@@ -426,7 +531,7 @@ export class ConnectionConsent {
           ...(credential && binding ? { account: binding.account, workspace: binding.workspace } : {}),
         };
       }));
-      return c.json({ data });
+      return c.json({ data: [...data, ...composioRows] });
     });
 
     // Card state: is an account chosen for this agent, and which saved
@@ -435,7 +540,26 @@ export class ConnectionConsent {
     app.get("/:sessionId/:requestId", async c => {
       const tenantId = c.get("tenant_id");
       const { sessionId, requestId } = ids(c);
-      const { request, agentId, url } = await this.context(tenantId, sessionId, requestId);
+      const { request, agentId, url, onAgent, composio } = await this.context(tenantId, sessionId, requestId);
+      const display = serviceDisplayName(request.service, url);
+      const toolkit = composioToolkitForUrl(url);
+      const composioOption = toolkit && this.deps.composio
+        ? { toolkit, available: await this.deps.composio.available(tenantId).catch(() => false) }
+        : undefined;
+      if (composio && !onAgent) {
+        // Connected through Composio; the provider's own server is gone.
+        return c.json({
+          service: request.service,
+          display_name: display,
+          mcp_server_url: url,
+          approved: true,
+          broken: false,
+          via: "composio",
+          current: { credential_id: "", vault_id: composio.vault_id, label: `${display} through Composio`, account: "Connected through Composio" },
+          connections: [],
+          ...(composioOption ? { composio: composioOption } : {}),
+        });
+      }
       const vaults = await this.deps.services.vaults.list({ tenantId, includeArchived: false });
       const groups = await this.deps.services.credentials.listByVaults({ tenantId, vaultIds: vaults.map(v => v.id) });
       const binding = await this.binding(tenantId, agentId, url);
@@ -478,6 +602,7 @@ export class ConnectionConsent {
           account: binding.account, workspace: binding.workspace,
         } : null,
         connections: unique.map(({ updated_at: _u, ...conn }) => conn),
+        ...(composioOption ? { composio: composioOption } : {}),
       });
     });
 
@@ -485,7 +610,7 @@ export class ConnectionConsent {
     app.post("/:sessionId/:requestId/identify", async c => {
       const tenantId = c.get("tenant_id");
       const { sessionId, requestId } = ids(c);
-      const { url } = await this.context(tenantId, sessionId, requestId);
+      const { url } = await this.serverContext(tenantId, sessionId, requestId);
       const body = await c.req.json<{ vault_id?: string; credential_id?: string }>().catch(() => ({} as { vault_id?: string; credential_id?: string }));
       const credential = await this.candidate(tenantId, url, body.vault_id!, body.credential_id!);
       const identity = await this.identify(tenantId, body.vault_id!, credential);
@@ -497,7 +622,7 @@ export class ConnectionConsent {
     app.post("/:sessionId/:requestId/use", async c => {
       const tenantId = c.get("tenant_id");
       const { sessionId, requestId } = ids(c);
-      const { request, agentId, url } = await this.context(tenantId, sessionId, requestId);
+      const { request, agentId, url } = await this.serverContext(tenantId, sessionId, requestId);
       type UseBody = { vault_id?: string; credential_id?: string; expected_version?: string; expected_account?: string; expected_workspace_id?: string };
       const body = await c.req.json<UseBody>().catch(() => ({} as UseBody));
       const credential = await this.candidate(tenantId, url, body.vault_id!, body.credential_id!);
@@ -525,7 +650,7 @@ export class ConnectionConsent {
     app.post("/:sessionId/:requestId/start", async c => {
       const tenantId = c.get("tenant_id");
       const { sessionId, requestId } = ids(c);
-      const { request, url } = await this.context(tenantId, sessionId, requestId);
+      const { request, url } = await this.serverContext(tenantId, sessionId, requestId);
       const display = serviceDisplayName(request.service, url);
       // Retries from the same card reuse its still-empty vault instead of
       // leaving one abandoned "<Service> connection" vault per click.
@@ -555,7 +680,7 @@ export class ConnectionConsent {
     app.post("/:sessionId/:requestId/api_key", async c => {
       const tenantId = c.get("tenant_id");
       const { sessionId, requestId } = ids(c);
-      const { request, url } = await this.context(tenantId, sessionId, requestId);
+      const { request, url } = await this.serverContext(tenantId, sessionId, requestId);
       const body = await c.req.json<{ token?: string }>().catch(() => ({} as { token?: string }));
       const token = typeof body.token === "string" ? body.token.trim() : "";
       if (!token) return c.json({ error: "Paste the API key first" }, 400);
@@ -573,6 +698,61 @@ export class ConnectionConsent {
       }
       return c.json(result);
     });
+
+    // Composio instead of the provider's own app: pick the vault and remember
+    // it for this card; the console then runs Composio's link popup.
+    app.post("/:sessionId/:requestId/composio/start", async c => {
+      const tenantId = c.get("tenant_id");
+      const { sessionId, requestId } = ids(c);
+      const { request, agent, url } = await this.context(tenantId, sessionId, requestId);
+      const toolkit = composioToolkitForUrl(url);
+      const fallback = this.deps.composio;
+      if (!toolkit || !fallback) throw new ConnectError(400, `${serviceDisplayName(request.service, url)} can't be connected through Composio`);
+      if (!await fallback.available(tenantId).catch(() => false)) {
+        throw new ConnectError(409, "Composio isn't set up for this workspace. Add a Composio API key under Apps, or use your own app below.");
+      }
+      const vaultId = await this.composioVault(tenantId, agent);
+      await this.deps.services.kv.put(composioStartKey(tenantId, sessionId, requestId), vaultId, { expirationTtl: 24 * 60 * 60 }).catch(() => {});
+      return c.json({ vault_id: vaultId, toolkit });
+    });
+
+    // The Composio popup finished: attach the account to the agent, swap the
+    // provider's server out, and tell the agent.
+    app.post("/:sessionId/:requestId/composio", async c => {
+      const tenantId = c.get("tenant_id");
+      const { sessionId, requestId } = ids(c);
+      const { request, agentId, url, onAgent, composio: existing } = await this.context(tenantId, sessionId, requestId);
+      const toolkit = composioToolkitForUrl(url);
+      const fallback = this.deps.composio;
+      if (!toolkit || !fallback) throw new ConnectError(400, `${serviceDisplayName(request.service, url)} can't be connected through Composio`);
+      const vaultId = await this.deps.services.kv.get(composioStartKey(tenantId, sessionId, requestId)).catch(() => null);
+      if (!vaultId) throw new ConnectError(409, "Start the Composio sign-in from this card first");
+      const body = await c.req.json<{ connected_account_id?: string }>().catch(() => ({} as { connected_account_id?: string }));
+      const connectedAccountId = typeof body.connected_account_id === "string" && body.connected_account_id ? body.connected_account_id : undefined;
+      // The same popup reported twice: already done, don't notify again.
+      if (existing && !onAgent && connectedAccountId && existing.connected_account_id === connectedAccountId) {
+        return c.json({ status: "connected", via: "composio", account: "Connected through Composio" });
+      }
+      const grafted = await fallback.graft({ tenantId, sessionId, toolkit, vaultId, ...(connectedAccountId ? { connectedAccountId } : {}) });
+      if (!grafted.ok) {
+        const status = grafted.status === 400 || grafted.status === 404 || grafted.status === 409 || grafted.status === 503 ? grafted.status : 502;
+        return c.json({ error: grafted.error }, status);
+      }
+      const connection: ComposioConnection = {
+        via: "composio", toolkit, vault_id: vaultId, connected_at: Date.now(),
+        ...(connectedAccountId ? { connected_account_id: connectedAccountId } : {}),
+      };
+      await this.deps.services.kv.put(composioConnectionKey(tenantId, agentId, url), JSON.stringify(connection));
+      if (onAgent) await fallback.removeServer(tenantId, agentId, url);
+      await fallback.onConnected({ tenantId, sessionId, requestId, service: request.service, url, connection }).catch(err => {
+        this.deps.services.logger?.warn({ err, op: "connection.composio_notify_failed", session_id: sessionId }, "composio grant notify failed");
+      });
+      this.deps.services.logger?.info({ op: "connection.composio_connected", session_id: sessionId, agent_id: agentId, toolkit }, "connected through Composio");
+      return c.json({ status: "connected", via: "composio", account: "Connected through Composio" });
+    });
     return app;
   }
 }
+
+const composioStartKey = (tenantId: string, sessionId: string, requestId: string) =>
+  `composio_start:${encodeURIComponent(tenantId)}:${encodeURIComponent(sessionId)}:${encodeURIComponent(requestId)}`;

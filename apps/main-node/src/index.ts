@@ -1,6 +1,6 @@
-import { ConnectionConsent, droppedMcpUrls } from "./lib/connection-consent.js";
+import { ConnectionConsent, connectionUrl, droppedMcpUrls } from "./lib/connection-consent.js";
 import { graftComposioToolkit } from "./lib/composio-graft.js";
-import { serviceDisplayName } from "@open-managed-agents/api-types";
+import { knownMcpServerForUrl, serviceDisplayName } from "@open-managed-agents/api-types";
 import { buildTelegramConnectRoutes } from "./lib/telegram-connect-routes.js";
 import { TelegramOnboarding } from "./lib/telegram-onboarding.js";
 import { DesktopGateway } from "./lib/desktop-gateway.js";
@@ -1823,6 +1823,24 @@ v1.get("/agents/:id/evidence/capability", async (c) => {
 // succeeded but every session, including scheduled ones, had zero LinkedIn
 // actions. Ensures a tool-router credential covering the toolkit exists in
 // the vault, adds the composio mcp_server to the agent, and links the vault.
+const composioGraftDeps: Parameters<typeof graftComposioToolkit>[0] = {
+  // Same order as the vault link route: workspace key → operator key →
+  // a key stored in this vault.
+  resolveKey: async (t, vaultId) => {
+    const key = await composioKeyForTenant(t);
+    if (key) return key;
+    const creds = await credentialService.list({ tenantId: t, vaultId }).catch(() => []);
+    for (const cr of creds) {
+      const auth = (cr as unknown as { auth?: { type?: string; api_key?: string } }).auth;
+      if (!cr.archived_at && auth?.type === "composio_mcp" && auth.api_key) return { apiKey: auth.api_key, source: "vault" };
+    }
+    return null;
+  },
+  credentials: credentialService as never,
+  sessions: sessionsService as never,
+  agents: agentsService as never,
+  ...(process.env.COMPOSIO_BASE_URL ? { composioBaseUrl: process.env.COMPOSIO_BASE_URL } : {}),
+};
 const composioGraftRoutes = new Hono<{ Variables: { tenant_id: string; user_id?: string } }>();
 composioGraftRoutes.post("/:id/composio/graft", async (c) => {
   const tenantId = c.var.tenant_id;
@@ -1830,23 +1848,7 @@ composioGraftRoutes.post("/:id/composio/graft", async (c) => {
     .json<{ toolkit?: string; vault_id?: string; connected_account_id?: string }>()
     .catch(() => ({}) as { toolkit?: string; vault_id?: string; connected_account_id?: string });
   const result = await graftComposioToolkit(
-    {
-      // Same order as the vault link route: workspace key → operator key →
-      // a key stored in this vault.
-      resolveKey: async (t, vaultId) => {
-        const key = await composioKeyForTenant(t);
-        if (key) return key;
-        const creds = await credentialService.list({ tenantId: t, vaultId }).catch(() => []);
-        for (const cr of creds) {
-          const auth = (cr as unknown as { auth?: { type?: string; api_key?: string } }).auth;
-          if (!cr.archived_at && auth?.type === "composio_mcp" && auth.api_key) return { apiKey: auth.api_key, source: "vault" };
-        }
-        return null;
-      },
-      credentials: credentialService as never,
-      sessions: sessionsService as never,
-      agents: agentsService as never,
-    },
+    composioGraftDeps,
     {
       tenantId,
       sessionId: c.req.param("id"),
@@ -2125,6 +2127,11 @@ async function postAccessRequest(
         ])
       : null;
   const needsAppSetup = !!oauthApp?.required && !oauthApp.configured;
+  // No app for this provider yet: the card leads with Composio's app when
+  // the workspace can use Composio.
+  const composioInstead =
+    needsAppSetup && !!knownMcpServerForUrl(mcpServerUrl)?.composioToolkit &&
+    !!(await composioKeyForTenant(tenantId).catch(() => null));
   const requestId = suppliedRequestId ?? `acreq-${generateEventId().replace(/^sevt-/, "")}`;
   await sessionRouter.appendEvent(sessionId, {
     type: "system.access_request",
@@ -2146,6 +2153,8 @@ async function postAccessRequest(
       ? `"${service}" is a model provider, not a connectable app — its key belongs in Console → Model Cards, and the user has been pointed there. Don't wait on an OAuth grant; continue other work.`
       : authKind === "mcp_api_key"
         ? `"${service}" authenticates with an API key, not OAuth. The user is being asked to paste the key into the credential vault (it never enters this conversation) — you'll receive a message when it's saved.`
+        : composioInstead
+          ? `Connect card for "${service}" posted. This workspace has no ${oauthApp?.label ?? service} app of its own, so the card connects through Composio in one click (the user can still set up their own app instead). Wait for the "[access granted]" message: it says whether the connection went through Composio, and if so the ${service} server is replaced by Composio's tools.`
         : needsAppSetup
           ? `Connect card for "${service}" posted, but ${oauthApp?.label ?? service} requires a one-time OAuth app registration first (its MCP server has no automatic client registration). The card walks the user through creating the app and pasting its Client ID/Secret — tell the user it's a one-time setup step, then wait; you'll receive a message when access is granted.`
         : authKind === "mcp_oauth" || key
@@ -2419,6 +2428,8 @@ v1.route("/vaults", buildVaultRoutes({
   services,
   composio: {
     apiKey: process.env.COMPOSIO_API_KEY,
+    // Test seam (e2e mocks); unset in production.
+    ...(process.env.COMPOSIO_BASE_URL ? { baseUrl: process.env.COMPOSIO_BASE_URL } : {}),
     // Managed-first: a tenant's pasted key (vault credential) wins over the
     // operator env fallback. Hoisted function declaration defined below.
     resolveApiKey: async (tenantId) =>
@@ -2461,6 +2472,32 @@ const connectionConsent = new ConnectionConsent({
         text: `[access granted] ${serviceDisplayName(service, binding.mcp_server_url)} is connected for this agent${who ? ` (${who})` : ""}. Continue where you left off.`,
       }],
     } as SessionEvent);
+  },
+  // Slack/GitHub without the workspace's own OAuth app: connect through
+  // Composio's app instead (see ComposioFallback).
+  composio: {
+    available: async (tenantId) => !!await composioKeyForTenant(tenantId).catch(() => null),
+    graft: (input) => graftComposioToolkit(composioGraftDeps, input),
+    removeServer: async (tenantId, agentId, url) => {
+      const agent = await agentsService.get({ tenantId, agentId });
+      if (!agent) return;
+      const servers = (agent.mcp_servers ?? []).filter(
+        (s) => !(s.type !== "stdio" && typeof s.url === "string" && connectionUrl(s.url) === connectionUrl(url)),
+      );
+      await updateAgentFromSetup(tenantId, agentId, { mcp_servers: servers });
+    },
+    onConnected: async ({ sessionId, requestId, service, url, connection }) => {
+      const name = serviceDisplayName(service, url);
+      await sessionRouter.appendEvent(sessionId, {
+        type: "system.access_granted", id: generateEventId(), request_id: requestId,
+        service, vault_id: connection.vault_id, mcp_server_url: url, via: "composio",
+      } as SessionEvent);
+      await sessionRouter.appendEvent(sessionId, {
+        type: "user.message", id: generateEventId(), content: [{ type: "text",
+          text: `[access granted] ${name} is connected for this agent through Composio. Its ${name} tools now come from the composio server (find them with COMPOSIO_SEARCH_TOOLS); the ${name} MCP server was removed from the harness on purpose — don't add it back. Continue where you left off.`,
+        }],
+      } as SessionEvent);
+    },
   },
 });
 v1.route("/connection-access", connectionConsent.routes());

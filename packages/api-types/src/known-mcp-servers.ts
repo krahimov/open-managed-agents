@@ -26,6 +26,10 @@ export interface KnownMcpServer {
   /** Provider has no dynamic client registration: the first connection needs
    *  a one-time OAuth app (the connect card walks the user through it). */
   needsOAuthApp?: boolean;
+  /** Composio toolkit covering the same service. When the provider needs a
+   *  one-time OAuth app the workspace hasn't set up, the connect card offers
+   *  this instead: Composio's own, already-approved app, one click. */
+  composioToolkit?: string;
 }
 
 export const KNOWN_MCP_SERVERS: readonly KnownMcpServer[] = [
@@ -45,6 +49,7 @@ export const KNOWN_MCP_SERVERS: readonly KnownMcpServer[] = [
     summary: "read and post messages, search channels and threads",
     domain: "slack.com",
     needsOAuthApp: true,
+    composioToolkit: "slack",
   },
   {
     id: "github",
@@ -54,6 +59,7 @@ export const KNOWN_MCP_SERVERS: readonly KnownMcpServer[] = [
     summary: "repos, issues, pull requests, code search",
     domain: "github.com",
     needsOAuthApp: true,
+    composioToolkit: "github",
   },
   {
     id: "notion",
