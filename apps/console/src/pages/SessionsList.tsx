@@ -14,6 +14,7 @@ import { DataTable, type ColumnDef } from "../components/DataTable";
 import { FacetedFilter } from "../components/FacetedFilter";
 import { FilterChip, CreatedFilterChip } from "../components/FilterChip";
 import { RowActionsMenu } from "../components/RowActionsMenu";
+import { IdChip, StatusPill } from "../components/Badge";
 
 import type { SessionRecord as Session } from "../types/session";
 
@@ -614,14 +615,6 @@ export function SessionsList() {
     setRevealedSecrets(new Set());
   };
 
-  const statusCls = (status?: string) => {
-    switch (status) {
-      case "idle": return "bg-success-subtle text-success";
-      case "running": return "bg-info-subtle text-info";
-      default: return "bg-bg-surface text-fg-muted";
-    }
-  };
-
   const displayed = sessions;
 
   // Active-filter chip displays — kept undefined when matching the
@@ -736,48 +729,44 @@ export function SessionsList() {
   const columns = useMemo<ColumnDef<Session>[]>(
     () => [
       {
-        id: "id",
-        accessorKey: "id",
-        header: "ID",
-        cell: ({ row }) => (
-          <span title={row.original.id} className="font-mono text-xs text-fg-muted">
-            {row.original.id}
-          </span>
-        ),
-        enableHiding: false,
-      },
-      {
         id: "name",
         accessorFn: (s) => s.title ?? "",
         header: "Name",
         cell: ({ row }) => (
-          <span className="inline-flex items-center gap-2 font-medium text-fg">
-            {row.original.title || "Untitled"}
+          <span className="inline-flex max-w-full items-center gap-2 text-[14.5px] font-semibold tracking-[-0.012em] text-fg">
+            <span className="truncate">{row.original.title || "Untitled"}</span>
             <LinearBadge metadata={row.original.metadata} />
             <SlackBadge metadata={row.original.metadata} />
             <EvalBadge metadata={row.original.metadata} />
           </span>
         ),
         enableHiding: false,
+        size: 220,
+      },
+      {
+        id: "id",
+        accessorKey: "id",
+        header: "ID",
+        cell: ({ row }) => <IdChip id={row.original.id} />,
+        enableHiding: false,
+        size: 210,
       },
       {
         id: "status",
         accessorFn: (s) => s.status ?? "idle",
         header: "Status",
-        cell: ({ row }) => (
-          <span
-            className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${statusCls(row.original.status)}`}
-          >
-            {row.original.status || "idle"}
-          </span>
-        ),
+        cell: ({ row }) => {
+          const st = row.original.status || "idle";
+          return <StatusPill status={st} label={st[0].toUpperCase() + st.slice(1)} />;
+        },
+        size: 130,
       },
       {
         id: "agent",
         accessorFn: (s) => s.agent.id,
         header: "Agent",
         cell: ({ row }) => (
-          <span className="text-fg-muted font-mono text-xs">{row.original.agent.id}</span>
+          <span className="font-mono text-[12px] text-fg-muted">{row.original.agent.id}</span>
         ),
       },
       {
@@ -785,7 +774,7 @@ export function SessionsList() {
         accessorFn: (s) => s.created_at,
         header: "Created",
         cell: ({ row }) => (
-          <span className="text-fg-muted">
+          <span className="text-fg-subtle tabular-nums">
             {new Date(row.original.created_at).toLocaleDateString()}
           </span>
         ),

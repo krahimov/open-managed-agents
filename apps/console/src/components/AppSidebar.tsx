@@ -144,7 +144,7 @@ export function AppSidebar() {
           // overrides beat shadcn's built-in data-active / hover fills
           // (Tailwind v4's `data-active:` matches true AND false).
           className={[
-            "h-8 gap-2.5 rounded-full px-3 text-[13.5px] tracking-[-0.01em] transition-[background-color,color] duration-[var(--dur-base)] ease-[var(--ease-soft)] [&>svg]:size-[15px]",
+            "h-[30px] gap-2.5 rounded-full px-3 text-[13.5px] tracking-[-0.01em] transition-[background-color,color] duration-[var(--dur-base)] ease-[var(--ease-soft)] [&>svg]:size-[15px]",
             active
               ? "!bg-fill !text-fg font-semibold [&>svg]:opacity-100"
               : "!bg-transparent !text-fg-muted font-normal hover:!text-fg hover:!bg-fill/60 [&>svg]:opacity-65",
@@ -176,10 +176,10 @@ export function AppSidebar() {
         <TenantSwitcher />
       </div>
 
-      <SidebarContent className="bg-sidebar px-1.5 pt-2 pb-3 gap-1 [&::-webkit-scrollbar]:hidden [scrollbar-width:none]">
+      <SidebarContent className="bg-sidebar px-1.5 pt-1 pb-2 gap-0.5 [&::-webkit-scrollbar]:hidden [scrollbar-width:none]">
         {groups.map((g) => (
-          <SidebarGroup key={g.label} className="py-1">
-            <SidebarGroupLabel className="eyebrow h-7 px-3 text-[10.5px] tracking-[0.07em]">
+          <SidebarGroup key={g.label} className="py-0.5">
+            <SidebarGroupLabel className="eyebrow h-6 mt-1 px-3 text-[10.5px] tracking-[0.07em]">
               {g.label}
             </SidebarGroupLabel>
             <SidebarMenu className="gap-px">{g.items.map(renderItem)}</SidebarMenu>

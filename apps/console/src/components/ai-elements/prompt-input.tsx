@@ -48,6 +48,7 @@ import {
   PlusIcon,
   SquareIcon,
   XIcon,
+  ArrowUpIcon,
 } from "lucide-react";
 import { nanoid } from "nanoid";
 import type {
@@ -921,7 +922,7 @@ export const PromptInput = ({
         ref={formRef}
         {...props}
       >
-        <InputGroup className="overflow-hidden">{children}</InputGroup>
+        <InputGroup className="overflow-hidden rounded-[22px] border-card-border bg-bg-surface shadow-[var(--shadow-card)] hover:border-card-border dark:border-card-border dark:bg-bg-surface has-[[data-slot=input-group-control]:focus-visible]:border-ring/70">{children}</InputGroup>
       </form>
     </>
   );
@@ -1055,7 +1056,7 @@ export const PromptInputTextarea = ({
 
   return (
     <InputGroupTextarea
-      className={cn("field-sizing-content max-h-48 min-h-16", className)}
+      className={cn("field-sizing-content max-h-48 min-h-16 px-5 pt-4 text-[15px] leading-relaxed placeholder:text-fg-subtle", className)}
       name="message"
       onCompositionEnd={handleCompositionEnd}
       onCompositionStart={handleCompositionStart}
@@ -1095,7 +1096,7 @@ export const PromptInputFooter = ({
 }: PromptInputFooterProps) => (
   <InputGroupAddon
     align="block-end"
-    className={cn("justify-between gap-1", className)}
+    className={cn("justify-between gap-1 px-3 pb-3", className)}
     {...props}
   />
 );
@@ -1225,7 +1226,7 @@ export const PromptInputSubmit = ({
 }: PromptInputSubmitProps) => {
   const isGenerating = status === "submitted" || status === "streaming";
 
-  let Icon = <CornerDownLeftIcon className="size-4" />;
+  let Icon = <ArrowUpIcon className="size-[18px]" strokeWidth={2.25} />;
 
   if (status === "submitted") {
     Icon = <Spinner />;
@@ -1250,7 +1251,7 @@ export const PromptInputSubmit = ({
   return (
     <InputGroupButton
       aria-label={isGenerating ? "Stop" : "Submit"}
-      className={cn(className)}
+      className={cn("size-8 rounded-full press", className)}
       onClick={handleClick}
       size={size}
       type={isGenerating && onStop ? "button" : "submit"}

@@ -512,15 +512,15 @@ export function ConnectionCard({
 
   return (
     <div
-      className="harness-diff-card max-w-2xl rounded-lg border border-border bg-bg-surface overflow-hidden"
+      className="harness-diff-card card max-w-[72ch] rounded-[18px] overflow-hidden"
       data-testid="connection-card"
       data-state={gone ? "gone" : connected ? "connected" : "pending"}
       data-connection-url={request.mcp_server_url}
     >
-      <div className="flex items-center gap-3 px-4 py-3">
+      <div className="flex items-center gap-3 px-5 py-4">
         <ServiceIcon service={request.service} url={request.mcp_server_url} />
         <div className="min-w-0 flex-1">
-          <div className="text-sm font-medium text-fg">{name}</div>
+          <div className="text-[15px] font-semibold tracking-[-0.012em] text-fg">{name}</div>
           <div className={`text-xs truncate ${connected ? "text-fg-muted" : "text-fg-subtle"}`}>{subtitle}</div>
         </div>
         {connected && !choosing ? (
@@ -552,13 +552,13 @@ export function ConnectionCard({
       </div>
 
       {showChooser && state && (
-        <div className="border-t border-border px-4 py-3 space-y-3">
+        <div className="border-t border-border px-5 py-4 space-y-3">
           {good.length > 0 && (
             <div className="space-y-1.5">
-              <div className="text-[11px] font-medium uppercase tracking-wider text-fg-subtle">
+              <div className="eyebrow">
                 Saved {name} accounts
               </div>
-              <ul className="divide-y divide-border rounded-md border border-border bg-bg">
+              <ul className="divide-y divide-border rounded-xl bg-bg-inset">
                 {good.map(({ conn, identity }) => (
                   <li key={conn.credential_id} className="flex items-center gap-3 px-3 py-2">
                     <div className="min-w-0 flex-1">
@@ -596,7 +596,7 @@ export function ConnectionCard({
               <summary className="cursor-pointer select-none">
                 {broken.length} older sign-in{broken.length === 1 ? "" : "s"} no longer work{broken.length === 1 ? "s" : ""}
               </summary>
-              <ul className="mt-1.5 divide-y divide-border rounded-md border border-border bg-bg">
+              <ul className="mt-1.5 divide-y divide-border rounded-xl bg-bg-inset">
                 {broken.map(({ conn, identity }) => (
                   <li key={conn.credential_id} className="flex items-center gap-3 px-3 py-2">
                     <div className="min-w-0 flex-1">
@@ -635,7 +635,7 @@ export function ConnectionCard({
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 placeholder={`Paste a ${name} API key`}
-                className="flex-1 min-w-0 h-8 rounded-md border border-border bg-bg px-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-brand"
+                className="flex-1 min-w-0 h-8 rounded-[10px] border border-border-strong bg-bg-surface px-2.5 text-xs font-mono focus:outline-none focus:border-ring focus:ring-4 focus:ring-ring/15 dark:bg-fill dark:border-border"
               />
               <Button size="sm" type="submit" disabled={!apiKey.trim() || !!busy} loading={busy === "api_key"} loadingLabel="Checking…">
                 Connect
@@ -718,15 +718,15 @@ export function ConnectionCard({
       )}
 
       {error && (
-        <div role="alert" className="border-t border-border bg-danger-subtle px-4 py-2 text-xs text-danger">
+        <div role="alert" className="border-t border-border bg-danger-subtle px-5 py-2.5 text-xs text-danger">
           {error}
         </div>
       )}
       {gone && (
-        <div className="border-t border-border px-4 py-2 text-xs text-fg-subtle">{gone}</div>
+        <div className="border-t border-border px-5 py-2.5 text-xs text-fg-subtle">{gone}</div>
       )}
       {showChooser && state && (
-        <div className="border-t border-border px-4 py-2 text-[11px] text-fg-subtle">
+        <div className="border-t border-border px-5 py-2.5 text-[11px] text-fg-subtle">
           Only the account you pick is shared with this agent. Tokens stay in your vault and never enter this chat.
         </div>
       )}

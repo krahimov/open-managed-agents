@@ -328,7 +328,7 @@ export function DataTable<T>({
                       className={cn(
                         "group/row transition-colors duration-[var(--dur-base)] ease-[var(--ease-soft)] hover:bg-fill/70",
                         "[&>td]:h-[60px] [&>td]:px-4 [&>td:first-child]:pl-6 [&>td]:align-middle [&>td]:text-sm",
-                        i > 0 && "[&>td]:border-t [&>td]:border-border [&>td:first-child]:border-t-0 [&>td:first-child]:bg-[linear-gradient(var(--border),var(--border))_top_right/calc(100%-1.5rem)_1px_no-repeat]",
+                        i > 0 && "[&>td]:border-t [&>td]:border-border",
                         onRowClick && "cursor-pointer",
                       )}
                     >

@@ -361,7 +361,7 @@ function Checkbox({ checked }: { checked: boolean }) {
   return (
     <div
       className={`w-4 h-4 rounded border flex items-center justify-center shrink-0 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
-        checked ? "bg-brand border-brand" : "bg-bg border-border-strong"
+        checked ? "bg-ink border-ink" : "bg-bg border-border-strong"
       }`}
     >
       {checked && (

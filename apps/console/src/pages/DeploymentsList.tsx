@@ -4,6 +4,7 @@ import { KeyRoundIcon, PauseCircleIcon, PlayCircleIcon, TrashIcon } from "lucide
 import { useApi } from "../lib/api";
 import { useApiQuery, useInfiniteApiQuery } from "../lib/useApiQuery";
 import { Button } from "@/components/ui/button";
+import { StatusPill } from "../components/Badge";
 import { DataTable, type ColumnDef } from "../components/DataTable";
 import { RowActionsMenu } from "../components/RowActionsMenu";
 import {
@@ -119,15 +120,10 @@ export function DeploymentsList() {
         accessorFn: (d) => (d.disabled ? "disabled" : "active"),
         header: "Status",
         cell: ({ row }) => (
-          <span
-            className={`inline-flex items-center text-xs px-2 py-0.5 rounded-full ${
-              row.original.disabled
-                ? "bg-bg-surface text-fg-subtle"
-                : "bg-success-subtle text-success"
-            }`}
-          >
-            {row.original.disabled ? "disabled" : "active"}
-          </span>
+          <StatusPill
+            status={row.original.disabled ? "neutral" : "completed"}
+            label={row.original.disabled ? "Disabled" : "Active"}
+          />
         ),
       },
       {

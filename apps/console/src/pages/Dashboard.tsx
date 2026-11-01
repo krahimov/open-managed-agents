@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router";
-import { Check, Copy, Terminal } from "lucide-react";
+import { ArrowRight, ArrowUpRight, Check, ChevronRight, Copy, Terminal } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import { useAuth } from "../lib/auth";
 import { useApiQuery } from "../lib/useApiQuery";
 import { toast } from "sonner";
@@ -88,21 +89,6 @@ export function Dashboard() {
     }
   };
 
-  const stat = (label: string, value: number | undefined, to: string) => (
-    <button
-      key={label}
-      onClick={() => nav(to)}
-      className="group relative text-left px-4 py-3.5 border border-border rounded-md bg-bg-surface shadow-[var(--shadow-sm)] hover:border-border-strong hover:bg-brand-subtle/45 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-    >
-      <div className="font-display text-[28px] leading-none font-semibold text-fg group-hover:text-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] tabular-nums">
-        {value ?? "–"}
-      </div>
-      <div className="mt-2 text-[11px] uppercase text-fg-muted font-medium">
-        {label}
-      </div>
-    </button>
-  );
-
   const stats_ = [
     { label: "Agents", value: stats?.agents, to: "/agents" },
     { label: "Sessions", value: stats?.sessions, to: "/sessions" },
@@ -118,289 +104,310 @@ export function Dashboard() {
     `Use ${BRAND_NAME} to create a research agent that monitors arXiv for new ML papers daily`;
   const skillPreview = HARNESS_AGENT_BUILDER_SKILL.split("\n").slice(0, 28).join("\n");
 
+  const CopyGlyph = ({ k }: { k: string }) =>
+    copied === k ? <Check className="size-4" /> : <Copy className="size-4" />;
+
+  // Bento layout: the two headline counts get tall tiles beside the
+  // feature tile; the remaining four sit in a row of compact tiles.
+  const [primaryStats, secondaryStats] = [stats_.slice(0, 2), stats_.slice(2)];
+
+  const statTile = (
+    s: { label: string; value: number | undefined; to: string },
+    i: number,
+    big: boolean,
+  ) => (
+    <button
+      key={s.label}
+      onClick={() => nav(s.to)}
+      style={{ animationDelay: `${80 + i * 40}ms` }}
+      className={`studio-rise group card card-hover press text-left flex flex-col justify-between outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring ${
+        big ? "rounded-[var(--radius-tile)] p-6 min-h-[164px]" : "p-5 min-h-[124px]"
+      }`}
+    >
+      <div className="flex items-center justify-between">
+        <span className="eyebrow">{s.label}</span>
+        <ArrowUpRight
+          className="size-4 text-fg-subtle opacity-0 -translate-x-1 translate-y-1 transition-all duration-[var(--dur-slow)] ease-[var(--ease-spring)] group-hover:opacity-100 group-hover:translate-x-0 group-hover:translate-y-0"
+          aria-hidden="true"
+        />
+      </div>
+      <div className="flex flex-col gap-1.5">
+      {statsPending ? (
+        <Skeleton className={big ? "h-11 w-16" : "h-8 w-12"} rounded="lg" />
+      ) : (
+        <div
+          className={`font-display tabular-nums text-fg ${
+            big ? "text-[56px] leading-none font-semibold tracking-[-0.045em]" : "text-numeral"
+          }`}
+        >
+          {s.value ?? "–"}
+        </div>
+      )}
+      {big && (
+        <span className="text-[13px] text-fg-subtle">
+          {s.label === "Sessions" ? "Conversations recorded" : "Configured in this workspace"}
+        </span>
+      )}
+      </div>
+    </button>
+  );
+
   return (
     <div className="flex-1 overflow-y-auto">
-      <div className="pl-4 pr-5 py-6 space-y-10">
+      <div className="px-8 pt-3 pb-14 max-w-[1320px]">
         {/* Header — onboarding voice only until the workspace has agents;
             after that the dashboard is an instrument, with the guide one
             quiet toggle away. */}
-        <header className="flex items-start justify-between gap-4">
-          <div>
-            <h1 className="text-[20px] leading-tight font-semibold text-fg">
+        <header className="flex flex-wrap items-end justify-between gap-4 mb-8">
+          <div className="min-w-0">
+            <div className="eyebrow mb-2">{BRAND_NAME} workspace</div>
+            <h1 className="font-display text-hero text-fg">
               {workspaceActive || statsPending ? "Overview" : `Get started with ${BRAND_NAME}`}
             </h1>
-            <p className="mt-1.5 text-[15px] text-fg-muted">
+            <p className="mt-2 text-[17px] leading-7 text-fg-muted max-w-[60ch]">
               {workspaceActive || statsPending
                 ? "Workspace activity at a glance."
                 : "Install the CLI, mint a key, and let agents operate against your control plane."}
             </p>
           </div>
           {workspaceActive && (
-            <button
-              onClick={() => setShowGuide((v) => !v)}
-              className="shrink-0 text-[12px] text-fg-muted hover:text-fg border border-border rounded-md px-2.5 py-1.5 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-            >
+            <Button variant="secondary" onClick={() => setShowGuide((v) => !v)}>
               {showGuide ? "Hide setup guide" : "Setup guide"}
-            </button>
+            </Button>
           )}
         </header>
 
-        {/* Quickstart — single panel with three rows, no per-step cards */}
+        {/* Quickstart — three steps as three columns in one tile */}
         {guideVisible && (
-        <section className="border border-border rounded-lg bg-bg-surface shadow-[var(--shadow-sm)] overflow-hidden">
-          {/* Step 1 */}
-          <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6 border-b border-border">
-            <div>
-              <div className="font-mono text-[11px] text-fg-subtle tracking-wider">STEP 01</div>
-              <div className="mt-1 font-medium text-fg text-[15px]">Install the CLI</div>
-            </div>
-            <div className="space-y-2.5 min-w-0">
-              <p className="text-sm text-fg-muted">
+          <section className="studio-rise card rounded-[var(--radius-tile)] mb-4 grid md:grid-cols-3 md:divide-x divide-border">
+            {/* Step 1 */}
+            <div className="p-6 md:p-7 min-w-0 space-y-3">
+              <div className="eyebrow">Step 01</div>
+              <div className="text-headline text-fg">Install the CLI</div>
+              <p className="text-sm text-fg-muted leading-relaxed">
                 The command-line client lets your
                 agent (or you) drive the platform from the terminal.
               </p>
               <button
                 onClick={() => copy(cmd, "cmd")}
-                className="group flex w-full sm:w-auto sm:inline-flex items-center gap-3 pl-3 pr-2 py-2 rounded-md border border-border bg-bg hover:border-border-strong hover:bg-brand-subtle/45 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] text-left"
+                className="group flex w-full items-center gap-3 pl-3.5 pr-2 h-10 rounded-xl bg-code-well text-code-well-fg hover:opacity-90 transition-opacity text-left press"
               >
-                <span className="text-fg-subtle select-none font-mono text-xs">›</span>
-                <span className="font-mono text-[13px] text-fg flex-1 truncate">{cmd}</span>
-                <span className="shrink-0 text-fg-subtle group-hover:text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] p-1">
-                  {copied === "cmd" ? (
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M20 6 9 17l-5-5" /></svg>
-                  ) : (
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" /></svg>
-                  )}
+                <span className="text-code-well-muted select-none font-mono text-xs">›</span>
+                <span className="font-mono text-[12.5px] flex-1 truncate">{cmd}</span>
+                <span className="shrink-0 text-code-well-muted group-hover:text-code-well-fg transition-colors p-1">
+                  <CopyGlyph k="cmd" />
                 </span>
               </button>
               <p className="text-[12px] text-fg-subtle">
                 or globally:{" "}
                 <button
                   onClick={() => copy(cmdGlobal, "cmd-global")}
-                  className="inline-flex items-center min-h-11 sm:min-h-0 font-mono text-fg-muted hover:text-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+                  className="inline-flex items-center min-h-11 sm:min-h-0 font-mono text-fg-muted hover:text-brand transition-colors"
                 >
                   {cmdGlobal}
                 </button>
               </p>
             </div>
-          </div>
 
-          {/* Step 2 */}
-          <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6 border-b border-border">
-            <div>
-              <div className="font-mono text-[11px] text-fg-subtle tracking-wider">STEP 02</div>
-              <div className="mt-1 font-medium text-fg text-[15px]">Mint an API key</div>
-            </div>
-            <div className="space-y-2.5">
-              <p className="text-sm text-fg-muted">
+            {/* Step 2 */}
+            <div className="p-6 md:p-7 min-w-0 space-y-3">
+              <div className="eyebrow">Step 02</div>
+              <div className="text-headline text-fg">Mint an API key</div>
+              <p className="text-sm text-fg-muted leading-relaxed">
                 Your agent needs this to authenticate. Keep it somewhere it can read.
               </p>
-              <button
-                onClick={() => nav("/api-keys")}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-brand text-brand-fg rounded-md text-[13px] font-medium hover:bg-brand-hover transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-              >
+              <Button onClick={() => nav("/api-keys")} data-icon="inline-end">
                 Generate API key
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M13 6l6 6-6 6" /></svg>
-              </button>
+                <ArrowRight className="size-4" />
+              </Button>
             </div>
-          </div>
 
-          {/* Step 3 */}
-          <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6">
-            <div>
-              <div className="font-mono text-[11px] text-fg-subtle tracking-wider">STEP 03</div>
-              <div className="mt-1 font-medium text-fg text-[15px]">Give it the task</div>
-            </div>
-            <div className="space-y-2.5">
-              <p className="text-sm text-fg-muted">
+            {/* Step 3 */}
+            <div className="p-6 md:p-7 min-w-0 space-y-3">
+              <div className="eyebrow">Step 03</div>
+              <div className="text-headline text-fg">Give it the task</div>
+              <p className="text-sm text-fg-muted leading-relaxed">
                 Point your agent at the CLI or API skill, then
                 ask for what you want:
               </p>
               <button
                 onClick={() => copy(examplePrompt, "prompt")}
-                className="group w-full text-left rounded-md border border-border bg-bg hover:border-border-strong hover:bg-brand-subtle/45 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] p-3 flex items-start gap-3"
+                className="group w-full text-left rounded-xl bg-fill hover:bg-fill-strong transition-colors p-3.5 flex items-start gap-3 press"
               >
-                <span className="shrink-0 mt-0.5 font-mono text-[10px] text-fg-subtle">
-                  PROMPT
-                </span>
                 <span className="flex-1 text-[13px] text-fg leading-snug">{examplePrompt}</span>
-                <span className="shrink-0 text-fg-subtle group-hover:text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] mt-0.5">
-                  {copied === "prompt" ? (
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M20 6 9 17l-5-5" /></svg>
-                  ) : (
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" /></svg>
-                  )}
+                <span className="shrink-0 text-fg-subtle group-hover:text-fg transition-colors mt-0.5">
+                  <CopyGlyph k="prompt" />
                 </span>
               </button>
             </div>
-          </div>
-        </section>
+          </section>
         )}
 
-        {/* Agent builder skill — copyable handoff for external coding agents */}
-        <section className="border border-border rounded-lg bg-bg-surface shadow-[var(--shadow-sm)] overflow-hidden">
-          <div className="grid lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-            <div className="p-5 md:p-6 border-b lg:border-b-0 lg:border-r border-border min-w-0">
-              <div className="inline-flex items-center gap-1.5 rounded-md border border-border bg-bg px-2 py-1 text-[11px] font-medium uppercase text-fg-subtle">
+        {/* Bento */}
+        <div className="grid grid-cols-1 md:grid-cols-6 lg:grid-cols-12 gap-4">
+          {/* Feature tile — agent builder skill with an inset dark code well */}
+          <section className="studio-rise card rounded-[var(--radius-tile)] md:col-span-6 lg:col-span-8 lg:row-span-2 overflow-hidden grid xl:grid-cols-[minmax(0,1.15fr)_minmax(0,1fr)]">
+            <div className="p-7 flex flex-col min-w-0">
+              <div className="eyebrow inline-flex items-center gap-1.5">
                 <Terminal className="size-3.5" />
                 Codex / Claude Code
               </div>
-              <h2 className="mt-4 font-display text-xl font-semibold text-fg">
+              <h2 className="mt-3 font-display text-[30px] leading-[1.1] font-bold tracking-[-0.028em] text-fg">
                 Agent builder skill
               </h2>
-              <p className="mt-2 text-sm text-fg-muted leading-6 max-w-[56ch]">
+              <p className="mt-3 text-[15px] text-fg-muted leading-relaxed max-w-[44ch]">
                 Paste this into your coding agent so it can create Harness Studio
                 agents, trigger CLI sign-in, route app OAuth, apply manifests,
                 and verify sessions.
               </p>
 
-              <div className="mt-5 flex flex-col sm:flex-row gap-2">
-                <button
-                  onClick={() => copy(HARNESS_AGENT_BUILDER_SKILL, "agent-builder-skill")}
-                  className="inline-flex items-center justify-center gap-2 px-3.5 py-2 bg-brand text-brand-fg rounded-md text-[13px] font-medium hover:bg-brand-hover transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-                >
-                  {copied === "agent-builder-skill" ? (
-                    <Check className="size-4" />
-                  ) : (
-                    <Copy className="size-4" />
-                  )}
+              <div className="mt-6 flex flex-wrap gap-2">
+                <Button onClick={() => copy(HARNESS_AGENT_BUILDER_SKILL, "agent-builder-skill")}>
+                  <CopyGlyph k="agent-builder-skill" />
                   Copy full skill
-                </button>
-                <button
+                </Button>
+                <Button
+                  variant="secondary"
                   onClick={() => copy(HARNESS_AGENT_BUILDER_PROMPT, "agent-builder-prompt")}
-                  className="inline-flex items-center justify-center gap-2 px-3.5 py-2 rounded-md border border-border bg-bg hover:border-border-strong hover:bg-brand-subtle/45 text-[13px] font-medium text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
                 >
-                  {copied === "agent-builder-prompt" ? (
-                    <Check className="size-4" />
-                  ) : (
-                    <Copy className="size-4" />
-                  )}
+                  <CopyGlyph k="agent-builder-prompt" />
                   Copy starter prompt
-                </button>
+                </Button>
               </div>
 
-              <ol className="mt-5 grid sm:grid-cols-3 gap-x-4 gap-y-2 text-[12px] text-fg-muted">
+              <ol className="mt-auto pt-8 grid grid-cols-3 gap-3 text-[12.5px] text-fg-muted">
                 {["CLI sign-in", "OAuth handoff", "Smoke test"].map((item, index) => (
-                  <li key={item} className="flex items-center gap-2 min-w-0">
-                    <span className="font-mono text-[11px] text-brand">
+                  <li key={item} className="min-w-0 border-t border-border pt-3">
+                    <div className="font-mono text-[11px] text-fg-subtle tabular-nums">
                       {String(index + 1).padStart(2, "0")}
-                    </span>
-                    <span className="truncate">{item}</span>
+                    </div>
+                    <div className="mt-0.5 truncate font-medium text-fg">{item}</div>
                   </li>
                 ))}
               </ol>
             </div>
 
-            <div className="bg-bg min-w-0">
-              <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-border">
-                <div className="min-w-0">
-                  <p className="text-[11px] uppercase font-medium text-fg-subtle">
-                    SKILL.md preview
+            <div className="p-3 xl:pl-0 min-w-0 flex">
+              <div className="relative flex-1 min-w-0 rounded-[14px] bg-code-well ring-1 ring-white/5 overflow-hidden flex flex-col">
+                <div className="flex items-center gap-3 pl-4 pr-2 h-11 border-b border-white/8">
+                  <div className="flex gap-1.5" aria-hidden="true">
+                    <span className="size-2.5 rounded-full bg-white/15" />
+                    <span className="size-2.5 rounded-full bg-white/15" />
+                    <span className="size-2.5 rounded-full bg-white/15" />
+                  </div>
+                  <p className="flex-1 min-w-0 truncate font-mono text-[11.5px] text-code-well-muted">
+                    SKILL.md <span className="opacity-60">· preview</span>
                   </p>
-                  <p className="text-[12px] text-fg-muted truncate">
-                    Self-contained paste target
-                  </p>
-                </div>
-                <button
-                  onClick={() => copy(HARNESS_AGENT_BUILDER_SKILL, "agent-builder-skill-preview")}
-                  className="inline-flex items-center justify-center size-8 rounded-md border border-border text-fg-muted hover:text-fg hover:bg-bg-surface transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-                  aria-label="Copy agent builder skill"
-                >
-                  {copied === "agent-builder-skill-preview" ? (
-                    <Check className="size-4" />
-                  ) : (
-                    <Copy className="size-4" />
-                  )}
-                </button>
-              </div>
-              <pre className="max-h-[360px] overflow-auto p-4 text-[12px] leading-5 text-fg-muted font-mono whitespace-pre-wrap break-words">
-                {skillPreview}
-              </pre>
-            </div>
-          </div>
-        </section>
-
-        {/* Stats — number-forward, no decorative icons */}
-        <section>
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
-            {stats_.map((s) => stat(s.label, s.value, s.to))}
-          </div>
-        </section>
-
-        {/* Recent sessions */}
-        <section>
-          <div className="flex items-baseline justify-between mb-3">
-            <h2 className="font-display text-lg font-semibold text-fg">Recent sessions</h2>
-            <button
-              onClick={() => nav("/sessions")}
-              className="inline-flex items-center min-h-11 sm:min-h-0 text-[13px] text-fg-muted hover:text-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-            >
-              View all →
-            </button>
-          </div>
-
-          {sessionsQuery.isLoading ? (
-            <div className="border border-border rounded-lg divide-y divide-border">
-              {Array.from({ length: 4 }).map((_, i) => (
-                <div key={i} className="flex items-center gap-4 px-4 py-3">
-                  <Skeleton className="h-3.5 w-[40%]" rounded="sm" />
-                  <Skeleton className="h-3.5 w-16" rounded="sm" />
-                  <Skeleton className="h-3.5 w-32" rounded="sm" />
-                  <Skeleton className="h-3.5 w-20 ml-auto" rounded="sm" />
-                </div>
-              ))}
-            </div>
-          ) : recentSessions.length === 0 ? (
-            <EmptyState
-              title="No sessions yet"
-              body={
-                <>
-                  Tell your agent to start one, or visit the{" "}
                   <button
-                    onClick={() => nav("/sessions")}
-                    className="inline-flex items-center min-h-11 sm:min-h-0 text-brand hover:underline"
+                    onClick={() => copy(HARNESS_AGENT_BUILDER_SKILL, "agent-builder-skill-preview")}
+                    className="inline-flex items-center justify-center size-8 rounded-full text-code-well-muted hover:text-code-well-fg hover:bg-white/10 transition-colors"
+                    aria-label="Copy agent builder skill"
                   >
-                    Sessions page
+                    <CopyGlyph k="agent-builder-skill-preview" />
                   </button>
-                  .
-                </>
-              }
-            />
-          ) : (
-            <div className="border border-border rounded-lg bg-bg-surface shadow-[var(--shadow-sm)] overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="bg-bg text-fg-subtle text-[11px] uppercase">
-                    <th className="text-left px-4 py-2.5 font-medium">Title</th>
-                    <th className="text-left px-4 py-2.5 font-medium">Status</th>
-                    <th className="text-left px-4 py-2.5 font-medium">Agent</th>
-                    <th className="text-left px-4 py-2.5 font-medium">Created</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {recentSessions.map((s) => (
-                    <tr
-                      key={s.id}
-                      onClick={() => nav(`/sessions/${s.id}`)}
-                      className="border-t border-border hover:bg-brand-subtle/45 cursor-pointer transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-                    >
-                      <td className="px-4 py-2.5 text-fg">{s.title || "Untitled"}</td>
-                      <td className="px-4 py-2.5">
-                        <StatusPill status={s.status || "idle"} />
-                      </td>
-                      <td className="px-4 py-2.5 text-fg-muted font-mono text-[12px]">
-                        {s.agent_id}
-                      </td>
-                      <td className="px-4 py-2.5 text-fg-muted text-[12px]">
-                        {new Date(s.created_at).toLocaleDateString()}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
+                </div>
+                <pre className="flex-1 max-h-[320px] overflow-auto px-4 py-3.5 text-[11.5px] leading-[1.7] text-code-well-fg/85 font-mono whitespace-pre-wrap break-words [scrollbar-width:thin]">
+                  {skillPreview}
+                </pre>
+                <div
+                  aria-hidden="true"
+                  className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-code-well to-transparent"
+                />
+              </div>
             </div>
-          )}
-        </section>
+          </section>
+
+          {/* Headline counts — tall tiles beside the feature */}
+          {primaryStats.map((s, i) => (
+            <div key={s.label} className="md:col-span-3 lg:col-span-4 flex [&>button]:flex-1">
+              {statTile(s, i, true)}
+            </div>
+          ))}
+
+          {/* Compact counts */}
+          {secondaryStats.map((s, i) => (
+            <div key={s.label} className="md:col-span-3 lg:col-span-3 flex [&>button]:flex-1">
+              {statTile(s, i + 2, false)}
+            </div>
+          ))}
+
+          {/* Recent sessions — editorial list */}
+          <section className="studio-rise card rounded-[var(--radius-tile)] md:col-span-6 lg:col-span-12 overflow-hidden" style={{ animationDelay: "320ms" }}>
+            <div className="flex items-end justify-between gap-4 px-7 pt-6 pb-4">
+              <div>
+                <div className="eyebrow mb-1">Activity</div>
+                <h2 className="font-display text-[22px] leading-7 font-bold tracking-[-0.022em] text-fg">
+                  Recent sessions
+                </h2>
+              </div>
+              <button
+                onClick={() => nav("/sessions")}
+                className="inline-flex items-center gap-1 min-h-11 sm:min-h-0 text-[13px] font-medium text-brand hover:underline underline-offset-4"
+              >
+                View all
+                <ChevronRight className="size-3.5" />
+              </button>
+            </div>
+
+            {sessionsQuery.isLoading ? (
+              <div className="px-7 pb-4">
+                {Array.from({ length: 4 }).map((_, i) => (
+                  <div key={i} className="flex items-center gap-6 h-16 border-t border-border">
+                    <Skeleton className="h-3 w-[32%]" rounded="full" />
+                    <Skeleton className="h-3 w-16" rounded="full" />
+                    <Skeleton className="h-3 w-20 ml-auto" rounded="full" />
+                  </div>
+                ))}
+              </div>
+            ) : recentSessions.length === 0 ? (
+              <div className="px-7 pb-7">
+                <EmptyState
+                  className="!shadow-none !border-0 bg-fill"
+                  title="No sessions yet"
+                  body={
+                    <>
+                      Tell your agent to start one, or visit the{" "}
+                      <button
+                        onClick={() => nav("/sessions")}
+                        className="inline-flex items-center min-h-11 sm:min-h-0 text-brand hover:underline"
+                      >
+                        Sessions page
+                      </button>
+                      .
+                    </>
+                  }
+                />
+              </div>
+            ) : (
+              <ul className="px-4 pb-4">
+                {recentSessions.map((s) => (
+                  <li key={s.id} className="mx-3 border-t border-border first:border-t-0">
+                    <button
+                      onClick={() => nav(`/sessions/${s.id}`)}
+                      className="-mx-3 w-[calc(100%+1.5rem)] grid grid-cols-[minmax(0,1fr)_auto] sm:grid-cols-[minmax(0,1fr)_120px_110px] items-center gap-x-6 px-3 h-16 rounded-xl text-left hover:bg-fill/70 transition-colors duration-[var(--dur-base)] outline-none focus-visible:bg-fill"
+                    >
+                      <span className="min-w-0">
+                        <span className="block truncate text-[14.5px] font-semibold tracking-[-0.012em] text-fg">
+                          {s.title || "Untitled"}
+                        </span>
+                        <span className="block truncate font-mono text-[11.5px] text-fg-subtle">
+                          {s.id}
+                          {s.agent_id ? <span className="opacity-70"> · {s.agent_id}</span> : null}
+                        </span>
+                      </span>
+                      <span className="hidden sm:flex">
+                        <StatusPill status={s.status || "idle"} />
+                      </span>
+                      <span className="text-right text-[13px] text-fg-subtle tabular-nums">
+                        {new Date(s.created_at).toLocaleDateString()}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+        </div>
       </div>
     </div>
   );

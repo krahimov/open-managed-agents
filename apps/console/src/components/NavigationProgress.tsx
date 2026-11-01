@@ -51,7 +51,7 @@ export function NavigationProgress() {
       style={{ opacity: visible ? 1 : 0, transition: "opacity 200ms ease-out" }}
     >
       <div
-        className="nav-progress-bar h-full bg-brand origin-left"
+        className="nav-progress-bar h-full bg-accent-fill origin-left"
         style={{
           transform: `scaleX(${progress / 100})`,
           transition: progress === 80

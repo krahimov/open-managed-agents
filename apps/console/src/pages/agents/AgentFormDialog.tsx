@@ -1,7 +1,21 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 import yaml from "js-yaml";
-import { CheckIcon, ExternalLinkIcon, RefreshCwIcon, XCircleIcon } from "lucide-react";
+import { CheckIcon, ExternalLinkIcon, RefreshCwIcon, XCircleIcon,
+  BarChart3Icon,
+  BugIcon,
+  BracesIcon,
+  CalendarRangeIcon,
+  HeadsetIcon,
+  MessagesSquareIcon,
+  PlusIcon,
+  RadarIcon,
+  SearchIcon,
+  SirenIcon,
+  SparklesIcon,
+  TelescopeIcon,
+  type LucideIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 
 import { getActiveTenantId, readApiErrorMessage, useApi } from "../../lib/api";
@@ -287,6 +301,21 @@ interface AgentFormDialogProps {
  * handling are reimplemented inline (mirroring `components/Modal.tsx`
  * behavior) so keyboard + screen-reader users get the same affordances.
  */
+
+/** Per-template glyph for the gallery tiles (presentational only). */
+const TEMPLATE_GLYPHS: Record<string, LucideIcon> = {
+  blank: PlusIcon,
+  "deep-research": TelescopeIcon,
+  "structured-extractor": BracesIcon,
+  "field-monitor": RadarIcon,
+  "support-agent": HeadsetIcon,
+  "incident-commander": SirenIcon,
+  "feedback-miner": MessagesSquareIcon,
+  "sprint-retro-facilitator": CalendarRangeIcon,
+  "support-to-eng-escalator": BugIcon,
+  "data-analyst": BarChart3Icon,
+};
+
 export function AgentFormDialog({
   open,
   onClose,
@@ -1384,10 +1413,10 @@ export function AgentFormDialog({
     : AGENT_TEMPLATES;
 
   const inputCls =
-    "w-full border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
+    "w-full border border-border-strong rounded-[10px] px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg-surface text-fg outline-none focus:border-ring focus:ring-4 focus:ring-ring/15 transition-[border-color,box-shadow] duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle dark:bg-fill dark:border-border";
   const tabCls = (t: string) =>
-    `inline-flex items-center justify-center px-3 py-1.5 min-h-11 sm:min-h-0 text-sm rounded-md transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
-      tab === t ? "bg-brand text-brand-fg" : "text-fg-muted hover:bg-bg-surface"
+    `inline-flex items-center justify-center h-8 px-3.5 min-h-11 sm:min-h-0 text-[13px] font-medium rounded-full transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
+      tab === t ? "bg-ink text-brand-fg" : "text-fg-muted hover:bg-fill hover:text-fg"
     }`;
 
   // Resolve which card the Model dropdown should highlight: explicit pick
@@ -1405,7 +1434,7 @@ export function AgentFormDialog({
   return (
     <>
       <div
-        className="fixed inset-0 bg-bg-overlay flex items-center justify-center z-50"
+        className="studio-overlay-mount fixed inset-0 bg-bg-overlay supports-backdrop-filter:backdrop-blur-[3px] flex items-center justify-center z-50 p-4"
         onClick={closeCreate}
       >
         <div
@@ -1413,65 +1442,89 @@ export function AgentFormDialog({
           role="dialog"
           aria-modal="true"
           aria-label={isEdit ? "Edit Agent" : "New Agent"}
-            className="bg-bg rounded-lg shadow-xl w-full max-w-5xl max-h-[85vh] flex flex-col"
+            className="studio-dialog-mount bg-bg dark:bg-bg-elevated rounded-[26px] shadow-[var(--shadow-dialog)] w-full max-w-5xl max-h-[88vh] flex flex-col overflow-hidden"
           onClick={(e) => e.stopPropagation()}
         >
           {/* Template selection step */}
           {createStep === "template" && (
             <>
-              <div className="px-6 pt-6 pb-4 border-b border-border">
-                <h2 className="font-display text-lg font-semibold text-fg">New Agent</h2>
-                <p className="text-sm text-fg-muted mt-1">
-                  Start from a template or build from scratch.
-                </p>
-                <input
-                  value={templateSearch}
-                  onChange={(e) => setTemplateSearch(e.target.value)}
-                  className={`${inputCls} mt-3`}
-                  placeholder="Search templates..."
-                  aria-label="Search templates"
-                />
+              <div className="px-8 pt-8 pb-5 flex flex-wrap items-end justify-between gap-4">
+                <div>
+                  <div className="eyebrow mb-1.5">Templates</div>
+                  <h2 className="font-display text-title text-fg">New Agent</h2>
+                  <p className="text-[15px] text-fg-muted mt-1.5">
+                    Start from a template or build from scratch.
+                  </p>
+                </div>
+                <div className="relative w-full sm:w-72">
+                  <SearchIcon className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 size-3.5 text-fg-subtle" aria-hidden="true" />
+                  <input
+                    value={templateSearch}
+                    onChange={(e) => setTemplateSearch(e.target.value)}
+                    className="w-full h-10 rounded-full bg-fill pl-9 pr-4 text-sm text-fg outline-none placeholder:text-fg-subtle border border-transparent focus:bg-bg-surface focus:border-ring focus:ring-4 focus:ring-ring/15 transition-[background-color,border-color,box-shadow] duration-[var(--dur-base)]"
+                    placeholder="Search templates..."
+                    aria-label="Search templates"
+                  />
+                </div>
               </div>
-              <div className="flex-1 overflow-y-auto px-6 py-4">
-                <div className="grid grid-cols-2 gap-3">
-                  {filteredTemplates.map((tmpl) => (
-                    <button
-                      key={tmpl.id}
-                      onClick={() => selectTemplate(tmpl)}
-                      className="text-left border border-border rounded-lg p-4 hover:border-brand hover:bg-bg-surface transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-                    >
-                      <div className="font-medium text-sm text-fg">{tmpl.name}</div>
-                      <div className="text-xs text-fg-muted mt-1 line-clamp-2">
-                        {tmpl.description}
-                      </div>
-                      {tmpl.tags.length > 0 && (
-                        <div className="flex flex-wrap gap-1 mt-2">
-                          {tmpl.tags.map((tag) => (
-                            <span
-                              key={tag}
-                              className="px-1.5 py-0.5 bg-bg-surface text-fg-muted rounded text-[10px]"
-                            >
-                              {tag}
-                            </span>
-                          ))}
-                        </div>
-                      )}
-                    </button>
-                  ))}
+              <div className="flex-1 overflow-y-auto px-8 pb-6 pt-1">
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                  {filteredTemplates.map((tmpl, i) => {
+                    const Glyph = TEMPLATE_GLYPHS[tmpl.id] ?? SparklesIcon;
+                    const blank = tmpl.id === "blank";
+                    return (
+                      <button
+                        key={tmpl.id}
+                        onClick={() => selectTemplate(tmpl)}
+                        style={{ animationDelay: `${Math.min(i, 9) * 30}ms` }}
+                        className={`studio-rise group text-left rounded-[18px] p-5 min-h-[172px] flex flex-col outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring card-hover press ${
+                          blank
+                            ? "border border-dashed border-border-strong bg-transparent hover:bg-bg-surface dark:hover:bg-white/[0.04]"
+                            : "bg-bg-surface shadow-[var(--shadow-card)] dark:bg-white/[0.045] dark:shadow-none dark:ring-1 dark:ring-card-border"
+                        }`}
+                      >
+                        <span
+                          className={`flex size-10 items-center justify-center rounded-[11px] ${
+                            blank
+                              ? "bg-fill text-fg-muted"
+                              : "bg-gradient-to-b from-[#3a3a3c] to-[#1d1d1f] text-white shadow-[inset_0_0.5px_0_rgb(255_255_255/0.2)] dark:from-[#f5f5f7] dark:to-[#d2d2d7] dark:text-[#1d1d1f]"
+                          }`}
+                          aria-hidden="true"
+                        >
+                          <Glyph className="size-[18px]" strokeWidth={1.75} />
+                        </span>
+                        <span className="mt-4 text-[15px] font-semibold tracking-[-0.014em] text-fg">
+                          {tmpl.name}
+                        </span>
+                        <span className="text-[13px] leading-snug text-fg-muted mt-1 line-clamp-2">
+                          {tmpl.description}
+                        </span>
+                        {tmpl.tags.length > 0 && (
+                          <span className="mt-auto pt-3 flex flex-wrap gap-1">
+                            {tmpl.tags.map((tag) => (
+                              <span
+                                key={tag}
+                                className="h-5 inline-flex items-center px-2 bg-fill text-fg-muted rounded-full text-[11px] font-medium capitalize"
+                              >
+                                {tag}
+                              </span>
+                            ))}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
                 </div>
                 {filteredTemplates.length === 0 && (
-                  <div className="text-center py-8 text-fg-subtle text-sm">
+                  <div className="text-center py-12 text-fg-subtle text-sm">
                     No templates match your search.
                   </div>
                 )}
               </div>
-              <div className="px-6 py-4 border-t border-border flex justify-end">
-                <button
-                  onClick={closeCreate}
-                  className="inline-flex items-center min-h-11 sm:min-h-0 px-4 py-2 text-sm text-fg-muted hover:text-fg"
-                >
+              <div className="px-8 py-4 border-t border-border flex justify-end">
+                <Button variant="ghost" onClick={closeCreate}>
                   Cancel
-                </button>
+                </Button>
               </div>
             </>
           )}
@@ -1479,8 +1532,8 @@ export function AgentFormDialog({
           {/* Form step */}
           {createStep === "form" && (
             <>
-              <div className="px-6 pt-6 pb-4 border-b border-border">
-                <div className="flex items-center justify-between mb-1">
+              <div className="px-8 pt-7 pb-4 border-b border-border">
+                <div className="flex items-center justify-between mb-2">
                   {isEdit ? (
                     <span className="text-sm text-fg-subtle">
                       Saving creates version {(editAgent?.version ?? 0) + 1}; running sessions keep their snapshot.
@@ -1497,15 +1550,15 @@ export function AgentFormDialog({
                     &larr; Templates
                   </button>
                   )}
-                  <div className="flex items-center gap-0.5 bg-bg-surface rounded-md p-0.5">
+                  <div className="flex items-center gap-0.5 bg-fill rounded-full p-[3px]">
                     {(["form", "yaml", "json"] as const).map((m) => (
                       <button
                         key={m}
                         onClick={() => switchMode(m)}
-                        className={`inline-flex items-center justify-center px-2 py-1 min-h-11 sm:min-h-0 text-xs rounded transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
+                        className={`inline-flex items-center justify-center h-7 px-3 min-h-11 sm:min-h-0 text-xs rounded-full transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
                           createMode === m
-                            ? "bg-bg text-fg font-medium shadow-sm"
-                            : "text-fg-muted hover:text-fg"
+                            ? "bg-bg-surface text-fg font-semibold shadow-[0_1px_3px_rgb(0_0_0/0.1)] dark:bg-white/14"
+                            : "text-fg-muted font-medium hover:text-fg"
                         }`}
                       >
                         {m === "form" ? "Form" : m.toUpperCase()}
@@ -1513,7 +1566,7 @@ export function AgentFormDialog({
                     ))}
                   </div>
                 </div>
-                <h2 className="font-display text-lg font-semibold text-fg">
+                <h2 className="font-display text-title text-fg">
                   {isEdit ? `Edit ${editAgent?.name || "agent"}` : "New Agent"}
                 </h2>
                 {createMode === "form" && (
@@ -2613,7 +2666,7 @@ function IntegrationsTab({
                   onClick={() => onToggle(entry)}
                   className={`inline-flex items-center justify-center gap-1.5 min-h-11 sm:min-h-0 px-3 py-1.5 rounded-md text-xs border ${
                     selected
-                      ? "border-brand bg-brand text-brand-fg"
+                      ? "border-ink bg-ink text-brand-fg"
                       : "border-border text-fg-muted hover:text-fg"
                   }`}
                 >
@@ -2713,7 +2766,7 @@ function VaultsTab({
                 <span
                   className={`inline-flex size-5 items-center justify-center rounded border shrink-0 ${
                     selected
-                      ? "border-brand bg-brand text-brand-fg"
+                      ? "border-ink bg-ink text-brand-fg"
                       : "border-border bg-bg"
                   }`}
                   aria-hidden="true"
@@ -3064,7 +3117,7 @@ function SkillsTab({
                 onClick={() => toggleAnthropicSkill(s.id)}
                 className={`flex items-center gap-2 px-3 py-2.5 rounded-md border text-sm text-left transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
                   active
-                    ? "border-brand bg-brand text-brand-fg"
+                    ? "border-ink bg-ink text-brand-fg"
                     : "border-border hover:border-border-strong"
                 }`}
               >
@@ -3115,7 +3168,7 @@ function SkillsTab({
                   }}
                   className={`flex items-center gap-2 w-full px-3 py-2.5 rounded-md border text-sm text-left transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
                     active
-                      ? "border-brand bg-brand text-brand-fg"
+                      ? "border-ink bg-ink text-brand-fg"
                       : "border-border hover:border-border-strong"
                   }`}
                 >

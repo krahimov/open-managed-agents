@@ -48,7 +48,7 @@ export function Markdown({ children }: { children: string }) {
       remarkPlugins={[remarkGfm]}
       components={{
         pre: ({ children }) => (
-          <pre className="bg-bg-surface border border-border rounded-md p-3 overflow-x-auto my-2 text-[13px]">
+          <pre className="bg-bg-inset rounded-xl px-4 py-3.5 overflow-x-auto my-3 text-[12.5px] leading-relaxed">
             {children}
           </pre>
         ),
@@ -56,7 +56,7 @@ export function Markdown({ children }: { children: string }) {
           const isInline = !className;
           if (isInline) {
             return (
-              <code className="bg-bg-surface px-1 py-0.5 rounded text-[0.85em] font-mono" {...props}>
+              <code className="bg-fill px-1.5 py-0.5 rounded-md text-[0.86em] font-mono" {...props}>
                 {children}
               </code>
             );
@@ -82,13 +82,13 @@ export function Markdown({ children }: { children: string }) {
             </code>
           );
         },
-        p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
-        ul: ({ children }) => <ul className="list-disc pl-5 my-1">{children}</ul>,
-        ol: ({ children }) => <ol className="list-decimal pl-5 my-1">{children}</ol>,
+        p: ({ children }) => <p className="mb-3 last:mb-0">{children}</p>,
+        ul: ({ children }) => <ul className="list-disc pl-5 my-2 marker:text-fg-subtle">{children}</ul>,
+        ol: ({ children }) => <ol className="list-decimal pl-5 my-2 marker:text-fg-subtle">{children}</ol>,
         li: ({ children }) => <li className="my-0.5">{children}</li>,
-        h1: ({ children }) => <h1 className="font-display text-lg font-semibold mt-3 mb-1 text-fg">{children}</h1>,
-        h2: ({ children }) => <h2 className="font-display text-base font-semibold mt-2 mb-1 text-fg">{children}</h2>,
-        h3: ({ children }) => <h3 className="font-semibold mt-2 mb-1 text-fg">{children}</h3>,
+        h1: ({ children }) => <h1 className="font-display text-[22px] leading-7 font-bold tracking-[-0.022em] mt-5 mb-2 text-fg">{children}</h1>,
+        h2: ({ children }) => <h2 className="font-display text-[18px] leading-6 font-bold tracking-[-0.018em] mt-4 mb-1.5 text-fg">{children}</h2>,
+        h3: ({ children }) => <h3 className="font-semibold mt-3 mb-1 text-fg">{children}</h3>,
         blockquote: ({ children }) => (
           <blockquote className="border-l-2 border-border-strong pl-3 my-2 text-fg-muted">{children}</blockquote>
         ),
@@ -96,10 +96,10 @@ export function Markdown({ children }: { children: string }) {
           <table className="border-collapse my-2 text-sm w-full">{children}</table>
         ),
         th: ({ children }) => (
-          <th className="border border-border px-2 py-1 bg-bg-surface text-left text-fg">{children}</th>
+          <th className="border-b border-border-strong px-3 py-2 text-left text-fg font-semibold">{children}</th>
         ),
         td: ({ children }) => (
-          <td className="border border-border px-2 py-1 text-fg">{children}</td>
+          <td className="border-b border-border px-3 py-2 text-fg">{children}</td>
         ),
       }}
     >

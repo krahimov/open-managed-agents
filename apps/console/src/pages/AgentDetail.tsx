@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { ChevronRight } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useParams, Link, useNavigate, useSearchParams } from "react-router";
 import { toast } from "sonner";
@@ -12,6 +13,7 @@ import { Field } from "../components/Field";
 import { PageHeader } from "../components/PageHeader";
 import { CreateDeploymentDialog } from "../components/CreateDeploymentDialog";
 import { Button } from "@/components/ui/button";
+import { IdChip, StatusPill } from "../components/Badge";
 import type { AgentRecord as Agent } from "../types/agent";
 import { AmbientTriggerControls } from "../components/AmbientTriggerControls";
 import { AgentComputerPanel } from "../components/AgentComputerPanel";
@@ -190,194 +192,210 @@ export function AgentDetail() {
   if (error) return <div className="p-10 text-danger">Error: {error}</div>;
   if (!agent) return <div className="p-10 text-fg-subtle">Loading...</div>;
 
+  const isArchived = !!agent.archived_at;
+  const props: Array<[string, React.ReactNode]> = [
+    ["ID", <IdChip key="id" id={agent.id} />],
+    ["Model", modelStr(agent.model)],
+    ["Harness", agent._oma?.harness || "default"],
+    ...(agent._oma?.default_environment_id
+      ? ([["Default Sandbox", <IdChip key="env" id={agent._oma.default_environment_id} />]] as Array<[string, React.ReactNode]>)
+      : []),
+    ...(agent._oma?.default_vault_ids && agent._oma.default_vault_ids.length > 0
+      ? ([[
+          "Default Vaults",
+          <span key="v" className="flex flex-wrap gap-1.5">
+            {agent._oma.default_vault_ids.map((v) => <IdChip key={v} id={v} />)}
+          </span>,
+        ]] as Array<[string, React.ReactNode]>)
+      : []),
+    ...(agent._oma?.runtime_binding
+      ? ([[
+          "Local Runtime",
+          <span key="rt" className="text-xs">
+            <span className="font-mono">{agent._oma.runtime_binding.runtime_id.slice(0, 8)}…</span>
+            <span className="text-fg-subtle"> · ACP agent: </span>
+            <span className="font-mono">{agent._oma.runtime_binding.acp_agent_id}</span>
+          </span>,
+        ]] as Array<[string, React.ReactNode]>)
+      : []),
+    ["Version", `v${agent.version}`],
+    ["Tools", (agent.tools || []).map((t: any) => t.type === "custom" ? `Custom: ${t.name}` : t.type).join(", ") || "None"],
+    ["Created", new Date(agent.created_at).toLocaleString()],
+    ["Updated", new Date(agent.updated_at || agent.created_at).toLocaleString()],
+    ...(agent.archived_at
+      ? ([["Archived", <span key="a" className="text-warning">{new Date(agent.archived_at).toLocaleString()}</span>]] as Array<[string, React.ReactNode]>)
+      : []),
+  ];
+
   return (
     <Page
       header={
         <PageHeader
+          size="hero"
+          eyebrow="Agent"
           title={agent.name}
+          subtitle={
+            <span className="flex flex-wrap items-center gap-x-4 gap-y-2 text-[14px]">
+              <StatusPill
+                status={isArchived ? "archived" : "active"}
+                label={isArchived ? "Archived" : "Active"}
+              />
+              <span className="text-fg">{modelStr(agent.model)}</span>
+              <span className="text-fg-subtle tabular-nums">Version {agent.version}</span>
+              <span className="text-fg-subtle">Harness · {agent._oma?.harness || "default"}</span>
+            </span>
+          }
           actions={
             <>
-              <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
+              <Button variant="ghost" onClick={del} className="text-danger hover:text-danger hover:bg-danger-subtle">
+                Delete
+              </Button>
+              <Button variant="ghost" onClick={archive}>
+                Archive
+              </Button>
+              <Button variant="secondary" onClick={() => setEditing(true)}>
                 Edit
               </Button>
-              <Button variant="outline" size="sm" onClick={openSetup} disabled={openingSetup}>
+              <Button variant="secondary" onClick={() => setShowDeploy(true)}>
+                Deploy
+              </Button>
+              <Button variant="secondary" onClick={openSetup} disabled={openingSetup}>
                 {openingSetup ? "Opening…" : "Setup chat"}
               </Button>
               <Button
-                variant="outline"
-                size="sm"
                 onClick={() => nav(`/sessions?new=1&agent_id=${encodeURIComponent(agent.id)}`)}
               >
                 Start session
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => setShowDeploy(true)}>
-                Deploy
-              </Button>
-              <Button variant="outline" size="sm" onClick={archive}>
-                Archive
-              </Button>
-              <Button variant="destructive" size="sm" onClick={del}>
-                Delete
               </Button>
             </>
           }
         />
       }
     >
-      <div className="space-y-6">
-        <AgentFormDialog
-          open={editing}
-          onClose={() => setEditing(false)}
-          editAgent={agent}
-          onSaved={() => {
-            void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}`] });
-            void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}/versions`] });
-            void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}/ambient-rules`] });
-          }}
-          onOpenSetup={() => void openSetup()}
-          allAgents={formAux.allAgents}
-          customSkills={formAux.customSkills}
-          modelCards={formAux.modelCards}
-          runtimes={formAux.runtimes}
-        />
-        {/* Properties grid */}
-        <div className="grid grid-cols-[140px_1fr] gap-x-4 gap-y-2 max-w-2xl text-sm">
-          <span className="text-fg-muted">ID</span><span className="font-mono text-xs">{agent.id}</span>
-          <span className="text-fg-muted">Model</span><span>{modelStr(agent.model)}</span>
-          <span className="text-fg-muted">Harness</span><span>{agent._oma?.harness || "default"}</span>
-          {agent._oma?.default_environment_id && (
-            <>
-              <span className="text-fg-muted">Default Sandbox</span>
-              <span className="font-mono text-xs">{agent._oma.default_environment_id}</span>
-            </>
-          )}
-          {agent._oma?.default_vault_ids && agent._oma.default_vault_ids.length > 0 && (
-            <>
-              <span className="text-fg-muted">Default Vaults</span>
-              <span className="font-mono text-xs">{agent._oma.default_vault_ids.join(", ")}</span>
-            </>
-          )}
-          {agent._oma?.runtime_binding && (
-            <>
-              <span className="text-fg-muted">Local Runtime</span>
-              <span className="text-xs">
-                <span className="font-mono">{agent._oma.runtime_binding.runtime_id.slice(0, 8)}…</span>
-                <span className="text-fg-subtle"> · ACP agent: </span>
-                <span className="font-mono">{agent._oma.runtime_binding.acp_agent_id}</span>
-              </span>
-            </>
-          )}
-          <span className="text-fg-muted">Version</span><span>v{agent.version}</span>
-          <span className="text-fg-muted">Tools</span>
-          <span>{(agent.tools || []).map((t: any) => t.type === "custom" ? `Custom: ${t.name}` : t.type).join(", ") || "None"}</span>
-          <span className="text-fg-muted">Created</span><span>{new Date(agent.created_at).toLocaleString()}</span>
-          <span className="text-fg-muted">Updated</span><span>{new Date(agent.updated_at || agent.created_at).toLocaleString()}</span>
-          {agent.archived_at && <><span className="text-fg-muted">Archived</span><span className="text-warning">{new Date(agent.archived_at).toLocaleString()}</span></>}
-        </div>
-
-      <AgentComputerPanel key={agent.id} agentId={agent.id} />
-
-      {/* Integrations — one fold per provider so adding a 4th / 5th doesn't
-          push the rest of the page below the viewport. Default-open when
-          there's at least one live publication so the user sees what's wired
-          up at a glance; otherwise default-closed. */}
-      <div className="mt-6 max-w-2xl">
-        <h2 className="font-display text-base font-semibold mb-2">Integrations</h2>
-        {composioApps.length > 0 && (
-          <div className="grid gap-2 sm:grid-cols-2 mb-3">
-            {composioApps.map((entry) => (
-              <div
-                key={entry.slug}
-                className="border border-border rounded-md p-3 flex items-center gap-3 bg-bg"
-              >
-                <img
-                  src={composioIntegrationIcon(entry)}
-                  alt=""
-                  loading="lazy"
-                  decoding="async"
-                  className="w-6 h-6 rounded shrink-0"
-                  onError={(e) => {
-                    (e.target as HTMLImageElement).style.display = "none";
-                  }}
-                />
-                <div className="min-w-0">
-                  <div className="font-medium text-sm text-fg truncate">{entry.name}</div>
-                  <div className="text-xs text-fg-subtle">{entry.category}</div>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-        <div className="space-y-2">
-          <IntegrationFold
-            kind="linear"
-            label="Linear"
-            icon={<LinearIcon className="w-4 h-4" />}
-            pubs={linearPubs}
-            agentId={agent.id}
-          />
-          <IntegrationFold
-            kind="github"
-            label="GitHub"
-            icon={<GitHubIcon className="w-4 h-4" />}
-            pubs={githubPubs}
-            agentId={agent.id}
-          />
-          <IntegrationFold
-            kind="slack"
-            label="Slack"
-            icon={<SlackIcon className="w-4 h-4" />}
-            pubs={slackPubs}
-            agentId={agent.id}
-          />
-        </div>
-      </div>
-
-      <AmbientRulesPanel
-        agentId={agent.id}
-        rules={ambientRulesRes?.data ?? []}
+      <AgentFormDialog
+        open={editing}
+        onClose={() => setEditing(false)}
+        editAgent={agent}
+        onSaved={() => {
+          void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}`] });
+          void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}/versions`] });
+          void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}/ambient-rules`] });
+        }}
+        onOpenSetup={() => void openSetup()}
+        allAgents={formAux.allAgents}
+        customSkills={formAux.customSkills}
+        modelCards={formAux.modelCards}
+        runtimes={formAux.runtimes}
       />
 
-      <AccessPanel agentId={agent.id} />
+      {/* Bento: overview + prompt side by side, then the operational
+          sections as full-bleed cards. */}
+      <div className="grid grid-cols-1 xl:grid-cols-12 gap-4 max-w-[1320px] pt-4">
+        <BentoCard eyebrow="Configuration" title="Overview" className={agent.system ? "xl:col-span-7" : "xl:col-span-12"}>
+          <dl className="grid sm:grid-cols-2 gap-x-8">
+            {props.map(([k, v]) => (
+              <div key={k} className="min-w-0 py-3 border-t border-border first:border-t-0 sm:[&:nth-child(2)]:border-t-0">
+                <dt className="eyebrow">{k}</dt>
+                <dd className="mt-1 text-sm text-fg truncate">{v}</dd>
+              </div>
+            ))}
+          </dl>
+        </BentoCard>
 
-      <AuditTrailPanel agentId={agent.id} agentName={agent.name} />
+        {agent.system && (
+          <BentoCard eyebrow="Behaviour" title="System prompt" className="xl:col-span-5 flex flex-col">
+            <pre className="flex-1 min-h-0 max-h-[340px] overflow-y-auto rounded-xl bg-bg-inset px-4 py-3.5 text-[12.5px] whitespace-pre-wrap font-mono text-fg-muted leading-relaxed">
+              {agent.system}
+            </pre>
+          </BentoCard>
+        )}
 
-      {/* System prompt */}
-      {agent.system && (
-        <div className="mt-8 max-w-2xl">
-          <h2 className="font-display text-base font-semibold mb-2">System Prompt</h2>
-          <pre className="bg-bg-surface border border-border rounded-lg p-4 text-sm whitespace-pre-wrap max-h-64 overflow-y-auto font-mono text-fg-muted leading-relaxed">
-            {agent.system}
-          </pre>
+        <div className="xl:col-span-12">
+          <AgentComputerPanel key={agent.id} agentId={agent.id} />
         </div>
-      )}
 
-      {/* Version history */}
-      {versions.length > 0 && (
-        <div className="mt-8 max-w-2xl">
-          <h2 className="font-display text-base font-semibold mb-2">Version History</h2>
-          <div className="border border-border rounded-lg overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase">
-                  <th className="text-left px-4 py-2">Version</th>
-                  <th className="text-left px-4 py-2">Model</th>
-                  <th className="text-left px-4 py-2">System Prompt</th>
-                </tr>
-              </thead>
-              <tbody>
-                {versions.map((v) => (
-                  <tr key={v.version} className="border-t border-border">
-                    <td className="px-4 py-2">v{v.version}</td>
-                    <td className="px-4 py-2 text-fg-muted">{modelStr(v.model)}</td>
-                    <td className="px-4 py-2 text-fg-muted max-w-xs truncate">{v.system || "—"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+        {/* Integrations — one fold per provider. Default-open when there's
+            at least one live publication. */}
+        <BentoCard eyebrow="Channels" title="Integrations" className={versions.length > 0 ? "xl:col-span-6" : "xl:col-span-12"}>
+          {composioApps.length > 0 && (
+            <div className="grid gap-2 sm:grid-cols-2 mb-3">
+              {composioApps.map((entry) => (
+                <div
+                  key={entry.slug}
+                  className="rounded-xl bg-bg-inset p-3 flex items-center gap-3"
+                >
+                  <img
+                    src={composioIntegrationIcon(entry)}
+                    alt=""
+                    loading="lazy"
+                    decoding="async"
+                    className="w-7 h-7 rounded-lg shrink-0"
+                    onError={(e) => {
+                      (e.target as HTMLImageElement).style.display = "none";
+                    }}
+                  />
+                  <div className="min-w-0">
+                    <div className="font-semibold text-sm text-fg truncate">{entry.name}</div>
+                    <div className="text-xs text-fg-subtle">{entry.category}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          <div className="divide-y divide-border">
+            <IntegrationFold
+              kind="linear"
+              label="Linear"
+              icon={<LinearIcon className="w-4 h-4" />}
+              pubs={linearPubs}
+              agentId={agent.id}
+            />
+            <IntegrationFold
+              kind="github"
+              label="GitHub"
+              icon={<GitHubIcon className="w-4 h-4" />}
+              pubs={githubPubs}
+              agentId={agent.id}
+            />
+            <IntegrationFold
+              kind="slack"
+              label="Slack"
+              icon={<SlackIcon className="w-4 h-4" />}
+              pubs={slackPubs}
+              agentId={agent.id}
+            />
           </div>
+        </BentoCard>
+
+        {/* Version history */}
+        {versions.length > 0 && (
+          <BentoCard eyebrow="History" title="Versions" className="xl:col-span-6">
+            <ul>
+              {versions.map((v) => (
+                <li key={v.version} className="grid grid-cols-[56px_minmax(0,0.8fr)_minmax(0,1.2fr)] items-center gap-4 h-12 border-t border-border text-sm">
+                  <span className="font-semibold tabular-nums text-fg">v{v.version}</span>
+                  <span className="truncate text-fg-muted">{modelStr(v.model)}</span>
+                  <span className="truncate text-fg-subtle">{v.system || "—"}</span>
+                </li>
+              ))}
+            </ul>
+          </BentoCard>
+        )}
+
+        <div className="xl:col-span-12">
+          <AmbientRulesPanel
+            agentId={agent.id}
+            rules={ambientRulesRes?.data ?? []}
+          />
         </div>
-      )}
+
+        <div className="xl:col-span-12">
+          <AccessPanel agentId={agent.id} />
+        </div>
+
+        <div className="xl:col-span-12">
+          <AuditTrailPanel agentId={agent.id} agentName={agent.name} />
+        </div>
       </div>
 
       <CreateDeploymentDialog
@@ -386,6 +404,34 @@ export function AgentDetail() {
         initialAgentId={agent.id}
       />
     </Page>
+  );
+}
+
+/** Bento section card — eyebrow + headline, content below, no inner box. */
+function BentoCard({
+  eyebrow,
+  title,
+  action,
+  className = "",
+  children,
+}: {
+  eyebrow?: string;
+  title: string;
+  action?: React.ReactNode;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <section className={`card rounded-[var(--radius-tile)] p-6 min-w-0 ${className}`.trim()}>
+      <div className="flex items-end justify-between gap-3 mb-4">
+        <div className="min-w-0">
+          {eyebrow && <div className="eyebrow mb-1">{eyebrow}</div>}
+          <h2 className="font-display text-[20px] leading-6 font-bold tracking-[-0.02em] text-fg">{title}</h2>
+        </div>
+        {action}
+      </div>
+      {children}
+    </section>
   );
 }
 
@@ -428,10 +474,11 @@ function AccessPanel({ agentId }: { agentId: string }) {
   const versions = data?.versions ?? [];
 
   return (
-    <div className="mt-6 max-w-2xl">
-      <h2 className="font-display text-base font-semibold mb-2">Access</h2>
+    <div className="card rounded-[var(--radius-tile)] p-6">
+      <div className="eyebrow mb-1">Permissions</div>
+      <h2 className="font-display text-[20px] leading-6 font-bold tracking-[-0.02em] mb-4">Access</h2>
       {!baseline || !baseline.enabled ? (
-        <div className="border border-border rounded-lg p-4 text-sm text-fg-subtle">
+        <div className="rounded-xl bg-bg-inset p-4 text-sm text-fg-subtle">
           No access policy. This agent can use every tool its config exposes
           (legacy behavior).
           {baseline && !baseline.enabled && (
@@ -439,8 +486,8 @@ function AccessPanel({ agentId }: { agentId: string }) {
           )}
         </div>
       ) : (
-        <div className="border border-border rounded-lg overflow-hidden">
-          <div className="flex items-center justify-between gap-3 px-4 py-2 bg-bg-surface/60 text-xs text-fg-muted">
+        <div className="rounded-xl bg-bg-inset overflow-hidden">
+          <div className="flex items-center justify-between gap-3 px-4 py-2.5 border-b border-border text-xs text-fg-muted">
             <span>
               Baseline grant <span className="font-mono">v{baseline.version}</span>
               {" · "}applies to sessions created after approval
@@ -610,10 +657,11 @@ function AuditTrailPanel({
     "px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg";
 
   return (
-    <div className="mt-8 max-w-4xl audit-trail-print">
+    <div className="card rounded-[var(--radius-tile)] p-6 audit-trail-print">
       <div className="flex items-center justify-between gap-3 mb-3">
         <div>
-          <h2 className="font-display text-base font-semibold">Audit trail</h2>
+          <div className="eyebrow mb-1">Compliance</div>
+          <h2 className="font-display text-[20px] leading-6 font-bold tracking-[-0.02em]">Audit trail</h2>
           <p className="text-xs text-fg-subtle">
             {agentName} · authority record generated{" "}
             {capability ? new Date(capability.generated_at).toLocaleString() : "…"}
@@ -637,10 +685,10 @@ function AuditTrailPanel({
           </span>
         )}
       </h3>
-      <div className="border border-border rounded-lg overflow-x-auto mb-2">
+      <div className="rounded-xl bg-bg-inset overflow-x-auto mb-2">
         <table className="w-full text-sm">
           <thead>
-            <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase">
+            <tr className="text-left eyebrow">
               <th className="text-left px-4 py-2">Tool</th>
               <th className="text-left px-4 py-2">Effect</th>
               <th className="text-left px-4 py-2">Rule</th>
@@ -676,11 +724,11 @@ function AuditTrailPanel({
         Approval history
       </h3>
       {(approvals?.versions ?? []).length === 0 ? (
-        <div className="border border-border rounded-lg p-4 text-sm text-fg-subtle">
+        <div className="rounded-xl bg-bg-inset p-4 text-sm text-fg-subtle">
           No grant versions yet — nothing has been approved for this agent.
         </div>
       ) : (
-        <div className="border border-border rounded-lg divide-y divide-border">
+        <div className="rounded-xl bg-bg-inset divide-y divide-border">
           {(approvals?.versions ?? []).map((v) => (
             <div key={v.version} className="px-4 py-2.5 text-sm">
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -762,7 +810,7 @@ function AuditTrailPanel({
             .join(" · ")}
         </p>
       )}
-      <div className="border border-border rounded-lg overflow-hidden">
+      <div className="rounded-xl bg-bg-inset overflow-hidden">
         {(activity?.events ?? []).length === 0 ? (
           <div className="px-4 py-6 text-sm text-fg-subtle">
             No policy, skill, or access events in this range.
@@ -856,10 +904,11 @@ function AmbientRulesPanel({
   };
 
   return (
-    <div className="mt-8 max-w-4xl">
-      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between mb-3">
+    <div className="card rounded-[var(--radius-tile)] p-6">
+      <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between mb-4">
         <div>
-          <h2 className="font-display text-base font-semibold">Ambient</h2>
+          <div className="eyebrow mb-1">Triggers</div>
+          <h2 className="font-display text-[20px] leading-6 font-bold tracking-[-0.02em]">Ambient</h2>
           <p className="text-xs text-fg-subtle">
             {rules.filter((r) => r.enabled).length} enabled · {rules.length} total
           </p>
@@ -867,7 +916,7 @@ function AmbientRulesPanel({
       </div>
 
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <div className="border border-border rounded-lg overflow-hidden">
+        <div className="rounded-xl bg-bg-inset overflow-hidden">
           {rules.length === 0 ? (
             <div className="px-4 py-8 text-sm text-fg-subtle">
               No ambient rules configured.
@@ -924,7 +973,7 @@ function AmbientRulesPanel({
           )}
         </div>
 
-        <div className="border border-border rounded-lg p-4 space-y-3">
+        <div className="rounded-xl bg-bg-inset p-4 space-y-3">
           <h3 className="font-display text-sm font-semibold">New Rule</h3>
           {err && <div className="text-xs text-danger">{err}</div>}
           <Field label="Name">
@@ -932,7 +981,7 @@ function AmbientRulesPanel({
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Hourly PR review"
-              className="w-full px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg"
+              className="w-full h-9 px-3 text-sm rounded-[10px] border border-border-strong bg-bg-surface text-fg outline-none focus:border-ring focus:ring-4 focus:ring-ring/15 dark:bg-fill dark:border-border"
             />
           </Field>
           <AmbientTriggerControls
@@ -945,7 +994,7 @@ function AmbientRulesPanel({
               <select
                 value={wakeMode}
                 onChange={(e) => setWakeMode(e.target.value as AmbientWakeMode)}
-                className="w-full px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg"
+                className="w-full h-9 px-3 text-sm rounded-[10px] border border-border-strong bg-bg-surface text-fg outline-none focus:border-ring focus:ring-4 focus:ring-ring/15 dark:bg-fill dark:border-border"
               >
                 {AMBIENT_WAKE_MODES.map((m) => (
                   <option key={m} value={m}>{m}</option>
@@ -956,7 +1005,7 @@ function AmbientRulesPanel({
               <select
                 value={decisionPreset}
                 onChange={(e) => setDecisionPreset(e.target.value as AmbientDecisionPreset)}
-                className="w-full px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg"
+                className="w-full h-9 px-3 text-sm rounded-[10px] border border-border-strong bg-bg-surface text-fg outline-none focus:border-ring focus:ring-4 focus:ring-ring/15 dark:bg-fill dark:border-border"
               >
                 <option value="always">Always wake</option>
                 <option value="new_signal">Only for new signal</option>
@@ -968,7 +1017,7 @@ function AmbientRulesPanel({
             <select
               value={budgetPreset}
               onChange={(e) => setBudgetPreset(e.target.value as AmbientBudgetPreset)}
-              className="w-full px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg"
+              className="w-full h-9 px-3 text-sm rounded-[10px] border border-border-strong bg-bg-surface text-fg outline-none focus:border-ring focus:ring-4 focus:ring-ring/15 dark:bg-fill dark:border-border"
             >
               <option value="conservative">Conservative</option>
               <option value="standard">Standard</option>
@@ -989,7 +1038,7 @@ function AmbientRulesPanel({
               type="datetime-local"
               value={nextWakeAt}
               onChange={(e) => setNextWakeAt(e.target.value)}
-              className="w-full px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg"
+              className="w-full h-9 px-3 text-sm rounded-[10px] border border-border-strong bg-bg-surface text-fg outline-none focus:border-ring focus:ring-4 focus:ring-ring/15 dark:bg-fill dark:border-border"
             />
           </Field>
           <Button
@@ -1027,16 +1076,21 @@ function IntegrationFold({
   return (
     <details
       open={pubs.length > 0}
-      className="border border-border rounded-lg bg-bg-surface/30 [&_summary::-webkit-details-marker]:hidden"
+      className="group/fold [&_summary::-webkit-details-marker]:hidden"
     >
-      <summary className="px-4 py-2.5 min-h-11 sm:min-h-0 flex items-center gap-3 text-sm cursor-pointer hover:bg-bg-surface/60 list-none">
+      <summary className="-mx-2 px-2 h-12 rounded-lg flex items-center gap-3 text-sm cursor-pointer hover:bg-fill/60 list-none transition-colors">
         <span className="text-fg-muted shrink-0">{icon}</span>
         <span className="font-medium text-fg">{label}</span>
-        <span className="ml-auto text-xs text-fg-subtle">
-          {pubs.length === 0 ? "Not published" : `${pubs.length} live`}
+        <span className="ml-auto">
+          {pubs.length === 0 ? (
+            <StatusPill status="neutral" label="Not published" />
+          ) : (
+            <StatusPill status="completed" label={`${pubs.length} live`} />
+          )}
         </span>
+        <ChevronRight className="size-3.5 text-fg-subtle transition-transform duration-[var(--dur-base)] group-open/fold:rotate-90" aria-hidden="true" />
       </summary>
-      <div className="px-4 pb-3 pt-2 border-t border-border/40 space-y-1.5 text-sm">
+      <div className="pl-7 pb-3 pt-0.5 space-y-1.5 text-sm">
         {pubs.length === 0 ? (
           <Link
             to={`/integrations/${kind}/publish?agent_id=${agentId}`}

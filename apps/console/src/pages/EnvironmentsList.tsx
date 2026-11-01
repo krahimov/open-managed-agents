@@ -7,6 +7,7 @@ import { Modal } from "../components/Modal";
 import { Button } from "@/components/ui/button";
 import { PopoverContent } from "@/components/ui/popover";
 import { Select, SelectOption } from "../components/Select";
+import { StatusPill } from "../components/Badge";
 import { DataTable, type ColumnDef } from "../components/DataTable";
 import { FacetedFilter } from "../components/FacetedFilter";
 import { FilterChip, CreatedFilterChip } from "../components/FilterChip";
@@ -111,15 +112,10 @@ export function EnvironmentsList() {
         accessorFn: (e) => (e.archived_at ? "archived" : "active"),
         header: "Status",
         cell: ({ row }) => (
-          <span
-            className={`inline-flex items-center text-xs px-2 py-0.5 rounded-full ${
-              row.original.archived_at
-                ? "bg-bg-surface text-fg-subtle"
-                : "bg-success-subtle text-success"
-            }`}
-          >
-            {row.original.archived_at ? "archived" : "active"}
-          </span>
+          <StatusPill
+            status={row.original.archived_at ? "neutral" : "completed"}
+            label={row.original.archived_at ? "Archived" : "Active"}
+          />
         ),
       },
       {

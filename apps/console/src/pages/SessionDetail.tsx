@@ -13,7 +13,8 @@ import { describeModelFailure, grantedRequestIdsOf, supersededAccessRequestIdsOf
 import { AmbientRuleCard } from "../components/AmbientRuleCard";
 import { SkillRequestCard } from "../components/SkillRequestCard";
 import { Button } from "@/components/ui/button";
-import { AgentIcon, ClockIcon, DurationIcon, EnvIcon, VaultIcon } from "../components/icons";
+import { AgentIcon, ClockIcon, DurationIcon, EnvIcon, LinearIcon, SlackIcon, VaultIcon } from "../components/icons";
+import { XIcon } from "lucide-react";
 import { FilesPanel, ResourcePanel } from "./session-detail/Panels";
 import {
   TrajectoryOutcomeChip,
@@ -784,8 +785,8 @@ export function SessionDetail() {
           trail and the entity id. Stop + Files actions live at the
           right (`ml-auto`) of the badges row so the page-level chrome
           stays one band tall. */}
-      <div className="pl-3 pr-4 py-3 flex flex-col gap-2 shrink-0">
-        <div className="flex items-center gap-2 flex-wrap">
+      <div className="px-8 pt-2 pb-3 flex flex-col gap-2 shrink-0">
+        <div className="flex items-center gap-x-3 gap-y-2 flex-wrap">
           {status === "idle" && awaitingKind ? (
             // Idle on requires_action is not "done": the turn is parked on
             // the client. Say so instead of a plain Idle pill.
@@ -849,7 +850,7 @@ export function SessionDetail() {
               <button
                 onClick={() => void interrupt()}
                 disabled={interrupting}
-                className="inline-flex items-center justify-center px-2.5 py-1 min-h-11 sm:min-h-0 rounded-md text-xs font-medium bg-bg-surface/60 text-fg-muted hover:bg-bg-surface hover:text-fg disabled:opacity-50 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+                className="inline-flex items-center justify-center h-8 px-3.5 min-h-11 sm:min-h-0 rounded-full text-[13px] font-medium bg-fill text-fg hover:bg-fill-strong press disabled:opacity-50 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
                 title="Interrupt the active turn on this thread"
               >
                 {interrupting ? "Stopping…" : "Stop"}
@@ -859,17 +860,17 @@ export function SessionDetail() {
                 user messages + a judge-drafted rubric into a suite task. */}
             <button
               onClick={() => setShowSaveAsEval(true)}
-              className="inline-flex items-center justify-center px-2.5 py-1 min-h-11 sm:min-h-0 rounded-md text-xs font-medium bg-bg-surface/60 text-fg-muted hover:bg-bg-surface hover:text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+              className="inline-flex items-center justify-center h-8 px-3.5 min-h-11 sm:min-h-0 rounded-full text-[13px] font-medium bg-fill text-fg hover:bg-fill-strong press transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
               title="Snapshot this session into an eval suite task"
             >
               Save as eval
             </button>
             <button
               onClick={() => setShowFiles((v) => !v)}
-              className={`inline-flex items-center justify-center px-2.5 py-1 min-h-11 sm:min-h-0 rounded-md text-xs font-medium transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
+              className={`inline-flex items-center justify-center h-8 px-3.5 min-h-11 sm:min-h-0 rounded-full text-[13px] font-medium transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] press ${
                 showFiles
-                  ? "bg-bg-surface text-fg"
-                  : "bg-bg-surface/60 text-fg-muted hover:bg-bg-surface hover:text-fg"
+                  ? "bg-ink text-brand-fg"
+                  : "bg-fill text-fg hover:bg-fill-strong"
               }`}
               title="Files the agent wrote to /mnt/session/outputs/"
             >
@@ -895,9 +896,11 @@ export function SessionDetail() {
       )}
 
       {/* View tabs */}
-      <div role="tablist" aria-label="Session view" className="pl-3 pr-4 flex items-center gap-1 shrink-0">
-        <ViewTab label="Conversation" active={view === "chat"} onClick={() => setView("chat")} />
-        <ViewTab label="Timeline" active={view === "timeline"} onClick={() => setView("timeline")} />
+      <div className="px-8 flex items-center gap-1 shrink-0 pb-1">
+        <div role="tablist" aria-label="Session view" className="inline-flex items-center rounded-full bg-fill p-[3px]">
+          <ViewTab label="Conversation" active={view === "chat"} onClick={() => setView("chat")} />
+          <ViewTab label="Timeline" active={view === "timeline"} onClick={() => setView("timeline")} />
+        </div>
         {view === "timeline" && (
           <span className="ml-auto text-xs text-fg-subtle font-mono">{events.length} events</span>
         )}
@@ -908,7 +911,7 @@ export function SessionDetail() {
         <button
           onClick={() => setShowTrajectory(true)}
           disabled={trajectory === undefined || trajectory === "loading"}
-          className={`${view === "timeline" ? "ml-3" : "ml-auto"} inline-flex items-center min-h-11 sm:min-h-0 text-xs text-fg-muted hover:text-fg disabled:opacity-40 disabled:cursor-not-allowed bg-bg-surface/60 hover:bg-bg-surface rounded px-2 py-1 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] my-1.5`}
+          className={`${view === "timeline" ? "ml-3" : "ml-auto"} inline-flex items-center h-8 min-h-11 sm:min-h-0 text-[13px] font-medium text-fg-muted hover:text-fg disabled:opacity-40 disabled:cursor-not-allowed hover:bg-fill rounded-full px-3.5 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]`}
           title={
             trajectory === "loading"
               ? "Loading trajectory…"
@@ -923,8 +926,8 @@ export function SessionDetail() {
 
       {/* Linear context (when triggered by a Linear webhook) */}
       {linear && (
-        <div className="pl-3 pr-4 py-2 bg-info-subtle text-xs flex items-center gap-2 text-info">
-          <span>🔗</span>
+        <div className="mx-8 mt-2 rounded-xl px-4 py-2 bg-info-subtle text-xs flex items-center gap-2 text-info">
+          <LinearIcon className="size-3.5" />
           <span className="font-medium">Linear</span>
           <span className="opacity-60">·</span>
           <span>
@@ -946,8 +949,8 @@ export function SessionDetail() {
 
       {/* Slack context (when triggered by a Slack event) */}
       {slack && (
-        <div className="pl-3 pr-4 py-2 bg-accent-violet-subtle text-xs flex items-center gap-2 text-accent-violet flex-wrap">
-          <span>💬</span>
+        <div className="mx-8 mt-2 rounded-xl px-4 py-2 bg-accent-violet-subtle text-xs flex items-center gap-2 text-accent-violet flex-wrap">
+          <SlackIcon className="size-3.5" />
           <span className="font-medium">Slack</span>
           <span className="opacity-60">·</span>
           <span>
@@ -1019,7 +1022,7 @@ export function SessionDetail() {
                 7) typing dots when only the agent is "thinking" with
                    nothing else streaming yet */}
           <Conversation className="flex-1 min-h-0">
-            <ConversationContent className="pl-3 pr-4 py-6 gap-4">
+            <ConversationContent className="mx-auto w-full max-w-[880px] px-8 pt-6 pb-10 gap-6">
               {(() => {
                 // Server-returned events are now in canonical drain order
                 // (events.seq = INSERT order = what the model saw). The
@@ -1256,7 +1259,7 @@ export function SessionDetail() {
               conversation above on a `bg-bg` (white) surface — no
               line, no top padding, just `pb-4` for breathing room
               below. */}
-          <div className="pl-3 pr-4 pb-4 bg-bg shrink-0">
+          <div className="mx-auto w-full max-w-[880px] px-8 pb-6 pt-1 bg-bg shrink-0">
             <PromptInput
               accept="image/*"
               multiple
@@ -1351,10 +1354,10 @@ function ViewTab({ label, active, onClick }: { label: string; active: boolean; o
       role="tab"
       aria-selected={active}
       tabIndex={active ? 0 : -1}
-      className={`inline-flex items-center justify-center px-3 py-2 min-h-11 sm:min-h-0 text-sm rounded-md my-1.5 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
+      className={`inline-flex items-center justify-center h-[30px] px-4 min-h-11 sm:min-h-0 text-[13px] rounded-full transition-[background-color,color,box-shadow] duration-[var(--dur-base)] ease-[var(--ease-soft)] ${
         active
-          ? "bg-bg-surface text-brand font-semibold"
-          : "text-fg-subtle hover:text-fg-muted hover:bg-bg-surface/60"
+          ? "bg-bg-surface text-fg font-semibold shadow-[0_1px_3px_rgb(0_0_0/0.1),0_0_0_0.5px_rgb(0_0_0/0.04)] dark:bg-white/14"
+          : "text-fg-muted font-medium hover:text-fg"
       }`}
     >
       {label}
@@ -1382,10 +1385,10 @@ function ThreadTab({
       role="tab"
       aria-selected={active}
       tabIndex={active ? 0 : -1}
-      className={`py-1 min-h-11 sm:min-h-0 text-xs whitespace-nowrap rounded-md my-1 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] flex items-center gap-1 ${
+      className={`h-7 min-h-11 sm:min-h-0 text-xs whitespace-nowrap rounded-full my-1 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] flex items-center gap-1 ${
         active
-          ? "bg-bg-surface text-info font-semibold"
-          : "text-fg-subtle hover:text-fg-muted hover:bg-bg-surface/60"
+          ? "bg-fill-strong text-fg font-semibold"
+          : "text-fg-muted hover:text-fg hover:bg-fill"
       }`}
       style={{ paddingLeft: `${0.75 + depth * 0.75}rem`, paddingRight: "0.75rem" }}
     >
@@ -1639,7 +1642,7 @@ function EventRender({
                 className="inline-flex items-center gap-1 rounded-full bg-info-subtle text-info px-2 py-0.5 font-medium text-[11px]"
                 title={scheduledAt ? `Scheduled at ${scheduledAt}` : undefined}
               >
-                <span aria-hidden>🕒</span>
+                <ClockIcon className="size-3" />
                 Scheduled wakeup
               </span>
             </div>
@@ -1666,8 +1669,8 @@ function EventRender({
         <Message from="user">
           {(isPending || isCancelled) && (
             <div className="text-xs text-fg-subtle text-right flex items-center justify-end gap-1">
-              {isPending && <span aria-hidden>⏳</span>}
-              {isCancelled && <span aria-hidden>✗</span>}
+              {isPending && <ClockIcon className="size-3" />}
+              {isCancelled && <XIcon className="size-3" aria-hidden="true" />}
               <span>{isCancelled ? "Retracted" : "Pending…"}</span>
             </div>
           )}

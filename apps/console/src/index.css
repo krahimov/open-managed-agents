@@ -173,7 +173,7 @@
     "Segoe UI", system-ui, sans-serif;
   --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Geist Variable", "Segoe UI",
     system-ui, sans-serif;
-  --font-mono: "SF Mono", ui-monospace, "JetBrains Mono Variable", Menlo, Consolas, monospace;
+  --font-mono: "SF Mono", "JetBrains Mono Variable", ui-monospace, Menlo, Consolas, monospace;
 
   /* Type scale — eyebrow → caption → body → headline → title → hero. */
   --text-eyebrow: 0.6875rem;

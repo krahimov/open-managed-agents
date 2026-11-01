@@ -113,10 +113,10 @@ function BrowserPreview({ agentId, machine }: { agentId: string; machine: AgentM
         <img
           src={imageUrl}
           alt={machine.desktopEnabled ? "Current Linux desktop on the agent's cloud computer" : "Current Chromium browser on the agent's cloud computer"}
-          className="w-full rounded-md border border-border bg-bg"
+          className="w-full rounded-xl bg-bg-inset"
         />
       ) : (
-        <div className="flex min-h-40 items-center justify-center rounded-md border border-border bg-bg text-sm text-fg-subtle">
+        <div className="flex min-h-40 items-center justify-center rounded-xl bg-bg-inset text-sm text-fg-subtle">
           {screenshot.isFetching ? "Loading browser preview..." : "No screenshot available yet."}
         </div>
       )}
@@ -152,10 +152,10 @@ export function AgentComputerPanel({ agentId }: { agentId: string }) {
   const stopping = control.isPending && control.variables?.path.endsWith("/stop");
 
   return (
-    <section aria-labelledby="agent-computer-heading" className="max-w-4xl rounded-lg border border-border bg-bg-surface p-4">
+    <section aria-labelledby="agent-computer-heading" className="card rounded-[var(--radius-tile)] p-6">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 id="agent-computer-heading" className="font-display text-base font-semibold flex items-center gap-2">
+          <h2 id="agent-computer-heading" className="font-display text-[20px] leading-6 font-bold tracking-[-0.02em] flex items-center gap-2">
             <Monitor className="size-4" aria-hidden="true" />
             Computer
           </h2>

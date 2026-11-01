@@ -8,6 +8,7 @@ import { DataTable, type ColumnDef } from "../components/DataTable";
 import { FacetedFilter } from "../components/FacetedFilter";
 import { FilterChip, CreatedFilterChip } from "../components/FilterChip";
 import { RowActionsMenu } from "../components/RowActionsMenu";
+import { IdChip, StatusPill } from "../components/Badge";
 import { Button } from "@/components/ui/button";
 import { PopoverContent } from "@/components/ui/popover";
 import type { AgentRecord as Agent } from "../types/agent";
@@ -69,22 +70,24 @@ export function AgentsList() {
   const columns = useMemo<ColumnDef<Agent>[]>(
     () => [
       {
-        id: "id",
-        accessorKey: "id",
-        header: "ID",
-        cell: ({ row }) => (
-          <span title={row.original.id} className="font-mono text-xs text-fg-muted">
-            {row.original.id}
-          </span>
-        ),
-        enableHiding: false,
-      },
-      {
         id: "name",
         accessorKey: "name",
         header: "Name",
-        cell: ({ row }) => <span className="font-medium text-fg">{row.original.name}</span>,
+        cell: ({ row }) => (
+          <span className="block truncate text-[14.5px] font-semibold tracking-[-0.012em] text-fg">
+            {row.original.name}
+          </span>
+        ),
         enableHiding: false,
+        size: 240,
+      },
+      {
+        id: "id",
+        accessorKey: "id",
+        header: "ID",
+        cell: ({ row }) => <IdChip id={row.original.id} />,
+        enableHiding: false,
+        size: 220,
       },
       {
         id: "model",
@@ -99,15 +102,10 @@ export function AgentsList() {
         accessorFn: (a) => (a.archived_at ? "archived" : "active"),
         header: "Status",
         cell: ({ row }) => (
-          <span
-            className={`inline-flex items-center text-xs px-2 py-0.5 rounded-full ${
-              row.original.archived_at
-                ? "bg-bg-surface text-fg-subtle"
-                : "bg-success-subtle text-success"
-            }`}
-          >
-            {row.original.archived_at ? "archived" : "active"}
-          </span>
+          <StatusPill
+            status={row.original.archived_at ? "archived" : "active"}
+            label={row.original.archived_at ? "Archived" : "Active"}
+          />
         ),
       },
       {
@@ -115,7 +113,7 @@ export function AgentsList() {
         accessorFn: (a) => a.created_at,
         header: "Created",
         cell: ({ row }) => (
-          <span className="text-fg-muted">
+          <span className="text-fg-subtle tabular-nums">
             {new Date(row.original.created_at).toLocaleDateString()}
           </span>
         ),
