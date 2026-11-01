@@ -14,6 +14,8 @@ import { DataTable, type ColumnDef } from "../components/DataTable";
 import { FacetedFilter } from "../components/FacetedFilter";
 import { FilterChip, CreatedFilterChip } from "../components/FilterChip";
 import { RowActionsMenu } from "../components/RowActionsMenu";
+import { StatusPill } from "../components/Badge";
+import { SessionsIcon } from "../components/icons";
 
 import type { SessionRecord as Session } from "../types/session";
 
@@ -165,7 +167,7 @@ function LinearBadge({ metadata }: { metadata?: Record<string, unknown> }) {
   if (!linear || (!linear.issueId && !linear.issueIdentifier)) return null;
   return (
     <span
-      className="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded bg-info-subtle text-info"
+      className="inline-flex items-center gap-1 text-[11px] font-medium px-2 h-5 rounded-full bg-info-subtle text-info"
       title={`Linear issue ${linear.issueIdentifier ?? linear.issueId}`}
     >
       🔗 {linear.issueIdentifier ?? "Linear"}
@@ -186,7 +188,7 @@ function SlackBadge({ metadata }: { metadata?: Record<string, unknown> }) {
     : "Slack";
   return (
     <span
-      className="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded bg-accent-violet-subtle text-accent-violet"
+      className="inline-flex items-center gap-1 text-[11px] font-medium px-2 h-5 rounded-full bg-accent-violet-subtle text-accent-violet"
       title={`Slack channel ${slack.channelId}${slack.threadTs ? ` thread ${slack.threadTs}` : ""}`}
     >
       💬 {label}
@@ -202,7 +204,7 @@ function EvalBadge({ metadata }: { metadata?: Record<string, unknown> }) {
     <a
       href={`/evals/${ev.run_id}`}
       onClick={(e) => e.stopPropagation()}
-      className="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded bg-info-subtle text-info hover:opacity-80 transition-opacity"
+      className="inline-flex items-center gap-1 text-[11px] font-medium px-2 h-5 rounded-full bg-info-subtle text-info hover:opacity-80 transition-opacity"
       title={`Eval run ${ev.run_id}${ev.task_id ? ` · task ${ev.task_id}` : ""}`}
     >
       🧪 {ev.task_id ?? "Eval"}
@@ -245,7 +247,7 @@ export function SessionsList() {
     return next;
   });
 
-  const inputCls = "w-full border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
+  const inputCls = "w-full field border-0 rounded-[10px] px-3 py-2 min-h-11 sm:min-h-0 text-sm text-fg outline-none focus:shadow-[inset_0_0_0_1px_var(--ring),0_0_0_3px_color-mix(in_oklab,var(--ring)_22%,transparent)] transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
 
   // Server-driven filter state. Each piece flows into sessionsParams below
   // → useInfiniteApiQuery resets to page 1 on params change → the list
@@ -614,14 +616,6 @@ export function SessionsList() {
     setRevealedSecrets(new Set());
   };
 
-  const statusCls = (status?: string) => {
-    switch (status) {
-      case "idle": return "bg-success-subtle text-success";
-      case "running": return "bg-info-subtle text-info";
-      default: return "bg-bg-surface text-fg-muted";
-    }
-  };
-
   const displayed = sessions;
 
   // Active-filter chip displays — kept undefined when matching the
@@ -736,26 +730,31 @@ export function SessionsList() {
   const columns = useMemo<ColumnDef<Session>[]>(
     () => [
       {
-        id: "id",
-        accessorKey: "id",
-        header: "ID",
+        id: "name",
+        accessorFn: (s) => s.title ?? "",
+        size: 240,
+        header: "Name",
         cell: ({ row }) => (
-          <span title={row.original.id} className="font-mono text-xs text-fg-muted">
-            {row.original.id}
+          <span className="flex items-center gap-3 min-w-0 font-medium text-fg">
+            <span aria-hidden="true" className="inline-flex size-8 shrink-0 items-center justify-center rounded-full bg-hover text-fg-muted">
+              <SessionsIcon className="size-4" />
+            </span>
+            <span className="truncate">{row.original.title || "Untitled"}</span>
+            <LinearBadge metadata={row.original.metadata} />
+            <SlackBadge metadata={row.original.metadata} />
+            <EvalBadge metadata={row.original.metadata} />
           </span>
         ),
         enableHiding: false,
       },
       {
-        id: "name",
-        accessorFn: (s) => s.title ?? "",
-        header: "Name",
+        id: "id",
+        accessorKey: "id",
+        size: 210,
+        header: "ID",
         cell: ({ row }) => (
-          <span className="inline-flex items-center gap-2 font-medium text-fg">
-            {row.original.title || "Untitled"}
-            <LinearBadge metadata={row.original.metadata} />
-            <SlackBadge metadata={row.original.metadata} />
-            <EvalBadge metadata={row.original.metadata} />
+          <span title={row.original.id} className="inline-flex max-w-full items-center h-6 px-2.5 rounded-full bg-hover font-mono text-[11.5px] text-fg-muted truncate">
+            {row.original.id}
           </span>
         ),
         enableHiding: false,
@@ -765,11 +764,7 @@ export function SessionsList() {
         accessorFn: (s) => s.status ?? "idle",
         header: "Status",
         cell: ({ row }) => (
-          <span
-            className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${statusCls(row.original.status)}`}
-          >
-            {row.original.status || "idle"}
-          </span>
+          <StatusPill status={row.original.status || "idle"} label={row.original.status || "idle"} />
         ),
       },
       {
@@ -777,7 +772,7 @@ export function SessionsList() {
         accessorFn: (s) => s.agent.id,
         header: "Agent",
         cell: ({ row }) => (
-          <span className="text-fg-muted font-mono text-xs">{row.original.agent.id}</span>
+          <span className="text-fg-muted font-mono text-[12px] truncate">{row.original.agent.id}</span>
         ),
       },
       {

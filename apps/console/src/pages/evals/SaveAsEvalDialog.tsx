@@ -255,7 +255,7 @@ export function SaveAsEvalDialog({
 
   const busy = save.loading || saveAndRun.loading;
   const inputCls =
-    "w-full px-3 py-1.5 rounded-md bg-bg border border-border text-sm text-fg placeholder:text-fg-subtle focus:outline-none focus:ring-1 focus:ring-brand";
+    "w-full px-3 py-1.5 field border-0 rounded-[10px] text-sm text-fg placeholder:text-fg-subtle focus:outline-none focus:shadow-[inset_0_0_0_1px_var(--ring),0_0_0_3px_color-mix(in_oklab,var(--ring)_22%,transparent)]";
 
   return (
     <Modal

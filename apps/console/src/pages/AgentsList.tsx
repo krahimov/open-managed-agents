@@ -5,6 +5,7 @@ import { ArchiveIcon, TrashIcon } from "lucide-react";
 import { useApi } from "../lib/api";
 import { useInfiniteApiQuery } from "../lib/useApiQuery";
 import { DataTable, type ColumnDef } from "../components/DataTable";
+import { Avatar } from "../components/Avatar";
 import { FacetedFilter } from "../components/FacetedFilter";
 import { FilterChip, CreatedFilterChip } from "../components/FilterChip";
 import { RowActionsMenu } from "../components/RowActionsMenu";
@@ -69,21 +70,28 @@ export function AgentsList() {
   const columns = useMemo<ColumnDef<Agent>[]>(
     () => [
       {
-        id: "id",
-        accessorKey: "id",
-        header: "ID",
+        id: "name",
+        accessorKey: "name",
+        size: 240,
+        header: "Name",
         cell: ({ row }) => (
-          <span title={row.original.id} className="font-mono text-xs text-fg-muted">
-            {row.original.id}
+          <span className="flex items-center gap-3 min-w-0">
+            <Avatar name={row.original.name} size="lg" squared />
+            <span className="font-medium text-fg truncate">{row.original.name}</span>
           </span>
         ),
         enableHiding: false,
       },
       {
-        id: "name",
-        accessorKey: "name",
-        header: "Name",
-        cell: ({ row }) => <span className="font-medium text-fg">{row.original.name}</span>,
+        id: "id",
+        accessorKey: "id",
+        size: 210,
+        header: "ID",
+        cell: ({ row }) => (
+          <span title={row.original.id} className="inline-flex max-w-full items-center h-6 px-2.5 rounded-full bg-hover font-mono text-[11.5px] text-fg-muted truncate">
+            {row.original.id}
+          </span>
+        ),
         enableHiding: false,
       },
       {
@@ -100,12 +108,16 @@ export function AgentsList() {
         header: "Status",
         cell: ({ row }) => (
           <span
-            className={`inline-flex items-center text-xs px-2 py-0.5 rounded-full ${
+            className={`inline-flex items-center gap-1.5 h-[22px] pl-2 pr-2.5 rounded-full text-[11.5px] font-medium ${
               row.original.archived_at
-                ? "bg-bg-surface text-fg-subtle"
+                ? "bg-hover text-fg-muted"
                 : "bg-success-subtle text-success"
             }`}
           >
+            <span
+              aria-hidden="true"
+              className={`size-1.5 rounded-full ${row.original.archived_at ? "bg-fg-subtle" : "bg-success"}`}
+            />
             {row.original.archived_at ? "archived" : "active"}
           </span>
         ),

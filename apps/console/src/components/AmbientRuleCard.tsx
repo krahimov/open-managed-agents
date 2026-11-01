@@ -49,7 +49,7 @@ export function AmbientRuleCard({ event }: { event: Event }) {
   const delayFor = () => `${rowIndex++ * 60}ms`;
 
   return (
-    <div className="harness-diff-card max-w-2xl border border-border rounded-lg bg-bg-surface overflow-hidden">
+    <div className="harness-diff-card max-w-2xl rounded-[20px] glass-card overflow-hidden">
       <div className="flex items-center justify-between gap-3 px-4 py-2.5 border-b border-border">
         <div className="text-sm font-medium min-w-0">
           Ambient rule created

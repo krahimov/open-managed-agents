@@ -284,7 +284,7 @@ export function SkillsList() {
   /* ---- helpers ---- */
 
   const inputCls =
-    "w-full border border-border rounded-lg px-3 py-2 min-h-11 sm:min-h-0 text-sm outline-none focus:border-border-strong transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] bg-bg text-fg";
+    "w-full field border-0 rounded-[10px] px-3 py-2 min-h-11 sm:min-h-0 text-sm outline-none focus:shadow-[inset_0_0_0_1px_var(--ring),0_0_0_3px_color-mix(in_oklab,var(--ring)_22%,transparent)] transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] text-fg";
 
   // TanStack column defs. Single table for both Anthropic built-in + custom
   // skills; the Source column lets the user tell them apart at a glance.

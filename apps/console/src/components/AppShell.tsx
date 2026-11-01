@@ -197,7 +197,7 @@ export function AppShell() {
                   // Cleanup handled when ref unmounts (el = null branch above).
                 }}
                 key={pathname}
-                className="flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable] [&::-webkit-scrollbar]:hidden [scrollbar-width:none]"
+                className={`flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable] [&::-webkit-scrollbar]:hidden [scrollbar-width:none] ${scrolled ? "[mask-image:linear-gradient(to_bottom,transparent,black_10px)]" : ""}`}
               >
                 <Outlet context={outletContext} />
               </main>

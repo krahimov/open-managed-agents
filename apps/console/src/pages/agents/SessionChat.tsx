@@ -405,7 +405,7 @@ export function SessionChat({
         </ConversationContent>
         <ConversationScrollButton />
       </Conversation>
-      <div className="border-t border-border p-3 bg-bg shrink-0">
+      <div className="px-3 pb-3 pt-2 shrink-0">
         <PromptInput
           onSubmit={async ({ text }) => {
             await send(text);

@@ -600,4 +600,4 @@ function CopyRow({ label, value, secret = false }: { label: string; value: strin
 }
 
 const inputCls =
-  "w-full border border-border rounded-md px-3 py-2 text-[13px] bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
+  "w-full field border-0 rounded-[10px] px-3 py-2 text-[13px] text-fg outline-none focus:shadow-[inset_0_0_0_1px_var(--ring),0_0_0_3px_color-mix(in_oklab,var(--ring)_22%,transparent)] transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";

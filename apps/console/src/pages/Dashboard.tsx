@@ -36,7 +36,8 @@ interface Stats {
 interface RecentSession {
   id: string;
   title: string;
-  agent_id: string;
+  agent_id?: string;
+  agent?: { id: string };
   status: string;
   created_at: string;
 }
@@ -409,7 +410,7 @@ export function Dashboard() {
                       <StatusPill status={s.status || "idle"} />
                     </span>
                     <span className="hidden md:block font-mono text-[12px] text-fg-muted truncate">
-                      {s.agent_id}
+                      {s.agent_id ?? s.agent?.id ?? "—"}
                     </span>
                     <span className="text-[12.5px] text-fg-muted text-right tabular-nums" title={new Date(s.created_at).toLocaleString()}>
                       {formatRelative(Date.now() - new Date(s.created_at).getTime())}

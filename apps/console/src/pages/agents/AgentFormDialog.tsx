@@ -1,4 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Avatar } from "../../components/Avatar";
+import { SegmentedIndicator, segmentedItemClass, segmentedListClass } from "@/components/ui/segmented";
 import { useNavigate } from "react-router";
 import yaml from "js-yaml";
 import { CheckIcon, ExternalLinkIcon, RefreshCwIcon, XCircleIcon } from "lucide-react";
@@ -1384,10 +1386,10 @@ export function AgentFormDialog({
     : AGENT_TEMPLATES;
 
   const inputCls =
-    "w-full border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
+    "w-full field border-0 rounded-[10px] px-3 py-2 min-h-11 sm:min-h-0 text-sm text-fg outline-none focus:shadow-[inset_0_0_0_1px_var(--ring),0_0_0_3px_color-mix(in_oklab,var(--ring)_22%,transparent)] transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
   const tabCls = (t: string) =>
-    `inline-flex items-center justify-center px-3 py-1.5 min-h-11 sm:min-h-0 text-sm rounded-md transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
-      tab === t ? "bg-brand text-brand-fg" : "text-fg-muted hover:bg-bg-surface"
+    `relative isolate inline-flex items-center justify-center gap-1.5 h-8 px-3.5 min-h-11 sm:min-h-8 text-[13px] font-medium rounded-full transition-colors duration-200 ${
+      tab === t ? "text-brand" : "text-fg-muted hover:text-fg hover:bg-hover"
     }`;
 
   // Resolve which card the Model dropdown should highlight: explicit pick
@@ -1405,7 +1407,7 @@ export function AgentFormDialog({
   return (
     <>
       <div
-        className="fixed inset-0 bg-bg-overlay flex items-center justify-center z-50"
+        className="sheet-scrim fixed inset-0 bg-bg-overlay backdrop-blur-[6px] flex items-center justify-center z-50 p-4"
         onClick={closeCreate}
       >
         <div
@@ -1413,49 +1415,52 @@ export function AgentFormDialog({
           role="dialog"
           aria-modal="true"
           aria-label={isEdit ? "Edit Agent" : "New Agent"}
-            className="bg-bg rounded-lg shadow-xl w-full max-w-5xl max-h-[85vh] flex flex-col"
+            className="sheet-pop glass-strong rounded-[28px] w-full max-w-5xl max-h-[85vh] flex flex-col overflow-hidden"
           onClick={(e) => e.stopPropagation()}
         >
           {/* Template selection step */}
           {createStep === "template" && (
             <>
-              <div className="px-6 pt-6 pb-4 border-b border-border">
-                <h2 className="font-display text-lg font-semibold text-fg">New Agent</h2>
-                <p className="text-sm text-fg-muted mt-1">
+              <div className="px-7 pt-7 pb-5 border-b border-border">
+                <h2 className="font-display text-[24px] leading-tight font-semibold tracking-[-0.025em] text-fg">New Agent</h2>
+                <p className="text-[14px] text-fg-muted mt-1">
                   Start from a template or build from scratch.
                 </p>
                 <input
                   value={templateSearch}
                   onChange={(e) => setTemplateSearch(e.target.value)}
-                  className={`${inputCls} mt-3`}
+                  className={`${inputCls} mt-4 !rounded-full !px-4 h-10`}
                   placeholder="Search templates..."
                   aria-label="Search templates"
                 />
               </div>
-              <div className="flex-1 overflow-y-auto px-6 py-4">
+              <div className="flex-1 overflow-y-auto px-7 py-5">
                 <div className="grid grid-cols-2 gap-3">
                   {filteredTemplates.map((tmpl) => (
                     <button
                       key={tmpl.id}
                       onClick={() => selectTemplate(tmpl)}
-                      className="text-left border border-border rounded-lg p-4 hover:border-brand hover:bg-bg-surface transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+                      className="group text-left flex items-start gap-3.5 rounded-[18px] glass-card p-4 transition-[transform,box-shadow,background-color] duration-300 ease-(--ease-spring) hover:-translate-y-0.5 hover:shadow-[inset_0_1px_0_0_var(--glass-hi),inset_0_0_0_1px_color-mix(in_oklab,var(--brand)_35%,transparent),0_0_0_0.5px_var(--glass-edge),var(--glass-shadow-lg)] active:scale-[0.985] motion-reduce:transform-none outline-none focus-visible:outline-2 focus-visible:outline-ring"
                     >
-                      <div className="font-medium text-sm text-fg">{tmpl.name}</div>
-                      <div className="text-xs text-fg-muted mt-1 line-clamp-2">
+                      <Avatar name={tmpl.name} size="lg" squared className="mt-0.5" />
+                      <span className="min-w-0 flex-1">
+                      <div className="font-semibold text-[14px] tracking-[-0.01em] text-fg group-hover:text-brand transition-colors">{tmpl.name}</div>
+                      <div className="text-[12.5px] text-fg-muted mt-0.5 line-clamp-2 leading-snug">
                         {tmpl.description}
                       </div>
                       {tmpl.tags.length > 0 && (
-                        <div className="flex flex-wrap gap-1 mt-2">
+                        <div className="flex flex-wrap gap-1 mt-2.5">
                           {tmpl.tags.map((tag) => (
                             <span
                               key={tag}
-                              className="px-1.5 py-0.5 bg-bg-surface text-fg-muted rounded text-[10px]"
+                              className="inline-flex items-center h-5 px-2 rounded-full bg-hover text-fg-muted text-[11px] font-medium"
                             >
                               {tag}
                             </span>
                           ))}
                         </div>
                       )}
+                      </span>
                     </button>
                   ))}
                 </div>
@@ -1465,10 +1470,10 @@ export function AgentFormDialog({
                   </div>
                 )}
               </div>
-              <div className="px-6 py-4 border-t border-border flex justify-end">
+              <div className="px-7 py-4 border-t border-border flex justify-end">
                 <button
                   onClick={closeCreate}
-                  className="inline-flex items-center min-h-11 sm:min-h-0 px-4 py-2 text-sm text-fg-muted hover:text-fg"
+                  className="inline-flex items-center h-9 min-h-11 sm:min-h-9 px-4 rounded-full glass-chip text-sm font-medium text-fg hover:bg-glass-strong transition-colors"
                 >
                   Cancel
                 </button>
@@ -1479,7 +1484,7 @@ export function AgentFormDialog({
           {/* Form step */}
           {createStep === "form" && (
             <>
-              <div className="px-6 pt-6 pb-4 border-b border-border">
+              <div className="px-7 pt-6 pb-4 border-b border-border">
                 <div className="flex items-center justify-between mb-1">
                   {isEdit ? (
                     <span className="text-sm text-fg-subtle">
@@ -1497,23 +1502,20 @@ export function AgentFormDialog({
                     &larr; Templates
                   </button>
                   )}
-                  <div className="flex items-center gap-0.5 bg-bg-surface rounded-md p-0.5">
+                  <div className={segmentedListClass}>
                     {(["form", "yaml", "json"] as const).map((m) => (
                       <button
                         key={m}
                         onClick={() => switchMode(m)}
-                        className={`inline-flex items-center justify-center px-2 py-1 min-h-11 sm:min-h-0 text-xs rounded transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
-                          createMode === m
-                            ? "bg-bg text-fg font-medium shadow-sm"
-                            : "text-fg-muted hover:text-fg"
-                        }`}
+                        className={segmentedItemClass(createMode === m, "min-h-11 sm:min-h-0 text-xs px-3")}
                       >
+                        {createMode === m && <SegmentedIndicator layoutId="agent-form-mode" />}
                         {m === "form" ? "Form" : m.toUpperCase()}
                       </button>
                     ))}
                   </div>
                 </div>
-                <h2 className="font-display text-lg font-semibold text-fg">
+                <h2 className="font-display text-[22px] leading-tight font-semibold tracking-[-0.025em] text-fg">
                   {isEdit ? `Edit ${editAgent?.name || "agent"}` : "New Agent"}
                 </h2>
                 {createMode === "form" && (
@@ -1529,6 +1531,7 @@ export function AgentFormDialog({
                       onClick={() => setTab("basic")}
                       className={tabCls("basic")}
                     >
+                      {tab === "basic" && <SegmentedIndicator layoutId="agent-form-tab" tint />}
                       Basic
                     </button>
                     <button
@@ -1538,6 +1541,7 @@ export function AgentFormDialog({
                       onClick={() => setTab("integrations")}
                       className={tabCls("integrations")}
                     >
+                      {tab === "integrations" && <SegmentedIndicator layoutId="agent-form-tab" tint />}
                       Integrations{" "}
                       {form.composioToolkits.length > 0 && (
                         <span className="ml-1 text-xs opacity-60">
@@ -1552,6 +1556,7 @@ export function AgentFormDialog({
                       onClick={() => setTab("ambient")}
                       className={tabCls("ambient")}
                     >
+                      {tab === "ambient" && <SegmentedIndicator layoutId="agent-form-tab" tint />}
                       Ambient{" "}
                       {form.ambientEnabled && (
                         <span className="ml-1 text-xs opacity-60">(1)</span>
@@ -1564,6 +1569,7 @@ export function AgentFormDialog({
                       onClick={() => setTab("vaults")}
                       className={tabCls("vaults")}
                     >
+                      {tab === "vaults" && <SegmentedIndicator layoutId="agent-form-tab" tint />}
                       Vaults{" "}
                       {form.defaultVaultIds.length > 0 && (
                         <span className="ml-1 text-xs opacity-60">
@@ -1578,6 +1584,7 @@ export function AgentFormDialog({
                       onClick={() => setTab("tools")}
                       className={tabCls("tools")}
                     >
+                      {tab === "tools" && <SegmentedIndicator layoutId="agent-form-tab" tint />}
                       Tools{" "}
                       {Object.keys(form.toolOverrides).length > 0 && (
                         <span className="ml-1 text-xs opacity-60">
@@ -1592,6 +1599,7 @@ export function AgentFormDialog({
                       onClick={() => setTab("sandbox")}
                       className={tabCls("sandbox")}
                     >
+                      {tab === "sandbox" && <SegmentedIndicator layoutId="agent-form-tab" tint />}
                       Sandbox
                     </button>
                     <button
@@ -1601,6 +1609,7 @@ export function AgentFormDialog({
                       onClick={() => setTab("skills")}
                       className={tabCls("skills")}
                     >
+                      {tab === "skills" && <SegmentedIndicator layoutId="agent-form-tab" tint />}
                       Skills{" "}
                       {form.skills.length > 0 && (
                         <span className="ml-1 text-xs opacity-60">({form.skills.length})</span>
@@ -1613,6 +1622,7 @@ export function AgentFormDialog({
                       onClick={() => setTab("mcp")}
                       className={tabCls("mcp")}
                     >
+                      {tab === "mcp" && <SegmentedIndicator layoutId="agent-form-tab" tint />}
                       MCP Servers{" "}
                       {form.mcpServers.length > 0 && (
                         <span className="ml-1 text-xs opacity-60">
@@ -1627,6 +1637,7 @@ export function AgentFormDialog({
                       onClick={() => setTab("agents")}
                       className={tabCls("agents")}
                     >
+                      {tab === "agents" && <SegmentedIndicator layoutId="agent-form-tab" tint />}
                       Multi-Agent{" "}
                       {form.callableAgents.length > 0 && (
                         <span className="ml-1 text-xs opacity-60">

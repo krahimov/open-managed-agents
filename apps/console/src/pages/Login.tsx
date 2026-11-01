@@ -413,7 +413,7 @@ function ClassicLogin() {
   }
 
   const inputCls =
-    "w-full border border-border rounded-md px-3 py-2.5 text-sm bg-bg-surface text-fg shadow-[var(--shadow-sm)] outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
+    "w-full field border-0 rounded-[10px] px-3 py-2.5 text-sm text-fg outline-none focus:shadow-[inset_0_0_0_1px_var(--ring),0_0_0_3px_color-mix(in_oklab,var(--ring)_22%,transparent)] transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
 
   const isOtpMode = mode === "verify-signup" || mode === "verify-login" || mode === "reset-otp";
 

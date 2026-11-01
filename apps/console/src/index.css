@@ -65,6 +65,7 @@
   --accent-violet: #6747e0;
   --accent-violet-subtle: #efebff;
 
+  --tint-mix: 18%;
   --hover-fill: rgb(15 23 42 / 0.055);
   --field-bg: rgb(255 255 255 / 0.8);
   --field-bg-hover: rgb(255 255 255 / 0.95);
@@ -148,6 +149,7 @@
   --accent-violet: #b4a2ff;
   --accent-violet-subtle: rgb(160 140 255 / 0.15);
 
+  --tint-mix: 24%;
   --hover-fill: rgb(255 255 255 / 0.075);
   --field-bg: rgb(255 255 255 / 0.055);
   --field-bg-hover: rgb(255 255 255 / 0.085);
@@ -336,7 +338,7 @@
 }
 /* Accent-tinted raised capsule (active nav item, selected segment). */
 @utility glass-tint {
-  background-color: color-mix(in oklab, var(--brand) 13%, var(--glass-fill-strong));
+  background-color: color-mix(in oklab, var(--brand) var(--tint-mix), var(--glass-fill-strong));
   box-shadow:
     inset 0 1px 0 0 var(--glass-hi),
     inset 0 0 0 1px color-mix(in oklab, var(--brand) 22%, transparent),
@@ -352,7 +354,7 @@
   box-shadow:
     inset 0 1px 0 0 rgb(255 255 255 / 0.32),
     inset 0 -1px 0 0 rgb(0 0 0 / 0.12),
-    0 0 0 0.5px color-mix(in oklab, var(--brand-solid) 70%, black),
+    0 0 0 0.5px color-mix(in oklab, var(--brand-solid) 85%, black),
     0 1px 2px rgb(15 23 42 / 0.12),
     0 6px 14px -6px color-mix(in oklab, var(--brand-solid) 55%, transparent);
 }
@@ -379,6 +381,52 @@
     0 0 0 0.5px var(--glass-edge),
     var(--glass-shadow-lg);
   font-family: var(--font-sans);
+}
+
+/* Composer — a floating glass capsule. The footer (attach + send) is
+   overlaid on the bottom edge so a single-line draft reads as one pill;
+   longer drafts grow upward with the buttons pinned to the last line. */
+[data-slot="input-group"][data-composer] {
+  position: relative;
+  min-height: 52px;
+  border-radius: 26px;
+  background-color: var(--glass-fill-strong);
+  background-image: var(--glass-sheen);
+  -webkit-backdrop-filter: blur(30px) saturate(1.9);
+  backdrop-filter: blur(30px) saturate(1.9);
+  box-shadow:
+    inset 0 1px 0 0 var(--glass-hi),
+    inset 0 0 0 1px var(--glass-rim),
+    0 0 0 0.5px var(--glass-edge),
+    var(--glass-shadow-lg);
+  transition: box-shadow 200ms var(--ease-soft);
+}
+[data-slot="input-group"][data-composer]:focus-within {
+  box-shadow:
+    inset 0 1px 0 0 var(--glass-hi),
+    inset 0 0 0 1px color-mix(in oklab, var(--ring) 55%, transparent),
+    0 0 0 4px color-mix(in oklab, var(--ring) 16%, transparent),
+    var(--glass-shadow-lg);
+}
+[data-slot="input-group"][data-composer] > textarea {
+  min-height: 52px;
+  max-height: 12rem;
+  padding: 15px 60px 15px 52px;
+  line-height: 22px;
+}
+[data-slot="input-group"][data-composer] > [data-align="block-end"] {
+  position: absolute;
+  inset: auto 0 0 0;
+  padding: 8px 8px 8px 10px;
+  pointer-events: none;
+}
+[data-slot="input-group"][data-composer] > [data-align="block-end"] > * {
+  pointer-events: auto;
+}
+[data-slot="input-group"][data-composer] button[type="submit"] {
+  width: 36px;
+  height: 36px;
+  border-radius: 999px;
 }
 
 /* ---------- Base typography ---------- */
@@ -533,6 +581,17 @@ body,
 [data-slot="dialog-content"][data-state="open"]   { animation: modal-content-in  420ms var(--ease-spring); }
 .modal-content[data-state="closed"],
 [data-slot="dialog-content"][data-state="closed"] { animation: modal-content-out var(--dur-base) var(--ease-soft); }
+
+/* Hand-rolled sheets (AgentFormDialog): flex-centred, so plain scale. */
+@keyframes sheet-pop-in {
+  from { opacity: 0; transform: scale(0.92); }
+  to   { opacity: 1; transform: scale(1); }
+}
+.sheet-scrim { animation: modal-overlay-in var(--dur-slow) var(--ease-soft); }
+.sheet-pop   { animation: sheet-pop-in 440ms var(--ease-spring); }
+@media (prefers-reduced-motion: reduce) {
+  .sheet-scrim, .sheet-pop { animation-duration: 1ms; }
+}
 
 /* Floating menus (dropdown, popover, select, hover-card, tooltip): grow
    out of their trigger with a short spring. Radix exposes the origin. */

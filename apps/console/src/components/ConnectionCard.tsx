@@ -92,7 +92,7 @@ export function ServiceIcon({ service, url, className = "size-8" }: { service: s
   const name = serviceDisplayName(service, url);
   return (
     <span
-      className={`${className} shrink-0 rounded-md border border-border bg-bg flex items-center justify-center overflow-hidden`}
+      className={`${className} shrink-0 rounded-[10px] glass-chip flex items-center justify-center overflow-hidden`}
       aria-hidden
     >
       {domain && !failed ? (
@@ -512,12 +512,12 @@ export function ConnectionCard({
 
   return (
     <div
-      className="harness-diff-card max-w-2xl rounded-lg border border-border bg-bg-surface overflow-hidden"
+      className="harness-diff-card max-w-2xl rounded-[20px] glass-card overflow-hidden"
       data-testid="connection-card"
       data-state={gone ? "gone" : connected ? "connected" : "pending"}
       data-connection-url={request.mcp_server_url}
     >
-      <div className="flex items-center gap-3 px-4 py-3">
+      <div className="flex items-center gap-3 px-4 py-3.5">
         <ServiceIcon service={request.service} url={request.mcp_server_url} />
         <div className="min-w-0 flex-1">
           <div className="text-sm font-medium text-fg">{name}</div>
@@ -525,7 +525,7 @@ export function ConnectionCard({
         </div>
         {connected && !choosing ? (
           <div className="flex items-center gap-2 shrink-0">
-            <span className="inline-flex items-center gap-1 text-xs font-medium text-success">
+            <span className="inline-flex items-center gap-1 h-[22px] px-2.5 rounded-full bg-success-subtle text-[11.5px] font-medium text-success">
               <CheckIcon className="size-3.5" aria-hidden /> Connected
             </span>
             <Button variant="ghost" size="sm" onClick={() => setChoosing(true)}>
@@ -545,7 +545,7 @@ export function ConnectionCard({
             <Spinner className="size-4 text-fg-subtle" />
           )
         ) : (
-          <span className="inline-flex items-center gap-1.5 text-xs text-warning shrink-0">
+          <span className="inline-flex items-center gap-1.5 h-[22px] px-2.5 rounded-full bg-warning-subtle text-[11.5px] font-medium text-warning shrink-0">
             <span className="size-1.5 rounded-full bg-warning" aria-hidden /> Not connected
           </span>
         )}
@@ -558,7 +558,7 @@ export function ConnectionCard({
               <div className="text-[11px] font-medium uppercase tracking-wider text-fg-subtle">
                 Saved {name} accounts
               </div>
-              <ul className="divide-y divide-border rounded-md border border-border bg-bg">
+              <ul className="divide-y divide-border rounded-[14px] glass-well">
                 {good.map(({ conn, identity }) => (
                   <li key={conn.credential_id} className="flex items-center gap-3 px-3 py-2">
                     <div className="min-w-0 flex-1">
@@ -596,7 +596,7 @@ export function ConnectionCard({
               <summary className="cursor-pointer select-none">
                 {broken.length} older sign-in{broken.length === 1 ? "" : "s"} no longer work{broken.length === 1 ? "s" : ""}
               </summary>
-              <ul className="mt-1.5 divide-y divide-border rounded-md border border-border bg-bg">
+              <ul className="mt-1.5 divide-y divide-border rounded-[14px] glass-well">
                 {broken.map(({ conn, identity }) => (
                   <li key={conn.credential_id} className="flex items-center gap-3 px-3 py-2">
                     <div className="min-w-0 flex-1">
@@ -635,7 +635,7 @@ export function ConnectionCard({
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 placeholder={`Paste a ${name} API key`}
-                className="flex-1 min-w-0 h-8 rounded-md border border-border bg-bg px-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-brand"
+                className="flex-1 min-w-0 h-8 rounded-[10px] border-0 bg-field shadow-[inset_0_0_0_1px_var(--border-strong)] px-3 text-xs font-mono focus:outline-none focus:shadow-[inset_0_0_0_1px_var(--ring),0_0_0_3px_color-mix(in_oklab,var(--ring)_22%,transparent)]"
               />
               <Button size="sm" type="submit" disabled={!apiKey.trim() || !!busy} loading={busy === "api_key"} loadingLabel="Checking…">
                 Connect

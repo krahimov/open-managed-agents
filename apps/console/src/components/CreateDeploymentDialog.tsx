@@ -41,7 +41,7 @@ const AGENT_DEFAULT_ENV = "__agent_default__";
 const LATEST_VERSION = "latest";
 
 const inputCls =
-  "w-full border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
+  "w-full field border-0 rounded-[10px] px-3 py-2 min-h-11 sm:min-h-0 text-sm text-fg outline-none focus:shadow-[inset_0_0_0_1px_var(--ring),0_0_0_3px_color-mix(in_oklab,var(--ring)_22%,transparent)] transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
 
 /** Ready-to-paste frontend snippet for a freshly minted publishable key.
  *  Uses the console's own origin as baseUrl — the public gateway is

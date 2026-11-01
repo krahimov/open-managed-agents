@@ -180,7 +180,7 @@ export function ModelCardsList() {
     setShowCreate(false); setEditingId(null); setForm({ ...INITIAL_FORM }); setError("");
   };
 
-  const inputCls = "w-full border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
+  const inputCls = "w-full field border-0 rounded-[10px] px-3 py-2 min-h-11 sm:min-h-0 text-sm text-fg outline-none focus:shadow-[inset_0_0_0_1px_var(--ring),0_0_0_3px_color-mix(in_oklab,var(--ring)_22%,transparent)] transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
 
   const providerLabel = (p: string) => PROVIDERS.find((x) => x.value === p)?.label || p;
 

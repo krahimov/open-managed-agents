@@ -195,29 +195,29 @@ export function AgentDetail() {
       header={
         <PageHeader
           title={agent.name}
+          subtitle={`${modelStr(agent.model)} · ${agent._oma?.harness || "default"} harness`}
           actions={
             <>
-              <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
+              <Button variant="ghost" onClick={archive}>
+                Archive
+              </Button>
+              <Button variant="destructive" onClick={del}>
+                Delete
+              </Button>
+              <span aria-hidden="true" className="h-5 w-px bg-border-strong mx-1" />
+              <Button variant="secondary" onClick={() => setEditing(true)}>
                 Edit
               </Button>
-              <Button variant="outline" size="sm" onClick={openSetup} disabled={openingSetup}>
+              <Button variant="secondary" onClick={openSetup} disabled={openingSetup}>
                 {openingSetup ? "Opening…" : "Setup chat"}
               </Button>
+              <Button variant="secondary" onClick={() => setShowDeploy(true)}>
+                Deploy
+              </Button>
               <Button
-                variant="outline"
-                size="sm"
                 onClick={() => nav(`/sessions?new=1&agent_id=${encodeURIComponent(agent.id)}`)}
               >
                 Start session
-              </Button>
-              <Button variant="outline" size="sm" onClick={() => setShowDeploy(true)}>
-                Deploy
-              </Button>
-              <Button variant="outline" size="sm" onClick={archive}>
-                Archive
-              </Button>
-              <Button variant="destructive" size="sm" onClick={del}>
-                Delete
               </Button>
             </>
           }
@@ -240,40 +240,64 @@ export function AgentDetail() {
           modelCards={formAux.modelCards}
           runtimes={formAux.runtimes}
         />
-        {/* Properties grid */}
-        <div className="grid grid-cols-[140px_1fr] gap-x-4 gap-y-2 max-w-2xl text-sm">
-          <span className="text-fg-muted">ID</span><span className="font-mono text-xs">{agent.id}</span>
-          <span className="text-fg-muted">Model</span><span>{modelStr(agent.model)}</span>
-          <span className="text-fg-muted">Harness</span><span>{agent._oma?.harness || "default"}</span>
-          {agent._oma?.default_environment_id && (
-            <>
-              <span className="text-fg-muted">Default Sandbox</span>
-              <span className="font-mono text-xs">{agent._oma.default_environment_id}</span>
-            </>
-          )}
-          {agent._oma?.default_vault_ids && agent._oma.default_vault_ids.length > 0 && (
-            <>
-              <span className="text-fg-muted">Default Vaults</span>
-              <span className="font-mono text-xs">{agent._oma.default_vault_ids.join(", ")}</span>
-            </>
-          )}
-          {agent._oma?.runtime_binding && (
-            <>
-              <span className="text-fg-muted">Local Runtime</span>
-              <span className="text-xs">
-                <span className="font-mono">{agent._oma.runtime_binding.runtime_id.slice(0, 8)}…</span>
-                <span className="text-fg-subtle"> · ACP agent: </span>
-                <span className="font-mono">{agent._oma.runtime_binding.acp_agent_id}</span>
+        {/* Properties — grouped glass list (label left, value right). */}
+        <section className="max-w-3xl">
+          <div className="flex items-center gap-2 mb-3 flex-wrap">
+            <span className="inline-flex items-center h-7 px-3 rounded-full glass-chip font-mono text-[12px] text-fg-muted">
+              {agent.id}
+            </span>
+            <span className="inline-flex items-center h-7 px-3 rounded-full bg-brand-subtle text-brand text-[12px] font-semibold font-rounded">
+              v{agent.version}
+            </span>
+            {agent.archived_at && (
+              <span className="inline-flex items-center h-7 px-3 rounded-full bg-warning-subtle text-warning text-[12px] font-medium">
+                Archived
               </span>
-            </>
-          )}
-          <span className="text-fg-muted">Version</span><span>v{agent.version}</span>
-          <span className="text-fg-muted">Tools</span>
-          <span>{(agent.tools || []).map((t: any) => t.type === "custom" ? `Custom: ${t.name}` : t.type).join(", ") || "None"}</span>
-          <span className="text-fg-muted">Created</span><span>{new Date(agent.created_at).toLocaleString()}</span>
-          <span className="text-fg-muted">Updated</span><span>{new Date(agent.updated_at || agent.created_at).toLocaleString()}</span>
-          {agent.archived_at && <><span className="text-fg-muted">Archived</span><span className="text-warning">{new Date(agent.archived_at).toLocaleString()}</span></>}
-        </div>
+            )}
+          </div>
+          <dl className="glass-card rounded-[20px] px-1.5 py-1 text-sm">
+            {(
+              [
+                ["ID", <span className="font-mono text-xs">{agent.id}</span>],
+                ["Model", modelStr(agent.model)],
+                ["Harness", agent._oma?.harness || "default"],
+                agent._oma?.default_environment_id
+                  ? ["Default Sandbox", <span className="font-mono text-xs">{agent._oma.default_environment_id}</span>]
+                  : null,
+                agent._oma?.default_vault_ids && agent._oma.default_vault_ids.length > 0
+                  ? ["Default Vaults", <span className="font-mono text-xs">{agent._oma.default_vault_ids.join(", ")}</span>]
+                  : null,
+                agent._oma?.runtime_binding
+                  ? [
+                      "Local Runtime",
+                      <span className="text-xs">
+                        <span className="font-mono">{agent._oma.runtime_binding.runtime_id.slice(0, 8)}…</span>
+                        <span className="text-fg-subtle"> · ACP agent: </span>
+                        <span className="font-mono">{agent._oma.runtime_binding.acp_agent_id}</span>
+                      </span>,
+                    ]
+                  : null,
+                ["Version", `v${agent.version}`],
+                ["Tools", (agent.tools || []).map((t: any) => t.type === "custom" ? `Custom: ${t.name}` : t.type).join(", ") || "None"],
+                ["Created", new Date(agent.created_at).toLocaleString()],
+                ["Updated", new Date(agent.updated_at || agent.created_at).toLocaleString()],
+                agent.archived_at
+                  ? ["Archived", <span className="text-warning">{new Date(agent.archived_at).toLocaleString()}</span>]
+                  : null,
+              ].filter(Boolean) as [string, React.ReactNode][]
+            ).map(([label, value], i, arr) => (
+              <div
+                key={label}
+                className={`grid grid-cols-[150px_minmax(0,1fr)] gap-4 items-center px-3 min-h-11 py-2 ${
+                  i < arr.length - 1 ? "border-b border-border" : ""
+                }`}
+              >
+                <dt className="text-fg-muted">{label}</dt>
+                <dd className="text-fg min-w-0 truncate text-right sm:text-left">{value}</dd>
+              </div>
+            ))}
+          </dl>
+        </section>
 
       <AgentComputerPanel key={agent.id} agentId={agent.id} />
 
@@ -281,14 +305,14 @@ export function AgentDetail() {
           push the rest of the page below the viewport. Default-open when
           there's at least one live publication so the user sees what's wired
           up at a glance; otherwise default-closed. */}
-      <div className="mt-6 max-w-2xl">
-        <h2 className="font-display text-base font-semibold mb-2">Integrations</h2>
+      <div className="mt-8 max-w-3xl">
+        <h2 className="font-display text-[17px] font-semibold tracking-[-0.015em] mb-3">Integrations</h2>
         {composioApps.length > 0 && (
           <div className="grid gap-2 sm:grid-cols-2 mb-3">
             {composioApps.map((entry) => (
               <div
                 key={entry.slug}
-                className="border border-border rounded-md p-3 flex items-center gap-3 bg-bg"
+                className="glass-card rounded-[16px] p-3 flex items-center gap-3"
               >
                 <img
                   src={composioIntegrationIcon(entry)}
@@ -344,9 +368,9 @@ export function AgentDetail() {
 
       {/* System prompt */}
       {agent.system && (
-        <div className="mt-8 max-w-2xl">
-          <h2 className="font-display text-base font-semibold mb-2">System Prompt</h2>
-          <pre className="bg-bg-surface border border-border rounded-lg p-4 text-sm whitespace-pre-wrap max-h-64 overflow-y-auto font-mono text-fg-muted leading-relaxed">
+        <div className="mt-8 max-w-3xl">
+          <h2 className="font-display text-[17px] font-semibold tracking-[-0.015em] mb-3">System Prompt</h2>
+          <pre className="glass-card rounded-[20px] p-5 text-[13px] whitespace-pre-wrap max-h-64 overflow-y-auto font-mono text-fg-muted leading-relaxed">
             {agent.system}
           </pre>
         </div>
@@ -354,12 +378,12 @@ export function AgentDetail() {
 
       {/* Version history */}
       {versions.length > 0 && (
-        <div className="mt-8 max-w-2xl">
-          <h2 className="font-display text-base font-semibold mb-2">Version History</h2>
-          <div className="border border-border rounded-lg overflow-x-auto">
+        <div className="mt-8 max-w-3xl">
+          <h2 className="font-display text-[17px] font-semibold tracking-[-0.015em] mb-3">Version History</h2>
+          <div className="glass-card rounded-[20px] overflow-x-auto">
             <table className="w-full text-sm">
               <thead>
-                <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase">
+                <tr className="text-fg-subtle text-xs border-b border-border">
                   <th className="text-left px-4 py-2">Version</th>
                   <th className="text-left px-4 py-2">Model</th>
                   <th className="text-left px-4 py-2">System Prompt</th>
@@ -428,10 +452,10 @@ function AccessPanel({ agentId }: { agentId: string }) {
   const versions = data?.versions ?? [];
 
   return (
-    <div className="mt-6 max-w-2xl">
-      <h2 className="font-display text-base font-semibold mb-2">Access</h2>
+    <div className="mt-8 max-w-3xl">
+      <h2 className="font-display text-[17px] font-semibold tracking-[-0.015em] mb-3">Access</h2>
       {!baseline || !baseline.enabled ? (
-        <div className="border border-border rounded-lg p-4 text-sm text-fg-subtle">
+        <div className="glass-card rounded-[20px] p-5 text-sm text-fg-subtle">
           No access policy. This agent can use every tool its config exposes
           (legacy behavior).
           {baseline && !baseline.enabled && (
@@ -439,7 +463,7 @@ function AccessPanel({ agentId }: { agentId: string }) {
           )}
         </div>
       ) : (
-        <div className="border border-border rounded-lg overflow-hidden">
+        <div className="glass-card rounded-[20px] overflow-hidden">
           <div className="flex items-center justify-between gap-3 px-4 py-2 bg-bg-surface/60 text-xs text-fg-muted">
             <span>
               Baseline grant <span className="font-mono">v{baseline.version}</span>
@@ -607,13 +631,13 @@ function AuditTrailPanel({
   };
 
   const inputCls =
-    "px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg";
+    "px-2.5 py-1.5 text-sm field border-0 rounded-[10px] text-fg";
 
   return (
     <div className="mt-8 max-w-4xl audit-trail-print">
       <div className="flex items-center justify-between gap-3 mb-3">
         <div>
-          <h2 className="font-display text-base font-semibold">Audit trail</h2>
+          <h2 className="font-display text-[17px] font-semibold tracking-[-0.015em]">Audit trail</h2>
           <p className="text-xs text-fg-subtle">
             {agentName} · authority record generated{" "}
             {capability ? new Date(capability.generated_at).toLocaleString() : "…"}
@@ -637,10 +661,10 @@ function AuditTrailPanel({
           </span>
         )}
       </h3>
-      <div className="border border-border rounded-lg overflow-x-auto mb-2">
+      <div className="glass-card rounded-[20px] overflow-x-auto mb-2">
         <table className="w-full text-sm">
           <thead>
-            <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase">
+            <tr className="text-fg-subtle text-xs border-b border-border">
               <th className="text-left px-4 py-2">Tool</th>
               <th className="text-left px-4 py-2">Effect</th>
               <th className="text-left px-4 py-2">Rule</th>
@@ -676,11 +700,11 @@ function AuditTrailPanel({
         Approval history
       </h3>
       {(approvals?.versions ?? []).length === 0 ? (
-        <div className="border border-border rounded-lg p-4 text-sm text-fg-subtle">
+        <div className="glass-card rounded-[20px] p-5 text-sm text-fg-subtle">
           No grant versions yet — nothing has been approved for this agent.
         </div>
       ) : (
-        <div className="border border-border rounded-lg divide-y divide-border">
+        <div className="glass-card rounded-[20px] divide-y divide-border">
           {(approvals?.versions ?? []).map((v) => (
             <div key={v.version} className="px-4 py-2.5 text-sm">
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -762,7 +786,7 @@ function AuditTrailPanel({
             .join(" · ")}
         </p>
       )}
-      <div className="border border-border rounded-lg overflow-hidden">
+      <div className="glass-card rounded-[20px] overflow-hidden">
         {(activity?.events ?? []).length === 0 ? (
           <div className="px-4 py-6 text-sm text-fg-subtle">
             No policy, skill, or access events in this range.
@@ -859,7 +883,7 @@ function AmbientRulesPanel({
     <div className="mt-8 max-w-4xl">
       <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between mb-3">
         <div>
-          <h2 className="font-display text-base font-semibold">Ambient</h2>
+          <h2 className="font-display text-[17px] font-semibold tracking-[-0.015em]">Ambient</h2>
           <p className="text-xs text-fg-subtle">
             {rules.filter((r) => r.enabled).length} enabled · {rules.length} total
           </p>
@@ -867,7 +891,7 @@ function AmbientRulesPanel({
       </div>
 
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <div className="border border-border rounded-lg overflow-hidden">
+        <div className="glass-card rounded-[20px] overflow-hidden">
           {rules.length === 0 ? (
             <div className="px-4 py-8 text-sm text-fg-subtle">
               No ambient rules configured.
@@ -924,7 +948,7 @@ function AmbientRulesPanel({
           )}
         </div>
 
-        <div className="border border-border rounded-lg p-4 space-y-3">
+        <div className="glass-card rounded-[20px] p-5 space-y-3">
           <h3 className="font-display text-sm font-semibold">New Rule</h3>
           {err && <div className="text-xs text-danger">{err}</div>}
           <Field label="Name">
@@ -1027,10 +1051,10 @@ function IntegrationFold({
   return (
     <details
       open={pubs.length > 0}
-      className="border border-border rounded-lg bg-bg-surface/30 [&_summary::-webkit-details-marker]:hidden"
+      className="glass-card rounded-[16px] [&_summary::-webkit-details-marker]:hidden"
     >
-      <summary className="px-4 py-2.5 min-h-11 sm:min-h-0 flex items-center gap-3 text-sm cursor-pointer hover:bg-bg-surface/60 list-none">
-        <span className="text-fg-muted shrink-0">{icon}</span>
+      <summary className="px-3 h-12 min-h-11 flex items-center gap-3 text-sm cursor-pointer rounded-[16px] hover:bg-hover list-none transition-colors">
+        <span className="inline-flex size-7 items-center justify-center rounded-full bg-hover text-fg-muted shrink-0">{icon}</span>
         <span className="font-medium text-fg">{label}</span>
         <span className="ml-auto text-xs text-fg-subtle">
           {pubs.length === 0 ? "Not published" : `${pubs.length} live`}
@@ -1052,7 +1076,7 @@ function IntegrationFold({
                 to={`/integrations/${kind}`}
                 className="flex items-center gap-2 min-h-11 sm:min-h-0 text-fg-muted hover:text-fg"
               >
-                <span className="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded bg-success-subtle text-success">
+                <span className="inline-flex items-center gap-1 text-[11px] font-medium px-2 h-5 rounded-full bg-success-subtle text-success">
                   Live
                 </span>
                 <span>

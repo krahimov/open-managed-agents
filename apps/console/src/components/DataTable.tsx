@@ -38,7 +38,7 @@ import { EmptyState, type EmptyStateKind } from "./EmptyState";
 import { PageHeader } from "./PageHeader";
 import { Skeleton } from "./Skeleton";
 import { cn } from "@/lib/utils";
-import { useLocation } from "react-router";
+import { useLocation, useMatches, type UIMatch } from "react-router";
 
 /**
  * DataTable — list page chrome with a frozen, column-aligned header.
@@ -208,6 +208,21 @@ export function DataTable<T>({
     </>
   );
 
+  // Large title (Apple "large title" pattern) — taken from the route's
+  // breadcrumb handle so list pages get real hierarchy without each page
+  // having to pass one.
+  const matches = useMatches();
+  const largeTitle = (() => {
+    for (let i = matches.length - 1; i >= 0; i--) {
+      const h = (matches[i].handle ?? {}) as {
+        crumb?: string | { label: string } | ((m: UIMatch) => string | { label: string });
+      };
+      const raw = typeof h.crumb === "function" ? h.crumb(matches[i]) : h.crumb;
+      if (raw) return typeof raw === "string" ? raw : raw.label;
+    }
+    return undefined;
+  })();
+
   const filteredRows = table.getRowModel().rows;
   const isEmpty = !loading && filteredRows.length === 0;
   const visibleColumns = table.getAllColumns().filter((c) => c.getIsVisible());
@@ -279,6 +294,8 @@ export function DataTable<T>({
   return (
     <>
       <PageHeader
+        title={title ?? largeTitle}
+        subtitle={subtitle}
         toolbar={toolbar}
         tableHeader={frozenHeader}
       />

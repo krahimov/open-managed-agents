@@ -152,10 +152,10 @@ export function AgentComputerPanel({ agentId }: { agentId: string }) {
   const stopping = control.isPending && control.variables?.path.endsWith("/stop");
 
   return (
-    <section aria-labelledby="agent-computer-heading" className="max-w-4xl rounded-lg border border-border bg-bg-surface p-4">
+    <section aria-labelledby="agent-computer-heading" className="max-w-3xl rounded-[20px] glass-card p-5">
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
-          <h2 id="agent-computer-heading" className="font-display text-base font-semibold flex items-center gap-2">
+          <h2 id="agent-computer-heading" className="font-display text-[17px] font-semibold tracking-[-0.015em] flex items-center gap-2">
             <Monitor className="size-4" aria-hidden="true" />
             Computer
           </h2>
