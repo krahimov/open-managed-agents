@@ -1,4 +1,8 @@
 @import "tailwindcss";
+/* Enter/exit keyframes for the shadcn primitives (`animate-in`, `fade-in-0`,
+   `zoom-in-95`, `slide-in-from-*`). Already a dependency; importing it is
+   what makes menus, popovers, selects and tooltips actually animate. */
+@import "tw-animate-css";
 
 /* Code highlight theme — light by default */
 @import "highlight.js/styles/github.css";
@@ -6,126 +10,234 @@
 /* ---------- Dark mode: class-based ---------- */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* ════════════════════════════════════════════════════════════════════════
+   STUDIO — design tokens
+   Editorial, premium, typography-led. apple.com canvas in light, Pro-app
+   near-black in dark. One accent (Apple link blue) for links, focus and
+   selection; primary actions are solid ink pills (near-black in light,
+   white in dark). Coral survives only in the logo mark.
+   ════════════════════════════════════════════════════════════════════════ */
+
 /* ---------- Light theme (default) ---------- */
 :root {
-  /* Single accent: coral. Reserved for primary actions, focus, active nav —
-     never decoration. (Design direction: cool near-monochrome + one accent.) */
-  --brand: #d9564a;
-  --brand-hover: #c74b40;
-  --brand-subtle: #fdefed;
+  /* Accent — Apple link blue. `text-brand`, `border-brand`, `ring-brand`,
+     `bg-brand-subtle` resolve here (links, focus, selection). Text uses
+     #0066CC (AA on the #F5F5F7 canvas); rings/fills use #0071E3. */
+  --brand: #0066cc;
+  --brand-hover: #0077ed;
+  --brand-subtle: #e8f1fc;
+  --accent-fill: #0071e3;
+
+  /* Ink — the primary action fill. `bg-brand`, `bg-primary` and
+     `hover:bg-brand-hover` resolve to these through the
+     --background-color-* theme namespace (see @theme), so every
+     hand-rolled "primary" button in the app becomes an ink pill. */
+  --ink: #1d1d1f;
+  --ink-hover: #000000;
   --brand-fg: #ffffff;
 
-  --bg: #fbfbfc;
-  --bg-sidebar: #f4f4f6;
+  /* Canvas + surfaces */
+  --bg: #f5f5f7;
+  --bg-sidebar: #f5f5f7;
   --bg-surface: #ffffff;
-  /* One step BELOW the page — code wells, stat insets, terminal chrome. */
-  --bg-inset: #f1f2f4;
-  --bg-overlay: oklch(0 0 0 / 0.28);
+  --bg-elevated: #ffffff;
+  /* One step below a white card — wells, insets, segmented tracks. */
+  --bg-inset: #f0f0f2;
+  --bg-overlay: rgb(0 0 0 / 0.22);
+  /* Dark code well — stays dark in both themes (feature tiles, terminals). */
+  --code-well: #1d1d1f;
+  --code-well-fg: #e8e8ed;
+  --code-well-muted: #a1a1a6;
 
-  --fg: #17171a;
-  --fg-muted: #6a6b72;
-  --fg-subtle: #a0a1a9;
+  /* Translucent fills — hover/pressed states that read on any surface. */
+  --fill: rgb(0 0 0 / 0.045);
+  --fill-strong: rgb(0 0 0 / 0.08);
 
-  --border: #e6e7eb;
-  --border-strong: #cacdd5;
+  --fg: #1d1d1f;
+  --fg-muted: #56565b;
+  --fg-subtle: #6e6e73;
 
-  --success: #178a55;
-  --success-subtle: #eaf7f0;
-  --warning: #a56315;
-  --warning-subtle: #fff3df;
-  --danger: #c93d47;
-  --danger-subtle: #fff0f1;
-  --info: #2f6fed;
-  --info-subtle: #edf4ff;
-  --accent-violet: #7c5cff;
-  --accent-violet-subtle: #f3f0ff;
+  --border: rgb(0 0 0 / 0.085);
+  --border-strong: rgb(0 0 0 / 0.16);
+  /* Cards carry no visible border in light — shadow + contrast only. */
+  --card-border: transparent;
 
-  /* Surface elevation — single shadow token, theme-aware. Light mode
-     uses near-black at 10% opacity; dark mode bumps to 50% so drop
-     shadows actually read against the dark surface. */
-  --shadow-md: 0 14px 34px -28px rgb(23 23 26 / 0.32);
-  --shadow-sm: 0 1px 2px rgb(23 23 26 / 0.04), 0 1px 1px rgb(23 23 26 / 0.03);
+  --success: #1f7a37;
+  --success-subtle: #e9f6ec;
+  --warning: #a14a00;
+  --warning-subtle: #fdf1e3;
+  --danger: #c4001a;
+  --danger-subtle: #fdecee;
+  --info: #0066cc;
+  --info-subtle: #e8f1fc;
+  --accent-violet: #8944ab;
+  --accent-violet-subtle: #f4ecf8;
 
-  /* Motion tokens. Default Tailwind transitions feel "computer-y" (linear
-     timing-function, 150ms blanket duration). These curves + scale give
-     interactions weight without being slow:
-     - soft: iOS-style spring out, perfect for modal/toast/menu reveal
-     - snap: tight ease-out for press states, hover state changes
-     - quart: gentle deceleration for layout-affecting changes
-     Pair with --dur-quick (button hover, focus), --dur-base (most state
-     changes), --dur-slow (overlays, page-level changes). */
+  /* Elevation — soft, layered, never a single hard drop. */
+  --shadow-sm: 0 0.5px 1px rgb(0 0 0 / 0.05), 0 1px 3px rgb(0 0 0 / 0.04);
+  --shadow-card: 0 0.5px 1px rgb(0 0 0 / 0.04), 0 2px 8px -2px rgb(0 0 0 / 0.05),
+    0 12px 32px -16px rgb(0 0 0 / 0.08);
+  --shadow-card-hover: 0 1px 2px rgb(0 0 0 / 0.04), 0 10px 24px -8px rgb(0 0 0 / 0.1),
+    0 28px 56px -24px rgb(0 0 0 / 0.16);
+  --shadow-md: 0 2px 6px rgb(0 0 0 / 0.04), 0 14px 34px -14px rgb(0 0 0 / 0.16);
+  --shadow-pop: 0 0 0 0.5px rgb(0 0 0 / 0.08), 0 2px 6px rgb(0 0 0 / 0.05),
+    0 12px 32px -8px rgb(0 0 0 / 0.18);
+  --shadow-dialog: 0 0 0 0.5px rgb(0 0 0 / 0.06), 0 8px 24px -8px rgb(0 0 0 / 0.12),
+    0 40px 90px -24px rgb(0 0 0 / 0.32);
+
+  /* Motion. soft = iOS sheet curve; snap = presses; quart = layout;
+     spring = a damped spring (slight overshoot) for reveals. */
   --ease-soft: cubic-bezier(0.32, 0.72, 0, 1);
   --ease-snap: cubic-bezier(0.5, 0, 0.1, 1);
   --ease-quart: cubic-bezier(0.25, 1, 0.5, 1);
-  --dur-quick: 100ms;
-  --dur-base: 150ms;
-  --dur-slow: 220ms;
+  --ease-spring: linear(
+    0, 0.009, 0.035 2.1%, 0.141 4.4%, 0.723 12.9%, 0.938 16.7%, 1.017 19.4%,
+    1.067, 1.089 24.8%, 1.085 27.7%, 1.045 34.4%, 1.012 39.4%, 0.996 46.4%,
+    0.993 52.9%, 1.001 69.5%, 1
+  );
+  --dur-quick: 120ms;
+  --dur-base: 180ms;
+  --dur-slow: 320ms;
 
-  --ring: var(--brand);
+  --ring: #0071e3;
+
+  /* sonner reads these */
+  --popover: var(--bg-elevated);
+  --popover-foreground: var(--fg);
   color-scheme: light;
 }
 
-/* ---------- Dark theme ---------- */
+/* ---------- Dark theme — Pro-app near-black ---------- */
 .dark {
-  --brand: #ff8d7e;
-  --brand-hover: #ffa294;
-  --brand-subtle: #36211d;
-  --brand-fg: #1c0f0c;
+  --brand: #2997ff;
+  --brand-hover: #47a6ff;
+  --brand-subtle: rgb(41 151 255 / 0.14);
+  --accent-fill: #0a84ff;
 
-  --bg: #111113;
-  --bg-sidebar: #17171a;
-  --bg-surface: #1c1c20;
-  /* One step below the page for inset wells. */
-  --bg-inset: #0c0c0e;
-  --bg-overlay: oklch(0 0 0 / 0.6);
+  --ink: #f5f5f7;
+  --ink-hover: #ffffff;
+  --brand-fg: #1d1d1f;
 
-  --fg: #f1f1f3;
-  --fg-muted: #a5a7af;
-  --fg-subtle: #777a84;
+  --bg: #0b0b0c;
+  --bg-sidebar: #0b0b0c;
+  --bg-surface: #161618;
+  --bg-elevated: #1d1d1f;
+  --bg-inset: #0e0e10;
+  --bg-overlay: rgb(0 0 0 / 0.6);
+  --code-well: #0b0b0c;
+  --code-well-fg: #e8e8ed;
+  --code-well-muted: #98989d;
+
+  --fill: rgb(255 255 255 / 0.065);
+  --fill-strong: rgb(255 255 255 / 0.11);
+
+  --fg: #f5f5f7;
+  --fg-muted: #a1a1a6;
+  --fg-subtle: #8a8a8f;
 
   /* Hairlines as alpha so they sit on any surface step without banding. */
-  --border: oklch(1 0 0 / 0.09);
-  --border-strong: oklch(1 0 0 / 0.18);
+  --border: rgb(255 255 255 / 0.085);
+  --border-strong: rgb(255 255 255 / 0.16);
+  --card-border: rgb(255 255 255 / 0.075);
 
-  --success: #53d18c;
-  --success-subtle: #163325;
-  --warning: #f0ad4e;
-  --warning-subtle: #352817;
-  --danger: #ff7782;
-  --danger-subtle: #371d21;
-  --info: #80a9ff;
-  --info-subtle: #172644;
-  --accent-violet: #b09cff;
-  --accent-violet-subtle: #261f40;
+  --success: #30d158;
+  --success-subtle: rgb(48 209 88 / 0.14);
+  --warning: #ff9f0a;
+  --warning-subtle: rgb(255 159 10 / 0.14);
+  --danger: #ff6961;
+  --danger-subtle: rgb(255 69 58 / 0.15);
+  --info: #64b5ff;
+  --info-subtle: rgb(41 151 255 / 0.14);
+  --accent-violet: #c98bf2;
+  --accent-violet-subtle: rgb(191 90 242 / 0.15);
 
-  /* Dark-mode shadow — needs more opacity to register against #151515.
-     shadow-sm carries a 1px top glint so raised surfaces read as lit
-     from above (the cheap trick behind "rich" dark UIs). */
-  --shadow-md: 0 18px 42px -28px rgb(0 0 0 / 0.85);
-  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.45), inset 0 1px 0 rgb(255 255 255 / 0.04);
+  /* Dark elevation leans on hairlines + a 1px top glint; drop shadows
+     only need to separate overlays from the canvas. */
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.5), inset 0 0.5px 0 rgb(255 255 255 / 0.05);
+  --shadow-card: inset 0 1px 0 rgb(255 255 255 / 0.035), 0 1px 2px rgb(0 0 0 / 0.4);
+  --shadow-card-hover: inset 0 1px 0 rgb(255 255 255 / 0.05), 0 18px 40px -16px rgb(0 0 0 / 0.9);
+  --shadow-md: 0 18px 42px -20px rgb(0 0 0 / 0.9);
+  --shadow-pop: 0 0 0 0.5px rgb(255 255 255 / 0.1), inset 0 0.5px 0 rgb(255 255 255 / 0.06),
+    0 16px 40px -8px rgb(0 0 0 / 0.75);
+  --shadow-dialog: 0 0 0 0.5px rgb(255 255 255 / 0.1), inset 0 0.5px 0 rgb(255 255 255 / 0.06),
+    0 40px 100px -20px rgb(0 0 0 / 0.85);
 
-  --ring: var(--brand);
+  --ring: #2997ff;
   color-scheme: dark;
 }
 
 /* ---------- Tailwind theme tokens ---------- */
 @theme {
-  /* Fonts */
-  --font-display: "Geist Variable", -apple-system, "Segoe UI", sans-serif;
-  --font-sans: "Geist Variable", -apple-system, "Segoe UI", sans-serif;
-  --font-mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  /* Fonts — Apple system first (SF Pro on Macs), Geist everywhere else. */
+  --font-display: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Geist Variable",
+    "Segoe UI", system-ui, sans-serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Geist Variable", "Segoe UI",
+    system-ui, sans-serif;
+  --font-mono: "SF Mono", ui-monospace, "JetBrains Mono Variable", Menlo, Consolas, monospace;
+
+  /* Type scale — eyebrow → caption → body → headline → title → hero. */
+  --text-eyebrow: 0.6875rem;
+  --text-eyebrow--line-height: 1rem;
+  --text-eyebrow--letter-spacing: 0.06em;
+  --text-eyebrow--font-weight: 600;
+  --text-caption: 0.75rem;
+  --text-caption--line-height: 1rem;
+  --text-body: 0.9375rem;
+  --text-body--line-height: 1.6;
+  --text-headline: 1.1875rem;
+  --text-headline--line-height: 1.5rem;
+  --text-headline--letter-spacing: -0.016em;
+  --text-headline--font-weight: 600;
+  --text-title: 1.75rem;
+  --text-title--line-height: 2.125rem;
+  --text-title--letter-spacing: -0.024em;
+  --text-title--font-weight: 700;
+  --text-hero: 2.5rem;
+  --text-hero--line-height: 2.875rem;
+  --text-hero--letter-spacing: -0.03em;
+  --text-hero--font-weight: 700;
+  --text-numeral: 2.75rem;
+  --text-numeral--line-height: 1;
+  --text-numeral--letter-spacing: -0.035em;
+  --text-numeral--font-weight: 600;
+
+  /* Radii — concentric family. Controls 9px, rows 12px, cards 20px. */
+  --radius-xs: 0.25rem;
+  --radius-sm: 0.375rem;
+  --radius-md: 0.5625rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+  --radius-2xl: 1.25rem;
+  --radius-3xl: 1.5rem;
+  --radius-card: 1.25rem;
+  --radius-tile: 1.375rem;
 
   /* Color palette — resolves dynamically via :root / .dark vars */
   --color-brand: var(--brand);
   --color-brand-hover: var(--brand-hover);
   --color-brand-subtle: var(--brand-subtle);
   --color-brand-fg: var(--brand-fg);
+  --color-ink: var(--ink);
+  --color-ink-hover: var(--ink-hover);
+  --color-accent-fill: var(--accent-fill);
+
+  /* Background namespace overrides: `bg-brand` is the primary ACTION fill
+     (ink pill), while `text-brand` / `border-brand` stay link blue. */
+  --background-color-brand: var(--ink);
+  --background-color-brand-hover: var(--ink-hover);
+  --background-color-primary: var(--ink);
 
   --color-bg: var(--bg);
   --color-bg-sidebar: var(--bg-sidebar);
   --color-bg-surface: var(--bg-surface);
+  --color-bg-elevated: var(--bg-elevated);
   --color-bg-inset: var(--bg-inset);
   --color-bg-overlay: var(--bg-overlay);
+  --color-code-well: var(--code-well);
+  --color-code-well-fg: var(--code-well-fg);
+  --color-code-well-muted: var(--code-well-muted);
+  --color-fill: var(--fill);
+  --color-fill-strong: var(--fill-strong);
 
   --color-fg: var(--fg);
   --color-fg-muted: var(--fg-muted);
@@ -133,6 +245,7 @@
 
   --color-border: var(--border);
   --color-border-strong: var(--border-strong);
+  --color-card-border: var(--card-border);
 
   --color-success: var(--success);
   --color-success-subtle: var(--success-subtle);
@@ -147,82 +260,113 @@
 
   --color-ring: var(--ring);
 
-  /* shadcn-style primitive aliases. The ai-elements + components/ui
-     primitives are vanilla shadcn copy-paste and reach for tokens like
-     `--color-secondary`, `--color-muted-foreground`, etc. Without these
-     aliases Tailwind v4 emits no rule for `bg-secondary`, `text-muted-
-     foreground`, `bg-popover`, `border-input` (the lookup just silently
-     yields nothing) and the lifted shadcn surfaces render unstyled.
-     Mapping straight onto the console palette keeps the chat surface
-     visually consistent with the rest of the console — no second palette
-     to maintain. Both themes (light + dark) get correct values automatically
-     because the tokens above are theme-aware. */
+  /* shadcn-style primitive aliases (ai-elements + components/ui are vanilla
+     shadcn and reach for these names). */
   --color-background: var(--bg);
   --color-foreground: var(--fg);
-  --color-card: var(--bg);
+  --color-card: var(--bg-surface);
   --color-card-foreground: var(--fg);
-  --color-popover: var(--bg);
+  --color-popover: var(--bg-elevated);
   --color-popover-foreground: var(--fg);
   --color-primary: var(--brand);
   --color-primary-foreground: var(--brand-fg);
-  --color-secondary: var(--bg-surface);
+  --color-secondary: var(--fill);
   --color-secondary-foreground: var(--fg);
-  --color-muted: var(--bg-surface);
+  --color-muted: var(--fill);
   --color-muted-foreground: var(--fg-muted);
-  --color-accent: var(--bg-surface);
+  --color-accent: var(--fill);
   --color-accent-foreground: var(--fg);
   --color-destructive: var(--danger);
   --color-destructive-foreground: #ffffff;
-  --color-input: var(--border);
+  --color-input: var(--border-strong);
 
-  /* shadcn primitives derive button + input rounding from --radius
-     via `rounded-[min(var(--radius-md),12px)]` and similar. The console's
-     existing rounded utilities use the Tailwind defaults, so pin a
-     value that matches our existing chat bubble feel (rounded-lg). */
-  --radius: 0.4375rem;
-  --radius-md: 0.4375rem;
+  --radius: 0.5625rem;
 
-  /* shadcn `Sidebar` primitive lookups. The sidebar component reaches
-     for its own --sidebar* family so its theming can drift from the
-     main canvas (typical use: subtly different bg, darker borders).
-     The console wants the sidebar to share the existing palette, so we alias
-     straight through — bg-sidebar / fg / brand are all already
-     theme-aware via :root / .dark. */
+  /* shadcn `Sidebar` primitive lookups — quiet, type-only sidebar. */
   --color-sidebar: var(--bg-sidebar);
   --color-sidebar-foreground: var(--fg);
-  --color-sidebar-primary: var(--brand);
+  --color-sidebar-primary: var(--ink);
   --color-sidebar-primary-foreground: var(--brand-fg);
-  --color-sidebar-accent: var(--bg-surface);
+  --color-sidebar-accent: var(--fill);
   --color-sidebar-accent-foreground: var(--fg);
   --color-sidebar-border: var(--border);
-  --color-sidebar-ring: var(--brand);
+  --color-sidebar-ring: var(--ring);
+}
+
+/* ---------- Studio utilities ---------- */
+
+/* The card: white on the grey canvas (light, no border) / lifted
+   graphite with a hairline (dark). */
+@utility card {
+  background-color: var(--bg-surface);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-card);
+}
+
+/* Interactive card — springy lift on hover, settles on press. */
+@utility card-hover {
+  transition:
+    transform var(--dur-slow) var(--ease-spring),
+    box-shadow var(--dur-slow) var(--ease-soft),
+    background-color var(--dur-base) var(--ease-soft);
+  &:hover {
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-card-hover);
+  }
+  &:active {
+    transform: translateY(0) scale(0.995);
+    transition-duration: var(--dur-quick);
+  }
+}
+
+/* Eyebrow label — small caps over headlines and section groups. */
+@utility eyebrow {
+  font-size: 0.6875rem;
+  line-height: 1rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--fg-subtle);
+}
+
+/* Press feedback for pills and tiles. */
+@utility press {
+  transition: transform var(--dur-quick) var(--ease-snap);
+  &:active:not(:disabled) {
+    transform: scale(0.97);
+  }
 }
 
 /* ---------- Base typography ---------- */
 body {
   font-family: var(--font-sans);
   font-size: 0.875rem; /* 14px base for app UI */
-  line-height: 1.6;
+  line-height: 1.5;
+  letter-spacing: -0.006em;
   /* Numbers align in tables, stats, timestamps — app-wide instrument feel. */
   font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
-/* Display headings track tighter — large Geist at default tracking reads
-   airy/marketing; tools read tight. */
+/* Display headings track tighter. */
 h1, h2, h3 {
   letter-spacing: -0.02em;
 }
 
-/* Lock the viewport — the AppShell sidebar + breadcrumb header are
-   global frame elements that must NEVER scroll out of view. Without
-   this, `html`/`body`/`#root` are auto-height by default; a tall portal,
-   absolutely-positioned overlay, or stray content can push body taller
-   than the viewport and let the whole document scroll, taking the
-   "fixed" frame with it. Pinning all three at exactly the viewport
-   height forces every scroll to happen inside `<main>` (the only
-   `overflow-y: auto` container in the shell). */
+/* Mono never inherits the negative body tracking. */
+code, pre, kbd, samp, .font-mono {
+  letter-spacing: 0;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent-fill) 24%, transparent);
+}
+
+/* Lock the viewport — the AppShell frame must NEVER scroll out of view;
+   every scroll happens inside `<main>`. */
 html,
 body,
 #root {
@@ -231,14 +375,15 @@ body,
   overflow: hidden;
 }
 
-/* Focus ring — brand-colored. Wrapped in @layer base so Tailwind utility
-   variants (focus-visible:outline-none, etc.) can override per-element.
-   Unlayered rules win over layered rules regardless of specificity, which
-   would otherwise make this impossible to suppress on a per-element basis. */
+/* Focus ring — Apple-blue. Layered so utilities can override. */
 @layer base {
   *:focus-visible {
     outline: 2px solid var(--ring);
     outline-offset: 2px;
+  }
+  button:not(:disabled),
+  [role="button"]:not([aria-disabled="true"]) {
+    cursor: pointer;
   }
 }
 
@@ -262,7 +407,7 @@ body,
    (greens, blues, purples) that look dim against --bg-surface in dark
    mode. Override with github-dark token palette so syntax stays readable. */
 .dark pre code.hljs {
-  background: var(--bg-surface);
+  background: transparent;
   color: var(--fg);
 }
 .dark .hljs-comment,
@@ -325,32 +470,48 @@ body,
   .brand-loader-dot { animation: none; opacity: 0.6; }
 }
 
-/* Modal (Radix Dialog) overlay + content animations.
-   Driven by data-state on Dialog.Overlay and Dialog.Content; Radix
-   waits for the closed-state animation to finish before unmounting
-   via its built-in Presence wrapper. Durations match the previous
-   hand-rolled Modal (overlay = --dur-base, content = --dur-slow). */
-@keyframes modal-overlay-in  { from { opacity: 0 } to { opacity: 1 } }
-@keyframes modal-overlay-out { from { opacity: 1 } to { opacity: 0 } }
-@keyframes modal-content-in {
-  from { opacity: 0; transform: translate(-50%, -50%) scale(0.96); }
-  to   { opacity: 1; transform: translate(-50%, -50%) scale(1);    }
+/* Dialog + sheet motion. Content springs in (slight overshoot, settles),
+   exits fast and quiet. Overlay is a plain fade. Radix keeps the node
+   mounted until the closed-state animation ends. `transform` is free to
+   animate because Tailwind v4 centres the dialog with the separate
+   `translate` property. */
+@keyframes studio-overlay-in  { from { opacity: 0 } to { opacity: 1 } }
+@keyframes studio-overlay-out { from { opacity: 1 } to { opacity: 0 } }
+@keyframes studio-dialog-in {
+  from { opacity: 0; transform: translateY(10px) scale(0.94); }
+  40%  { opacity: 1; }
+  to   { opacity: 1; transform: none; }
 }
-@keyframes modal-content-out {
-  from { opacity: 1; transform: translate(-50%, -50%) scale(1);    }
-  to   { opacity: 0; transform: translate(-50%, -50%) scale(0.96); }
+@keyframes studio-dialog-out {
+  from { opacity: 1; transform: none; }
+  to   { opacity: 0; transform: scale(0.97); }
 }
-.modal-overlay[data-state="open"]    { animation: modal-overlay-in  var(--dur-base) var(--ease-soft); }
-.modal-overlay[data-state="closed"]  { animation: modal-overlay-out var(--dur-base) var(--ease-soft); }
-.modal-content[data-state="open"]    { animation: modal-content-in  var(--dur-slow) var(--ease-soft); }
-.modal-content[data-state="closed"]  { animation: modal-content-out var(--dur-slow) var(--ease-soft); }
+.studio-overlay[data-state="open"]   { animation: studio-overlay-in 240ms var(--ease-soft) both; }
+.studio-overlay[data-state="closed"] { animation: studio-overlay-out 160ms var(--ease-soft) both; }
+.studio-dialog[data-state="open"]    { animation: studio-dialog-in 520ms var(--ease-spring) both; }
+.studio-dialog[data-state="closed"]  { animation: studio-dialog-out 150ms var(--ease-soft) both; }
+/* Hand-rolled dialogs (no data-state) — mount-only spring. */
+.studio-dialog-mount { animation: studio-dialog-in 520ms var(--ease-spring) both; }
+.studio-overlay-mount { animation: studio-overlay-in 240ms var(--ease-soft) both; }
 @media (prefers-reduced-motion: reduce) {
-  .modal-overlay[data-state="open"],
-  .modal-overlay[data-state="closed"],
-  .modal-content[data-state="open"],
-  .modal-content[data-state="closed"] {
+  .studio-overlay[data-state],
+  .studio-dialog[data-state],
+  .studio-dialog-mount,
+  .studio-overlay-mount {
     animation-duration: 1ms;
   }
+}
+
+/* Staggered reveal for bento tiles and list rows on first paint. */
+@keyframes studio-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+.studio-rise {
+  animation: studio-rise 560ms var(--ease-spring) both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .studio-rise { animation: none; }
 }
 
 /* Skeleton placeholder pulse — quieter than animate-pulse (Tailwind's

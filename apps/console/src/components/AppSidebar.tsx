@@ -139,22 +139,19 @@ export function AppSidebar() {
           asChild
           isActive={active}
           tooltip={item.label}
-          // Decoration follows selection — same principle as the filter
-          // chips: inactive rows are completely transparent (no pill,
-          // no hover fill), only the active route gets the
-          // bg-sidebar-accent pill. The `!` overrides are necessary
-          // because Tailwind v4's `data-active:` variant matches the
-          // attribute regardless of value (true/false both fire), so
-          // shadcn's built-in `data-active:bg-sidebar-accent` would
-          // otherwise paint every row.
-          className={
+          // Type-only navigation: inactive rows are bare text; the active
+          // route is marked by weight plus a small tinted pill. The `!`
+          // overrides beat shadcn's built-in data-active / hover fills
+          // (Tailwind v4's `data-active:` matches true AND false).
+          className={[
+            "h-8 gap-2.5 rounded-full px-3 text-[13.5px] tracking-[-0.01em] transition-[background-color,color] duration-[var(--dur-base)] ease-[var(--ease-soft)] [&>svg]:size-[15px]",
             active
-              ? "border border-border bg-bg-surface text-fg font-medium shadow-[var(--shadow-sm)]"
-              : "border border-transparent !bg-transparent !text-fg-muted hover:!bg-bg-surface/70 hover:!text-fg"
-          }
+              ? "!bg-fill !text-fg font-semibold [&>svg]:opacity-100"
+              : "!bg-transparent !text-fg-muted font-normal hover:!text-fg hover:!bg-fill/60 [&>svg]:opacity-65",
+          ].join(" ")}
         >
           <NavLink to={item.to} end={item.end}>
-            <item.icon className="size-4 opacity-80" />
+            <item.icon className="size-[15px]" />
             <span>{item.label}</span>
           </NavLink>
         </SidebarMenuButton>
@@ -167,35 +164,30 @@ export function AppSidebar() {
       collapsible="icon"
       className="bg-sidebar border-0 group-data-[side=left]:border-r-0"
     >
-      <SidebarHeader className="bg-sidebar h-12 px-3 flex-row items-center gap-2">
+      <SidebarHeader className="bg-sidebar h-12 px-4 flex-row items-center gap-2.5 group-data-[collapsible=icon]:px-3.5">
         <Logo size="sm" />
-        <span className="text-sm font-semibold text-fg group-data-[collapsible=icon]:hidden">
+        <span className="font-display text-[15px] font-semibold tracking-[-0.02em] text-fg group-data-[collapsible=icon]:hidden">
           {BRAND_NAME}
         </span>
       </SidebarHeader>
 
-      {/* Tenant sits between brand row and nav content — same h-11 px-3
-          recipe as the brand row so the collapse animation pins its
-          icon at the same x=12 axis as the product mark above. `mt-2`
-          drops it 8 px below the brand row so its vertical center
-          aligns with the toolbar chips on the right (PageHeader's
-          py-3 pushes them down by the same amount). */}
-      <div className="mt-2">
+      {/* Workspace switcher sits directly under the wordmark. */}
+      <div className="mt-1.5">
         <TenantSwitcher />
       </div>
 
-      <SidebarContent className="bg-sidebar px-1 pb-2 [&::-webkit-scrollbar]:hidden [scrollbar-width:none]">
+      <SidebarContent className="bg-sidebar px-1.5 pt-2 pb-3 gap-1 [&::-webkit-scrollbar]:hidden [scrollbar-width:none]">
         {groups.map((g) => (
           <SidebarGroup key={g.label} className="py-1">
-            <SidebarGroupLabel className="h-6 px-2 text-[10px] font-semibold uppercase text-fg-subtle">
+            <SidebarGroupLabel className="eyebrow h-7 px-3 text-[10.5px] tracking-[0.07em]">
               {g.label}
             </SidebarGroupLabel>
-            <SidebarMenu>{g.items.map(renderItem)}</SidebarMenu>
+            <SidebarMenu className="gap-px">{g.items.map(renderItem)}</SidebarMenu>
           </SidebarGroup>
         ))}
       </SidebarContent>
 
-      <SidebarFooter className="bg-sidebar p-0">
+      <SidebarFooter className="bg-sidebar p-0 pt-1">
         <UserProfile />
       </SidebarFooter>
     </Sidebar>

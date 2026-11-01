@@ -33,58 +33,66 @@ import type { AppOutletContext } from "./AppShell";
  * Returns null when the slot isn't mounted, or when no slot has content.
  */
 interface PageHeaderProps {
+  /** Small caps label above the title (section / entity kind). */
+  eyebrow?: ReactNode;
   title?: ReactNode;
   subtitle?: ReactNode;
   actions?: ReactNode;
   toolbar?: ReactNode;
   tableHeader?: ReactNode;
+  /** `hero` = 40px display title (dashboards, entity heroes); default 28px. */
+  size?: "default" | "hero";
   className?: string;
 }
 
 export function PageHeader({
+  eyebrow,
   title,
   subtitle,
   actions,
   toolbar,
   tableHeader,
+  size = "default",
   className,
 }: PageHeaderProps) {
   const ctx = useOutletContext<AppOutletContext | undefined>();
   const slot = ctx?.pageHeaderSlot;
   if (!slot) return null;
 
-  const hasTopRow = !!title || !!subtitle || !!actions;
+  const hasTopRow = !!title || !!subtitle || !!actions || !!eyebrow;
   if (!hasTopRow && !toolbar && !tableHeader) return null;
 
   return createPortal(
-    <div className={cn("bg-bg/92 backdrop-blur supports-[backdrop-filter]:bg-bg/86", className)}>
+    <div className={cn("bg-bg", className)}>
       {hasTopRow && (
-        <div className="flex items-start gap-4 pl-4 pr-5 pt-3">
+        <div className="flex flex-wrap items-end gap-x-6 gap-y-3 px-8 pt-3 pb-1">
           <div className="min-w-0 flex-1">
+            {eyebrow && <div className="eyebrow mb-1.5">{eyebrow}</div>}
             {title && (
-              <h1 className="text-lg font-semibold truncate">
+              <h1
+                className={cn(
+                  "font-display text-fg truncate",
+                  size === "hero" ? "text-hero" : "text-title",
+                )}
+              >
                 {title}
               </h1>
             )}
             {subtitle && (
-              <p className="text-sm text-fg-muted mt-0.5">{subtitle}</p>
+              <p className="mt-1.5 max-w-[68ch] text-[15px] leading-6 text-fg-muted">{subtitle}</p>
             )}
           </div>
           {actions && (
-            <div className="flex items-center gap-2 shrink-0">{actions}</div>
+            <div className="flex flex-wrap items-center gap-2 shrink-0 pb-0.5">{actions}</div>
           )}
         </div>
       )}
       {toolbar && (
-        <div className="flex items-center gap-2 pl-4 pr-5 py-3 overflow-x-auto">
+        <div className="flex items-center gap-2 px-8 pt-5 pb-4 overflow-x-auto [scrollbar-width:none]">
           {toolbar}
         </div>
       )}
-      {tableHeader && (
-        <div className="pl-4 pr-5">
-          {tableHeader}
-        </div>
-      )}
+      {tableHeader && <div className="px-8">{tableHeader}</div>}
     </div>,
     slot,
   );

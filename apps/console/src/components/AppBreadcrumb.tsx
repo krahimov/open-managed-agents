@@ -42,10 +42,9 @@ type CrumbHandle = { crumb?: CrumbValue | ((m: UIMatch) => CrumbValue) };
  * Hidden when there are no crumbs (root index route or routes without
  * a `crumb` handle) so the top toolbar reads clean.
  */
-export function AppBreadcrumb() {
+function useCrumbs() {
   const matches = useMatches();
-
-  const crumbs = matches
+  return matches
     .map((m) => {
       const handle = (m.handle ?? {}) as CrumbHandle;
       const raw =
@@ -55,6 +54,17 @@ export function AppBreadcrumb() {
       return { label: c.label, to: c.to ?? m.pathname };
     })
     .filter((c): c is { label: string; to: string } => c !== null);
+}
+
+/** Leaf breadcrumb label — the route's own name. List pages use it as
+ *  their large editorial title so the title and the crumb never drift. */
+export function usePageTitle(): string | undefined {
+  const crumbs = useCrumbs();
+  return crumbs[crumbs.length - 1]?.label;
+}
+
+export function AppBreadcrumb() {
+  const crumbs = useCrumbs();
 
   if (crumbs.length === 0) return null;
 
@@ -67,7 +77,7 @@ export function AppBreadcrumb() {
             <Fragment key={`${c.to}-${i}`}>
               {i > 0 && (
                 <BreadcrumbSeparator>
-                  <ChevronRightIcon className="size-3.5" />
+                  <ChevronRightIcon className="size-3 opacity-60" />
                 </BreadcrumbSeparator>
               )}
               <BreadcrumbItem>

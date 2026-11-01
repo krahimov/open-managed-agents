@@ -60,9 +60,9 @@ export function FacetedFilter({
               >
                 <div
                   className={cn(
-                    "mr-2 flex size-4 items-center justify-center rounded-sm border",
+                    "mr-2 flex size-4 items-center justify-center rounded-full border",
                     selected
-                      ? "bg-brand border-brand text-bg"
+                      ? "bg-accent-fill border-accent-fill text-white"
                       : "border-border opacity-50 [&_svg]:invisible",
                   )}
                 >

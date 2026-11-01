@@ -77,8 +77,8 @@ export function Modal({
           widthClass,
         )}
       >
-        <DialogHeader className="px-6 py-4 border-b border-border gap-1">
-          <DialogTitle className="text-lg font-semibold font-display truncate">
+        <DialogHeader className="px-7 pt-7 pb-3 pr-16 gap-1.5">
+          <DialogTitle className="truncate">
             {title}
           </DialogTitle>
           {subtitle && (
@@ -88,10 +88,10 @@ export function Modal({
           )}
         </DialogHeader>
 
-        <div className="flex-1 overflow-y-auto px-6 py-4">{children}</div>
+        <div className="flex-1 overflow-y-auto px-7 pt-2 pb-6">{children}</div>
 
         {footer && (
-          <DialogFooter className="m-0 px-6 py-4 border-t border-border bg-transparent rounded-none sm:justify-end gap-3">
+          <DialogFooter className="m-0 px-7 py-4 border-t border-border bg-transparent rounded-none rounded-b-[22px] sm:justify-end gap-2">
             {footer}
           </DialogFooter>
         )}

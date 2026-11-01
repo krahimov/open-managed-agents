@@ -98,19 +98,19 @@ export function TenantSwitcher() {
             type="button"
             aria-label="Switch workspace"
             disabled={!ready}
-            className="mx-2 w-[calc(100%-1rem)] h-9 rounded-md px-2 flex items-center gap-2 text-left text-fg-muted hover:bg-bg-surface hover:text-fg transition-colors disabled:cursor-default disabled:hover:bg-transparent outline-none focus-visible:bg-bg-surface"
+            className="mx-2 w-[calc(100%-1rem)] h-10 rounded-xl px-2 flex items-center gap-2.5 text-left text-fg-muted hover:bg-fill hover:text-fg transition-colors duration-[var(--dur-base)] disabled:cursor-default disabled:hover:bg-transparent outline-none focus-visible:bg-fill"
           >
             {ready ? (
               <Avatar name={current.name} size="sm" squared />
             ) : (
-              <div className="size-6 rounded-md bg-brand-subtle shrink-0" aria-hidden="true" />
+              <div className="size-6 rounded-[7px] bg-fill-strong shrink-0" aria-hidden="true" />
             )}
             <div className="min-w-0 flex-1 leading-tight group-data-[collapsible=icon]:hidden">
-              <div className="text-sm font-medium truncate text-fg">
+              <div className="text-[13.5px] font-semibold tracking-[-0.01em] truncate text-fg">
                 {ready ? displayName(current) : " "}
               </div>
               {ready && tenants.length > 1 && (
-                <div className="text-[10px] text-fg-subtle uppercase">
+                <div className="eyebrow text-[10px]">
                   {current.role}
                 </div>
               )}

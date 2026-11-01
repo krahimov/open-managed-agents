@@ -63,11 +63,11 @@ export function UserProfile() {
         <button
           type="button"
           aria-label="Account menu"
-          className="mx-2 mb-2 w-[calc(100%-1rem)] h-9 rounded-md px-2 flex items-center gap-2 text-left text-fg-muted hover:bg-bg-surface hover:text-fg transition-colors"
+          className="mx-2 mb-3 w-[calc(100%-1rem)] h-11 rounded-xl px-2 flex items-center gap-2.5 text-left text-fg-muted hover:bg-fill hover:text-fg transition-colors duration-[var(--dur-base)]"
         >
-          <Avatar name={label} size="sm" />
+          <Avatar name={label} size="md" />
           <div className="flex-1 min-w-0 text-left leading-tight group-data-[collapsible=icon]:hidden">
-            <div className="text-sm text-sidebar-foreground truncate">
+            <div className="text-[13px] font-medium text-fg truncate">
               {user.name || user.email}
             </div>
             {user.email && user.name && (
@@ -115,7 +115,7 @@ export function UserProfile() {
 
         <DropdownMenuSeparator />
 
-        <DropdownMenuLabel className="text-[11px] uppercase text-fg-subtle font-medium">
+        <DropdownMenuLabel className="eyebrow px-2">
           Theme
         </DropdownMenuLabel>
         <DropdownMenuGroup>
@@ -129,7 +129,7 @@ export function UserProfile() {
               >
                 <Icon className="size-4 opacity-80" />
                 {optLabel}
-                {active && <CheckIcon className="ml-auto size-4 text-brand" />}
+                {active && <CheckIcon className="ml-auto size-4 text-accent-fill" />}
               </DropdownMenuItem>
             );
           })}

@@ -42,24 +42,24 @@ export function FilterChip({
     <Popover>
       <div
         className={cn(
-          "inline-flex items-center gap-1 h-8 text-sm shrink-0 transition-colors",
+          "inline-flex items-center gap-1 h-8 rounded-full text-[13px] shrink-0 transition-colors duration-[var(--dur-base)] ease-[var(--ease-soft)]",
           active
-            ? "rounded-full border border-brand text-brand bg-brand-subtle"
-            : "text-fg-muted hover:text-fg",
+            ? "bg-ink text-brand-fg"
+            : "bg-fill text-fg-muted hover:bg-fill-strong hover:text-fg has-[[aria-expanded=true]]:bg-fill-strong has-[[aria-expanded=true]]:text-fg",
         )}
       >
         <PopoverTrigger asChild>
           <button
             type="button"
             className={cn(
-              "inline-flex items-center gap-1 h-full outline-none",
-              active ? "pl-3 pr-2" : "px-2",
+              "inline-flex items-center gap-1 h-full rounded-full outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
+              active ? "pl-3.5 pr-1.5" : "pl-3.5 pr-2.5",
             )}
           >
             <span className="font-medium">{label}</span>
             {display && (
               <>
-                <span className="text-fg-subtle">:</span>
+                <span className="opacity-60">:</span>
                 <span>{display}</span>
               </>
             )}
@@ -73,7 +73,7 @@ export function FilterChip({
               e.stopPropagation();
               onClear();
             }}
-            className="inline-flex items-center justify-center size-5 mr-1.5 rounded-full hover:bg-brand/10"
+            className="inline-flex items-center justify-center size-5 mr-1.5 rounded-full hover:bg-white/20 dark:hover:bg-black/15"
             aria-label={`Clear ${label} filter`}
           >
             <XIcon className="size-3" />
@@ -208,13 +208,13 @@ export function CreatedFilterChip({
             type="button"
             onClick={() => apply(p)}
             className={cn(
-              "w-full flex items-center justify-between gap-2 px-2 py-1.5 rounded text-sm",
-              "hover:bg-bg-surface",
+              "w-full flex items-center justify-between gap-2 px-2.5 py-1.5 min-h-8 rounded-lg text-sm",
+              "hover:bg-fill",
               preset === p && "text-fg font-medium",
             )}
           >
             {CREATED_PRESET_LABELS[p]}
-            {preset === p && <CheckIcon className="size-3.5 text-brand" />}
+            {preset === p && <CheckIcon className="size-3.5 text-accent-fill" />}
           </button>
         ))}
         {preset === "custom" && (

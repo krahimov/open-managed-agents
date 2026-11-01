@@ -20,7 +20,7 @@ export function Logo({ size = "sm", className = "" }: LogoProps) {
       viewBox="0 0 32 32"
       role="img"
       aria-label={BRAND_NAME}
-      className={`shrink-0 text-brand ${className}`.trim()}
+      className={`shrink-0 ${/\btext-/.test(className) ? "" : "text-fg"} ${className}`.trim()}
       xmlns="http://www.w3.org/2000/svg"
     >
       {/* Orrery mark: ring + hand from the hub, coral body on the ring.

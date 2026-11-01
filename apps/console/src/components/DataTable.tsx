@@ -7,6 +7,7 @@ import {
 import {
   EyeIcon,
   EyeOffIcon,
+  PlusIcon,
   SearchIcon,
   SettingsIcon,
 } from "lucide-react";
@@ -39,6 +40,8 @@ import { PageHeader } from "./PageHeader";
 import { Skeleton } from "./Skeleton";
 import { cn } from "@/lib/utils";
 import { useLocation } from "react-router";
+import { usePageTitle } from "./AppBreadcrumb";
+import { pageDescription } from "../lib/page-meta";
 
 /**
  * DataTable — list page chrome with a frozen, column-aligned header.
@@ -176,6 +179,11 @@ export function DataTable<T>({
   });
 
   const showCreate = !!onCreate && !!createLabel;
+  // Editorial header: every list page gets a large title (the route's own
+  // crumb unless the caller names it) and a one-line deck.
+  const routeTitle = usePageTitle();
+  const headerTitle = title ?? routeTitle;
+  const headerSubtitle = subtitle ?? pageDescription(pathname);
 
   // Single-row toolbar: [+ New X] on far left, page-specific filter
   // chips next, then a flex spacer pushes [search] + [Columns] to the
@@ -185,14 +193,12 @@ export function DataTable<T>({
   // search box still right-aligns via `ml-auto`.
   const toolbar = (
     <>
-      {headerActions}
-      {showCreate && <Button onClick={onCreate}>{createLabel}</Button>}
       {filters}
       <div className="flex-1" />
       {onSearchChange && (
-        <InputGroup className="w-full sm:w-64 shrink-0">
-          <InputGroupAddon>
-            <SearchIcon className="size-3.5 opacity-50" />
+        <InputGroup className="w-full sm:w-64 shrink-0 rounded-full bg-fill border-transparent hover:border-transparent dark:bg-fill has-[[data-slot=input-group-control]:focus-visible]:bg-bg-surface">
+          <InputGroupAddon className="pl-3">
+            <SearchIcon className="size-3.5 opacity-60" />
           </InputGroupAddon>
           <InputGroupInput
             type="search"
@@ -207,6 +213,15 @@ export function DataTable<T>({
       <ColumnVisibilityMenu table={table} />
     </>
   );
+
+  // Title-row actions: page-specific extras + the primary create pill.
+  const titleActions =
+    headerActions || showCreate ? (
+      <>
+        {headerActions}
+        {showCreate && <CreateButton label={createLabel!} onClick={onCreate!} />}
+      </>
+    ) : undefined;
 
   const filteredRows = table.getRowModel().rows;
   const isEmpty = !loading && filteredRows.length === 0;
@@ -233,8 +248,8 @@ export function DataTable<T>({
     // on this element — see the useEffect below. Without this sync,
     // wide tables (many columns / long URLs) horizontal-scroll the
     // body but the header stays put → cells lose alignment.
-    <div id="dt-header-scroll" className="overflow-x-hidden">
-      <table className="w-full table-fixed text-fg-muted">
+    <div id="dt-header-scroll" className="overflow-x-hidden px-px">
+      <table className="w-full table-fixed text-fg-subtle">
         {colgroup}
         <thead>
           {table.getHeaderGroups().map((headerGroup) => (
@@ -242,10 +257,10 @@ export function DataTable<T>({
               {headerGroup.headers.map((header) => (
                 <th
                   key={header.id}
-                  className="h-9 px-3 text-left text-xs font-medium align-middle whitespace-nowrap"
+                  className="h-8 px-4 first:pl-6 text-left eyebrow align-middle whitespace-nowrap"
                 >
                   {header.isPlaceholder ? null : (
-                    <span className="font-medium">
+                    <span>
                       {flexRender(header.column.columnDef.header, header.getContext())}
                     </span>
                   )}
@@ -276,6 +291,9 @@ export function DataTable<T>({
   return (
     <>
       <PageHeader
+        title={headerTitle}
+        subtitle={headerSubtitle}
+        actions={titleActions}
         toolbar={toolbar}
         tableHeader={frozenHeader}
       />
@@ -283,7 +301,7 @@ export function DataTable<T>({
       {loading ? (
         <SkeletonRows colSpan={visibleColumnCount} />
       ) : isEmpty ? (
-        <div className="pl-4 pr-5 py-4">
+        <div className="px-8 pt-2 pb-12">
           <EmptyState
             title={emptyTitle}
             body={emptySubtitle}
@@ -294,52 +312,61 @@ export function DataTable<T>({
           />
         </div>
       ) : (
-        <div id="dt-body-scroll" className="pl-4 pr-5 pb-5 overflow-x-auto">
-          {/* Body sits flush against the frozen header in the slot —
-              no extra top padding so the gap between header and first
-              row is only the row pill's own `border-spacing-y-1.5`
-              (6 px). overflow-x-auto lets wide tables scroll
-              horizontally; the useEffect above mirrors scrollLeft to
-              the frozen header so column alignment is preserved. */}
-          <table className="w-full table-fixed border-separate border-spacing-y-1.5">
-            {colgroup}
-            <tbody>
-              {filteredRows.map((row) => {
-                const cells = row.getVisibleCells();
-                return (
-                  <tr
-                    key={row.id}
-                    onClick={onRowClick ? () => onRowClick(row.original) : undefined}
-                    className={cn(
-                      "bg-bg-surface shadow-[var(--shadow-sm)] hover:bg-brand-subtle/45 transition-colors",
-                      "[&>td]:bg-transparent [&>td]:px-3 [&>td]:py-2 [&>td]:align-middle [&>td]:text-sm",
-                      "[&>td:first-child]:rounded-l-md",
-                      "[&>td:last-child]:rounded-r-md",
-                      onRowClick && "cursor-pointer",
-                    )}
-                  >
-                    {cells.map((cell) => (
-                      <td key={cell.id} className="truncate">
-                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                      </td>
-                    ))}
-                  </tr>
-                );
-              })}
-              {onLoadMore && hasMore && (
-                <LoadMoreRow
-                  colSpan={visibleColumnCount}
-                  loading={!!loadingMore}
-                  onLoadMore={onLoadMore}
-                />
-              )}
-            </tbody>
-          </table>
+        <div className="px-8 pt-1 pb-12">
+          {/* One continuous card, rows divided by inset hairlines — an
+              editorial list rather than a stack of boxes. */}
+          <div id="dt-body-scroll" className="card overflow-x-auto">
+            <table className="w-full table-fixed border-separate border-spacing-0">
+              {colgroup}
+              <tbody>
+                {filteredRows.map((row, i) => {
+                  const cells = row.getVisibleCells();
+                  return (
+                    <tr
+                      key={row.id}
+                      onClick={onRowClick ? () => onRowClick(row.original) : undefined}
+                      className={cn(
+                        "group/row transition-colors duration-[var(--dur-base)] ease-[var(--ease-soft)] hover:bg-fill/70",
+                        "[&>td]:h-[60px] [&>td]:px-4 [&>td:first-child]:pl-6 [&>td]:align-middle [&>td]:text-sm",
+                        i > 0 && "[&>td]:border-t [&>td]:border-border [&>td:first-child]:border-t-0 [&>td:first-child]:bg-[linear-gradient(var(--border),var(--border))_top_right/calc(100%-1.5rem)_1px_no-repeat]",
+                        onRowClick && "cursor-pointer",
+                      )}
+                    >
+                      {cells.map((cell) => (
+                        <td key={cell.id} className="truncate">
+                          {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                        </td>
+                      ))}
+                    </tr>
+                  );
+                })}
+                {onLoadMore && hasMore && (
+                  <LoadMoreRow
+                    colSpan={visibleColumnCount}
+                    loading={!!loadingMore}
+                    onLoadMore={onLoadMore}
+                  />
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 
       {children}
     </>
+  );
+}
+
+/** Primary create pill. A leading "+ " in the label becomes a glyph so
+ *  the pill reads like an Apple action ("＋ New agent"). */
+export function CreateButton({ label, onClick }: { label: string; onClick: () => void }) {
+  const plus = label.startsWith("+ ");
+  return (
+    <Button onClick={onClick} className={plus ? "pl-3" : undefined}>
+      {plus && <PlusIcon className="size-4 -ml-0.5" strokeWidth={2.25} />}
+      {plus ? label.slice(2) : label}
+    </Button>
   );
 }
 
@@ -353,13 +380,13 @@ function ColumnVisibilityMenu<T>({ table }: { table: TanstackTable<T> }) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="outline" className="ml-auto shrink-0">
+        <Button variant="ghost" className="ml-auto shrink-0">
           <SettingsIcon className="size-3.5" />
           Columns
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-48">
-        <DropdownMenuLabel className="text-[11px] uppercase text-fg-subtle font-medium">
+        <DropdownMenuLabel className="eyebrow px-2">
           Visible columns
         </DropdownMenuLabel>
         <DropdownMenuSeparator />
@@ -401,36 +428,36 @@ function ColumnVisibilityMenu<T>({ table }: { table: TanstackTable<T> }) {
 function SkeletonRows({ colSpan }: { colSpan: number }) {
   const cols = colSpan || 4;
   return (
-    <div className="pl-4 pr-5 pb-5">
-      <table className="w-full table-fixed border-separate border-spacing-y-1.5">
-        <tbody>
-          {Array.from({ length: 10 }).map((_, rowIdx) => (
-            <tr
-              key={`sk-${rowIdx}`}
-              className={cn(
-                "bg-bg-surface",
-                "[&>td]:bg-transparent [&>td]:px-3 [&>td]:py-2 [&>td]:align-middle",
-                "[&>td:first-child]:rounded-l-md",
-                "[&>td:last-child]:rounded-r-md",
-              )}
-            >
-              {Array.from({ length: cols }).map((_, colIdx) => {
-                const widthClass = (() => {
-                  if (colIdx === 0) return rowIdx % 2 === 0 ? "w-[55%]" : "w-[42%]";
-                  if (colIdx === cols - 1)
-                    return rowIdx % 2 === 0 ? "w-[38%]" : "w-[48%]";
-                  return rowIdx % 3 === 0 ? "w-[85%]" : rowIdx % 3 === 1 ? "w-[72%]" : "w-[60%]";
-                })();
-                return (
-                  <td key={colIdx}>
-                    <Skeleton className={`h-3.5 ${widthClass}`} rounded="sm" />
-                  </td>
-                );
-              })}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div className="px-8 pt-[33px] pb-12">
+      <div className="card overflow-hidden">
+        <table className="w-full table-fixed border-separate border-spacing-0">
+          <tbody>
+            {Array.from({ length: 8 }).map((_, rowIdx) => (
+              <tr
+                key={`sk-${rowIdx}`}
+                className={cn(
+                  "[&>td]:h-[60px] [&>td]:px-4 [&>td:first-child]:pl-6 [&>td]:align-middle",
+                  rowIdx > 0 && "[&>td]:border-t [&>td]:border-border",
+                )}
+              >
+                {Array.from({ length: cols }).map((_, colIdx) => {
+                  const widthClass = (() => {
+                    if (colIdx === 0) return rowIdx % 2 === 0 ? "w-[55%]" : "w-[42%]";
+                    if (colIdx === cols - 1)
+                      return rowIdx % 2 === 0 ? "w-[38%]" : "w-[48%]";
+                    return rowIdx % 3 === 0 ? "w-[85%]" : rowIdx % 3 === 1 ? "w-[72%]" : "w-[60%]";
+                  })();
+                  return (
+                    <td key={colIdx}>
+                      <Skeleton className={`h-3 ${widthClass}`} rounded="full" />
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -463,7 +490,7 @@ function LoadMoreRow({
 
   return (
     <tr ref={ref}>
-      <td colSpan={colSpan} className="text-center py-4 text-xs text-fg-subtle">
+      <td colSpan={colSpan} className="text-center py-4 text-xs text-fg-subtle border-t border-border">
         {loading ? "Loading more…" : " "}
       </td>
     </tr>

@@ -124,7 +124,7 @@ export function AppShell() {
         className="h-svh overflow-hidden"
         style={{
           // 224px expanded, 52px collapsed-icon — matches benchmark.
-          "--sidebar-width": "14.75rem",
+          "--sidebar-width": "15rem",
           "--sidebar-width-icon": "3.25rem",
         } as React.CSSProperties}
       >
@@ -156,20 +156,23 @@ export function AppShell() {
           />
         </div>
 
-        <div className="flex w-full bg-sidebar h-full overflow-hidden">
+        <div className="flex w-full bg-bg h-full overflow-hidden">
           <AppSidebar />
 
           <div className="flex-1 min-w-0 flex flex-col min-h-0">
-            <header className="h-12 flex items-center gap-1.5 pl-2 pr-4 bg-sidebar shrink-0">
-              <SidebarTrigger className="h-6 w-6 text-fg-muted hover:text-fg hover:bg-sidebar-accent" />
+            {/* Top bar — deliberately quiet: the sidebar toggle and a
+                subtle breadcrumb on the bare canvas. No band, no border;
+                the page title below carries the hierarchy. */}
+            <header className="h-12 flex items-center gap-2 pl-3 pr-8 shrink-0">
+              <SidebarTrigger className="size-7 rounded-full text-fg-subtle hover:text-fg hover:bg-fill" />
               <AppBreadcrumb />
             </header>
 
-            <div className="flex-1 min-h-0 rounded-tl-lg border-l border-t border-border bg-bg flex flex-col overflow-hidden shadow-[var(--shadow-md)]">
+            <div className="flex-1 min-h-0 bg-bg flex flex-col overflow-hidden">
               <div
                 ref={setPageHeaderSlot}
                 className={[
-                  "empty:hidden shrink-0 transition-[border-color] duration-150",
+                  "empty:hidden shrink-0 transition-[border-color] duration-[var(--dur-base)]",
                   scrolled ? "border-b border-border" : "border-b border-transparent",
                 ].join(" ")}
               />

@@ -69,10 +69,10 @@ export function RowActionsMenu({ actions, label = "Row actions" }: RowActionsMen
             aria-label={label}
             onClick={(e) => e.stopPropagation()}
             className={cn(
-              "inline-flex items-center justify-center size-7 rounded-md",
-              "text-fg-subtle hover:text-fg hover:bg-bg-surface",
-              "transition-colors outline-none",
-              "focus-visible:bg-bg-surface",
+              "inline-flex items-center justify-center size-8 rounded-full",
+              "text-fg-subtle hover:text-fg hover:bg-fill-strong aria-expanded:bg-fill-strong aria-expanded:text-fg",
+              "transition-colors duration-[var(--dur-base)] outline-none",
+              "focus-visible:bg-fill-strong",
             )}
           >
             <MoreHorizontalIcon className="size-4" />
