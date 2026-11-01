@@ -100,12 +100,13 @@ export function AgentsList() {
         header: "Status",
         cell: ({ row }) => (
           <span
-            className={`inline-flex items-center text-xs px-2 py-0.5 rounded-full ${
+            className={`inline-flex items-center gap-1.5 h-5 pl-1.5 pr-2 rounded-full text-[11px] font-medium ${
               row.original.archived_at
-                ? "bg-bg-surface text-fg-subtle"
+                ? "bg-bg-hover text-fg-muted dark:bg-white/[0.08]"
                 : "bg-success-subtle text-success"
             }`}
           >
+            <span aria-hidden="true" className="size-1.5 rounded-full bg-current opacity-80" />
             {row.original.archived_at ? "archived" : "active"}
           </span>
         ),

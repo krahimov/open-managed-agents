@@ -101,7 +101,7 @@ export function TenantSwitcher() {
             className="sq-press mx-3 w-[calc(100%-1.5rem)] h-10 rounded-lg px-1.5 flex items-center gap-2 text-left text-fg-muted bg-bg-hover shadow-[inset_0_0_0_0.5px_var(--border)] hover:bg-bg-press hover:text-fg disabled:cursor-default outline-none group-data-[collapsible=icon]:mx-1.5 group-data-[collapsible=icon]:w-10 group-data-[collapsible=icon]:bg-transparent group-data-[collapsible=icon]:shadow-none"
           >
             {ready ? (
-              <Avatar name={current.name} size="md" squared />
+              <Avatar name={displayName(current)} size="md" squared />
             ) : (
               <div className="size-7 rounded-md bg-bg-press shrink-0" aria-hidden="true" />
             )}

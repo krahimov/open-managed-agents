@@ -94,7 +94,7 @@ export function VaultsList() {
           <span
             className={`inline-flex items-center text-xs px-2 py-0.5 rounded-full ${
               row.original.archived_at
-                ? "bg-bg-surface text-fg-subtle"
+                ? "bg-bg-hover text-fg-subtle"
                 : "bg-success-subtle text-success"
             }`}
           >

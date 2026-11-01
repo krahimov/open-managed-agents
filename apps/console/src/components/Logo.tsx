@@ -29,8 +29,8 @@ export function Logo({ size = "sm", className = "" }: LogoProps) {
           orbiting body as the one remaining touch of Orrery coral. */}
       <defs>
         <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0" stopColor="#3a3a40" />
-          <stop offset="1" stopColor="#1c1c20" />
+          <stop offset="0" style={{ stopColor: "var(--logo-tile-top, #3a3a40)" }} />
+          <stop offset="1" style={{ stopColor: "var(--logo-tile-bottom, #1c1c20)" }} />
         </linearGradient>
       </defs>
       <rect x="0.5" y="0.5" width="31" height="31" rx="8" fill={`url(#${gid})`} />
@@ -47,7 +47,7 @@ export function Logo({ size = "sm", className = "" }: LogoProps) {
         <circle cx="16" cy="16" r="8.5" />
       </g>
       <circle cx="16" cy="16" r="1.8" fill="#ffffff" />
-      <circle cx="20.7" cy="11.3" r="3" fill="var(--logo-coral, #e5624f)" />
+      <circle cx="20.7" cy="11.3" r="3" style={{ fill: "var(--logo-coral, #e5624f)" }} />
     </svg>
   );
 }

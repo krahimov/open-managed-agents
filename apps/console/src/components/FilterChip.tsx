@@ -200,7 +200,7 @@ export function CreatedFilterChip({
         align="start"
         sideOffset={4}
         collisionPadding={8}
-        className="w-60 p-1"
+        className="w-60 p-[5px] gap-0"
       >
         {(Object.keys(CREATED_PRESET_LABELS) as CreatedPreset[]).map((p) => (
           <button
@@ -208,8 +208,8 @@ export function CreatedFilterChip({
             type="button"
             onClick={() => apply(p)}
             className={cn(
-              "w-full flex items-center justify-between gap-2 px-2 py-1.5 rounded text-sm",
-              "hover:bg-bg-surface",
+              "w-full flex items-center justify-between gap-2 px-2 h-7 rounded-[5px] text-sm",
+              "hover:bg-brand hover:text-brand-fg hover:[&_svg]:text-brand-fg",
               preset === p && "text-fg font-medium",
             )}
           >

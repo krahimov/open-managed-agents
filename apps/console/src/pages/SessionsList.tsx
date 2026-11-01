@@ -616,9 +616,11 @@ export function SessionsList() {
 
   const statusCls = (status?: string) => {
     switch (status) {
-      case "idle": return "bg-success-subtle text-success";
+      case "idle": return "bg-bg-hover text-fg-muted dark:bg-white/[0.08]";
       case "running": return "bg-info-subtle text-info";
-      default: return "bg-bg-surface text-fg-muted";
+      case "terminated": return "bg-danger-subtle text-danger";
+      case "rescheduling": return "bg-warning-subtle text-warning";
+      default: return "bg-bg-hover text-fg-muted dark:bg-white/[0.08]";
     }
   };
 
@@ -765,9 +767,11 @@ export function SessionsList() {
         accessorFn: (s) => s.status ?? "idle",
         header: "Status",
         cell: ({ row }) => (
-          <span
-            className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${statusCls(row.original.status)}`}
-          >
+          <span className={`inline-flex items-center gap-1.5 h-5 pl-1.5 pr-2 rounded-full text-[11px] font-medium ${statusCls(row.original.status)}`}>
+            <span
+              aria-hidden="true"
+              className={`size-1.5 rounded-full bg-current ${row.original.status === "running" ? "animate-pulse" : "opacity-70"}`}
+            />
             {row.original.status || "idle"}
           </span>
         ),

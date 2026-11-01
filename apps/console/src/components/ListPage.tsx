@@ -20,6 +20,7 @@ import {
 import { EmptyState, type EmptyStateKind } from "./EmptyState";
 import { Page } from "./Page";
 import { PageHeader } from "./PageHeader";
+import { useRouteTitle } from "./AppBreadcrumb";
 import { Skeleton } from "./Skeleton";
 
 interface Column<T> {
@@ -144,20 +145,28 @@ export function ListPage<T>({
   children,
 }: ListPageProps<T>) {
   const showCreate = !!onCreate && !!createLabel;
+  const routeTitle = useRouteTitle();
+  const titleActions =
+    headerActions || showCreate ? (
+      <>
+        {headerActions}
+        {showCreate && <Button onClick={onCreate}>{createLabel}</Button>}
+      </>
+    ) : undefined;
 
   // Single-row toolbar: [+ New X] far left → filter chips + archive
   // toggle → spacer → [search] far right. Matches the LangSmith /
   // Linear / Vercel single-row pattern. No top-right "actions" zone
   // any more; the create CTA lives inline with the rest of the
   // toolbar so the eye lands in one place.
+  const hasToolbar = !!filters || !!onShowArchivedChange || !!onSearchChange;
   const toolbar = (
     <>
-      {headerActions}
-      {showCreate && <Button onClick={onCreate}>{createLabel}</Button>}
       {filters}
       {onShowArchivedChange && (
-        <label className="flex items-center gap-2 text-sm text-fg-muted cursor-pointer select-none shrink-0">
+        <label className="flex items-center gap-2 text-[13px] text-fg-muted cursor-pointer select-none shrink-0">
           <Checkbox
+            variant="switch"
             checked={showArchived ?? false}
             onCheckedChange={(c) => onShowArchivedChange(c === true)}
           />
@@ -166,7 +175,7 @@ export function ListPage<T>({
       )}
       <div className="flex-1" />
       {onSearchChange && (
-        <InputGroup className="w-full sm:w-64 shrink-0">
+        <InputGroup className="w-full sm:w-60 shrink-0 h-7 rounded-[7px] bg-bg-hover border-transparent shadow-none dark:bg-white/[0.07]">
           <InputGroupAddon>
             <SearchIcon className="size-3.5 opacity-50" />
           </InputGroupAddon>
@@ -189,7 +198,16 @@ export function ListPage<T>({
   const tableHeadSticky = "sticky top-0 z-10";
 
   return (
-    <Page header={<PageHeader toolbar={toolbar} />}>
+    <Page
+      header={
+        <PageHeader
+          title={title ?? routeTitle}
+          subtitle={subtitle}
+          actions={titleActions}
+          toolbar={hasToolbar ? toolbar : undefined}
+        />
+      }
+    >
       {loading ? (
         <TableShell columns={columns} headSticky={tableHeadSticky}>
           {/* Skeleton rows — clamped to 10 so empty workspaces don't
@@ -197,7 +215,7 @@ export function ListPage<T>({
           {Array.from({ length: 10 }).map((_, rowIdx) => (
             <TableRow
               key={`sk-${rowIdx}`}
-              className="border-0 bg-bg-surface shadow-[var(--shadow-sm)] hover:bg-bg-surface [&>td:first-child]:rounded-l-md [&>td:last-child]:rounded-r-md"
+              className="sq-table-row border-0 hover:bg-transparent"
             >
               {columns.map((col, colIdx) => {
                 const widthClass = (() => {
@@ -208,7 +226,7 @@ export function ListPage<T>({
                 })();
                 return (
                   <TableCell key={col.key} className={col.className}>
-                    <Skeleton className={`h-3.5 ${widthClass}`} rounded="sm" />
+                    <Skeleton className={`h-3 ${widthClass}`} rounded="full" />
                   </TableCell>
                 );
               })}
@@ -216,7 +234,7 @@ export function ListPage<T>({
           ))}
         </TableShell>
       ) : data.length === 0 ? (
-        <div className="pl-4 pr-5 py-4">
+        <div className="py-2">
           <EmptyState
             title={emptyTitle}
             body={emptySubtitle}
@@ -227,17 +245,13 @@ export function ListPage<T>({
           />
         </div>
       ) : (
-        <div className="pl-4 pr-5">
+        <div>
           <TableShell columns={columns} headSticky={tableHeadSticky}>
             {data.map((item) => (
               <TableRow
                 key={getRowKey(item)}
                 onClick={onRowClick ? () => onRowClick(item) : undefined}
-                className={[
-                  "border-0 bg-bg-surface shadow-[var(--shadow-sm)] hover:bg-brand-subtle/45",
-                  "[&>td:first-child]:rounded-l-md [&>td:last-child]:rounded-r-md",
-                  onRowClick ? "cursor-pointer" : "",
-                ].join(" ")}
+                className="sq-table-row border-0"
               >
                 {columns.map((col) => (
                   <TableCell key={col.key} className={col.className}>
@@ -272,19 +286,17 @@ interface TableShellProps<T> {
 
 function TableShell<T>({ columns, headSticky, children }: TableShellProps<T>) {
   return (
-    <Table className="border-separate border-spacing-y-1.5">
-      {/* Cleaner thead — normal-case xs text with a bg tint that matches
-          the rest of the canvas (bg-bg/95 + backdrop-blur lets the row
-          beneath bleed through faintly as the user scrolls under it).
-          The previous uppercase treatment read as
-          dashboard-y / Bootstrap-era; modern app tables (Linear, Vercel,
-          Plane) use plain case + subtle weight. */}
-      <TableHeader
-        className={`${headSticky} bg-bg/95 backdrop-blur supports-[backdrop-filter]:bg-bg/80 text-fg-muted`}
-      >
-        <TableRow className="border-0 hover:bg-transparent">
+    // Grouped list: one rounded surface, a quiet column header strip at
+    // the top, rows split by inset hairlines.
+    <div className="sq-group">
+    <Table className="border-collapse [&_td]:px-4 [&_td]:h-11 [&_td]:text-[13px]">
+      <TableHeader className={`${headSticky} bg-bg-surface text-fg-subtle [&_tr]:border-0`}>
+        <TableRow className="border-0 hover:bg-transparent shadow-[0_0.5px_0_var(--hairline)]">
           {columns.map((col) => (
-            <TableHead key={col.key} className={`h-9 text-xs font-medium ${col.className ?? ""}`}>
+            <TableHead
+              key={col.key}
+              className={`h-8 px-4 text-[11px] font-semibold tracking-[0.01em] text-fg-subtle ${col.className ?? ""}`}
+            >
               {col.label}
             </TableHead>
           ))}
@@ -292,6 +304,7 @@ function TableShell<T>({ columns, headSticky, children }: TableShellProps<T>) {
       </TableHeader>
       <TableBody>{children}</TableBody>
     </Table>
+    </div>
   );
 }
 
@@ -333,7 +346,7 @@ function LoadMoreRow({
   }, [loading, onLoadMore]);
 
   return (
-    <TableRow ref={ref} className="hover:bg-transparent">
+    <TableRow ref={ref} className="sq-table-sentinel border-0 hover:bg-transparent">
       <TableCell colSpan={colSpan} className="text-center py-4 text-xs text-fg-subtle">
         {loading ? "Loading more…" : " "}
       </TableCell>

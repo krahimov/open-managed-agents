@@ -519,7 +519,7 @@ function TraceFactsPanel({
                       c.exit_code === 0
                         ? "bg-success-subtle text-success"
                         : c.exit_code === -1
-                        ? "bg-bg-surface text-fg-subtle"
+                        ? "bg-bg-hover text-fg-subtle"
                         : "bg-danger-subtle text-danger"
                     }`}
                     title={c.exit_code === -1 ? "no result recorded" : `exit ${c.exit_code}`}

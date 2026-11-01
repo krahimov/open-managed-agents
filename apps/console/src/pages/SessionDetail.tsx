@@ -784,7 +784,7 @@ export function SessionDetail() {
           trail and the entity id. Stop + Files actions live at the
           right (`ml-auto`) of the badges row so the page-level chrome
           stays one band tall. */}
-      <div className="pl-3 pr-4 py-3 flex flex-col gap-2 shrink-0">
+      <div className="px-6 pt-1 pb-3 flex flex-col gap-2 shrink-0">
         <div className="flex items-center gap-2 flex-wrap">
           {status === "idle" && awaitingKind ? (
             // Idle on requires_action is not "done": the turn is parked on
@@ -849,7 +849,7 @@ export function SessionDetail() {
               <button
                 onClick={() => void interrupt()}
                 disabled={interrupting}
-                className="inline-flex items-center justify-center px-2.5 py-1 min-h-11 sm:min-h-0 rounded-md text-xs font-medium bg-bg-surface/60 text-fg-muted hover:bg-bg-surface hover:text-fg disabled:opacity-50 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+                className="sq-press inline-flex items-center justify-center px-2.5 h-7 min-h-11 sm:min-h-7 rounded-[6px] text-[12px] font-medium bg-bg-surface text-fg shadow-[var(--shadow-button)] hover:bg-[#fafafa] dark:bg-white/[0.10] dark:hover:bg-white/[0.14] disabled:opacity-50 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
                 title="Interrupt the active turn on this thread"
               >
                 {interrupting ? "Stopping…" : "Stop"}
@@ -859,17 +859,17 @@ export function SessionDetail() {
                 user messages + a judge-drafted rubric into a suite task. */}
             <button
               onClick={() => setShowSaveAsEval(true)}
-              className="inline-flex items-center justify-center px-2.5 py-1 min-h-11 sm:min-h-0 rounded-md text-xs font-medium bg-bg-surface/60 text-fg-muted hover:bg-bg-surface hover:text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+              className="sq-press inline-flex items-center justify-center px-2.5 h-7 min-h-11 sm:min-h-7 rounded-[6px] text-[12px] font-medium bg-bg-surface text-fg shadow-[var(--shadow-button)] hover:bg-[#fafafa] dark:bg-white/[0.10] dark:hover:bg-white/[0.14] transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
               title="Snapshot this session into an eval suite task"
             >
               Save as eval
             </button>
             <button
               onClick={() => setShowFiles((v) => !v)}
-              className={`inline-flex items-center justify-center px-2.5 py-1 min-h-11 sm:min-h-0 rounded-md text-xs font-medium transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
+              className={`sq-press inline-flex items-center justify-center px-2.5 h-7 min-h-11 sm:min-h-7 rounded-[6px] text-[12px] font-medium transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
                 showFiles
-                  ? "bg-bg-surface text-fg"
-                  : "bg-bg-surface/60 text-fg-muted hover:bg-bg-surface hover:text-fg"
+                  ? "bg-brand-subtle text-brand shadow-[inset_0_0_0_0.5px_color-mix(in_srgb,var(--accent)_40%,transparent)]"
+                  : "bg-bg-surface text-fg shadow-[var(--shadow-button)] hover:bg-[#fafafa] dark:bg-white/[0.10] dark:hover:bg-white/[0.14]"
               }`}
               title="Files the agent wrote to /mnt/session/outputs/"
             >
@@ -895,9 +895,12 @@ export function SessionDetail() {
       )}
 
       {/* View tabs */}
-      <div role="tablist" aria-label="Session view" className="pl-3 pr-4 flex items-center gap-1 shrink-0">
-        <ViewTab label="Conversation" active={view === "chat"} onClick={() => setView("chat")} />
-        <ViewTab label="Timeline" active={view === "timeline"} onClick={() => setView("timeline")} />
+      <div className="px-6 pb-2 flex items-center gap-2 shrink-0 shadow-[0_0.5px_0_var(--hairline)]">
+        {/* Segmented control (macOS) for the two session views. */}
+        <div role="tablist" aria-label="Session view" className="sq-segmented my-1">
+          <ViewTab label="Conversation" active={view === "chat"} onClick={() => setView("chat")} />
+          <ViewTab label="Timeline" active={view === "timeline"} onClick={() => setView("timeline")} />
+        </div>
         {view === "timeline" && (
           <span className="ml-auto text-xs text-fg-subtle font-mono">{events.length} events</span>
         )}
@@ -908,7 +911,7 @@ export function SessionDetail() {
         <button
           onClick={() => setShowTrajectory(true)}
           disabled={trajectory === undefined || trajectory === "loading"}
-          className={`${view === "timeline" ? "ml-3" : "ml-auto"} inline-flex items-center min-h-11 sm:min-h-0 text-xs text-fg-muted hover:text-fg disabled:opacity-40 disabled:cursor-not-allowed bg-bg-surface/60 hover:bg-bg-surface rounded px-2 py-1 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] my-1.5`}
+          className={`${view === "timeline" ? "ml-3" : "ml-auto"} sq-press inline-flex items-center min-h-11 sm:min-h-7 h-7 text-[12px] font-medium text-fg-muted hover:text-fg disabled:opacity-40 disabled:cursor-not-allowed hover:bg-bg-hover rounded-[6px] px-2.5`}
           title={
             trajectory === "loading"
               ? "Loading trajectory…"
@@ -1019,7 +1022,7 @@ export function SessionDetail() {
                 7) typing dots when only the agent is "thinking" with
                    nothing else streaming yet */}
           <Conversation className="flex-1 min-h-0">
-            <ConversationContent className="pl-3 pr-4 py-6 gap-4">
+            <ConversationContent className="w-full max-w-[880px] mx-auto px-6 py-8 gap-4">
               {(() => {
                 // Server-returned events are now in canonical drain order
                 // (events.seq = INSERT order = what the model saw). The
@@ -1256,7 +1259,7 @@ export function SessionDetail() {
               conversation above on a `bg-bg` (white) surface — no
               line, no top padding, just `pb-4` for breathing room
               below. */}
-          <div className="pl-3 pr-4 pb-4 bg-bg shrink-0">
+          <div className="px-6 pb-5 pt-1 bg-bg shrink-0 w-full max-w-[928px] mx-auto">
             <PromptInput
               accept="image/*"
               multiple
@@ -1351,10 +1354,10 @@ function ViewTab({ label, active, onClick }: { label: string; active: boolean; o
       role="tab"
       aria-selected={active}
       tabIndex={active ? 0 : -1}
-      className={`inline-flex items-center justify-center px-3 py-2 min-h-11 sm:min-h-0 text-sm rounded-md my-1.5 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
+      className={`inline-flex items-center justify-center px-3.5 h-11 sm:h-[26px] text-[13px] font-medium rounded-[6px] outline-none focus-visible:ring-[3px] focus-visible:ring-system-accent/45 transition-[background-color,color,box-shadow] duration-[var(--dur-base)] ease-[var(--ease-soft)] ${
         active
-          ? "bg-bg-surface text-brand font-semibold"
-          : "text-fg-subtle hover:text-fg-muted hover:bg-bg-surface/60"
+          ? "bg-bg-surface text-fg shadow-[var(--shadow-button)] dark:bg-white/[0.16]"
+          : "text-fg-muted hover:text-fg"
       }`}
     >
       {label}

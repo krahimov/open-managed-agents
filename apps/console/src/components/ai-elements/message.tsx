@@ -54,9 +54,12 @@ export const MessageContent = ({
 }: MessageContentProps) => (
   <div
     className={cn(
-      "is-user:dark flex w-fit min-w-0 max-w-full flex-col gap-2 overflow-hidden text-sm",
-      "group-[.is-user]:ml-auto group-[.is-user]:rounded-lg group-[.is-user]:bg-secondary group-[.is-user]:px-4 group-[.is-user]:py-3 group-[.is-user]:text-foreground",
-      "group-[.is-assistant]:text-foreground",
+      "flex w-fit min-w-0 max-w-full flex-col gap-2 overflow-hidden text-[13.5px] leading-[1.55]",
+      // Messages-style user bubble: accent fill, white text, continuous
+      // 18px corners with a tighter trailing-bottom corner.
+      "group-[.is-user]:ml-auto group-[.is-user]:max-w-[min(72ch,80%)] group-[.is-user]:rounded-[18px] group-[.is-user]:rounded-br-[6px] group-[.is-user]:bg-brand group-[.is-user]:px-3.5 group-[.is-user]:py-2 group-[.is-user]:text-brand-fg group-[.is-user]:shadow-[0_1px_1px_rgb(0_0_0/0.06)] group-[.is-user]:[&_a]:text-brand-fg group-[.is-user]:[&_a]:underline group-[.is-user]:[&_code]:bg-white/20 group-[.is-user]:[&_code]:text-brand-fg",
+      // Assistant text flows unboxed on the canvas.
+      "group-[.is-assistant]:text-fg",
       className
     )}
     {...props}

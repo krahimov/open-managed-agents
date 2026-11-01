@@ -57,7 +57,9 @@ function CommandDialog({
         )}
         showCloseButton={showCloseButton}
       >
-        {children}
+        {/* cmdk items need a <Command> root for their store; without it
+            opening the palette threw "reading 'subscribe'". */}
+        <Command className="bg-transparent">{children}</Command>
       </DialogContent>
     </Dialog>
   )
@@ -153,7 +155,7 @@ function CommandItem({
     <CommandPrimitive.Item
       data-slot="command-item"
       className={cn(
-        "group/command-item relative flex cursor-default items-center gap-2 rounded-[6px] px-2 py-1.5 text-sm outline-hidden select-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-selected:bg-brand data-selected:text-brand-fg data-selected:**:text-brand-fg! [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+        "group/command-item relative flex cursor-default items-center gap-2 rounded-[6px] px-2 py-1.5 text-sm outline-hidden select-none data-[disabled=true]:pointer-events-none data-[disabled=true]:opacity-50 data-[selected=true]:bg-brand data-[selected=true]:text-brand-fg data-[selected=true]:**:text-brand-fg! [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
         className
       )}
       {...props}
@@ -172,7 +174,7 @@ function CommandShortcut({
     <span
       data-slot="command-shortcut"
       className={cn(
-        "ml-auto text-xs text-muted-foreground group-data-selected/command-item:text-brand-fg",
+        "ml-auto text-xs text-muted-foreground group-data-[selected=true]/command-item:text-brand-fg",
         className
       )}
       {...props}

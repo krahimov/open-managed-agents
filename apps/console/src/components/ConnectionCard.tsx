@@ -92,7 +92,7 @@ export function ServiceIcon({ service, url, className = "size-8" }: { service: s
   const name = serviceDisplayName(service, url);
   return (
     <span
-      className={`${className} shrink-0 rounded-md border border-border bg-bg flex items-center justify-center overflow-hidden`}
+      className={`${className} shrink-0 rounded-[8px] bg-bg-surface shadow-[var(--shadow-sm)] flex items-center justify-center overflow-hidden`}
       aria-hidden
     >
       {domain && !failed ? (
@@ -512,7 +512,7 @@ export function ConnectionCard({
 
   return (
     <div
-      className="harness-diff-card max-w-2xl rounded-lg border border-border bg-bg-surface overflow-hidden"
+      className="harness-diff-card max-w-2xl rounded-xl bg-bg-surface shadow-[var(--shadow-md)] overflow-hidden"
       data-testid="connection-card"
       data-state={gone ? "gone" : connected ? "connected" : "pending"}
       data-connection-url={request.mcp_server_url}
@@ -520,12 +520,12 @@ export function ConnectionCard({
       <div className="flex items-center gap-3 px-4 py-3">
         <ServiceIcon service={request.service} url={request.mcp_server_url} />
         <div className="min-w-0 flex-1">
-          <div className="text-sm font-medium text-fg">{name}</div>
+          <div className="text-[13px] font-semibold text-fg">{name}</div>
           <div className={`text-xs truncate ${connected ? "text-fg-muted" : "text-fg-subtle"}`}>{subtitle}</div>
         </div>
         {connected && !choosing ? (
           <div className="flex items-center gap-2 shrink-0">
-            <span className="inline-flex items-center gap-1 text-xs font-medium text-success">
+            <span className="inline-flex items-center gap-1 h-5 px-2 rounded-full bg-success-subtle text-[11px] font-medium text-success">
               <CheckIcon className="size-3.5" aria-hidden /> Connected
             </span>
             <Button variant="ghost" size="sm" onClick={() => setChoosing(true)}>
@@ -545,22 +545,22 @@ export function ConnectionCard({
             <Spinner className="size-4 text-fg-subtle" />
           )
         ) : (
-          <span className="inline-flex items-center gap-1.5 text-xs text-warning shrink-0">
+          <span className="inline-flex items-center gap-1.5 h-5 pl-1.5 pr-2 rounded-full bg-warning-subtle text-[11px] font-medium text-warning shrink-0">
             <span className="size-1.5 rounded-full bg-warning" aria-hidden /> Not connected
           </span>
         )}
       </div>
 
       {showChooser && state && (
-        <div className="border-t border-border px-4 py-3 space-y-3">
+        <div className="shadow-[inset_0_0.5px_0_var(--hairline)] px-4 py-3 space-y-3">
           {good.length > 0 && (
             <div className="space-y-1.5">
-              <div className="text-[11px] font-medium uppercase tracking-wider text-fg-subtle">
+              <div className="px-1 text-[11px] font-semibold text-fg-subtle">
                 Saved {name} accounts
               </div>
-              <ul className="divide-y divide-border rounded-md border border-border bg-bg">
+              <ul className="divide-y divide-hairline rounded-[10px] bg-bg-inset/60 shadow-[inset_0_0_0_0.5px_var(--border)] dark:bg-white/[0.03]">
                 {good.map(({ conn, identity }) => (
-                  <li key={conn.credential_id} className="flex items-center gap-3 px-3 py-2">
+                  <li key={conn.credential_id} className="flex items-center gap-3 px-3 min-h-11 py-2">
                     <div className="min-w-0 flex-1">
                       <div className="text-sm text-fg truncate">{who(identity?.account, identity?.workspace) || conn.label}</div>
                       <div className="text-xs text-fg-subtle truncate">
@@ -596,9 +596,9 @@ export function ConnectionCard({
               <summary className="cursor-pointer select-none">
                 {broken.length} older sign-in{broken.length === 1 ? "" : "s"} no longer work{broken.length === 1 ? "s" : ""}
               </summary>
-              <ul className="mt-1.5 divide-y divide-border rounded-md border border-border bg-bg">
+              <ul className="mt-1.5 divide-y divide-hairline rounded-[10px] bg-bg-inset/60 shadow-[inset_0_0_0_0.5px_var(--border)] dark:bg-white/[0.03]">
                 {broken.map(({ conn, identity }) => (
-                  <li key={conn.credential_id} className="flex items-center gap-3 px-3 py-2">
+                  <li key={conn.credential_id} className="flex items-center gap-3 px-3 min-h-11 py-2">
                     <div className="min-w-0 flex-1">
                       <div className="text-sm text-fg truncate">{conn.label}</div>
                       <div className="text-xs text-danger truncate">{identity?.message ?? "This sign-in no longer works."}</div>
@@ -635,7 +635,7 @@ export function ConnectionCard({
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 placeholder={`Paste a ${name} API key`}
-                className="flex-1 min-w-0 h-8 rounded-md border border-border bg-bg px-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-brand"
+                className="flex-1 min-w-0 h-[30px] rounded-[7px] border border-input bg-bg-surface px-2.5 text-xs font-mono focus:outline-none focus:border-system-accent focus:ring-[3px] focus:ring-system-accent/25"
               />
               <Button size="sm" type="submit" disabled={!apiKey.trim() || !!busy} loading={busy === "api_key"} loadingLabel="Checking…">
                 Connect
@@ -718,15 +718,15 @@ export function ConnectionCard({
       )}
 
       {error && (
-        <div role="alert" className="border-t border-border bg-danger-subtle px-4 py-2 text-xs text-danger">
+        <div role="alert" className="bg-danger-subtle px-4 py-2 text-xs text-danger">
           {error}
         </div>
       )}
       {gone && (
-        <div className="border-t border-border px-4 py-2 text-xs text-fg-subtle">{gone}</div>
+        <div className="shadow-[inset_0_0.5px_0_var(--hairline)] px-4 py-2 text-xs text-fg-subtle">{gone}</div>
       )}
       {showChooser && state && (
-        <div className="border-t border-border px-4 py-2 text-[11px] text-fg-subtle">
+        <div className="shadow-[inset_0_0.5px_0_var(--hairline)] bg-bg-inset/40 dark:bg-white/[0.02] px-4 py-2 text-[11px] text-fg-subtle">
           Only the account you pick is shared with this agent. Tokens stay in your vault and never enter this chat.
         </div>
       )}

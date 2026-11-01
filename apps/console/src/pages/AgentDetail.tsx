@@ -10,6 +10,7 @@ import { Page } from "../components/Page";
 import { Modal } from "../components/Modal";
 import { Field } from "../components/Field";
 import { PageHeader } from "../components/PageHeader";
+import { GroupRow, GroupSection } from "../components/GroupedList";
 import { CreateDeploymentDialog } from "../components/CreateDeploymentDialog";
 import { Button } from "@/components/ui/button";
 import type { AgentRecord as Agent } from "../types/agent";
@@ -195,6 +196,18 @@ export function AgentDetail() {
       header={
         <PageHeader
           title={agent.name}
+          subtitle={
+            <span className="inline-flex items-center gap-2">
+              <span>{modelStr(agent.model)}</span>
+              <span aria-hidden="true" className="text-fg-subtle">·</span>
+              <span className="tabular-nums">v{agent.version}</span>
+              {agent.archived_at && (
+                <span className="inline-flex h-5 items-center rounded-full bg-warning-subtle px-2 text-[11px] font-medium text-warning">
+                  Archived
+                </span>
+              )}
+            </span>
+          }
           actions={
             <>
               <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
@@ -202,13 +215,6 @@ export function AgentDetail() {
               </Button>
               <Button variant="outline" size="sm" onClick={openSetup} disabled={openingSetup}>
                 {openingSetup ? "Opening…" : "Setup chat"}
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => nav(`/sessions?new=1&agent_id=${encodeURIComponent(agent.id)}`)}
-              >
-                Start session
               </Button>
               <Button variant="outline" size="sm" onClick={() => setShowDeploy(true)}>
                 Deploy
@@ -219,12 +225,19 @@ export function AgentDetail() {
               <Button variant="destructive" size="sm" onClick={del}>
                 Delete
               </Button>
+              <span aria-hidden="true" className="mx-1 h-5 w-px bg-hairline" />
+              <Button
+                size="sm"
+                onClick={() => nav(`/sessions?new=1&agent_id=${encodeURIComponent(agent.id)}`)}
+              >
+                Start session
+              </Button>
             </>
           }
         />
       }
     >
-      <div className="space-y-6">
+      <div className="space-y-8">
         <AgentFormDialog
           open={editing}
           onClose={() => setEditing(false)}
@@ -240,40 +253,44 @@ export function AgentDetail() {
           modelCards={formAux.modelCards}
           runtimes={formAux.runtimes}
         />
-        {/* Properties grid */}
-        <div className="grid grid-cols-[140px_1fr] gap-x-4 gap-y-2 max-w-2xl text-sm">
-          <span className="text-fg-muted">ID</span><span className="font-mono text-xs">{agent.id}</span>
-          <span className="text-fg-muted">Model</span><span>{modelStr(agent.model)}</span>
-          <span className="text-fg-muted">Harness</span><span>{agent._oma?.harness || "default"}</span>
+        {/* Properties — a System Settings grouped form: label on the
+            leading edge, value on the trailing edge, inset hairlines. */}
+        <GroupSection title="Details" className="max-w-3xl">
+          <GroupRow label="ID" value={agent.id} mono />
+          <GroupRow label="Model" value={modelStr(agent.model)} />
+          <GroupRow label="Harness" value={agent._oma?.harness || "default"} />
           {agent._oma?.default_environment_id && (
-            <>
-              <span className="text-fg-muted">Default Sandbox</span>
-              <span className="font-mono text-xs">{agent._oma.default_environment_id}</span>
-            </>
+            <GroupRow label="Default Sandbox" value={agent._oma.default_environment_id} mono />
           )}
           {agent._oma?.default_vault_ids && agent._oma.default_vault_ids.length > 0 && (
-            <>
-              <span className="text-fg-muted">Default Vaults</span>
-              <span className="font-mono text-xs">{agent._oma.default_vault_ids.join(", ")}</span>
-            </>
+            <GroupRow label="Default Vaults" value={agent._oma.default_vault_ids.join(", ")} mono />
           )}
           {agent._oma?.runtime_binding && (
-            <>
-              <span className="text-fg-muted">Local Runtime</span>
-              <span className="text-xs">
-                <span className="font-mono">{agent._oma.runtime_binding.runtime_id.slice(0, 8)}…</span>
-                <span className="text-fg-subtle"> · ACP agent: </span>
-                <span className="font-mono">{agent._oma.runtime_binding.acp_agent_id}</span>
-              </span>
-            </>
+            <GroupRow
+              label="Local Runtime"
+              value={
+                <span className="text-xs">
+                  <span className="font-mono">{agent._oma.runtime_binding.runtime_id.slice(0, 8)}…</span>
+                  <span className="text-fg-subtle"> · ACP agent: </span>
+                  <span className="font-mono">{agent._oma.runtime_binding.acp_agent_id}</span>
+                </span>
+              }
+            />
           )}
-          <span className="text-fg-muted">Version</span><span>v{agent.version}</span>
-          <span className="text-fg-muted">Tools</span>
-          <span>{(agent.tools || []).map((t: any) => t.type === "custom" ? `Custom: ${t.name}` : t.type).join(", ") || "None"}</span>
-          <span className="text-fg-muted">Created</span><span>{new Date(agent.created_at).toLocaleString()}</span>
-          <span className="text-fg-muted">Updated</span><span>{new Date(agent.updated_at || agent.created_at).toLocaleString()}</span>
-          {agent.archived_at && <><span className="text-fg-muted">Archived</span><span className="text-warning">{new Date(agent.archived_at).toLocaleString()}</span></>}
-        </div>
+          <GroupRow label="Version" value={`v${agent.version}`} />
+          <GroupRow
+            label="Tools"
+            value={(agent.tools || []).map((t: any) => t.type === "custom" ? `Custom: ${t.name}` : t.type).join(", ") || "None"}
+          />
+          <GroupRow label="Created" value={new Date(agent.created_at).toLocaleString()} />
+          <GroupRow label="Updated" value={new Date(agent.updated_at || agent.created_at).toLocaleString()} />
+          {agent.archived_at && (
+            <GroupRow
+              label="Archived"
+              value={<span className="text-warning">{new Date(agent.archived_at).toLocaleString()}</span>}
+            />
+          )}
+        </GroupSection>
 
       <AgentComputerPanel key={agent.id} agentId={agent.id} />
 
@@ -281,34 +298,33 @@ export function AgentDetail() {
           push the rest of the page below the viewport. Default-open when
           there's at least one live publication so the user sees what's wired
           up at a glance; otherwise default-closed. */}
-      <div className="mt-6 max-w-2xl">
-        <h2 className="font-display text-base font-semibold mb-2">Integrations</h2>
+      <section className="max-w-3xl">
+        <h2 className="sq-section-title mb-2 px-1">Integrations</h2>
         {composioApps.length > 0 && (
-          <div className="grid gap-2 sm:grid-cols-2 mb-3">
+          <div className="sq-group mb-3">
             {composioApps.map((entry) => (
               <div
                 key={entry.slug}
-                className="border border-border rounded-md p-3 flex items-center gap-3 bg-bg"
+                className="sq-row px-4 h-12 flex items-center gap-3"
+                style={{ ["--sq-inset" as string]: "52px" }}
               >
                 <img
                   src={composioIntegrationIcon(entry)}
                   alt=""
                   loading="lazy"
                   decoding="async"
-                  className="w-6 h-6 rounded shrink-0"
+                  className="w-6 h-6 rounded-[6px] shrink-0"
                   onError={(e) => {
                     (e.target as HTMLImageElement).style.display = "none";
                   }}
                 />
-                <div className="min-w-0">
-                  <div className="font-medium text-sm text-fg truncate">{entry.name}</div>
-                  <div className="text-xs text-fg-subtle">{entry.category}</div>
-                </div>
+                <div className="min-w-0 flex-1 font-medium text-[13px] text-fg truncate">{entry.name}</div>
+                <div className="text-[12px] text-fg-subtle">{entry.category}</div>
               </div>
             ))}
           </div>
         )}
-        <div className="space-y-2">
+        <div className="sq-group">
           <IntegrationFold
             kind="linear"
             label="Linear"
@@ -331,7 +347,7 @@ export function AgentDetail() {
             agentId={agent.id}
           />
         </div>
-      </div>
+      </section>
 
       <AmbientRulesPanel
         agentId={agent.id}
@@ -344,9 +360,9 @@ export function AgentDetail() {
 
       {/* System prompt */}
       {agent.system && (
-        <div className="mt-8 max-w-2xl">
-          <h2 className="font-display text-base font-semibold mb-2">System Prompt</h2>
-          <pre className="bg-bg-surface border border-border rounded-lg p-4 text-sm whitespace-pre-wrap max-h-64 overflow-y-auto font-mono text-fg-muted leading-relaxed">
+        <div className="max-w-3xl">
+          <h2 className="sq-section-title mb-2 px-1">System Prompt</h2>
+          <pre className="sq-group p-4 text-[12px] whitespace-pre-wrap max-h-64 overflow-y-auto font-mono text-fg-muted leading-relaxed">
             {agent.system}
           </pre>
         </div>
@@ -354,23 +370,23 @@ export function AgentDetail() {
 
       {/* Version history */}
       {versions.length > 0 && (
-        <div className="mt-8 max-w-2xl">
-          <h2 className="font-display text-base font-semibold mb-2">Version History</h2>
-          <div className="border border-border rounded-lg overflow-x-auto">
-            <table className="w-full text-sm">
+        <div className="max-w-3xl">
+          <h2 className="sq-section-title mb-2 px-1">Version History</h2>
+          <div className="sq-group overflow-x-auto">
+            <table className="w-full text-[13px] border-collapse">
               <thead>
-                <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase">
-                  <th className="text-left px-4 py-2">Version</th>
-                  <th className="text-left px-4 py-2">Model</th>
-                  <th className="text-left px-4 py-2">System Prompt</th>
+                <tr className="text-fg-subtle text-[11px] shadow-[0_0.5px_0_var(--hairline)]">
+                  <th className="text-left font-semibold px-4 h-8">Version</th>
+                  <th className="text-left font-semibold px-4 h-8">Model</th>
+                  <th className="text-left font-semibold px-4 h-8">System Prompt</th>
                 </tr>
               </thead>
               <tbody>
                 {versions.map((v) => (
-                  <tr key={v.version} className="border-t border-border">
-                    <td className="px-4 py-2">v{v.version}</td>
-                    <td className="px-4 py-2 text-fg-muted">{modelStr(v.model)}</td>
-                    <td className="px-4 py-2 text-fg-muted max-w-xs truncate">{v.system || "—"}</td>
+                  <tr key={v.version} className="sq-table-row">
+                    <td className="px-4 h-10 tabular-nums font-medium">v{v.version}</td>
+                    <td className="px-4 h-10 text-fg-muted">{modelStr(v.model)}</td>
+                    <td className="px-4 h-10 text-fg-muted max-w-xs truncate">{v.system || "—"}</td>
                   </tr>
                 ))}
               </tbody>
@@ -428,10 +444,10 @@ function AccessPanel({ agentId }: { agentId: string }) {
   const versions = data?.versions ?? [];
 
   return (
-    <div className="mt-6 max-w-2xl">
-      <h2 className="font-display text-base font-semibold mb-2">Access</h2>
+    <div className="max-w-3xl">
+      <h2 className="sq-section-title mb-2 px-1">Access</h2>
       {!baseline || !baseline.enabled ? (
-        <div className="border border-border rounded-lg p-4 text-sm text-fg-subtle">
+        <div className="sq-group p-4 text-sm text-fg-subtle">
           No access policy. This agent can use every tool its config exposes
           (legacy behavior).
           {baseline && !baseline.enabled && (
@@ -439,7 +455,7 @@ function AccessPanel({ agentId }: { agentId: string }) {
           )}
         </div>
       ) : (
-        <div className="border border-border rounded-lg overflow-hidden">
+        <div className="sq-group overflow-hidden">
           <div className="flex items-center justify-between gap-3 px-4 py-2 bg-bg-surface/60 text-xs text-fg-muted">
             <span>
               Baseline grant <span className="font-mono">v{baseline.version}</span>
@@ -449,7 +465,7 @@ function AccessPanel({ agentId }: { agentId: string }) {
               approved by {baseline.approved_by}
             </span>
           </div>
-          <ul className="divide-y divide-border">
+          <ul className="divide-y divide-hairline">
             {baseline.rules.map((rule, i) => (
               <li key={i} className="flex items-center gap-3 px-4 py-2 text-sm">
                 <span
@@ -610,10 +626,10 @@ function AuditTrailPanel({
     "px-2.5 py-1.5 text-sm rounded-md border border-border bg-bg text-fg";
 
   return (
-    <div className="mt-8 max-w-4xl audit-trail-print">
+    <div className="max-w-3xl audit-trail-print">
       <div className="flex items-center justify-between gap-3 mb-3">
         <div>
-          <h2 className="font-display text-base font-semibold">Audit trail</h2>
+          <h2 className="sq-section-title px-1">Audit trail</h2>
           <p className="text-xs text-fg-subtle">
             {agentName} · authority record generated{" "}
             {capability ? new Date(capability.generated_at).toLocaleString() : "…"}
@@ -637,7 +653,7 @@ function AuditTrailPanel({
           </span>
         )}
       </h3>
-      <div className="border border-border rounded-lg overflow-x-auto mb-2">
+      <div className="sq-group overflow-x-auto mb-2">
         <table className="w-full text-sm">
           <thead>
             <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase">
@@ -676,11 +692,11 @@ function AuditTrailPanel({
         Approval history
       </h3>
       {(approvals?.versions ?? []).length === 0 ? (
-        <div className="border border-border rounded-lg p-4 text-sm text-fg-subtle">
+        <div className="sq-group p-4 text-sm text-fg-subtle">
           No grant versions yet — nothing has been approved for this agent.
         </div>
       ) : (
-        <div className="border border-border rounded-lg divide-y divide-border">
+        <div className="sq-group divide-y divide-hairline">
           {(approvals?.versions ?? []).map((v) => (
             <div key={v.version} className="px-4 py-2.5 text-sm">
               <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -762,13 +778,13 @@ function AuditTrailPanel({
             .join(" · ")}
         </p>
       )}
-      <div className="border border-border rounded-lg overflow-hidden">
+      <div className="sq-group overflow-hidden">
         {(activity?.events ?? []).length === 0 ? (
           <div className="px-4 py-6 text-sm text-fg-subtle">
             No policy, skill, or access events in this range.
           </div>
         ) : (
-          <ul className="divide-y divide-border">
+          <ul className="divide-y divide-hairline">
             {(activity?.events ?? []).map((e, i) => (
               <li key={i} className="flex items-baseline gap-3 px-4 py-1.5 text-sm">
                 <span className="font-mono text-xs text-fg-subtle whitespace-nowrap">
@@ -856,10 +872,10 @@ function AmbientRulesPanel({
   };
 
   return (
-    <div className="mt-8 max-w-4xl">
+    <div className="max-w-3xl">
       <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between mb-3">
         <div>
-          <h2 className="font-display text-base font-semibold">Ambient</h2>
+          <h2 className="sq-section-title px-1">Ambient</h2>
           <p className="text-xs text-fg-subtle">
             {rules.filter((r) => r.enabled).length} enabled · {rules.length} total
           </p>
@@ -867,13 +883,13 @@ function AmbientRulesPanel({
       </div>
 
       <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
-        <div className="border border-border rounded-lg overflow-hidden">
+        <div className="sq-group overflow-hidden">
           {rules.length === 0 ? (
             <div className="px-4 py-8 text-sm text-fg-subtle">
               No ambient rules configured.
             </div>
           ) : (
-            <div className="divide-y divide-border">
+            <div className="divide-y divide-hairline">
               {rules.map((rule) => (
                 <div key={rule.id} className="px-4 py-3 flex flex-col gap-3 sm:flex-row sm:items-center">
                   <div className="min-w-0 flex-1">
@@ -924,7 +940,7 @@ function AmbientRulesPanel({
           )}
         </div>
 
-        <div className="border border-border rounded-lg p-4 space-y-3">
+        <div className="sq-group p-4 space-y-3">
           <h3 className="font-display text-sm font-semibold">New Rule</h3>
           {err && <div className="text-xs text-danger">{err}</div>}
           <Field label="Name">
@@ -1027,16 +1043,18 @@ function IntegrationFold({
   return (
     <details
       open={pubs.length > 0}
-      className="border border-border rounded-lg bg-bg-surface/30 [&_summary::-webkit-details-marker]:hidden"
+      className="sq-row group/fold [&_summary::-webkit-details-marker]:hidden"
+      style={{ ["--sq-inset" as string]: "44px" }}
     >
-      <summary className="px-4 py-2.5 min-h-11 sm:min-h-0 flex items-center gap-3 text-sm cursor-pointer hover:bg-bg-surface/60 list-none">
+      <summary className="px-4 h-11 flex items-center gap-3 text-[13px] cursor-default hover:bg-bg-hover list-none transition-colors">
         <span className="text-fg-muted shrink-0">{icon}</span>
         <span className="font-medium text-fg">{label}</span>
-        <span className="ml-auto text-xs text-fg-subtle">
+        <span className="ml-auto text-[12px] text-fg-subtle">
           {pubs.length === 0 ? "Not published" : `${pubs.length} live`}
         </span>
+        <svg aria-hidden="true" viewBox="0 0 16 16" className="size-3 text-fg-subtle transition-transform duration-200 group-open/fold:rotate-90"><path d="M6 3.5 10.5 8 6 12.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" /></svg>
       </summary>
-      <div className="px-4 pb-3 pt-2 border-t border-border/40 space-y-1.5 text-sm">
+      <div className="pl-11 pr-4 pb-3 pt-0.5 space-y-1.5 text-[13px]">
         {pubs.length === 0 ? (
           <Link
             to={`/integrations/${kind}/publish?agent_id=${agentId}`}

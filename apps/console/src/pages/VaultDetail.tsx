@@ -242,7 +242,7 @@ export function VaultDetail() {
               <span
                 className={`inline-flex items-center text-[11px] px-2 py-0.5 rounded-full ${
                   archived
-                    ? "bg-bg-surface text-fg-subtle"
+                    ? "bg-bg-hover text-fg-subtle"
                     : "bg-success-subtle text-success"
                 }`}
               >
@@ -372,7 +372,7 @@ export function VaultDetail() {
                           <span
                             className={`inline-flex items-center text-[11px] px-2 py-0.5 rounded-full ${
                               c.archived_at
-                                ? "bg-bg-surface text-fg-subtle"
+                                ? "bg-bg-hover text-fg-subtle"
                                 : "bg-success-subtle text-success"
                             }`}
                           >

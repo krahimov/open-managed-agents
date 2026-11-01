@@ -1,6 +1,16 @@
 import { useState } from "react";
 import { useNavigate } from "react-router";
-import { Check, Copy, Terminal } from "lucide-react";
+import { ArrowRight, Check, ChevronRight, Copy, Terminal } from "lucide-react";
+import type { ComponentType } from "react";
+import { Button } from "@/components/ui/button";
+import {
+  AgentIcon,
+  EnvIcon,
+  ModelCardsIcon,
+  SessionsIcon,
+  SkillsIcon,
+  VaultIcon,
+} from "../components/icons";
 import { useAuth } from "../lib/auth";
 import { useApiQuery } from "../lib/useApiQuery";
 import { toast } from "sonner";
@@ -88,28 +98,41 @@ export function Dashboard() {
     }
   };
 
-  const stat = (label: string, value: number | undefined, to: string) => (
+  // macOS widget tile: 16px radius, glyph in a tinted disc, big
+  // tabular number in the rounded face, small caption.
+  const stat = (
+    label: string,
+    value: number | undefined,
+    to: string,
+    Icon: ComponentType<{ className?: string }>,
+  ) => (
     <button
       key={label}
       onClick={() => nav(to)}
-      className="group relative text-left px-4 py-3.5 border border-border rounded-md bg-bg-surface shadow-[var(--shadow-sm)] hover:border-border-strong hover:bg-brand-subtle/45 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+      className="sq-press group relative text-left p-4 rounded-2xl bg-bg-surface shadow-[var(--shadow-sm)] hover:shadow-[var(--shadow-md)] outline-none focus-visible:ring-[3px] focus-visible:ring-system-accent/45"
     >
-      <div className="font-display text-[28px] leading-none font-semibold text-fg group-hover:text-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] tabular-nums">
+      <div className="flex items-center justify-between">
+        <span className="inline-flex size-7 items-center justify-center rounded-full bg-brand-subtle text-brand">
+          <Icon className="size-3.5 [stroke-width:2]" />
+        </span>
+        <ChevronRight className="size-4 text-fg-subtle opacity-0 -translate-x-1 transition-[opacity,translate] duration-[var(--dur-base)] group-hover:opacity-100 group-hover:translate-x-0" />
+      </div>
+      <div className="mt-4 font-rounded text-[32px] leading-none font-semibold tracking-[-0.02em] text-fg tabular-nums">
         {value ?? "–"}
       </div>
-      <div className="mt-2 text-[11px] uppercase text-fg-muted font-medium">
+      <div className="mt-1.5 text-[12px] text-fg-muted font-medium">
         {label}
       </div>
     </button>
   );
 
   const stats_ = [
-    { label: "Agents", value: stats?.agents, to: "/agents" },
-    { label: "Sessions", value: stats?.sessions, to: "/sessions" },
-    { label: "Environments", value: stats?.environments, to: "/environments" },
-    { label: "Vaults", value: stats?.vaults, to: "/vaults" },
-    { label: "Skills", value: stats?.skills, to: "/skills" },
-    { label: "Model Cards", value: stats?.model_cards, to: "/model-cards" },
+    { label: "Agents", value: stats?.agents, to: "/agents", icon: AgentIcon },
+    { label: "Sessions", value: stats?.sessions, to: "/sessions", icon: SessionsIcon },
+    { label: "Environments", value: stats?.environments, to: "/environments", icon: EnvIcon },
+    { label: "Vaults", value: stats?.vaults, to: "/vaults", icon: VaultIcon },
+    { label: "Skills", value: stats?.skills, to: "/skills", icon: SkillsIcon },
+    { label: "Model Cards", value: stats?.model_cards, to: "/model-cards", icon: ModelCardsIcon },
   ];
 
   const cmd = "npx -y -p @openma/cli oma";
@@ -118,157 +141,159 @@ export function Dashboard() {
     `Use ${BRAND_NAME} to create a research agent that monitors arXiv for new ML papers daily`;
   const skillPreview = HARNESS_AGENT_BUILDER_SKILL.split("\n").slice(0, 28).join("\n");
 
+  // Shared copy glyph for the copy-to-clipboard wells.
+  const copyGlyph = (key: string) =>
+    copied === key ? <Check className="size-3.5 text-success" /> : <Copy className="size-3.5" />;
+
   return (
     <div className="flex-1 overflow-y-auto">
-      <div className="pl-4 pr-5 py-6 space-y-10">
-        {/* Header — onboarding voice only until the workspace has agents;
-            after that the dashboard is an instrument, with the guide one
-            quiet toggle away. */}
-        <header className="flex items-start justify-between gap-4">
-          <div>
-            <h1 className="text-[20px] leading-tight font-semibold text-fg">
+      <div className="px-6 pt-2 pb-12 max-w-[1240px] space-y-8">
+        {/* Large title. Onboarding voice only until the workspace has
+            agents; after that the dashboard is an instrument, with the
+            guide one quiet toggle away. */}
+        <header className="flex items-end justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="font-display text-[26px] leading-[32px] font-bold tracking-[-0.022em] text-fg">
               {workspaceActive || statsPending ? "Overview" : `Get started with ${BRAND_NAME}`}
             </h1>
-            <p className="mt-1.5 text-[15px] text-fg-muted">
+            <p className="mt-0.5 text-[13px] text-fg-muted">
               {workspaceActive || statsPending
                 ? "Workspace activity at a glance."
                 : "Install the CLI, mint a key, and let agents operate against your control plane."}
             </p>
           </div>
           {workspaceActive && (
-            <button
-              onClick={() => setShowGuide((v) => !v)}
-              className="shrink-0 text-[12px] text-fg-muted hover:text-fg border border-border rounded-md px-2.5 py-1.5 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-            >
+            <Button variant="outline" size="sm" onClick={() => setShowGuide((v) => !v)}>
               {showGuide ? "Hide setup guide" : "Setup guide"}
-            </button>
+            </Button>
           )}
         </header>
 
-        {/* Quickstart — single panel with three rows, no per-step cards */}
+        {/* Widgets — number-forward stat tiles. */}
+        <section aria-label="Workspace totals">
+          <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 gap-3">
+            {stats_.map((s) => stat(s.label, s.value, s.to, s.icon))}
+          </div>
+        </section>
+
+        {/* Quickstart — a grouped list, one row per step. */}
         {guideVisible && (
-        <section className="border border-border rounded-lg bg-bg-surface shadow-[var(--shadow-sm)] overflow-hidden">
-          {/* Step 1 */}
-          <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6 border-b border-border">
-            <div>
-              <div className="font-mono text-[11px] text-fg-subtle tracking-wider">STEP 01</div>
-              <div className="mt-1 font-medium text-fg text-[15px]">Install the CLI</div>
-            </div>
-            <div className="space-y-2.5 min-w-0">
-              <p className="text-sm text-fg-muted">
-                The command-line client lets your
-                agent (or you) drive the platform from the terminal.
-              </p>
-              <button
-                onClick={() => copy(cmd, "cmd")}
-                className="group flex w-full sm:w-auto sm:inline-flex items-center gap-3 pl-3 pr-2 py-2 rounded-md border border-border bg-bg hover:border-border-strong hover:bg-brand-subtle/45 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] text-left"
-              >
-                <span className="text-fg-subtle select-none font-mono text-xs">›</span>
-                <span className="font-mono text-[13px] text-fg flex-1 truncate">{cmd}</span>
-                <span className="shrink-0 text-fg-subtle group-hover:text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] p-1">
-                  {copied === "cmd" ? (
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M20 6 9 17l-5-5" /></svg>
-                  ) : (
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" /></svg>
-                  )}
-                </span>
-              </button>
-              <p className="text-[12px] text-fg-subtle">
-                or globally:{" "}
+        <section className="sq-reveal">
+          <h2 className="sq-section-title mb-2 px-1">Set up</h2>
+          <div className="sq-group">
+            {/* Step 1 */}
+            <div className="sq-row grid md:grid-cols-[220px_1fr] gap-x-6 gap-y-2 px-4 py-4" style={{ ["--sq-inset" as string]: "56px" }}>
+              <div className="flex items-start gap-3">
+                <span className="mt-px inline-flex size-6 shrink-0 items-center justify-center rounded-full bg-brand text-brand-fg text-[11px] font-semibold font-rounded">1</span>
+                <div className="font-medium text-fg text-[13px] leading-6">Install the CLI</div>
+              </div>
+              <div className="space-y-2 min-w-0">
+                <p className="text-[13px] text-fg-muted">
+                  The command-line client lets your
+                  agent (or you) drive the platform from the terminal.
+                </p>
                 <button
-                  onClick={() => copy(cmdGlobal, "cmd-global")}
-                  className="inline-flex items-center min-h-11 sm:min-h-0 font-mono text-fg-muted hover:text-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+                  onClick={() => copy(cmd, "cmd")}
+                  className="sq-press group flex w-full sm:w-auto sm:inline-flex items-center gap-3 pl-3 pr-2 h-8 rounded-[7px] bg-bg-inset shadow-[inset_0_0_0_0.5px_var(--border)] hover:text-fg text-left"
                 >
-                  {cmdGlobal}
+                  <span className="text-fg-subtle select-none font-mono text-xs">›</span>
+                  <span className="font-mono text-[12px] text-fg flex-1 truncate">{cmd}</span>
+                  <span className="shrink-0 text-fg-subtle group-hover:text-fg p-1">
+                    {copyGlyph("cmd")}
+                  </span>
                 </button>
-              </p>
+                <p className="text-[12px] text-fg-subtle">
+                  or globally:{" "}
+                  <button
+                    onClick={() => copy(cmdGlobal, "cmd-global")}
+                    className="inline-flex items-center min-h-11 sm:min-h-0 font-mono text-fg-muted hover:text-brand"
+                  >
+                    {cmdGlobal}
+                  </button>
+                </p>
+              </div>
             </div>
-          </div>
 
-          {/* Step 2 */}
-          <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6 border-b border-border">
-            <div>
-              <div className="font-mono text-[11px] text-fg-subtle tracking-wider">STEP 02</div>
-              <div className="mt-1 font-medium text-fg text-[15px]">Mint an API key</div>
+            {/* Step 2 */}
+            <div className="sq-row grid md:grid-cols-[220px_1fr] gap-x-6 gap-y-2 px-4 py-4" style={{ ["--sq-inset" as string]: "56px" }}>
+              <div className="flex items-start gap-3">
+                <span className="mt-px inline-flex size-6 shrink-0 items-center justify-center rounded-full bg-brand text-brand-fg text-[11px] font-semibold font-rounded">2</span>
+                <div className="font-medium text-fg text-[13px] leading-6">Mint an API key</div>
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <p className="text-[13px] text-fg-muted">
+                  Your agent needs this to authenticate. Keep it somewhere it can read.
+                </p>
+                <Button size="sm" onClick={() => nav("/api-keys")}>
+                  Generate API key
+                  <ArrowRight className="size-3.5" />
+                </Button>
+              </div>
             </div>
-            <div className="space-y-2.5">
-              <p className="text-sm text-fg-muted">
-                Your agent needs this to authenticate. Keep it somewhere it can read.
-              </p>
-              <button
-                onClick={() => nav("/api-keys")}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-brand text-brand-fg rounded-md text-[13px] font-medium hover:bg-brand-hover transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-              >
-                Generate API key
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M13 6l6 6-6 6" /></svg>
-              </button>
-            </div>
-          </div>
 
-          {/* Step 3 */}
-          <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6">
-            <div>
-              <div className="font-mono text-[11px] text-fg-subtle tracking-wider">STEP 03</div>
-              <div className="mt-1 font-medium text-fg text-[15px]">Give it the task</div>
-            </div>
-            <div className="space-y-2.5">
-              <p className="text-sm text-fg-muted">
-                Point your agent at the CLI or API skill, then
-                ask for what you want:
-              </p>
-              <button
-                onClick={() => copy(examplePrompt, "prompt")}
-                className="group w-full text-left rounded-md border border-border bg-bg hover:border-border-strong hover:bg-brand-subtle/45 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] p-3 flex items-start gap-3"
-              >
-                <span className="shrink-0 mt-0.5 font-mono text-[10px] text-fg-subtle">
-                  PROMPT
-                </span>
-                <span className="flex-1 text-[13px] text-fg leading-snug">{examplePrompt}</span>
-                <span className="shrink-0 text-fg-subtle group-hover:text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] mt-0.5">
-                  {copied === "prompt" ? (
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M20 6 9 17l-5-5" /></svg>
-                  ) : (
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" /></svg>
-                  )}
-                </span>
-              </button>
+            {/* Step 3 */}
+            <div className="sq-row grid md:grid-cols-[220px_1fr] gap-x-6 gap-y-2 px-4 py-4" style={{ ["--sq-inset" as string]: "56px" }}>
+              <div className="flex items-start gap-3">
+                <span className="mt-px inline-flex size-6 shrink-0 items-center justify-center rounded-full bg-brand text-brand-fg text-[11px] font-semibold font-rounded">3</span>
+                <div className="font-medium text-fg text-[13px] leading-6">Give it the task</div>
+              </div>
+              <div className="space-y-2">
+                <p className="text-[13px] text-fg-muted">
+                  Point your agent at the CLI or API skill, then
+                  ask for what you want:
+                </p>
+                <button
+                  onClick={() => copy(examplePrompt, "prompt")}
+                  className="sq-press group w-full text-left rounded-[10px] bg-bg-inset shadow-[inset_0_0_0_0.5px_var(--border)] p-3 flex items-start gap-3"
+                >
+                  <span className="shrink-0 mt-0.5 text-[11px] font-semibold text-fg-subtle">
+                    Prompt
+                  </span>
+                  <span className="flex-1 text-[13px] text-fg leading-snug">{examplePrompt}</span>
+                  <span className="shrink-0 text-fg-subtle group-hover:text-fg mt-0.5">
+                    {copyGlyph("prompt")}
+                  </span>
+                </button>
+              </div>
             </div>
           </div>
         </section>
         )}
 
         {/* Agent builder skill — copyable handoff for external coding agents */}
-        <section className="border border-border rounded-lg bg-bg-surface shadow-[var(--shadow-sm)] overflow-hidden">
-          <div className="grid lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-            <div className="p-5 md:p-6 border-b lg:border-b-0 lg:border-r border-border min-w-0">
-              <div className="inline-flex items-center gap-1.5 rounded-md border border-border bg-bg px-2 py-1 text-[11px] font-medium uppercase text-fg-subtle">
-                <Terminal className="size-3.5" />
-                Codex / Claude Code
+        <section>
+          <h2 className="sq-section-title mb-2 px-1">Build with your coding agent</h2>
+          <div className="sq-group grid lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
+            <div className="p-5 md:p-6 min-w-0 flex flex-col">
+              <div className="flex items-center gap-3">
+                <span className="inline-flex size-10 items-center justify-center rounded-[10px] bg-linear-to-b from-[#3a3a40] to-[#1c1c20] text-white shadow-[var(--shadow-sm)]">
+                  <Terminal className="size-5" strokeWidth={1.75} />
+                </span>
+                <div>
+                  <h3 className="font-display text-[17px] font-semibold tracking-[-0.015em] text-fg">
+                    Agent builder skill
+                  </h3>
+                  <p className="text-[12px] text-fg-subtle">Codex / Claude Code</p>
+                </div>
               </div>
-              <h2 className="mt-4 font-display text-xl font-semibold text-fg">
-                Agent builder skill
-              </h2>
-              <p className="mt-2 text-sm text-fg-muted leading-6 max-w-[56ch]">
+              <p className="mt-4 text-[13px] text-fg-muted leading-[1.55] max-w-[56ch]">
                 Paste this into your coding agent so it can create Harness Studio
                 agents, trigger CLI sign-in, route app OAuth, apply manifests,
                 and verify sessions.
               </p>
 
               <div className="mt-5 flex flex-col sm:flex-row gap-2">
-                <button
-                  onClick={() => copy(HARNESS_AGENT_BUILDER_SKILL, "agent-builder-skill")}
-                  className="inline-flex items-center justify-center gap-2 px-3.5 py-2 bg-brand text-brand-fg rounded-md text-[13px] font-medium hover:bg-brand-hover transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-                >
+                <Button onClick={() => copy(HARNESS_AGENT_BUILDER_SKILL, "agent-builder-skill")}>
                   {copied === "agent-builder-skill" ? (
                     <Check className="size-4" />
                   ) : (
                     <Copy className="size-4" />
                   )}
                   Copy full skill
-                </button>
-                <button
+                </Button>
+                <Button
+                  variant="outline"
                   onClick={() => copy(HARNESS_AGENT_BUILDER_PROMPT, "agent-builder-prompt")}
-                  className="inline-flex items-center justify-center gap-2 px-3.5 py-2 rounded-md border border-border bg-bg hover:border-border-strong hover:bg-brand-subtle/45 text-[13px] font-medium text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
                 >
                   {copied === "agent-builder-prompt" ? (
                     <Check className="size-4" />
@@ -276,14 +301,17 @@ export function Dashboard() {
                     <Copy className="size-4" />
                   )}
                   Copy starter prompt
-                </button>
+                </Button>
               </div>
 
-              <ol className="mt-5 grid sm:grid-cols-3 gap-x-4 gap-y-2 text-[12px] text-fg-muted">
+              <ol className="mt-5 flex flex-wrap gap-2 text-[12px] text-fg-muted">
                 {["CLI sign-in", "OAuth handoff", "Smoke test"].map((item, index) => (
-                  <li key={item} className="flex items-center gap-2 min-w-0">
-                    <span className="font-mono text-[11px] text-brand">
-                      {String(index + 1).padStart(2, "0")}
+                  <li
+                    key={item}
+                    className="inline-flex items-center gap-1.5 h-6 pl-1 pr-2.5 rounded-full bg-bg-hover dark:bg-white/[0.06]"
+                  >
+                    <span className="inline-flex size-4 items-center justify-center rounded-full bg-bg-surface text-[10px] font-semibold text-brand shadow-[var(--shadow-sm)]">
+                      {index + 1}
                     </span>
                     <span className="truncate">{item}</span>
                   </li>
@@ -291,19 +319,20 @@ export function Dashboard() {
               </ol>
             </div>
 
-            <div className="bg-bg min-w-0">
-              <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-border">
-                <div className="min-w-0">
-                  <p className="text-[11px] uppercase font-medium text-fg-subtle">
-                    SKILL.md preview
+            <div className="min-w-0 m-1.5 rounded-[10px] bg-bg-inset shadow-[inset_0_0_0_0.5px_var(--border)] overflow-hidden">
+              <div className="flex items-center justify-between gap-3 pl-4 pr-2 h-11 shadow-[0_0.5px_0_var(--hairline)]">
+                <div className="min-w-0 flex items-baseline gap-2">
+                  <p className="text-[12px] font-semibold text-fg">
+                    SKILL.md
                   </p>
-                  <p className="text-[12px] text-fg-muted truncate">
+                  <p className="text-[12px] text-fg-subtle truncate">
                     Self-contained paste target
                   </p>
                 </div>
-                <button
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
                   onClick={() => copy(HARNESS_AGENT_BUILDER_SKILL, "agent-builder-skill-preview")}
-                  className="inline-flex items-center justify-center size-8 rounded-md border border-border text-fg-muted hover:text-fg hover:bg-bg-surface transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
                   aria-label="Copy agent builder skill"
                 >
                   {copied === "agent-builder-skill-preview" ? (
@@ -311,42 +340,38 @@ export function Dashboard() {
                   ) : (
                     <Copy className="size-4" />
                   )}
-                </button>
+                </Button>
               </div>
-              <pre className="max-h-[360px] overflow-auto p-4 text-[12px] leading-5 text-fg-muted font-mono whitespace-pre-wrap break-words">
+              <pre className="max-h-[236px] overflow-auto px-4 py-3 text-[11.5px] leading-[1.6] text-fg-muted font-mono whitespace-pre-wrap break-words">
                 {skillPreview}
               </pre>
             </div>
           </div>
         </section>
 
-        {/* Stats — number-forward, no decorative icons */}
+        {/* Recent sessions — a grouped list. */}
         <section>
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
-            {stats_.map((s) => stat(s.label, s.value, s.to))}
-          </div>
-        </section>
-
-        {/* Recent sessions */}
-        <section>
-          <div className="flex items-baseline justify-between mb-3">
-            <h2 className="font-display text-lg font-semibold text-fg">Recent sessions</h2>
+          <div className="flex items-baseline justify-between mb-2 px-1">
+            <h2 className="sq-section-title">Recent sessions</h2>
             <button
               onClick={() => nav("/sessions")}
-              className="inline-flex items-center min-h-11 sm:min-h-0 text-[13px] text-fg-muted hover:text-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+              className="inline-flex items-center gap-0.5 min-h-11 sm:min-h-0 text-[13px] text-brand hover:underline underline-offset-2"
             >
-              View all →
+              View all
+              <ChevronRight className="size-3.5" />
             </button>
           </div>
 
           {sessionsQuery.isLoading ? (
-            <div className="border border-border rounded-lg divide-y divide-border">
+            <div className="sq-group">
               {Array.from({ length: 4 }).map((_, i) => (
-                <div key={i} className="flex items-center gap-4 px-4 py-3">
-                  <Skeleton className="h-3.5 w-[40%]" rounded="sm" />
-                  <Skeleton className="h-3.5 w-16" rounded="sm" />
-                  <Skeleton className="h-3.5 w-32" rounded="sm" />
-                  <Skeleton className="h-3.5 w-20 ml-auto" rounded="sm" />
+                <div key={i} className="sq-row flex items-center gap-4 px-4 h-14">
+                  <Skeleton className="size-8" rounded="full" />
+                  <div className="flex-1 space-y-1.5">
+                    <Skeleton className="h-3 w-[40%]" rounded="full" />
+                    <Skeleton className="h-2.5 w-[24%]" rounded="full" />
+                  </div>
+                  <Skeleton className="h-3 w-20" rounded="full" />
                 </div>
               ))}
             </div>
@@ -367,38 +392,34 @@ export function Dashboard() {
               }
             />
           ) : (
-            <div className="border border-border rounded-lg bg-bg-surface shadow-[var(--shadow-sm)] overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="bg-bg text-fg-subtle text-[11px] uppercase">
-                    <th className="text-left px-4 py-2.5 font-medium">Title</th>
-                    <th className="text-left px-4 py-2.5 font-medium">Status</th>
-                    <th className="text-left px-4 py-2.5 font-medium">Agent</th>
-                    <th className="text-left px-4 py-2.5 font-medium">Created</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {recentSessions.map((s) => (
-                    <tr
-                      key={s.id}
-                      onClick={() => nav(`/sessions/${s.id}`)}
-                      className="border-t border-border hover:bg-brand-subtle/45 cursor-pointer transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-                    >
-                      <td className="px-4 py-2.5 text-fg">{s.title || "Untitled"}</td>
-                      <td className="px-4 py-2.5">
-                        <StatusPill status={s.status || "idle"} />
-                      </td>
-                      <td className="px-4 py-2.5 text-fg-muted font-mono text-[12px]">
+            <ul className="sq-group">
+              {recentSessions.map((s) => (
+                <li key={s.id} className="sq-row" style={{ ["--sq-inset" as string]: "60px" }}>
+                  <button
+                    type="button"
+                    onClick={() => nav(`/sessions/${s.id}`)}
+                    className="group w-full flex items-center gap-3 px-4 h-14 text-left hover:bg-bg-hover transition-colors duration-[var(--dur-quick)] outline-none focus-visible:bg-bg-hover"
+                  >
+                    <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-full bg-bg-inset text-fg-muted shadow-[inset_0_0_0_0.5px_var(--border)]">
+                      <SessionsIcon className="size-4 [stroke-width:1.75]" />
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-[13px] font-medium text-fg">
+                        {s.title || "Untitled"}
+                      </span>
+                      <span className="block truncate font-mono text-[11px] text-fg-subtle">
                         {s.agent_id}
-                      </td>
-                      <td className="px-4 py-2.5 text-fg-muted text-[12px]">
-                        {new Date(s.created_at).toLocaleDateString()}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                      </span>
+                    </span>
+                    <StatusPill status={s.status || "idle"} />
+                    <span className="w-24 text-right text-[12px] text-fg-muted tabular-nums">
+                      {new Date(s.created_at).toLocaleDateString()}
+                    </span>
+                    <ChevronRight className="size-4 text-fg-subtle/70 group-hover:text-fg-muted" />
+                  </button>
+                </li>
+              ))}
+            </ul>
           )}
         </section>
       </div>

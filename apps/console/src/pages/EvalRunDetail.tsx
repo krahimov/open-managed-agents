@@ -519,7 +519,7 @@ export function EvalRunDetail() {
 function MetricChip({ label, value }: { label: string; value: boolean | undefined }) {
   const cls =
     value === undefined
-      ? "bg-bg-surface text-fg-subtle"
+      ? "bg-bg-hover text-fg-subtle"
       : value
       ? "bg-success-subtle text-success"
       : "bg-danger-subtle text-danger";

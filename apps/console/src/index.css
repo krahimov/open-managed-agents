@@ -98,11 +98,13 @@
   --brand-fg: #ffffff;
   --brand-text: #409cff;
   --logo-coral: #ff7a66;
+  --logo-tile-top: #4c4c53;
+  --logo-tile-bottom: #2a2a2f;
 
-  --canvas: #101012;
-  --canvas-tint-a: rgb(10 132 255 / 0.14);
-  --canvas-tint-b: rgb(191 90 242 / 0.08);
-  --canvas-tint-c: rgb(48 209 88 / 0.04);
+  --canvas: #121214;
+  --canvas-tint-a: rgb(10 132 255 / 0.07);
+  --canvas-tint-b: rgb(191 90 242 / 0.04);
+  --canvas-tint-c: rgb(48 209 88 / 0.025);
 
   --bg: #1e1e1e;
   --bg-sidebar: rgb(38 38 42 / 0.66);
@@ -948,4 +950,21 @@ body,
 }
 @media (prefers-reduced-motion: reduce) {
   .sq-large-title, .sq-inline-title { transition: none; }
+}
+
+/* Native form controls → macOS pop-up buttons and accent checkboxes.
+   Unlayered on purpose: page-level `px-*` utilities must not push the
+   value text under the chevron. */
+select:not([multiple]):not([size]) {
+  -webkit-appearance: none;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 14'%3E%3Cpath d='M2 5l3-3 3 3M2 9l3 3 3-3' fill='none' stroke='%238e8e93' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  background-size: 9px 13px;
+  padding-right: 28px;
+}
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent);
 }

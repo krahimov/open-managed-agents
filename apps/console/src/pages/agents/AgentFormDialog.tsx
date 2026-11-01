@@ -1384,10 +1384,13 @@ export function AgentFormDialog({
     : AGENT_TEMPLATES;
 
   const inputCls =
-    "w-full border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
+    "w-full border border-input rounded-[7px] px-2.5 py-1.5 min-h-11 sm:min-h-[30px] text-sm bg-bg-surface dark:bg-white/[0.05] text-fg outline-none focus:border-system-accent focus:ring-[3px] focus:ring-system-accent/25 transition-[border-color,box-shadow] duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
+  // Section tabs render as one segmented control (macOS).
   const tabCls = (t: string) =>
-    `inline-flex items-center justify-center px-3 py-1.5 min-h-11 sm:min-h-0 text-sm rounded-md transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
-      tab === t ? "bg-brand text-brand-fg" : "text-fg-muted hover:bg-bg-surface"
+    `inline-flex items-center justify-center px-3 h-11 sm:h-7 text-[13px] font-medium rounded-[6px] transition-[background-color,color,box-shadow] duration-[var(--dur-base)] ease-[var(--ease-soft)] outline-none focus-visible:ring-[3px] focus-visible:ring-system-accent/45 ${
+      tab === t
+        ? "bg-bg-surface text-fg shadow-[var(--shadow-button)] dark:bg-white/[0.16]"
+        : "text-fg-muted hover:text-fg"
     }`;
 
   // Resolve which card the Model dropdown should highlight: explicit pick
@@ -1405,7 +1408,7 @@ export function AgentFormDialog({
   return (
     <>
       <div
-        className="fixed inset-0 bg-bg-overlay flex items-center justify-center z-50"
+        className="fixed inset-0 bg-bg-overlay supports-backdrop-filter:backdrop-blur-[2px] flex items-start justify-center pt-[max(6vh,40px)] px-4 z-50 animate-in fade-in-0 duration-200"
         onClick={closeCreate}
       >
         <div
@@ -1413,49 +1416,69 @@ export function AgentFormDialog({
           role="dialog"
           aria-modal="true"
           aria-label={isEdit ? "Edit Agent" : "New Agent"}
-            className="bg-bg rounded-lg shadow-xl w-full max-w-5xl max-h-[85vh] flex flex-col"
+            className="animate-sheet-in bg-bg-raised rounded-[14px] shadow-[var(--shadow-lg)] w-full max-w-5xl max-h-[calc(100vh-max(6vh,40px)-24px)] flex flex-col overflow-hidden"
           onClick={(e) => e.stopPropagation()}
         >
           {/* Template selection step */}
           {createStep === "template" && (
             <>
-              <div className="px-6 pt-6 pb-4 border-b border-border">
-                <h2 className="font-display text-lg font-semibold text-fg">New Agent</h2>
-                <p className="text-sm text-fg-muted mt-1">
-                  Start from a template or build from scratch.
-                </p>
-                <input
-                  value={templateSearch}
-                  onChange={(e) => setTemplateSearch(e.target.value)}
-                  className={`${inputCls} mt-3`}
-                  placeholder="Search templates..."
-                  aria-label="Search templates"
-                />
+              <div className="px-6 pt-5 pb-4 shadow-[0_0.5px_0_var(--hairline)] flex flex-wrap items-end justify-between gap-x-6 gap-y-3">
+                <div>
+                  <h2 className="font-display text-[17px] font-semibold tracking-[-0.015em] text-fg">New Agent</h2>
+                  <p className="text-[13px] text-fg-muted mt-0.5">
+                    Start from a template or build from scratch.
+                  </p>
+                </div>
+                <div className="relative w-full sm:w-72">
+                  <svg aria-hidden="true" viewBox="0 0 16 16" className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 size-3.5 text-fg-subtle"><circle cx="7" cy="7" r="4.5" fill="none" stroke="currentColor" strokeWidth="1.6" /><path d="m10.5 10.5 3 3" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" /></svg>
+                  <input
+                    value={templateSearch}
+                    onChange={(e) => setTemplateSearch(e.target.value)}
+                    className={`${inputCls} pl-8 bg-bg-hover! dark:bg-white/[0.07]! border-transparent`}
+                    placeholder="Search templates..."
+                    aria-label="Search templates"
+                  />
+                </div>
               </div>
-              <div className="flex-1 overflow-y-auto px-6 py-4">
-                <div className="grid grid-cols-2 gap-3">
+              {/* Template gallery: white tiles on the window grey, each
+                  with a monogram app-icon so the grid scans like the
+                  macOS template chooser. */}
+              <div className="flex-1 overflow-y-auto px-6 py-5 bg-bg">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   {filteredTemplates.map((tmpl) => (
                     <button
                       key={tmpl.id}
                       onClick={() => selectTemplate(tmpl)}
-                      className="text-left border border-border rounded-lg p-4 hover:border-brand hover:bg-bg-surface transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+                      className="sq-press group text-left flex gap-3.5 rounded-xl bg-bg-surface p-4 shadow-[var(--shadow-sm)] hover:shadow-[var(--shadow-md),0_0_0_2px_var(--accent)] outline-none focus-visible:shadow-[0_0_0_3px_color-mix(in_srgb,var(--accent)_55%,transparent)]"
                     >
-                      <div className="font-medium text-sm text-fg">{tmpl.name}</div>
-                      <div className="text-xs text-fg-muted mt-1 line-clamp-2">
-                        {tmpl.description}
-                      </div>
-                      {tmpl.tags.length > 0 && (
-                        <div className="flex flex-wrap gap-1 mt-2">
-                          {tmpl.tags.map((tag) => (
-                            <span
-                              key={tag}
-                              className="px-1.5 py-0.5 bg-bg-surface text-fg-muted rounded text-[10px]"
-                            >
-                              {tag}
-                            </span>
-                          ))}
-                        </div>
-                      )}
+                      <span
+                        aria-hidden="true"
+                        className={`inline-flex size-10 shrink-0 items-center justify-center rounded-[10px] font-rounded text-[17px] font-semibold text-white shadow-[inset_0_0_0_0.5px_rgb(0_0_0/0.1),0_1px_2px_rgb(0_0_0/0.12)] bg-linear-to-b ${
+                          tmpl.id === "blank" || tmpl.name.toLowerCase().startsWith("blank")
+                            ? "from-[#b4b4ba] to-[#8a8a90]"
+                            : "from-[#5aa9ff] to-[#0a6ce0]"
+                        }`}
+                      >
+                        {tmpl.name.trim().charAt(0).toUpperCase()}
+                      </span>
+                      <span className="min-w-0 flex-1">
+                        <span className="block font-semibold text-[13px] text-fg">{tmpl.name}</span>
+                        <span className="block text-[12px] leading-[1.45] text-fg-muted mt-0.5 line-clamp-2">
+                          {tmpl.description}
+                        </span>
+                        {tmpl.tags.length > 0 && (
+                          <span className="flex flex-wrap gap-1 mt-2">
+                            {tmpl.tags.map((tag) => (
+                              <span
+                                key={tag}
+                                className="inline-flex h-[18px] items-center px-1.5 bg-bg-hover dark:bg-white/[0.08] text-fg-muted rounded-full text-[10.5px] font-medium"
+                              >
+                                {tag}
+                              </span>
+                            ))}
+                          </span>
+                        )}
+                      </span>
                     </button>
                   ))}
                 </div>
@@ -1465,10 +1488,10 @@ export function AgentFormDialog({
                   </div>
                 )}
               </div>
-              <div className="px-6 py-4 border-t border-border flex justify-end">
+              <div className="px-6 py-3.5 shadow-[0_-0.5px_0_var(--hairline)] flex justify-end">
                 <button
                   onClick={closeCreate}
-                  className="inline-flex items-center min-h-11 sm:min-h-0 px-4 py-2 text-sm text-fg-muted hover:text-fg"
+                  className="sq-press inline-flex items-center justify-center min-h-11 sm:min-h-0 h-[30px] px-3 rounded-[7px] text-[13px] font-medium text-fg bg-bg-surface shadow-[var(--shadow-button)] hover:bg-[#fafafa] dark:bg-white/[0.10] dark:hover:bg-white/[0.14]"
                 >
                   Cancel
                 </button>
@@ -1479,7 +1502,7 @@ export function AgentFormDialog({
           {/* Form step */}
           {createStep === "form" && (
             <>
-              <div className="px-6 pt-6 pb-4 border-b border-border">
+              <div className="px-6 pt-5 pb-4 shadow-[0_0.5px_0_var(--hairline)]">
                 <div className="flex items-center justify-between mb-1">
                   {isEdit ? (
                     <span className="text-sm text-fg-subtle">
@@ -1497,14 +1520,14 @@ export function AgentFormDialog({
                     &larr; Templates
                   </button>
                   )}
-                  <div className="flex items-center gap-0.5 bg-bg-surface rounded-md p-0.5">
+                  <div className="sq-segmented">
                     {(["form", "yaml", "json"] as const).map((m) => (
                       <button
                         key={m}
                         onClick={() => switchMode(m)}
-                        className={`inline-flex items-center justify-center px-2 py-1 min-h-11 sm:min-h-0 text-xs rounded transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
+                        className={`inline-flex items-center justify-center px-2.5 h-11 sm:h-6 text-[12px] font-medium rounded-[6px] transition-[background-color,color,box-shadow] duration-[var(--dur-base)] ease-[var(--ease-soft)] ${
                           createMode === m
-                            ? "bg-bg text-fg font-medium shadow-sm"
+                            ? "bg-bg-surface text-fg shadow-[var(--shadow-button)] dark:bg-white/[0.16]"
                             : "text-fg-muted hover:text-fg"
                         }`}
                       >
@@ -1513,14 +1536,14 @@ export function AgentFormDialog({
                     ))}
                   </div>
                 </div>
-                <h2 className="font-display text-lg font-semibold text-fg">
+                <h2 className="font-display text-[17px] font-semibold tracking-[-0.015em] text-fg">
                   {isEdit ? `Edit ${editAgent?.name || "agent"}` : "New Agent"}
                 </h2>
                 {createMode === "form" && (
                   <div
                     role="tablist"
                     aria-label="Agent configuration sections"
-                    className="flex flex-wrap gap-1 mt-3"
+                    className="sq-segmented mt-3 flex-wrap"
                   >
                     <button
                       role="tab"
@@ -1765,7 +1788,7 @@ export function AgentFormDialog({
                 )}
               </div>
 
-              <div className="px-6 py-4 border-t border-border flex justify-between items-center">
+              <div className="px-6 py-3.5 shadow-[0_-0.5px_0_var(--hairline)] flex justify-between items-center">
                 <div className="text-xs text-fg-subtle">
                   {createMode === "form" && (
                     <>
@@ -1795,7 +1818,7 @@ export function AgentFormDialog({
                   {createMode !== "form" && <span>{createMode.toUpperCase()} editor</span>}
                 </div>
                 <div className="flex gap-2">
-                  <Button variant="ghost" onClick={closeCreate}>
+                  <Button variant="outline" onClick={closeCreate}>
                     Cancel
                   </Button>
                   {isEdit && onOpenSetup && (

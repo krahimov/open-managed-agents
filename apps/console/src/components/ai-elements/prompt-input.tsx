@@ -42,7 +42,7 @@ import {
 import { cn } from "@/lib/utils";
 import type { ChatStatus, FileUIPart, SourceDocumentUIPart } from "ai";
 import {
-  CornerDownLeftIcon,
+  ArrowUpIcon,
   ImageIcon,
   Monitor,
   PlusIcon,
@@ -921,7 +921,9 @@ export const PromptInput = ({
         ref={formRef}
         {...props}
       >
-        <InputGroup className="overflow-hidden">{children}</InputGroup>
+        {/* Rounded Messages-style field: raised surface, soft shadow,
+            circular send button inline at the trailing edge. */}
+        <InputGroup className="overflow-hidden h-auto rounded-[20px] border-transparent bg-bg-surface shadow-[var(--shadow-md)] dark:bg-bg-surface has-[[data-slot=input-group-control]:focus-visible]:border-system-accent/60 has-[[data-slot=input-group-control]:focus-visible]:ring-[3px] has-[[data-slot=input-group-control]:focus-visible]:ring-system-accent/20">{children}</InputGroup>
       </form>
     </>
   );
@@ -1055,7 +1057,7 @@ export const PromptInputTextarea = ({
 
   return (
     <InputGroupTextarea
-      className={cn("field-sizing-content max-h-48 min-h-16", className)}
+      className={cn("field-sizing-content max-h-48 min-h-12 px-4 pt-3 pb-1 text-[13.5px] leading-[1.5] placeholder:text-fg-subtle", className)}
       name="message"
       onCompositionEnd={handleCompositionEnd}
       onCompositionStart={handleCompositionStart}
@@ -1095,7 +1097,7 @@ export const PromptInputFooter = ({
 }: PromptInputFooterProps) => (
   <InputGroupAddon
     align="block-end"
-    className={cn("justify-between gap-1", className)}
+    className={cn("justify-between gap-1 px-2 pb-2 pt-0", className)}
     {...props}
   />
 );
@@ -1136,7 +1138,7 @@ export const PromptInputButton = ({
 
   const button = (
     <InputGroupButton
-      className={cn(className)}
+      className={cn("rounded-full text-fg-muted", className)}
       size={newSize}
       type="button"
       variant={variant}
@@ -1225,7 +1227,7 @@ export const PromptInputSubmit = ({
 }: PromptInputSubmitProps) => {
   const isGenerating = status === "submitted" || status === "streaming";
 
-  let Icon = <CornerDownLeftIcon className="size-4" />;
+  let Icon = <ArrowUpIcon className="size-4" strokeWidth={2.5} />;
 
   if (status === "submitted") {
     Icon = <Spinner />;
@@ -1250,7 +1252,7 @@ export const PromptInputSubmit = ({
   return (
     <InputGroupButton
       aria-label={isGenerating ? "Stop" : "Submit"}
-      className={cn(className)}
+      className={cn("size-7 rounded-full", className)}
       onClick={handleClick}
       size={size}
       type={isGenerating && onStop ? "button" : "submit"}
