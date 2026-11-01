@@ -98,19 +98,19 @@ export function TenantSwitcher() {
             type="button"
             aria-label="Switch workspace"
             disabled={!ready}
-            className="mx-2 w-[calc(100%-1rem)] h-9 rounded-md px-2 flex items-center gap-2 text-left text-fg-muted hover:bg-bg-surface hover:text-fg transition-colors disabled:cursor-default disabled:hover:bg-transparent outline-none focus-visible:bg-bg-surface"
+            className="sq-press mx-3 w-[calc(100%-1.5rem)] h-10 rounded-lg px-1.5 flex items-center gap-2 text-left text-fg-muted bg-bg-hover shadow-[inset_0_0_0_0.5px_var(--border)] hover:bg-bg-press hover:text-fg disabled:cursor-default outline-none group-data-[collapsible=icon]:mx-1.5 group-data-[collapsible=icon]:w-10 group-data-[collapsible=icon]:bg-transparent group-data-[collapsible=icon]:shadow-none"
           >
             {ready ? (
-              <Avatar name={current.name} size="sm" squared />
+              <Avatar name={current.name} size="md" squared />
             ) : (
-              <div className="size-6 rounded-md bg-brand-subtle shrink-0" aria-hidden="true" />
+              <div className="size-7 rounded-md bg-bg-press shrink-0" aria-hidden="true" />
             )}
             <div className="min-w-0 flex-1 leading-tight group-data-[collapsible=icon]:hidden">
-              <div className="text-sm font-medium truncate text-fg">
+              <div className="text-[13px] font-semibold truncate text-fg">
                 {ready ? displayName(current) : " "}
               </div>
               {ready && tenants.length > 1 && (
-                <div className="text-[10px] text-fg-subtle uppercase">
+                <div className="text-[11px] text-fg-subtle capitalize">
                   {current.role}
                 </div>
               )}
@@ -149,7 +149,7 @@ export function TenantSwitcher() {
                 <div className="text-[10px] text-fg-subtle font-mono">{t.id}</div>
               </div>
               {t.id === active && (
-                <CheckIcon className="size-3.5 text-success shrink-0" />
+                <CheckIcon className="size-3.5 text-brand shrink-0" />
               )}
             </DropdownMenuItem>
           ))}
@@ -217,7 +217,7 @@ function CreateTenantModal({
           and integrations. You'll be the owner of the new one.
         </p>
         <div>
-          <label htmlFor="tenant-create-name" className="block text-xs uppercase text-fg-subtle mb-1">
+          <label htmlFor="tenant-create-name" className="block text-[13px] font-medium text-fg mb-1.5">
             Name
           </label>
           <input
@@ -228,7 +228,7 @@ function CreateTenantModal({
             placeholder="e.g. Acme Production"
             autoFocus
             disabled={working}
-            className="w-full bg-bg border border-border rounded-lg px-3 py-2 min-h-11 sm:min-h-0 text-sm outline-none focus:border-border-strong"
+            className="w-full bg-bg-surface border border-border-strong rounded-[7px] px-2.5 h-8 text-sm outline-none focus:border-system-accent focus:ring-[3px] focus:ring-system-accent/25"
           />
         </div>
         {error && (
@@ -237,13 +237,9 @@ function CreateTenantModal({
           </div>
         )}
         <div className="flex gap-2 justify-end">
-          <button
-            onClick={onClose}
-            disabled={working}
-            className="inline-flex items-center justify-center px-4 py-2 min-h-11 sm:min-h-0 rounded-lg border border-border text-sm text-fg-muted hover:bg-bg-surface disabled:opacity-40"
-          >
+          <Button variant="outline" onClick={onClose} disabled={working}>
             Cancel
-          </button>
+          </Button>
           <Button onClick={submit} disabled={working || !name.trim()}>
             {working ? "Creating…" : "Create workspace"}
           </Button>

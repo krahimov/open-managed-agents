@@ -33,6 +33,20 @@ import {
 type CrumbValue = string | { label: string; to?: string };
 type CrumbHandle = { crumb?: CrumbValue | ((m: UIMatch) => CrumbValue) };
 
+/** Label of the deepest route crumb — the page's own name. List pages
+ *  use it as their large title so the title always matches the nav. */
+export function useRouteTitle(): string | undefined {
+  const matches = useMatches();
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const m = matches[i];
+    const handle = (m.handle ?? {}) as CrumbHandle;
+    const raw = typeof handle.crumb === "function" ? handle.crumb(m) : handle.crumb;
+    if (!raw) continue;
+    return typeof raw === "string" ? raw : raw.label;
+  }
+  return undefined;
+}
+
 /**
  * AppShell breadcrumb. Walks the active route match chain via
  * `useMatches()` (data-router-only — main.tsx switched to
@@ -59,21 +73,26 @@ export function AppBreadcrumb() {
   if (crumbs.length === 0) return null;
 
   return (
-    <ShadcnBreadcrumb>
-      <BreadcrumbList>
+    <ShadcnBreadcrumb className="min-w-0">
+      <BreadcrumbList className="flex-nowrap gap-1 text-[13px]">
         {crumbs.map((c, i) => {
           const isLast = i === crumbs.length - 1;
           return (
             <Fragment key={`${c.to}-${i}`}>
               {i > 0 && (
-                <BreadcrumbSeparator>
-                  <ChevronRightIcon className="size-3.5" />
+                <BreadcrumbSeparator className="text-fg-subtle/70">
+                  <ChevronRightIcon className="size-3" strokeWidth={2.25} />
                 </BreadcrumbSeparator>
               )}
               <BreadcrumbItem>
                 {isLast ? (
                   <BreadcrumbPage
-                    className="truncate max-w-[200px] sm:max-w-[280px]"
+                    className={[
+                      "truncate max-w-[220px] sm:max-w-[320px] font-semibold text-fg tracking-[-0.005em]",
+                      // Single-level pages: the inline title hands off
+                      // to the page's large title until it folds away.
+                      crumbs.length === 1 ? "sq-inline-title" : "",
+                    ].join(" ")}
                     title={c.label}
                   >
                     {c.label}
@@ -85,7 +104,12 @@ export function AppBreadcrumb() {
                   // full browser reload — losing all in-memory state
                   // (TQ cache, route state, dialogs).
                   <BreadcrumbLink asChild>
-                    <Link to={c.to}>{c.label}</Link>
+                    <Link
+                      to={c.to}
+                      className="rounded-[5px] px-1.5 py-0.5 text-fg-muted hover:text-fg hover:bg-bg-hover"
+                    >
+                      {c.label}
+                    </Link>
                   </BreadcrumbLink>
                 )}
               </BreadcrumbItem>

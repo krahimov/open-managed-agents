@@ -30,23 +30,27 @@ const Toaster = ({ ...props }: ToasterProps) => {
       position="bottom-right"
       duration={4000}
       icons={{
-        success: <CircleCheckIcon className="size-4" />,
-        info: <InfoIcon className="size-4" />,
-        warning: <TriangleAlertIcon className="size-4" />,
-        error: <OctagonXIcon className="size-4" />,
+        success: <CircleCheckIcon className="size-4 text-success" />,
+        info: <InfoIcon className="size-4 text-brand" />,
+        warning: <TriangleAlertIcon className="size-4 text-warning" />,
+        error: <OctagonXIcon className="size-4 text-danger" />,
         loading: <Loader2Icon className="size-4 animate-spin" />,
       }}
       style={
         {
-          "--normal-bg": "var(--popover)",
-          "--normal-text": "var(--popover-foreground)",
-          "--normal-border": "var(--border)",
-          "--border-radius": "var(--radius)",
+          // macOS notification banner: raised material, 14px corners,
+          // soft layered shadow, hairline edge.
+          "--normal-bg": "var(--bg-raised)",
+          "--normal-text": "var(--fg)",
+          "--normal-border": "var(--hairline)",
+          "--border-radius": "14px",
         } as React.CSSProperties
       }
       toastOptions={{
         classNames: {
-          toast: "cn-toast",
+          toast: "cn-toast !shadow-[var(--shadow-lg)] !text-[13px] !font-sans",
+          title: "!font-semibold",
+          description: "!text-fg-muted",
         },
       }}
       {...props}

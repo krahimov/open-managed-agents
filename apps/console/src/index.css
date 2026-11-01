@@ -1,4 +1,5 @@
 @import "tailwindcss";
+@import "tw-animate-css";
 
 /* Code highlight theme — light by default */
 @import "highlight.js/styles/github.css";
@@ -6,125 +7,176 @@
 /* ---------- Dark mode: class-based ---------- */
 @custom-variant dark (&:where(.dark, .dark *));
 
-/* ---------- Light theme (default) ---------- */
+/* ==========================================================================
+   SEQUOIA — design tokens
+   A first-party macOS feel: translucent source list over a softly tinted
+   canvas, white grouped-inset surfaces, one accent (system blue), semantic
+   status colours, hairlines instead of boxes.
+
+   Accent is split in three so every use stays AA:
+     --accent      #007AFF / #0A84FF  — focus rings, switches, selection dots,
+                                        sidebar glyphs (non-text, ≥3:1)
+     --brand       fills that carry white text (buttons, selected nav row),
+                   tuned a step deeper so white text clears 4.5:1
+     --brand-text  blue used for text and links on any surface
+   The Orrery coral survives only in the logo mark (--logo-coral).
+   ========================================================================== */
 :root {
-  /* Single accent: coral. Reserved for primary actions, focus, active nav —
-     never decoration. (Design direction: cool near-monochrome + one accent.) */
-  --brand: #d9564a;
-  --brand-hover: #c74b40;
-  --brand-subtle: #fdefed;
+  --accent: #007aff;
+  --brand: #0a6ce0;
+  --brand-hover: #0960c9;
+  --brand-press: #0855b3;
+  --brand-subtle: #e8f1fe;
   --brand-fg: #ffffff;
+  --brand-text: #0a5fcb;
+  --logo-coral: #e5624f;
 
-  --bg: #fbfbfc;
-  --bg-sidebar: #f4f4f6;
-  --bg-surface: #ffffff;
-  /* One step BELOW the page — code wells, stat insets, terminal chrome. */
-  --bg-inset: #f1f2f4;
-  --bg-overlay: oklch(0 0 0 / 0.28);
+  /* Canvas: the "desktop" the translucent sidebar floats over. */
+  --canvas: #ebedf2;
+  --canvas-tint-a: rgb(0 122 255 / 0.10);
+  --canvas-tint-b: rgb(175 82 222 / 0.07);
+  --canvas-tint-c: rgb(52 199 89 / 0.05);
 
-  --fg: #17171a;
-  --fg-muted: #6a6b72;
-  --fg-subtle: #a0a1a9;
+  --bg: #f5f5f7;                 /* window / content pane */
+  --bg-sidebar: rgb(240 240 244 / 0.68); /* material, over --canvas */
+  --bg-bar: rgb(245 245 247 / 0.82);     /* toolbar material */
+  --bg-surface: #ffffff;         /* grouped-inset surface */
+  --bg-raised: #ffffff;          /* menus, popovers, sheets */
+  --bg-inset: #ececf0;           /* wells: code, segmented track */
+  --bg-hover: rgb(0 0 0 / 0.04); /* row hover tint */
+  --bg-press: rgb(0 0 0 / 0.07);
+  --bg-overlay: rgb(20 20 24 / 0.22);
 
-  --border: #e6e7eb;
-  --border-strong: #cacdd5;
+  --fg: #1d1d1f;
+  --fg-muted: #5f5f64;
+  --fg-subtle: #75757a;
 
-  --success: #178a55;
-  --success-subtle: #eaf7f0;
-  --warning: #a56315;
-  --warning-subtle: #fff3df;
-  --danger: #c93d47;
-  --danger-subtle: #fff0f1;
-  --info: #2f6fed;
-  --info-subtle: #edf4ff;
-  --accent-violet: #7c5cff;
-  --accent-violet-subtle: #f3f0ff;
+  --border: rgb(0 0 0 / 0.085);
+  --border-strong: rgb(0 0 0 / 0.16);
+  --hairline: rgb(60 60 67 / 0.13);
+  --highlight: rgb(255 255 255 / 0);   /* top edge glint (dark only) */
 
-  /* Surface elevation — single shadow token, theme-aware. Light mode
-     uses near-black at 10% opacity; dark mode bumps to 50% so drop
-     shadows actually read against the dark surface. */
-  --shadow-md: 0 14px 34px -28px rgb(23 23 26 / 0.32);
-  --shadow-sm: 0 1px 2px rgb(23 23 26 / 0.04), 0 1px 1px rgb(23 23 26 / 0.03);
+  --success: #1a7f37;
+  --success-subtle: #e5f5ea;
+  --warning: #b25000;
+  --warning-subtle: #fff1df;
+  --danger: #d70015;
+  --danger-subtle: #ffebed;
+  --info: #0a5fcb;
+  --info-subtle: #e8f1fe;
+  --accent-violet: #8944ab;
+  --accent-violet-subtle: #f5ebfb;
 
-  /* Motion tokens. Default Tailwind transitions feel "computer-y" (linear
-     timing-function, 150ms blanket duration). These curves + scale give
-     interactions weight without being slow:
-     - soft: iOS-style spring out, perfect for modal/toast/menu reveal
-     - snap: tight ease-out for press states, hover state changes
-     - quart: gentle deceleration for layout-affecting changes
-     Pair with --dur-quick (button hover, focus), --dur-base (most state
-     changes), --dur-slow (overlays, page-level changes). */
+  /* Elevation — soft, layered, never a single hard drop. */
+  --shadow-sm: 0 0 0 0.5px rgb(0 0 0 / 0.05), 0 1px 2px rgb(0 0 0 / 0.05);
+  --shadow-md: 0 0 0 0.5px rgb(0 0 0 / 0.06), 0 2px 6px rgb(0 0 0 / 0.05), 0 10px 24px -8px rgb(0 0 0 / 0.10);
+  --shadow-lg: 0 0 0 0.5px rgb(0 0 0 / 0.08), 0 8px 20px rgb(0 0 0 / 0.08), 0 32px 64px -16px rgb(0 0 0 / 0.22);
+  --shadow-button: 0 0 0 0.5px rgb(0 0 0 / 0.10), 0 1px 1.5px rgb(0 0 0 / 0.08);
+
+  /* Motion. --ease-spring is a CSS linear() approximation of a critically
+     under-damped spring (≈1.7% overshoot) — used for sheets, menus,
+     popovers and press release. */
   --ease-soft: cubic-bezier(0.32, 0.72, 0, 1);
   --ease-snap: cubic-bezier(0.5, 0, 0.1, 1);
   --ease-quart: cubic-bezier(0.25, 1, 0.5, 1);
-  --dur-quick: 100ms;
-  --dur-base: 150ms;
-  --dur-slow: 220ms;
+  --ease-spring: linear(0, 0.006, 0.025 2.8%, 0.101 6.1%, 0.539 18.9%, 0.721 25.3%, 0.849 31.5%, 0.937 38.1%, 0.968 41.8%, 0.991 45.7%, 1.006 50.1%, 1.015 55%, 1.017 63.9%, 1.001 85.9%, 1);
+  --dur-quick: 110ms;
+  --dur-base: 180ms;
+  --dur-slow: 320ms;
 
-  --ring: var(--brand);
+  --ring: var(--accent);
   color-scheme: light;
 }
 
-/* ---------- Dark theme ---------- */
+/* ---------- Dark theme — macOS dark materials ---------- */
 .dark {
-  --brand: #ff8d7e;
-  --brand-hover: #ffa294;
-  --brand-subtle: #36211d;
-  --brand-fg: #1c0f0c;
+  --accent: #0a84ff;
+  --brand: #0a6ee6;
+  --brand-hover: #1a7af0;
+  --brand-press: #0862cc;
+  --brand-subtle: #12294a;
+  --brand-fg: #ffffff;
+  --brand-text: #409cff;
+  --logo-coral: #ff7a66;
 
-  --bg: #111113;
-  --bg-sidebar: #17171a;
-  --bg-surface: #1c1c20;
-  /* One step below the page for inset wells. */
-  --bg-inset: #0c0c0e;
-  --bg-overlay: oklch(0 0 0 / 0.6);
+  --canvas: #101012;
+  --canvas-tint-a: rgb(10 132 255 / 0.14);
+  --canvas-tint-b: rgb(191 90 242 / 0.08);
+  --canvas-tint-c: rgb(48 209 88 / 0.04);
 
-  --fg: #f1f1f3;
-  --fg-muted: #a5a7af;
-  --fg-subtle: #777a84;
+  --bg: #1e1e1e;
+  --bg-sidebar: rgb(38 38 42 / 0.66);
+  --bg-bar: rgb(30 30 30 / 0.82);
+  --bg-surface: #2a2a2c;
+  --bg-raised: #323234;
+  --bg-inset: #18181a;
+  --bg-hover: rgb(255 255 255 / 0.05);
+  --bg-press: rgb(255 255 255 / 0.09);
+  --bg-overlay: rgb(0 0 0 / 0.5);
 
-  /* Hairlines as alpha so they sit on any surface step without banding. */
-  --border: oklch(1 0 0 / 0.09);
-  --border-strong: oklch(1 0 0 / 0.18);
+  --fg: #f5f5f7;
+  --fg-muted: #aeaeb2;
+  --fg-subtle: #929298;
 
-  --success: #53d18c;
-  --success-subtle: #163325;
-  --warning: #f0ad4e;
-  --warning-subtle: #352817;
-  --danger: #ff7782;
-  --danger-subtle: #371d21;
-  --info: #80a9ff;
-  --info-subtle: #172644;
-  --accent-violet: #b09cff;
-  --accent-violet-subtle: #261f40;
+  --border: rgb(255 255 255 / 0.09);
+  --border-strong: rgb(255 255 255 / 0.17);
+  --hairline: rgb(255 255 255 / 0.085);
+  --highlight: rgb(255 255 255 / 0.06);
 
-  /* Dark-mode shadow — needs more opacity to register against #151515.
-     shadow-sm carries a 1px top glint so raised surfaces read as lit
-     from above (the cheap trick behind "rich" dark UIs). */
-  --shadow-md: 0 18px 42px -28px rgb(0 0 0 / 0.85);
-  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.45), inset 0 1px 0 rgb(255 255 255 / 0.04);
+  --success: #30d158;
+  --success-subtle: #193b24;
+  --warning: #ff9f0a;
+  --warning-subtle: #3d2c12;
+  --danger: #ff6961;
+  --danger-subtle: #42201f;
+  --info: #409cff;
+  --info-subtle: #12294a;
+  --accent-violet: #bf5af2;
+  --accent-violet-subtle: #33203f;
 
-  --ring: var(--brand);
+  --shadow-sm: 0 0 0 0.5px rgb(0 0 0 / 0.5), 0 1px 2px rgb(0 0 0 / 0.3), inset 0 1px 0 var(--highlight);
+  --shadow-md: 0 0 0 0.5px rgb(0 0 0 / 0.6), 0 4px 12px rgb(0 0 0 / 0.3), 0 16px 32px -12px rgb(0 0 0 / 0.5), inset 0 1px 0 var(--highlight);
+  --shadow-lg: 0 0 0 0.5px rgb(0 0 0 / 0.7), 0 12px 28px rgb(0 0 0 / 0.4), 0 40px 80px -20px rgb(0 0 0 / 0.7), inset 0 1px 0 rgb(255 255 255 / 0.08);
+  --shadow-button: 0 0 0 0.5px rgb(0 0 0 / 0.6), 0 1px 1.5px rgb(0 0 0 / 0.3), inset 0 1px 0 rgb(255 255 255 / 0.07);
+
+  --ring: var(--accent);
   color-scheme: dark;
 }
 
 /* ---------- Tailwind theme tokens ---------- */
 @theme {
-  /* Fonts */
-  --font-display: "Geist Variable", -apple-system, "Segoe UI", sans-serif;
-  --font-sans: "Geist Variable", -apple-system, "Segoe UI", sans-serif;
-  --font-mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  /* Fonts — SF Pro on Apple platforms, Geist elsewhere. */
+  --font-display: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Geist Variable", system-ui, sans-serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Geist Variable", system-ui, sans-serif;
+  --font-rounded: ui-rounded, "SF Pro Rounded", -apple-system, BlinkMacSystemFont, "Geist Variable", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono Variable", "JetBrains Mono", Menlo, Consolas, monospace;
 
-  /* Color palette — resolves dynamically via :root / .dark vars */
+  /* macOS type ramp: body 13, callout 12, caption 11. `text-sm` drives
+     most of the console, so pinning it to 13/18 gives the whole app
+     native density in one move. */
+  --text-xs: 0.75rem;
+  --text-xs--line-height: 1rem;
+  --text-sm: 0.8125rem;
+  --text-sm--line-height: 1.125rem;
+  --text-base: 0.9375rem;
+  --text-base--line-height: 1.375rem;
+
   --color-brand: var(--brand);
   --color-brand-hover: var(--brand-hover);
   --color-brand-subtle: var(--brand-subtle);
   --color-brand-fg: var(--brand-fg);
+  --color-brand-text: var(--brand-text);
+  --color-system-accent: var(--accent);
 
+  --color-canvas: var(--canvas);
   --color-bg: var(--bg);
   --color-bg-sidebar: var(--bg-sidebar);
+  --color-bg-bar: var(--bg-bar);
   --color-bg-surface: var(--bg-surface);
+  --color-bg-raised: var(--bg-raised);
   --color-bg-inset: var(--bg-inset);
+  --color-bg-hover: var(--bg-hover);
+  --color-bg-press: var(--bg-press);
   --color-bg-overlay: var(--bg-overlay);
 
   --color-fg: var(--fg);
@@ -133,6 +185,7 @@
 
   --color-border: var(--border);
   --color-border-strong: var(--border-strong);
+  --color-hairline: var(--hairline);
 
   --color-success: var(--success);
   --color-success-subtle: var(--success-subtle);
@@ -147,72 +200,72 @@
 
   --color-ring: var(--ring);
 
-  /* shadcn-style primitive aliases. The ai-elements + components/ui
-     primitives are vanilla shadcn copy-paste and reach for tokens like
-     `--color-secondary`, `--color-muted-foreground`, etc. Without these
-     aliases Tailwind v4 emits no rule for `bg-secondary`, `text-muted-
-     foreground`, `bg-popover`, `border-input` (the lookup just silently
-     yields nothing) and the lifted shadcn surfaces render unstyled.
-     Mapping straight onto the console palette keeps the chat surface
-     visually consistent with the rest of the console — no second palette
-     to maintain. Both themes (light + dark) get correct values automatically
-     because the tokens above are theme-aware. */
+  /* shadcn-style primitive aliases — mapped onto the console palette so
+     the vendored primitives inherit the same look in both themes. */
   --color-background: var(--bg);
   --color-foreground: var(--fg);
-  --color-card: var(--bg);
+  --color-card: var(--bg-surface);
   --color-card-foreground: var(--fg);
-  --color-popover: var(--bg);
+  --color-popover: var(--bg-raised);
   --color-popover-foreground: var(--fg);
   --color-primary: var(--brand);
   --color-primary-foreground: var(--brand-fg);
   --color-secondary: var(--bg-surface);
   --color-secondary-foreground: var(--fg);
-  --color-muted: var(--bg-surface);
+  --color-muted: var(--bg-hover);
   --color-muted-foreground: var(--fg-muted);
-  --color-accent: var(--bg-surface);
+  --color-accent: var(--bg-hover);
   --color-accent-foreground: var(--fg);
   --color-destructive: var(--danger);
   --color-destructive-foreground: #ffffff;
-  --color-input: var(--border);
+  --color-input: var(--border-strong);
 
-  /* shadcn primitives derive button + input rounding from --radius
-     via `rounded-[min(var(--radius-md),12px)]` and similar. The console's
-     existing rounded utilities use the Tailwind defaults, so pin a
-     value that matches our existing chat bubble feel (rounded-lg). */
+  /* Radii — concentric family. Controls 7, groups 12, widgets 16,
+     sheets 14. */
   --radius: 0.4375rem;
   --radius-md: 0.4375rem;
+  --radius-lg: 0.625rem;
+  --radius-xl: 0.75rem;
+  --radius-2xl: 1rem;
 
-  /* shadcn `Sidebar` primitive lookups. The sidebar component reaches
-     for its own --sidebar* family so its theming can drift from the
-     main canvas (typical use: subtly different bg, darker borders).
-     The console wants the sidebar to share the existing palette, so we alias
-     straight through — bg-sidebar / fg / brand are all already
-     theme-aware via :root / .dark. */
   --color-sidebar: var(--bg-sidebar);
   --color-sidebar-foreground: var(--fg);
   --color-sidebar-primary: var(--brand);
   --color-sidebar-primary-foreground: var(--brand-fg);
-  --color-sidebar-accent: var(--bg-surface);
+  --color-sidebar-accent: var(--bg-press);
   --color-sidebar-accent-foreground: var(--fg);
-  --color-sidebar-border: var(--border);
-  --color-sidebar-ring: var(--brand);
+  --color-sidebar-border: var(--hairline);
+  --color-sidebar-ring: var(--accent);
+
+  --animate-sheet-in: sheet-in var(--dur-slow) var(--ease-spring) both;
+  --animate-sheet-out: sheet-out 180ms var(--ease-soft) both;
+  --animate-pop-in: pop-in 220ms var(--ease-spring) both;
+}
+
+/* `text-brand` is used ~130× for links and accents. Text needs the
+   lighter/deeper `--brand-text` (AA on every surface) while fills keep
+   `--brand`. Unlayered so it beats the generated utility. */
+.text-brand,
+.hover\:text-brand:hover,
+.group:hover .group-hover\:text-brand {
+  color: var(--brand-text);
 }
 
 /* ---------- Base typography ---------- */
 body {
   font-family: var(--font-sans);
-  font-size: 0.875rem; /* 14px base for app UI */
-  line-height: 1.6;
+  font-size: 0.8125rem; /* 13px — macOS body */
+  line-height: 1.45;
+  letter-spacing: -0.003em;
   /* Numbers align in tables, stats, timestamps — app-wide instrument feel. */
   font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
 
-/* Display headings track tighter — large Geist at default tracking reads
-   airy/marketing; tools read tight. */
+/* SF-style optical tracking: tighter as size grows. */
 h1, h2, h3 {
-  letter-spacing: -0.02em;
+  letter-spacing: -0.018em;
 }
 
 /* Lock the viewport — the AppShell sidebar + breadcrumb header are
@@ -237,25 +290,32 @@ body,
    would otherwise make this impossible to suppress on a per-element basis. */
 @layer base {
   *:focus-visible {
-    outline: 2px solid var(--ring);
-    outline-offset: 2px;
+    outline: 3px solid color-mix(in srgb, var(--ring) 55%, transparent);
+    outline-offset: 1px;
+  }
+  ::selection {
+    background: color-mix(in srgb, var(--accent) 26%, transparent);
   }
 }
 
 /* Scrollbar subtle styling */
+/* Overlay-style scrollbars: thin capsule, inset from the edge. */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 11px;
+  height: 11px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
   background: var(--border-strong);
-  border-radius: 3px;
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--fg-subtle);
+  background-clip: content-box;
 }
 
 /* Dark mode code highlights — github.css ships light-mode token colors
@@ -333,17 +393,17 @@ body,
 @keyframes modal-overlay-in  { from { opacity: 0 } to { opacity: 1 } }
 @keyframes modal-overlay-out { from { opacity: 1 } to { opacity: 0 } }
 @keyframes modal-content-in {
-  from { opacity: 0; transform: translate(-50%, -50%) scale(0.96); }
-  to   { opacity: 1; transform: translate(-50%, -50%) scale(1);    }
+  from { opacity: 0; transform: translate(-50%, -28px) scale(0.985); }
+  to   { opacity: 1; transform: translate(-50%, 0) scale(1); }
 }
 @keyframes modal-content-out {
-  from { opacity: 1; transform: translate(-50%, -50%) scale(1);    }
-  to   { opacity: 0; transform: translate(-50%, -50%) scale(0.96); }
+  from { opacity: 1; transform: translate(-50%, 0) scale(1); }
+  to   { opacity: 0; transform: translate(-50%, -20px) scale(0.985); }
 }
 .modal-overlay[data-state="open"]    { animation: modal-overlay-in  var(--dur-base) var(--ease-soft); }
 .modal-overlay[data-state="closed"]  { animation: modal-overlay-out var(--dur-base) var(--ease-soft); }
-.modal-content[data-state="open"]    { animation: modal-content-in  var(--dur-slow) var(--ease-soft); }
-.modal-content[data-state="closed"]  { animation: modal-content-out var(--dur-slow) var(--ease-soft); }
+.modal-content[data-state="open"]    { animation: modal-content-in  420ms var(--ease-spring); }
+.modal-content[data-state="closed"]  { animation: modal-content-out 200ms var(--ease-soft); }
 @media (prefers-reduced-motion: reduce) {
   .modal-overlay[data-state="open"],
   .modal-overlay[data-state="closed"],
@@ -664,4 +724,228 @@ body,
     opacity: 1;
     transform: none;
   }
+}
+
+/* ==========================================================================
+   SEQUOIA — component layer
+   Shared recipes that are awkward as utility strings. Everything here is
+   token-driven so light/dark follow automatically.
+   ========================================================================== */
+
+/* The "desktop" behind the translucent sidebar: a calm tinted wash. Static
+   gradients only — the sidebar is the single blurred surface above it. */
+.sq-canvas {
+  background-color: var(--canvas);
+  background-image:
+    radial-gradient(60% 50% at 0% 0%, var(--canvas-tint-a), transparent 70%),
+    radial-gradient(50% 45% at 0% 100%, var(--canvas-tint-b), transparent 70%),
+    radial-gradient(40% 40% at 30% 55%, var(--canvas-tint-c), transparent 70%);
+}
+
+/* Source-list material. */
+.sq-material-sidebar {
+  background-color: var(--bg-sidebar);
+  -webkit-backdrop-filter: blur(40px) saturate(180%);
+  backdrop-filter: blur(40px) saturate(180%);
+}
+
+/* Toolbar material — used by the unified top bar. */
+.sq-material-bar {
+  background-color: var(--bg-bar);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  backdrop-filter: blur(24px) saturate(180%);
+}
+
+/* Large section header above a grouped list (System Settings style). */
+.sq-section-title {
+  font-family: var(--font-display);
+  font-size: 0.9375rem;
+  line-height: 1.25rem;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--fg);
+}
+
+/* Grouped inset list. Rows are separated by hairlines inset from the
+   leading edge (16px), never touching the group's rounded corners. */
+.sq-group {
+  background: var(--bg-surface);
+  border-radius: 12px;
+  box-shadow: var(--shadow-sm);
+  overflow: clip; /* clip (not hidden) keeps sticky descendants working */
+}
+.sq-group > .sq-row,
+.sq-group > * > .sq-row {
+  position: relative;
+}
+.sq-group .sq-row + .sq-row::before,
+.sq-group .sq-row-sep::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: var(--sq-inset, 16px);
+  right: 0;
+  height: 1px;
+  background: var(--hairline);
+  pointer-events: none;
+}
+
+/* Grouped table rows — hairline under every row but the last, inset from
+   the leading edge. Implemented as a cell background so it costs nothing
+   per row (no pseudo-elements, no blur). */
+.sq-table-row > td {
+  background-image: linear-gradient(var(--hairline), var(--hairline));
+  background-repeat: no-repeat;
+  background-position: bottom left;
+  background-size: 100% 1px;
+}
+.sq-table-row > td:first-child {
+  background-size: calc(100% - 16px) 1px;
+  background-position: bottom right;
+}
+.sq-table-row:last-child > td,
+.sq-table-row:has(+ .sq-table-sentinel) > td {
+  background-image: none;
+}
+.sq-table-row {
+  transition: background-color var(--dur-quick) var(--ease-soft);
+}
+.sq-table-row:hover {
+  background-color: var(--bg-hover);
+}
+
+/* Segmented control track (tabs, filter pills). */
+.sq-segmented {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 8px;
+  background: var(--bg-inset);
+  box-shadow: inset 0 0 0 0.5px var(--border);
+}
+.dark .sq-segmented {
+  background: rgb(255 255 255 / 0.06);
+}
+
+/* macOS push-button sheen on the default (accent) button. */
+.sq-sheen {
+  background-image: linear-gradient(180deg, rgb(255 255 255 / 0.16), rgb(255 255 255 / 0) 60%);
+}
+
+/* iOS-style switch drawn on the Radix checkbox when `variant="switch"`. */
+[data-slot="checkbox"][data-variant="switch"] {
+  width: 32px;
+  height: 20px;
+  border-radius: 999px;
+  border: 0;
+  background: color-mix(in srgb, var(--fg) 16%, transparent);
+  box-shadow: inset 0 0 0 0.5px var(--border);
+  transition: background-color 200ms var(--ease-soft);
+}
+[data-slot="checkbox"][data-variant="switch"]::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  background: #fff;
+  box-shadow: 0 0 0 0.5px rgb(0 0 0 / 0.06), 0 2px 4px rgb(0 0 0 / 0.18);
+  transition: transform 280ms var(--ease-spring);
+}
+[data-slot="checkbox"][data-variant="switch"][data-state="checked"] {
+  background: var(--accent);
+}
+[data-slot="checkbox"][data-variant="switch"][data-state="checked"]::before {
+  transform: translateX(12px);
+}
+[data-slot="checkbox"][data-variant="switch"] [data-slot="checkbox-indicator"] {
+  display: none;
+}
+
+/* Sheet (dialog) motion: drops from the top centre with a spring. */
+/* Tailwind v4 positions with the `translate` property, so these only
+   touch `transform` and compose cleanly with -translate-x-1/2. */
+@keyframes sheet-in {
+  from { opacity: 0; transform: translateY(-28px) scale(0.98); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes sheet-out {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to   { opacity: 0; transform: translateY(-16px) scale(0.985); }
+}
+@keyframes overlay-in  { from { opacity: 0 } to { opacity: 1 } }
+@keyframes overlay-out { from { opacity: 1 } to { opacity: 0 } }
+.sq-sheet[data-state="open"]   { animation: sheet-in 460ms var(--ease-spring) both; }
+.sq-sheet[data-state="closed"] { animation: sheet-out 180ms var(--ease-soft) both; }
+.sq-overlay[data-state="open"]   { animation: overlay-in 240ms var(--ease-soft) both; }
+.sq-overlay[data-state="closed"] { animation: overlay-out 180ms var(--ease-soft) both; }
+/* Menus and popovers pop with a short spring from their origin. */
+[data-slot="dropdown-menu-content"][data-state="open"],
+[data-slot="dropdown-menu-sub-content"][data-state="open"],
+[data-slot="popover-content"][data-state="open"],
+[data-slot="select-content"][data-state="open"] {
+  animation: pop-in 240ms var(--ease-spring) both;
+}
+@keyframes pop-in {
+  from { opacity: 0; transform: scale(0.96) translateY(-2px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+@keyframes sq-fade-up {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.sq-reveal {
+  animation: sq-fade-up 360ms var(--ease-spring) both;
+}
+
+/* Press feedback on controls — a short spring back on release. */
+.sq-press {
+  transition: transform 260ms var(--ease-spring), background-color var(--dur-quick) var(--ease-soft), box-shadow var(--dur-quick) var(--ease-soft), color var(--dur-quick) var(--ease-soft);
+}
+.sq-press:active:not(:disabled) {
+  transform: scale(0.97);
+  transition-duration: 60ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sq-reveal { animation: none; }
+  .sq-sheet[data-state], .sq-overlay[data-state],
+  [data-slot="dropdown-menu-content"][data-state="open"],
+  [data-slot="dropdown-menu-sub-content"][data-state="open"],
+  [data-slot="popover-content"][data-state="open"],
+  [data-slot="select-content"][data-state="open"] { animation-duration: 1ms !important; }
+  .sq-press:active:not(:disabled) { transform: none; }
+  [data-slot="checkbox"][data-variant="switch"]::before { transition: none; }
+}
+
+/* Large title ⇄ inline title hand-off. The page's large title folds
+   (grid-rows 1fr → 0fr) once the shell is `data-collapsed`; on single-
+   level pages the toolbar's inline title is hidden while the large one
+   is visible, then fades in as it folds. */
+.sq-large-title {
+  display: grid;
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transition: grid-template-rows 360ms var(--ease-spring), opacity 200ms var(--ease-soft);
+}
+.sq-large-title > div {
+  min-height: 0;
+  overflow: hidden;
+}
+.sq-shell[data-collapsed="true"] .sq-large-title {
+  grid-template-rows: 0fr;
+  opacity: 0;
+}
+.sq-inline-title {
+  transition: opacity 200ms var(--ease-soft), transform 260ms var(--ease-spring);
+}
+.sq-shell:has([data-large-title]):not([data-collapsed="true"]) .sq-inline-title {
+  opacity: 0;
+  transform: translateY(3px);
+}
+@media (prefers-reduced-motion: reduce) {
+  .sq-large-title, .sq-inline-title { transition: none; }
 }

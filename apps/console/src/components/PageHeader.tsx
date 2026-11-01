@@ -57,18 +57,27 @@ export function PageHeader({
   if (!hasTopRow && !toolbar && !tableHeader) return null;
 
   return createPortal(
-    <div className={cn("bg-bg/92 backdrop-blur supports-[backdrop-filter]:bg-bg/86", className)}>
+    <div className={cn("bg-bg", className)}>
       {hasTopRow && (
-        <div className="flex items-start gap-4 pl-4 pr-5 pt-3">
-          <div className="min-w-0 flex-1">
-            {title && (
-              <h1 className="text-lg font-semibold truncate">
-                {title}
-              </h1>
-            )}
-            {subtitle && (
-              <p className="text-sm text-fg-muted mt-0.5">{subtitle}</p>
-            )}
+        <div className="flex items-end gap-4 pl-6 pr-6 pt-2 pb-3">
+          {/* Large title (macOS / iOS): 26px bold display type that folds
+              away once the content scrolls, handing over to the inline
+              title in the toolbar. Actions stay put. `data-large-title`
+              tells the shell a large title is showing (index.css). */}
+          <div
+            {...(title ? { "data-large-title": "" } : {})}
+            className="sq-large-title min-w-0 flex-1"
+          >
+            <div>
+              {title && (
+                <h1 className="font-display text-[26px] leading-[32px] font-bold tracking-[-0.022em] text-fg truncate">
+                  {title}
+                </h1>
+              )}
+              {subtitle && (
+                <div className="text-[13px] text-fg-muted mt-0.5">{subtitle}</div>
+              )}
+            </div>
           </div>
           {actions && (
             <div className="flex items-center gap-2 shrink-0">{actions}</div>
@@ -76,12 +85,12 @@ export function PageHeader({
         </div>
       )}
       {toolbar && (
-        <div className="flex items-center gap-2 pl-4 pr-5 py-3 overflow-x-auto">
+        <div className="flex items-center gap-2 pl-6 pr-6 pt-1 pb-3 overflow-x-auto [scrollbar-width:none]">
           {toolbar}
         </div>
       )}
       {tableHeader && (
-        <div className="pl-4 pr-5">
+        <div className="pl-6 pr-6">
           {tableHeader}
         </div>
       )}

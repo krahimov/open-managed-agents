@@ -139,22 +139,19 @@ export function AppSidebar() {
           asChild
           isActive={active}
           tooltip={item.label}
-          // Decoration follows selection — same principle as the filter
-          // chips: inactive rows are completely transparent (no pill,
-          // no hover fill), only the active route gets the
-          // bg-sidebar-accent pill. The `!` overrides are necessary
-          // because Tailwind v4's `data-active:` variant matches the
-          // attribute regardless of value (true/false both fire), so
-          // shadcn's built-in `data-active:bg-sidebar-accent` would
-          // otherwise paint every row.
+          // Finder-with-focus selection: the active row is a filled
+          // accent rounded-rect with white text and glyph; inactive rows
+          // are transparent with accent-tinted glyphs. The `!` overrides
+          // beat shadcn's `data-active:` variant, which Tailwind v4
+          // matches regardless of the attribute's value.
           className={
             active
-              ? "border border-border bg-bg-surface text-fg font-medium shadow-[var(--shadow-sm)]"
-              : "border border-transparent !bg-transparent !text-fg-muted hover:!bg-bg-surface/70 hover:!text-fg"
+              ? "h-7 rounded-[6px] px-2 gap-2 !bg-brand !text-brand-fg font-medium shadow-[inset_0_0.5px_0_rgb(255_255_255/0.18)] [&_svg]:!text-brand-fg"
+              : "h-7 rounded-[6px] px-2 gap-2 !bg-transparent !text-fg hover:!bg-bg-press active:!bg-bg-press [&_svg]:text-system-accent"
           }
         >
           <NavLink to={item.to} end={item.end}>
-            <item.icon className="size-4 opacity-80" />
+            <item.icon className="size-4 [stroke-width:1.75]" />
             <span>{item.label}</span>
           </NavLink>
         </SidebarMenuButton>
@@ -165,37 +162,35 @@ export function AppSidebar() {
   return (
     <Sidebar
       collapsible="icon"
-      className="bg-sidebar border-0 group-data-[side=left]:border-r-0"
+      className="border-0 group-data-[side=left]:border-r-0 shadow-[0.5px_0_0_var(--hairline)]"
     >
-      <SidebarHeader className="bg-sidebar h-12 px-3 flex-row items-center gap-2">
+      {/* Brand row shares the 52px toolbar band so mark + title sit on
+          the same baseline as the toolbar to the right. */}
+      <SidebarHeader className="h-[52px] px-4 flex-row items-center gap-2 group-data-[collapsible=icon]:px-3.5">
         <Logo size="sm" />
-        <span className="text-sm font-semibold text-fg group-data-[collapsible=icon]:hidden">
+        <span className="font-display text-[14px] font-semibold tracking-[-0.01em] text-fg group-data-[collapsible=icon]:hidden">
           {BRAND_NAME}
         </span>
       </SidebarHeader>
 
-      {/* Tenant sits between brand row and nav content — same h-11 px-3
-          recipe as the brand row so the collapse animation pins its
-          icon at the same x=12 axis as the product mark above. `mt-2`
-          drops it 8 px below the brand row so its vertical center
-          aligns with the toolbar chips on the right (PageHeader's
-          py-3 pushes them down by the same amount). */}
-      <div className="mt-2">
+      <div className="pb-1">
         <TenantSwitcher />
       </div>
 
-      <SidebarContent className="bg-sidebar px-1 pb-2 [&::-webkit-scrollbar]:hidden [scrollbar-width:none]">
+      <SidebarContent className="px-1.5 pb-2 gap-0 [&::-webkit-scrollbar]:hidden [scrollbar-width:none]">
         {groups.map((g) => (
-          <SidebarGroup key={g.label} className="py-1">
-            <SidebarGroupLabel className="h-6 px-2 text-[10px] font-semibold uppercase text-fg-subtle">
+          <SidebarGroup key={g.label} className="px-1.5 pt-2.5 pb-0">
+            {/* SF-style source-list header: sentence case, bold 11px,
+                secondary label colour. */}
+            <SidebarGroupLabel className="h-6 px-2 text-[11px] font-semibold tracking-[0.01em] text-fg-subtle">
               {g.label}
             </SidebarGroupLabel>
-            <SidebarMenu>{g.items.map(renderItem)}</SidebarMenu>
+            <SidebarMenu className="gap-px">{g.items.map(renderItem)}</SidebarMenu>
           </SidebarGroup>
         ))}
       </SidebarContent>
 
-      <SidebarFooter className="bg-sidebar p-0">
+      <SidebarFooter className="p-0 pt-1 shadow-[0_-0.5px_0_var(--hairline)]">
         <UserProfile />
       </SidebarFooter>
     </Sidebar>

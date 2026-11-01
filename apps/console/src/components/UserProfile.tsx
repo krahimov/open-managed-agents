@@ -63,11 +63,11 @@ export function UserProfile() {
         <button
           type="button"
           aria-label="Account menu"
-          className="mx-2 mb-2 w-[calc(100%-1rem)] h-9 rounded-md px-2 flex items-center gap-2 text-left text-fg-muted hover:bg-bg-surface hover:text-fg transition-colors"
+          className="sq-press mx-3 my-2 w-[calc(100%-1.5rem)] h-10 rounded-lg px-1.5 flex items-center gap-2 text-left text-fg-muted hover:bg-bg-press hover:text-fg outline-none group-data-[collapsible=icon]:mx-1.5 group-data-[collapsible=icon]:w-10"
         >
-          <Avatar name={label} size="sm" />
+          <Avatar name={label} size="md" />
           <div className="flex-1 min-w-0 text-left leading-tight group-data-[collapsible=icon]:hidden">
-            <div className="text-sm text-sidebar-foreground truncate">
+            <div className="text-[13px] font-medium text-sidebar-foreground truncate">
               {user.name || user.email}
             </div>
             {user.email && user.name && (
@@ -115,7 +115,7 @@ export function UserProfile() {
 
         <DropdownMenuSeparator />
 
-        <DropdownMenuLabel className="text-[11px] uppercase text-fg-subtle font-medium">
+        <DropdownMenuLabel className="text-[11px] text-fg-subtle font-semibold">
           Theme
         </DropdownMenuLabel>
         <DropdownMenuGroup>

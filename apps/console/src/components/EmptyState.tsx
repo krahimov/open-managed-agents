@@ -33,9 +33,9 @@ const SIZE: Record<
   "sm" | "md" | "lg",
   { wrap: string; icon: string; gap: string; title: string; body: string }
 > = {
-  sm: { wrap: "py-6 px-4", icon: "w-7 h-7", gap: "mb-2", title: "text-sm", body: "text-xs" },
-  md: { wrap: "py-10 px-6", icon: "w-9 h-9", gap: "mb-3", title: "text-sm", body: "text-[13px]" },
-  lg: { wrap: "py-16 px-8", icon: "w-10 h-10", gap: "mb-4", title: "text-base", body: "text-sm" },
+  sm: { wrap: "py-6 px-4", icon: "w-5 h-5", gap: "mb-2.5", title: "text-[13px]", body: "text-xs" },
+  md: { wrap: "py-10 px-6", icon: "w-6 h-6", gap: "mb-3", title: "text-[14px]", body: "text-[13px]" },
+  lg: { wrap: "py-16 px-8", icon: "w-8 h-8", gap: "mb-4", title: "text-[17px]", body: "text-[13px]" },
 };
 
 /** Entities that have a hand-drawn illustration. Anything not listed
@@ -104,9 +104,16 @@ export function EmptyState({
   const logoSize = size === "lg" ? "lg" : size === "sm" ? "sm" : "md";
   return (
     <div
-      className={`border border-border rounded-lg bg-bg-surface text-center shadow-[var(--shadow-sm)] ${s.wrap} ${className}`.trim()}
+      className={`sq-reveal rounded-xl bg-bg-surface text-center shadow-[var(--shadow-sm)] ${s.wrap} ${className}`.trim()}
     >
+      {/* Glyph sits in a soft circular well — the SF Symbols-in-a-disc
+          treatment System Settings uses for empty panes. */}
       <div className={`flex justify-center ${s.gap}`}>
+        <span
+          className={`inline-flex items-center justify-center rounded-full bg-bg-inset text-fg-subtle shadow-[inset_0_0_0_0.5px_var(--border)] ${
+            size === "lg" ? "size-16" : size === "sm" ? "size-10" : "size-12"
+          }`}
+        >
         {loading ? (
           <BrandLoader size={size} label={title} />
         ) : icon ? (
@@ -118,9 +125,10 @@ export function EmptyState({
         ) : (
           <Logo size={logoSize} className="text-fg-subtle" />
         )}
+        </span>
       </div>
-      <p className={`text-fg ${s.title} font-medium`}>{title}</p>
-      {body && <div className={`text-fg-muted mt-1.5 ${s.body}`}>{body}</div>}
+      <p className={`font-display text-fg ${s.title} font-semibold tracking-[-0.01em]`}>{title}</p>
+      {body && <div className={`text-fg-muted mt-1 max-w-[44ch] mx-auto ${s.body}`}>{body}</div>}
       {action && <div className="mt-4 inline-flex">{action}</div>}
     </div>
   );

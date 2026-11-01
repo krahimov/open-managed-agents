@@ -53,7 +53,11 @@ export function Avatar({ name, src, size = "md", squared, className = "" }: Avat
       )}
       <AvatarFallback
         className={cn(
-          "bg-brand-subtle text-brand font-mono font-bold",
+          // macOS monogram: soft vertical gradient, white rounded
+          // initial. Workspaces (squared) take the accent; people the
+          // neutral contact grey.
+          "font-rounded font-semibold text-white bg-linear-to-b shadow-[inset_0_0_0_0.5px_rgb(0_0_0/0.08)]",
+          squared ? "from-[#5aa9ff] to-[#0a6ce0]" : "from-[#aeaeb4] to-[#86868c]",
           squared ? "rounded-md" : "rounded-full",
         )}
       >

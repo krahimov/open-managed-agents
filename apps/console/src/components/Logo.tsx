@@ -13,6 +13,7 @@ interface LogoProps {
 
 export function Logo({ size = "sm", className = "" }: LogoProps) {
   const px = SIZE_PX[size];
+  const gid = `orrery-tile-${size}`;
   return (
     <svg
       width={px}
@@ -20,25 +21,33 @@ export function Logo({ size = "sm", className = "" }: LogoProps) {
       viewBox="0 0 32 32"
       role="img"
       aria-label={BRAND_NAME}
-      className={`shrink-0 text-brand ${className}`.trim()}
+      className={`shrink-0 ${className}`.trim()}
       xmlns="http://www.w3.org/2000/svg"
     >
-      {/* Orrery mark: ring + hand from the hub, coral body on the ring.
-          Geometry is public/logo.svg's 64-grid halved; ink follows
-          currentColor so the sidebar/theme tints it, the orbiting body
-          keeps the brand coral. */}
+      {/* Orrery app-icon tile: a graphite squircle (macOS app icon
+          proportions) carrying the ring + hand in white, with the
+          orbiting body as the one remaining touch of Orrery coral. */}
+      <defs>
+        <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stopColor="#3a3a40" />
+          <stop offset="1" stopColor="#1c1c20" />
+        </linearGradient>
+      </defs>
+      <rect x="0.5" y="0.5" width="31" height="31" rx="8" fill={`url(#${gid})`} />
+      <rect x="0.5" y="0.5" width="31" height="31" rx="8" fill="none" stroke="rgb(255 255 255 / 0.12)" />
       <g
-        stroke="currentColor"
-        strokeWidth="2.75"
+        stroke="#ffffff"
+        strokeWidth="2.25"
         strokeLinecap="round"
         strokeLinejoin="round"
         fill="none"
+        transform="translate(16 16) scale(0.78) translate(-16 -16)"
       >
         <path d="M16 16l6-6" />
         <circle cx="16" cy="16" r="8.5" />
       </g>
-      <circle cx="16" cy="16" r="2.25" fill="currentColor" />
-      <circle cx="22" cy="10" r="3.5" fill="#d9564a" />
+      <circle cx="16" cy="16" r="1.8" fill="#ffffff" />
+      <circle cx="20.7" cy="11.3" r="3" fill="var(--logo-coral, #e5624f)" />
     </svg>
   );
 }

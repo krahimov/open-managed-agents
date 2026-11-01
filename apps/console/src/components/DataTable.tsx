@@ -39,6 +39,7 @@ import { PageHeader } from "./PageHeader";
 import { Skeleton } from "./Skeleton";
 import { cn } from "@/lib/utils";
 import { useLocation } from "react-router";
+import { useRouteTitle } from "./AppBreadcrumb";
 
 /**
  * DataTable — list page chrome with a frozen, column-aligned header.
@@ -176,6 +177,7 @@ export function DataTable<T>({
   });
 
   const showCreate = !!onCreate && !!createLabel;
+  const routeTitle = useRouteTitle();
 
   // Single-row toolbar: [+ New X] on far left, page-specific filter
   // chips next, then a flex spacer pushes [search] + [Columns] to the
@@ -183,14 +185,22 @@ export function DataTable<T>({
   // continuous action row above the table (no separate top-right
   // "actions" zone). When there's no createCTA and no filters, the
   // search box still right-aligns via `ml-auto`.
+  // Primary actions ride with the large title (top-right, like a macOS
+  // toolbar's trailing items); the toolbar row below holds filters on the
+  // leading edge and search + Columns on the trailing edge.
+  const titleActions =
+    headerActions || showCreate ? (
+      <>
+        {headerActions}
+        {showCreate && <Button onClick={onCreate}>{createLabel}</Button>}
+      </>
+    ) : undefined;
   const toolbar = (
     <>
-      {headerActions}
-      {showCreate && <Button onClick={onCreate}>{createLabel}</Button>}
       {filters}
       <div className="flex-1" />
       {onSearchChange && (
-        <InputGroup className="w-full sm:w-64 shrink-0">
+        <InputGroup className="w-full sm:w-60 shrink-0 h-7 rounded-[7px] bg-bg-hover border-transparent shadow-none dark:bg-white/[0.07]">
           <InputGroupAddon>
             <SearchIcon className="size-3.5 opacity-50" />
           </InputGroupAddon>
@@ -233,8 +243,13 @@ export function DataTable<T>({
     // on this element — see the useEffect below. Without this sync,
     // wide tables (many columns / long URLs) horizontal-scroll the
     // body but the header stays put → cells lose alignment.
-    <div id="dt-header-scroll" className="overflow-x-hidden">
-      <table className="w-full table-fixed text-fg-muted">
+    // Header cap: the rounded top of the grouped list. It lives in the
+    // fixed slot, so rows scroll up underneath it like a Finder list.
+    <div
+      id="dt-header-scroll"
+      className="overflow-x-hidden rounded-t-xl bg-bg-surface shadow-[0_0_0_0.5px_var(--border),0_0.5px_0_var(--hairline)]"
+    >
+      <table className="w-full table-fixed text-fg-subtle">
         {colgroup}
         <thead>
           {table.getHeaderGroups().map((headerGroup) => (
@@ -242,10 +257,10 @@ export function DataTable<T>({
               {headerGroup.headers.map((header) => (
                 <th
                   key={header.id}
-                  className="h-9 px-3 text-left text-xs font-medium align-middle whitespace-nowrap"
+                  className="h-8 px-4 text-left text-[11px] font-semibold tracking-[0.01em] align-middle whitespace-nowrap"
                 >
                   {header.isPlaceholder ? null : (
-                    <span className="font-medium">
+                    <span>
                       {flexRender(header.column.columnDef.header, header.getContext())}
                     </span>
                   )}
@@ -276,6 +291,9 @@ export function DataTable<T>({
   return (
     <>
       <PageHeader
+        title={title ?? routeTitle}
+        subtitle={subtitle}
+        actions={titleActions}
         toolbar={toolbar}
         tableHeader={frozenHeader}
       />
@@ -283,7 +301,7 @@ export function DataTable<T>({
       {loading ? (
         <SkeletonRows colSpan={visibleColumnCount} />
       ) : isEmpty ? (
-        <div className="pl-4 pr-5 py-4">
+        <div className="px-6 py-2">
           <EmptyState
             title={emptyTitle}
             body={emptySubtitle}
@@ -294,47 +312,44 @@ export function DataTable<T>({
           />
         </div>
       ) : (
-        <div id="dt-body-scroll" className="pl-4 pr-5 pb-5 overflow-x-auto">
-          {/* Body sits flush against the frozen header in the slot —
-              no extra top padding so the gap between header and first
-              row is only the row pill's own `border-spacing-y-1.5`
-              (6 px). overflow-x-auto lets wide tables scroll
-              horizontally; the useEffect above mirrors scrollLeft to
-              the frozen header so column alignment is preserved. */}
-          <table className="w-full table-fixed border-separate border-spacing-y-1.5">
-            {colgroup}
-            <tbody>
-              {filteredRows.map((row) => {
-                const cells = row.getVisibleCells();
-                return (
-                  <tr
-                    key={row.id}
-                    onClick={onRowClick ? () => onRowClick(row.original) : undefined}
-                    className={cn(
-                      "bg-bg-surface shadow-[var(--shadow-sm)] hover:bg-brand-subtle/45 transition-colors",
-                      "[&>td]:bg-transparent [&>td]:px-3 [&>td]:py-2 [&>td]:align-middle [&>td]:text-sm",
-                      "[&>td:first-child]:rounded-l-md",
-                      "[&>td:last-child]:rounded-r-md",
-                      onRowClick && "cursor-pointer",
-                    )}
-                  >
-                    {cells.map((cell) => (
-                      <td key={cell.id} className="truncate">
-                        {flexRender(cell.column.columnDef.cell, cell.getContext())}
-                      </td>
-                    ))}
-                  </tr>
-                );
-              })}
-              {onLoadMore && hasMore && (
-                <LoadMoreRow
-                  colSpan={visibleColumnCount}
-                  loading={!!loadingMore}
-                  onLoadMore={onLoadMore}
-                />
-              )}
-            </tbody>
-          </table>
+        <div id="dt-body-scroll" className="px-6 pb-10 overflow-x-auto">
+          {/* Body: the rest of the grouped list — flush under the header
+              cap, rounded at the bottom, rows split by inset hairlines
+              and tinted on hover. */}
+          <div className="rounded-b-xl bg-bg-surface shadow-[0_0_0_0.5px_var(--border),0_1px_2px_rgb(0_0_0/0.04)] [overflow:clip]">
+            <table className="w-full table-fixed border-collapse">
+              {colgroup}
+              <tbody>
+                {filteredRows.map((row) => {
+                  const cells = row.getVisibleCells();
+                  return (
+                    <tr
+                      key={row.id}
+                      onClick={onRowClick ? () => onRowClick(row.original) : undefined}
+                      className={cn(
+                        "sq-table-row",
+                        "[&>td]:px-4 [&>td]:h-11 [&>td]:align-middle [&>td]:text-[13px]",
+                        onRowClick && "cursor-default",
+                      )}
+                    >
+                      {cells.map((cell) => (
+                        <td key={cell.id} className="truncate">
+                          {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                        </td>
+                      ))}
+                    </tr>
+                  );
+                })}
+                {onLoadMore && hasMore && (
+                  <LoadMoreRow
+                    colSpan={visibleColumnCount}
+                    loading={!!loadingMore}
+                    onLoadMore={onLoadMore}
+                  />
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
 
@@ -353,7 +368,7 @@ function ColumnVisibilityMenu<T>({ table }: { table: TanstackTable<T> }) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="outline" className="ml-auto shrink-0">
+        <Button variant="outline" size="sm" className="ml-auto shrink-0">
           <SettingsIcon className="size-3.5" />
           Columns
         </Button>
@@ -401,36 +416,33 @@ function ColumnVisibilityMenu<T>({ table }: { table: TanstackTable<T> }) {
 function SkeletonRows({ colSpan }: { colSpan: number }) {
   const cols = colSpan || 4;
   return (
-    <div className="pl-4 pr-5 pb-5">
-      <table className="w-full table-fixed border-separate border-spacing-y-1.5">
-        <tbody>
-          {Array.from({ length: 10 }).map((_, rowIdx) => (
-            <tr
-              key={`sk-${rowIdx}`}
-              className={cn(
-                "bg-bg-surface",
-                "[&>td]:bg-transparent [&>td]:px-3 [&>td]:py-2 [&>td]:align-middle",
-                "[&>td:first-child]:rounded-l-md",
-                "[&>td:last-child]:rounded-r-md",
-              )}
-            >
-              {Array.from({ length: cols }).map((_, colIdx) => {
-                const widthClass = (() => {
-                  if (colIdx === 0) return rowIdx % 2 === 0 ? "w-[55%]" : "w-[42%]";
-                  if (colIdx === cols - 1)
-                    return rowIdx % 2 === 0 ? "w-[38%]" : "w-[48%]";
-                  return rowIdx % 3 === 0 ? "w-[85%]" : rowIdx % 3 === 1 ? "w-[72%]" : "w-[60%]";
-                })();
-                return (
-                  <td key={colIdx}>
-                    <Skeleton className={`h-3.5 ${widthClass}`} rounded="sm" />
-                  </td>
-                );
-              })}
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div className="px-6 pt-1 pb-10">
+      <div className="sq-group">
+        <table className="w-full table-fixed border-collapse">
+          <tbody>
+            {Array.from({ length: 10 }).map((_, rowIdx) => (
+              <tr
+                key={`sk-${rowIdx}`}
+                className="sq-table-row [&>td]:px-4 [&>td]:h-11 [&>td]:align-middle"
+              >
+                {Array.from({ length: cols }).map((_, colIdx) => {
+                  const widthClass = (() => {
+                    if (colIdx === 0) return rowIdx % 2 === 0 ? "w-[55%]" : "w-[42%]";
+                    if (colIdx === cols - 1)
+                      return rowIdx % 2 === 0 ? "w-[38%]" : "w-[48%]";
+                    return rowIdx % 3 === 0 ? "w-[85%]" : rowIdx % 3 === 1 ? "w-[72%]" : "w-[60%]";
+                  })();
+                  return (
+                    <td key={colIdx}>
+                      <Skeleton className={`h-3 ${widthClass}`} rounded="full" />
+                    </td>
+                  );
+                })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -462,8 +474,8 @@ function LoadMoreRow({
   }, [loading, onLoadMore]);
 
   return (
-    <tr ref={ref}>
-      <td colSpan={colSpan} className="text-center py-4 text-xs text-fg-subtle">
+    <tr ref={ref} className="sq-table-sentinel">
+      <td colSpan={colSpan} className="text-center py-3 text-xs text-fg-subtle">
         {loading ? "Loading more…" : " "}
       </td>
     </tr>

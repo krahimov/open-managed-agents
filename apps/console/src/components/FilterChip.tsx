@@ -42,18 +42,18 @@ export function FilterChip({
     <Popover>
       <div
         className={cn(
-          "inline-flex items-center gap-1 h-8 text-sm shrink-0 transition-colors",
+          "sq-press inline-flex items-center gap-1 h-7 rounded-full text-[13px] shrink-0 transition-colors",
           active
-            ? "rounded-full border border-brand text-brand bg-brand-subtle"
-            : "text-fg-muted hover:text-fg",
+            ? "text-brand bg-brand-subtle shadow-[inset_0_0_0_0.5px_color-mix(in_srgb,var(--accent)_35%,transparent)]"
+            : "text-fg-muted bg-bg-hover hover:bg-bg-press hover:text-fg dark:bg-white/[0.07] dark:hover:bg-white/[0.11]",
         )}
       >
         <PopoverTrigger asChild>
           <button
             type="button"
             className={cn(
-              "inline-flex items-center gap-1 h-full outline-none",
-              active ? "pl-3 pr-2" : "px-2",
+              "inline-flex items-center gap-1 h-full rounded-full outline-none focus-visible:ring-[3px] focus-visible:ring-system-accent/45",
+              active ? "pl-3 pr-1.5" : "pl-3 pr-2",
             )}
           >
             <span className="font-medium">{label}</span>
@@ -63,7 +63,7 @@ export function FilterChip({
                 <span>{display}</span>
               </>
             )}
-            {!active && <ChevronDownIcon className="size-3.5 opacity-60" />}
+            {!active && <ChevronDownIcon className="size-3 opacity-70" strokeWidth={2.5} />}
           </button>
         </PopoverTrigger>
         {active && onClear && (
@@ -73,7 +73,7 @@ export function FilterChip({
               e.stopPropagation();
               onClear();
             }}
-            className="inline-flex items-center justify-center size-5 mr-1.5 rounded-full hover:bg-brand/10"
+            className="inline-flex items-center justify-center size-5 mr-1 rounded-full bg-brand/15 hover:bg-brand/25"
             aria-label={`Clear ${label} filter`}
           >
             <XIcon className="size-3" />

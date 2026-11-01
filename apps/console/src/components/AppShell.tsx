@@ -1,5 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { Outlet, Navigate, useLocation, useNavigate } from "react-router";
+import { SearchIcon } from "lucide-react";
 
 import {
   Sidebar,
@@ -72,6 +73,34 @@ export interface AppOutletContext {
   pageHeaderSlot: HTMLDivElement | null;
 }
 
+/**
+ * Toolbar search field — a quiet macOS-style capsule that opens the
+ * existing ⌘K command palette (CommandPalette listens on window). It's a
+ * discoverable affordance only; the palette owns all behaviour.
+ */
+function ToolbarSearch() {
+  const isMac =
+    typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform);
+  return (
+    <button
+      type="button"
+      onClick={() =>
+        window.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "k", metaKey: isMac, ctrlKey: !isMac, bubbles: true }),
+        )
+      }
+      className="sq-press hidden md:inline-flex h-7 w-56 items-center gap-2 rounded-[7px] bg-bg-inset pl-2 pr-1.5 text-[13px] text-fg-subtle shadow-[inset_0_0_0_0.5px_var(--border)] hover:text-fg-muted outline-none"
+      aria-label="Search and jump to a page"
+    >
+      <SearchIcon className="size-3.5 shrink-0" aria-hidden="true" />
+      <span className="flex-1 text-left">Search</span>
+      <kbd className="font-sans text-[11px] text-fg-subtle rounded-[4px] px-1 py-px shadow-[inset_0_0_0_0.5px_var(--border-strong)]">
+        {isMac ? "⌘K" : "Ctrl K"}
+      </kbd>
+    </button>
+  );
+}
+
 export function AppShell() {
   const { isAuthenticated, isLoading } = useAuth();
   const { pathname, search, hash } = useLocation();
@@ -101,6 +130,10 @@ export function AppShell() {
   // remounts on route change so the listener gets re-bound there.
   const mainRef = useRef<HTMLElement | null>(null);
   const [scrolled, setScrolled] = useState(false);
+  // Large-title fold: only once the user has actually scrolled AND the
+  // page has enough slack that folding the title can't bounce the
+  // scroll position back to 0 (which would unfold it again).
+  const [collapsed, setCollapsed] = useState(false);
   useMemo(() => {
     // re-binding handled by `key={pathname}` on <main> + a ref callback.
     void pathname;
@@ -123,8 +156,8 @@ export function AppShell() {
       <SidebarProvider
         className="h-svh overflow-hidden"
         style={{
-          // 224px expanded, 52px collapsed-icon — matches benchmark.
-          "--sidebar-width": "14.75rem",
+          // 240px source list, 52px collapsed-icon.
+          "--sidebar-width": "15rem",
           "--sidebar-width-icon": "3.25rem",
         } as React.CSSProperties}
       >
@@ -156,21 +189,38 @@ export function AppShell() {
           />
         </div>
 
-        <div className="flex w-full bg-sidebar h-full overflow-hidden">
+        {/* Window: a softly tinted "desktop" canvas sits behind the
+            translucent source list; the content pane is an opaque
+            window surface to its right. */}
+        <div
+          data-scrolled={scrolled ? "true" : "false"}
+          data-collapsed={collapsed ? "true" : "false"}
+          className="group/shell sq-shell sq-canvas flex w-full h-full overflow-hidden"
+        >
           <AppSidebar />
 
-          <div className="flex-1 min-w-0 flex flex-col min-h-0">
-            <header className="h-12 flex items-center gap-1.5 pl-2 pr-4 bg-sidebar shrink-0">
-              <SidebarTrigger className="h-6 w-6 text-fg-muted hover:text-fg hover:bg-sidebar-accent" />
+          <div className="relative flex-1 min-w-0 flex flex-col min-h-0 bg-bg shadow-[-0.5px_0_0_var(--hairline)]">
+            {/* Unified toolbar. Hairline fades in once the content below
+                has scrolled, exactly like a macOS window toolbar. */}
+            <header
+              className={[
+                "h-[52px] shrink-0 flex items-center gap-2 pl-3 pr-4 bg-bg transition-[box-shadow] duration-[var(--dur-base)]",
+                scrolled ? "shadow-[0_0.5px_0_var(--hairline)]" : "",
+              ].join(" ")}
+            >
+              <SidebarTrigger className="size-7 rounded-md text-fg-muted hover:text-fg hover:bg-bg-hover" />
+              <div aria-hidden="true" className="h-4 w-px bg-hairline mx-1" />
               <AppBreadcrumb />
+              <div className="flex-1" />
+              <ToolbarSearch />
             </header>
 
-            <div className="flex-1 min-h-0 rounded-tl-lg border-l border-t border-border bg-bg flex flex-col overflow-hidden shadow-[var(--shadow-md)]">
+            <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
               <div
                 ref={setPageHeaderSlot}
                 className={[
-                  "empty:hidden shrink-0 transition-[border-color] duration-150",
-                  scrolled ? "border-b border-border" : "border-b border-transparent",
+                  "empty:hidden shrink-0 relative z-10 transition-[box-shadow] duration-[var(--dur-base)]",
+                  scrolled ? "shadow-[0_0.5px_0_var(--hairline)]" : "",
                 ].join(" ")}
               />
               <TelegramOnboarding />
@@ -179,9 +229,15 @@ export function AppShell() {
                   mainRef.current = el;
                   if (!el) {
                     setScrolled(false);
+                    setCollapsed(false);
                     return;
                   }
-                  const onScroll = () => setScrolled(el.scrollTop > 0);
+                  const onScroll = () => {
+                    setScrolled(el.scrollTop > 0);
+                    if (el.scrollTop <= 0) setCollapsed(false);
+                    else if (el.scrollTop > 8 && el.scrollHeight - el.clientHeight > 120)
+                      setCollapsed(true);
+                  };
                   onScroll();
                   el.addEventListener("scroll", onScroll, { passive: true });
                   // Cleanup handled when ref unmounts (el = null branch above).
