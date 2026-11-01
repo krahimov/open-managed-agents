@@ -108,7 +108,7 @@ export function AppShell() {
 
   if (isLoading) {
     return (
-      <div className="flex h-screen items-center justify-center bg-bg">
+      <div className="flex h-screen items-center justify-center">
         <BrandLoader size="lg" label="Loading session" />
       </div>
     );
@@ -124,8 +124,8 @@ export function AppShell() {
         className="h-svh overflow-hidden"
         style={{
           // 224px expanded, 52px collapsed-icon — matches benchmark.
-          "--sidebar-width": "14.75rem",
-          "--sidebar-width-icon": "3.25rem",
+          "--sidebar-width": "16.25rem",
+          "--sidebar-width-icon": "3.5rem",
         } as React.CSSProperties}
       >
         <NavigationProgress />
@@ -156,21 +156,31 @@ export function AppShell() {
           />
         </div>
 
-        <div className="flex w-full bg-sidebar h-full overflow-hidden">
+        {/* Liquid Glass frame: the static colour mesh (painted on
+            <body>) runs edge to edge; the sidebar floats over it as a
+            detached glass panel and the toolbar is a glass capsule. The
+            content canvas is transparent so cards sit directly on the
+            mesh. */}
+        <div className="flex w-full h-full overflow-hidden">
           <AppSidebar />
 
           <div className="flex-1 min-w-0 flex flex-col min-h-0">
-            <header className="h-12 flex items-center gap-1.5 pl-2 pr-4 bg-sidebar shrink-0">
-              <SidebarTrigger className="h-6 w-6 text-fg-muted hover:text-fg hover:bg-sidebar-accent" />
-              <AppBreadcrumb />
+            <header className="h-[60px] flex items-end pb-1 pl-6 pr-6 shrink-0">
+              <div className="glass h-9 rounded-full flex items-center gap-1 pl-1 pr-3.5 min-w-0 max-w-full">
+                <SidebarTrigger className="size-7 text-fg-muted hover:text-fg" />
+                <span aria-hidden="true" className="h-4 w-px bg-border-strong mx-1" />
+                <AppBreadcrumb />
+              </div>
             </header>
 
-            <div className="flex-1 min-h-0 rounded-tl-lg border-l border-t border-border bg-bg flex flex-col overflow-hidden shadow-[var(--shadow-md)]">
+            <div className="flex-1 min-h-0 flex flex-col overflow-hidden">
               <div
                 ref={setPageHeaderSlot}
                 className={[
-                  "empty:hidden shrink-0 transition-[border-color] duration-150",
-                  scrolled ? "border-b border-border" : "border-b border-transparent",
+                  "empty:hidden shrink-0 relative z-10 transition-[box-shadow] duration-200",
+                  scrolled
+                    ? "shadow-[0_1px_0_var(--border),0_10px_20px_-18px_rgb(15_23_42/0.4)]"
+                    : "shadow-none",
                 ].join(" ")}
               />
               <TelegramOnboarding />
@@ -187,7 +197,7 @@ export function AppShell() {
                   // Cleanup handled when ref unmounts (el = null branch above).
                 }}
                 key={pathname}
-                className="flex-1 min-h-0 overflow-y-auto bg-bg [scrollbar-gutter:stable] [&::-webkit-scrollbar]:hidden [scrollbar-width:none]"
+                className="flex-1 min-h-0 overflow-y-auto [scrollbar-gutter:stable] [&::-webkit-scrollbar]:hidden [scrollbar-width:none]"
               >
                 <Outlet context={outletContext} />
               </main>

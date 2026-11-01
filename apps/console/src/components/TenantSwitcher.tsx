@@ -98,19 +98,19 @@ export function TenantSwitcher() {
             type="button"
             aria-label="Switch workspace"
             disabled={!ready}
-            className="mx-2 w-[calc(100%-1rem)] h-9 rounded-md px-2 flex items-center gap-2 text-left text-fg-muted hover:bg-bg-surface hover:text-fg transition-colors disabled:cursor-default disabled:hover:bg-transparent outline-none focus-visible:bg-bg-surface"
+            className="w-full h-11 rounded-[16px] pl-2 pr-2.5 flex items-center gap-2.5 text-left text-fg-muted bg-hover/70 shadow-[inset_0_0_0_0.5px_var(--border)] hover:bg-hover hover:text-fg transition-colors duration-200 disabled:cursor-default outline-none focus-visible:outline-2 focus-visible:outline-ring group-data-[collapsible=icon]:size-8 group-data-[collapsible=icon]:p-1 group-data-[collapsible=icon]:bg-transparent group-data-[collapsible=icon]:shadow-none"
           >
             {ready ? (
-              <Avatar name={current.name} size="sm" squared />
+              <Avatar name={current.name} size="lg" squared />
             ) : (
-              <div className="size-6 rounded-md bg-brand-subtle shrink-0" aria-hidden="true" />
+              <div className="size-8 rounded-[8px] bg-brand-subtle shrink-0" aria-hidden="true" />
             )}
             <div className="min-w-0 flex-1 leading-tight group-data-[collapsible=icon]:hidden">
               <div className="text-sm font-medium truncate text-fg">
                 {ready ? displayName(current) : " "}
               </div>
               {ready && tenants.length > 1 && (
-                <div className="text-[10px] text-fg-subtle uppercase">
+                <div className="text-[11px] text-fg-subtle capitalize">
                   {current.role}
                 </div>
               )}

@@ -63,11 +63,11 @@ export function UserProfile() {
         <button
           type="button"
           aria-label="Account menu"
-          className="mx-2 mb-2 w-[calc(100%-1rem)] h-9 rounded-md px-2 flex items-center gap-2 text-left text-fg-muted hover:bg-bg-surface hover:text-fg transition-colors"
+          className="w-full h-11 rounded-full pl-1.5 pr-3 flex items-center gap-2.5 text-left text-fg-muted hover:bg-hover hover:text-fg transition-colors duration-200 outline-none focus-visible:outline-2 focus-visible:outline-ring group-data-[collapsible=icon]:size-8 group-data-[collapsible=icon]:p-0 group-data-[collapsible=icon]:justify-center"
         >
-          <Avatar name={label} size="sm" />
+          <Avatar name={label} size="lg" />
           <div className="flex-1 min-w-0 text-left leading-tight group-data-[collapsible=icon]:hidden">
-            <div className="text-sm text-sidebar-foreground truncate">
+            <div className="text-[13px] font-medium text-sidebar-foreground truncate">
               {user.name || user.email}
             </div>
             {user.email && user.name && (

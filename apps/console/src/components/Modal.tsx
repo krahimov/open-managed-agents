@@ -73,12 +73,12 @@ export function Modal({
     >
       <DialogContent
         className={cn(
-          "max-h-[85vh] flex flex-col gap-0 p-0",
+          "max-h-[85vh] flex flex-col gap-0 p-0 overflow-hidden",
           widthClass,
         )}
       >
-        <DialogHeader className="px-6 py-4 border-b border-border gap-1">
-          <DialogTitle className="text-lg font-semibold font-display truncate">
+        <DialogHeader className="px-6 pt-5 pb-4 pr-14 gap-1">
+          <DialogTitle className="text-[19px] font-semibold font-display tracking-[-0.02em] truncate">
             {title}
           </DialogTitle>
           {subtitle && (
@@ -88,10 +88,10 @@ export function Modal({
           )}
         </DialogHeader>
 
-        <div className="flex-1 overflow-y-auto px-6 py-4">{children}</div>
+        <div className="flex-1 overflow-y-auto px-6 pb-5 pt-1">{children}</div>
 
         {footer && (
-          <DialogFooter className="m-0 px-6 py-4 border-t border-border bg-transparent rounded-none sm:justify-end gap-3">
+          <DialogFooter className="m-0 px-6 py-4 border-t border-border bg-transparent rounded-none sm:justify-end gap-2">
             {footer}
           </DialogFooter>
         )}

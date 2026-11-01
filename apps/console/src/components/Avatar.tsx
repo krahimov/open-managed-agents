@@ -38,7 +38,7 @@ interface AvatarProps {
 
 export function Avatar({ name, src, size = "md", squared, className = "" }: AvatarProps) {
   const initial = (name?.trim().charAt(0) || "?").toUpperCase();
-  const shape = squared ? "rounded-md after:rounded-md *:rounded-md" : "rounded-full";
+  const shape = squared ? "rounded-[8px] after:rounded-[8px] *:rounded-[8px]" : "rounded-full";
 
   return (
     <ShadcnAvatar className={cn(SIZE[size], shape, "shrink-0", className)}>
@@ -53,8 +53,8 @@ export function Avatar({ name, src, size = "md", squared, className = "" }: Avat
       )}
       <AvatarFallback
         className={cn(
-          "bg-brand-subtle text-brand font-mono font-bold",
-          squared ? "rounded-md" : "rounded-full",
+          "bg-brand-subtle text-brand font-rounded font-semibold shadow-[inset_0_1px_0_var(--glass-hi),inset_0_0_0_0.5px_color-mix(in_oklab,var(--brand)_28%,transparent)]",
+          squared ? "rounded-[8px]" : "rounded-full",
         )}
       >
         {initial}

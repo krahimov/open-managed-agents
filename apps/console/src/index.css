@@ -6,103 +6,178 @@
 /* ---------- Dark mode: class-based ---------- */
 @custom-variant dark (&:where(.dark, .dark *));
 
-/* ---------- Light theme (default) ---------- */
+/* ════════════════════════════════════════════════════════════════════════
+   Orrery — "Liquid Glass" design language
+   ────────────────────────────────────────────────────────────────────────
+   Layered, luminous, quiet. A soft static colour mesh sits behind every
+   screen; large containers (sidebar, toolbar, cards, sheets, composer)
+   are glass — translucent fill + saturation blur + a specular rim that
+   is brightest along the top edge. Rows and text inside the glass stay
+   flat and opaque-feeling for legibility.
+
+   Accent: a single indigo-leaning system blue. Blue is the colour glass
+   "wants" — it reads as tint rather than paint on translucent surfaces,
+   harmonises with the cool/warm mesh, and stays legible at AA on both
+   themes. The Orrery coral survives only as the orbiting body in the
+   logo mark (the app icon), never as UI chrome.
+
+   Light:  --brand #1f5ae6 → 5.1:1 on the canvas, 5.7:1 white-on-fill.
+   Dark:   --brand #7aabff for text/icons (7.7:1 on glass);
+           --brand-solid #2a66e8 for filled controls (5.0:1 white-on-fill).
+   ════════════════════════════════════════════════════════════════════════ */
+
 :root {
-  /* Single accent: coral. Reserved for primary actions, focus, active nav —
-     never decoration. (Design direction: cool near-monochrome + one accent.) */
-  --brand: #d9564a;
-  --brand-hover: #c74b40;
-  --brand-subtle: #fdefed;
+  --brand: #1f5ae6;
+  --brand-hover: #1a4fd0;
+  --brand-subtle: #e6eeff;
   --brand-fg: #ffffff;
+  /* Filled controls (primary button, send button). Identical to --brand
+     in light; deeper than --brand in dark so white labels pass AA. */
+  --brand-solid: #1f5ae6;
+  --brand-solid-hover: #1a4fd0;
+  --brand-solid-fg: #ffffff;
 
-  --bg: #fbfbfc;
-  --bg-sidebar: #f4f4f6;
-  --bg-surface: #ffffff;
-  /* One step BELOW the page — code wells, stat insets, terminal chrome. */
-  --bg-inset: #f1f2f4;
-  --bg-overlay: oklch(0 0 0 / 0.28);
+  /* Canvas: the opaque base the mesh is painted over. Elements that need
+     an opaque "page" colour (inputs over glass, sticky bands) use --bg. */
+  --bg: #f1f3f8;
+  --bg-sidebar: rgb(255 255 255 / 0.56);
+  /* Cards / rows: white glass — translucent so the mesh tints through. */
+  --bg-surface: rgb(255 255 255 / 0.72);
+  /* Inset wells sit *below* glass: a cool, slightly darker tint. */
+  --bg-inset: rgb(226 230 240 / 0.62);
+  --bg-overlay: rgb(15 20 35 / 0.22);
 
-  --fg: #17171a;
-  --fg-muted: #6a6b72;
-  --fg-subtle: #a0a1a9;
+  --fg: #0f1218;
+  --fg-muted: #4a4f5b;   /* 7.3:1 on canvas */
+  --fg-subtle: #686d7a;  /* 4.6:1 on canvas, 5.2:1 on white glass */
 
-  --border: #e6e7eb;
-  --border-strong: #cacdd5;
+  --border: rgb(15 23 42 / 0.085);
+  --border-strong: rgb(15 23 42 / 0.16);
 
-  --success: #178a55;
-  --success-subtle: #eaf7f0;
-  --warning: #a56315;
-  --warning-subtle: #fff3df;
-  --danger: #c93d47;
-  --danger-subtle: #fff0f1;
-  --info: #2f6fed;
-  --info-subtle: #edf4ff;
-  --accent-violet: #7c5cff;
-  --accent-violet-subtle: #f3f0ff;
+  --success: #0f7a4a;
+  --success-subtle: #e3f5eb;
+  --warning: #9a5408;
+  --warning-subtle: #fdf0dc;
+  --danger: #c62f3c;
+  --danger-subtle: #fde9eb;
+  --info: #1f5ae6;
+  --info-subtle: #e6eeff;
+  --accent-violet: #6747e0;
+  --accent-violet-subtle: #efebff;
 
-  /* Surface elevation — single shadow token, theme-aware. Light mode
-     uses near-black at 10% opacity; dark mode bumps to 50% so drop
-     shadows actually read against the dark surface. */
-  --shadow-md: 0 14px 34px -28px rgb(23 23 26 / 0.32);
-  --shadow-sm: 0 1px 2px rgb(23 23 26 / 0.04), 0 1px 1px rgb(23 23 26 / 0.03);
+  --hover-fill: rgb(15 23 42 / 0.055);
+  --field-bg: rgb(255 255 255 / 0.8);
+  --field-bg-hover: rgb(255 255 255 / 0.95);
 
-  /* Motion tokens. Default Tailwind transitions feel "computer-y" (linear
-     timing-function, 150ms blanket duration). These curves + scale give
-     interactions weight without being slow:
-     - soft: iOS-style spring out, perfect for modal/toast/menu reveal
-     - snap: tight ease-out for press states, hover state changes
-     - quart: gentle deceleration for layout-affecting changes
-     Pair with --dur-quick (button hover, focus), --dur-base (most state
-     changes), --dur-slow (overlays, page-level changes). */
+  /* ── Glass material ────────────────────────────────────────────────── */
+  --glass-fill: rgb(255 255 255 / 0.58);
+  --glass-fill-strong: rgb(250 251 254 / 0.84);   /* text-heavy / menus / sheets */
+  --glass-fill-subtle: rgb(255 255 255 / 0.42);
+  --glass-sheen: linear-gradient(180deg, rgb(255 255 255 / 0.55) 0%, rgb(255 255 255 / 0) 42%);
+  --glass-hi: rgb(255 255 255 / 0.95);   /* top specular line */
+  --glass-rim: rgb(255 255 255 / 0.55);  /* all-round inner rim */
+  --glass-lo: rgb(15 23 42 / 0.03);      /* bottom inner shade */
+  --glass-edge: rgb(15 23 42 / 0.09);    /* outer hairline */
+  --glass-blur: blur(28px) saturate(1.9);
+  --glass-shadow:
+    0 1px 1px rgb(15 23 42 / 0.03),
+    0 6px 16px -8px rgb(15 23 42 / 0.10),
+    0 24px 48px -24px rgb(15 23 42 / 0.16);
+  --glass-shadow-lg:
+    0 2px 4px rgb(15 23 42 / 0.04),
+    0 18px 40px -12px rgb(15 23 42 / 0.20),
+    0 48px 96px -32px rgb(15 23 42 / 0.28);
+
+  /* Canvas mesh — four soft pools, cool top-left → warm bottom-right. */
+  --mesh:
+    radial-gradient(60vw 50vh at 8% 0%, rgb(186 210 255 / 0.55), transparent 70%),
+    radial-gradient(48vw 46vh at 96% 6%, rgb(255 220 200 / 0.50), transparent 70%),
+    radial-gradient(56vw 50vh at 78% 100%, rgb(200 236 230 / 0.50), transparent 70%),
+    radial-gradient(46vw 44vh at 12% 96%, rgb(255 236 214 / 0.42), transparent 70%);
+
+  --shadow-sm: 0 1px 1px rgb(15 23 42 / 0.04), 0 1px 3px rgb(15 23 42 / 0.04);
+  --shadow-md: var(--glass-shadow);
+
+  /* ── Motion ────────────────────────────────────────────────────────────
+     soft  — iOS sheet spring-out (reveals, menus)
+     snap  — tight ease-out for hover/press
+     quart — gentle deceleration for layout changes
+     spring— slight overshoot for presses & pops (CSS linear() spring). */
   --ease-soft: cubic-bezier(0.32, 0.72, 0, 1);
   --ease-snap: cubic-bezier(0.5, 0, 0.1, 1);
   --ease-quart: cubic-bezier(0.25, 1, 0.5, 1);
-  --dur-quick: 100ms;
-  --dur-base: 150ms;
-  --dur-slow: 220ms;
+  --ease-spring: linear(0, 0.006, 0.025 2.8%, 0.101 6.1%, 0.539 18.9%, 0.721 25.3%, 0.849 31.5%, 0.937 38.1%, 0.968 41.8%, 0.991 45.7%, 1.006 50.1%, 1.015 55%, 1.017 63.9%, 1.001 85.9%, 1);
+  --dur-quick: 120ms;
+  --dur-base: 180ms;
+  --dur-slow: 320ms;
 
   --ring: var(--brand);
   color-scheme: light;
 }
 
-/* ---------- Dark theme ---------- */
 .dark {
-  --brand: #ff8d7e;
-  --brand-hover: #ffa294;
-  --brand-subtle: #36211d;
-  --brand-fg: #1c0f0c;
+  --brand: #7aabff;
+  --brand-hover: #94bbff;
+  --brand-subtle: rgb(80 130 255 / 0.16);
+  --brand-fg: #04122e;
+  --brand-solid: #2a66e8;
+  --brand-solid-hover: #3471f0;
+  --brand-solid-fg: #ffffff;
 
-  --bg: #111113;
-  --bg-sidebar: #17171a;
-  --bg-surface: #1c1c20;
-  /* One step below the page for inset wells. */
-  --bg-inset: #0c0c0e;
-  --bg-overlay: oklch(0 0 0 / 0.6);
+  --bg: #0b0d12;
+  --bg-sidebar: rgb(28 31 40 / 0.55);
+  --bg-surface: rgb(255 255 255 / 0.055);
+  --bg-inset: rgb(0 0 0 / 0.32);
+  --bg-overlay: rgb(0 0 0 / 0.5);
 
-  --fg: #f1f1f3;
-  --fg-muted: #a5a7af;
-  --fg-subtle: #777a84;
+  --fg: #f2f4f8;
+  --fg-muted: #a9aebb;   /* 7.9:1 on glass */
+  --fg-subtle: #8b909d;  /* 5.2:1 on glass */
 
-  /* Hairlines as alpha so they sit on any surface step without banding. */
-  --border: oklch(1 0 0 / 0.09);
-  --border-strong: oklch(1 0 0 / 0.18);
+  --border: rgb(255 255 255 / 0.08);
+  --border-strong: rgb(255 255 255 / 0.15);
 
-  --success: #53d18c;
-  --success-subtle: #163325;
-  --warning: #f0ad4e;
-  --warning-subtle: #352817;
-  --danger: #ff7782;
-  --danger-subtle: #371d21;
-  --info: #80a9ff;
-  --info-subtle: #172644;
-  --accent-violet: #b09cff;
-  --accent-violet-subtle: #261f40;
+  --success: #4fd08b;
+  --success-subtle: rgb(79 208 139 / 0.14);
+  --warning: #f2b257;
+  --warning-subtle: rgb(242 178 87 / 0.14);
+  --danger: #ff7a85;
+  --danger-subtle: rgb(255 122 133 / 0.14);
+  --info: #7aabff;
+  --info-subtle: rgb(80 130 255 / 0.16);
+  --accent-violet: #b4a2ff;
+  --accent-violet-subtle: rgb(160 140 255 / 0.15);
 
-  /* Dark-mode shadow — needs more opacity to register against #151515.
-     shadow-sm carries a 1px top glint so raised surfaces read as lit
-     from above (the cheap trick behind "rich" dark UIs). */
-  --shadow-md: 0 18px 42px -28px rgb(0 0 0 / 0.85);
-  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.45), inset 0 1px 0 rgb(255 255 255 / 0.04);
+  --hover-fill: rgb(255 255 255 / 0.075);
+  --field-bg: rgb(255 255 255 / 0.055);
+  --field-bg-hover: rgb(255 255 255 / 0.085);
+
+  --glass-fill: rgb(30 33 43 / 0.52);
+  --glass-fill-strong: rgb(24 27 36 / 0.86);
+  --glass-fill-subtle: rgb(255 255 255 / 0.04);
+  --glass-sheen: linear-gradient(180deg, rgb(255 255 255 / 0.06) 0%, rgb(255 255 255 / 0) 40%);
+  --glass-hi: rgb(255 255 255 / 0.16);
+  --glass-rim: rgb(255 255 255 / 0.06);
+  --glass-lo: rgb(0 0 0 / 0.25);
+  --glass-edge: rgb(0 0 0 / 0.55);
+  --glass-shadow:
+    0 1px 1px rgb(0 0 0 / 0.3),
+    0 8px 20px -8px rgb(0 0 0 / 0.5),
+    0 28px 56px -24px rgb(0 0 0 / 0.6);
+  --glass-shadow-lg:
+    0 2px 4px rgb(0 0 0 / 0.35),
+    0 24px 48px -12px rgb(0 0 0 / 0.6),
+    0 64px 120px -32px rgb(0 0 0 / 0.7);
+
+  /* Deep ink with faint colour pools. */
+  --mesh:
+    radial-gradient(60vw 52vh at 6% 0%, rgb(46 82 190 / 0.30), transparent 70%),
+    radial-gradient(46vw 44vh at 98% 4%, rgb(150 80 60 / 0.16), transparent 70%),
+    radial-gradient(56vw 50vh at 80% 100%, rgb(30 110 120 / 0.20), transparent 70%),
+    radial-gradient(40vw 40vh at 10% 100%, rgb(70 60 140 / 0.12), transparent 70%);
+
+  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.4), inset 0 1px 0 rgb(255 255 255 / 0.04);
+  --shadow-md: var(--glass-shadow);
 
   --ring: var(--brand);
   color-scheme: dark;
@@ -110,16 +185,19 @@
 
 /* ---------- Tailwind theme tokens ---------- */
 @theme {
-  /* Fonts */
-  --font-display: "Geist Variable", -apple-system, "Segoe UI", sans-serif;
-  --font-sans: "Geist Variable", -apple-system, "Segoe UI", sans-serif;
-  --font-mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  /* Apple system fonts first (SF Pro on macOS / iOS), Geist elsewhere. */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Geist Variable", system-ui, sans-serif;
+  --font-display: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Geist Variable", system-ui, sans-serif;
+  --font-rounded: ui-rounded, "SF Pro Rounded", -apple-system, BlinkMacSystemFont, "Geist Variable", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono Variable", Menlo, Consolas, monospace;
 
-  /* Color palette — resolves dynamically via :root / .dark vars */
   --color-brand: var(--brand);
   --color-brand-hover: var(--brand-hover);
   --color-brand-subtle: var(--brand-subtle);
   --color-brand-fg: var(--brand-fg);
+  --color-brand-solid: var(--brand-solid);
+  --color-brand-solid-hover: var(--brand-solid-hover);
+  --color-brand-solid-fg: var(--brand-solid-fg);
 
   --color-bg: var(--bg);
   --color-bg-sidebar: var(--bg-sidebar);
@@ -145,49 +223,47 @@
   --color-accent-violet: var(--accent-violet);
   --color-accent-violet-subtle: var(--accent-violet-subtle);
 
+  --color-glass: var(--glass-fill);
+  --color-hover: var(--hover-fill);
+  --color-field: var(--field-bg);
+  --color-field-hover: var(--field-bg-hover);
+  --color-glass-strong: var(--glass-fill-strong);
+
   --color-ring: var(--ring);
 
-  /* shadcn-style primitive aliases. The ai-elements + components/ui
-     primitives are vanilla shadcn copy-paste and reach for tokens like
-     `--color-secondary`, `--color-muted-foreground`, etc. Without these
-     aliases Tailwind v4 emits no rule for `bg-secondary`, `text-muted-
-     foreground`, `bg-popover`, `border-input` (the lookup just silently
-     yields nothing) and the lifted shadcn surfaces render unstyled.
-     Mapping straight onto the console palette keeps the chat surface
-     visually consistent with the rest of the console — no second palette
-     to maintain. Both themes (light + dark) get correct values automatically
-     because the tokens above are theme-aware. */
+  /* shadcn aliases — mapped onto the console palette. Popovers resolve to
+     the strong glass fill so menus read as frosted, not as solid paper. */
   --color-background: var(--bg);
   --color-foreground: var(--fg);
-  --color-card: var(--bg);
+  --color-card: var(--bg-surface);
   --color-card-foreground: var(--fg);
-  --color-popover: var(--bg);
+  --color-popover: var(--glass-fill-strong);
   --color-popover-foreground: var(--fg);
-  --color-primary: var(--brand);
-  --color-primary-foreground: var(--brand-fg);
+  --color-primary: var(--brand-solid);
+  --color-primary-foreground: var(--brand-solid-fg);
   --color-secondary: var(--bg-surface);
   --color-secondary-foreground: var(--fg);
-  --color-muted: var(--bg-surface);
+  --color-muted: var(--bg-inset);
   --color-muted-foreground: var(--fg-muted);
-  --color-accent: var(--bg-surface);
+  --color-accent: var(--hover-fill);
   --color-accent-foreground: var(--fg);
   --color-destructive: var(--danger);
   --color-destructive-foreground: #ffffff;
-  --color-input: var(--border);
+  --color-input: var(--border-strong);
 
-  /* shadcn primitives derive button + input rounding from --radius
-     via `rounded-[min(var(--radius-md),12px)]` and similar. The console's
-     existing rounded utilities use the Tailwind defaults, so pin a
-     value that matches our existing chat bubble feel (rounded-lg). */
-  --radius: 0.4375rem;
-  --radius-md: 0.4375rem;
+  /* Concentric radius scale — window 24 · card 20 · control 12-14 · pill. */
+  --radius: 0.625rem;
+  --radius-xs: 0.25rem;
+  --radius-sm: 0.375rem;
+  --radius-md: 0.625rem;
+  --radius-lg: 0.875rem;
+  --radius-xl: 1rem;
+  --radius-2xl: 1.25rem;
+  --radius-3xl: 1.5rem;
+  --radius-card: 1.25rem;
+  --radius-panel: 1.5rem;
+  --radius-control: 0.75rem;
 
-  /* shadcn `Sidebar` primitive lookups. The sidebar component reaches
-     for its own --sidebar* family so its theming can drift from the
-     main canvas (typical use: subtly different bg, darker borders).
-     The console wants the sidebar to share the existing palette, so we alias
-     straight through — bg-sidebar / fg / brand are all already
-     theme-aware via :root / .dark. */
   --color-sidebar: var(--bg-sidebar);
   --color-sidebar-foreground: var(--fg);
   --color-sidebar-primary: var(--brand);
@@ -198,31 +274,134 @@
   --color-sidebar-ring: var(--brand);
 }
 
+/* ════════════════════════════════════════════════════════════════════════
+   Glass utilities
+   ────────────────────────────────────────────────────────────────────────
+   glass         — floating chrome: sidebar, toolbar capsules, composer,
+                   menus. Backdrop blur + saturation. Use sparingly.
+   glass-strong  — sheets & dialogs: denser fill so long text stays AA.
+   glass-card    — content cards on the static canvas. Same rim + sheen,
+                   NO backdrop-filter (the canvas behind is static and
+                   smooth, so blur would cost GPU and buy nothing).
+   glass-chip    — small controls (secondary pills, chips, tool calls).
+   glass-well    — inset area inside glass (code, previews, inputs).
+   ════════════════════════════════════════════════════════════════════════ */
+@utility glass {
+  background-color: var(--glass-fill);
+  background-image: var(--glass-sheen);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow:
+    inset 0 1px 0 0 var(--glass-hi),
+    inset 0 0 0 1px var(--glass-rim),
+    inset 0 -1px 0 0 var(--glass-lo),
+    0 0 0 0.5px var(--glass-edge),
+    var(--glass-shadow);
+}
+@utility glass-strong {
+  background-color: var(--glass-fill-strong);
+  background-image: var(--glass-sheen);
+  -webkit-backdrop-filter: blur(40px) saturate(1.8);
+  backdrop-filter: blur(40px) saturate(1.8);
+  box-shadow:
+    inset 0 1px 0 0 var(--glass-hi),
+    inset 0 0 0 1px var(--glass-rim),
+    0 0 0 0.5px var(--glass-edge),
+    var(--glass-shadow-lg);
+}
+@utility glass-card {
+  background-color: var(--bg-surface);
+  background-image: var(--glass-sheen);
+  box-shadow:
+    inset 0 1px 0 0 var(--glass-hi),
+    inset 0 0 0 1px var(--glass-rim),
+    inset 0 -1px 0 0 var(--glass-lo),
+    0 0 0 0.5px var(--glass-edge),
+    var(--glass-shadow);
+}
+@utility glass-chip {
+  background-color: var(--glass-fill);
+  box-shadow:
+    inset 0 1px 0 0 var(--glass-hi),
+    inset 0 0 0 1px var(--glass-rim),
+    0 0 0 0.5px var(--glass-edge),
+    0 1px 2px rgb(15 23 42 / 0.06),
+    0 4px 10px -6px rgb(15 23 42 / 0.12);
+}
+@utility glass-well {
+  background-color: var(--bg-inset);
+  box-shadow:
+    inset 0 1px 2px 0 rgb(15 23 42 / 0.06),
+    inset 0 0 0 1px var(--border);
+}
+/* Accent-tinted raised capsule (active nav item, selected segment). */
+@utility glass-tint {
+  background-color: color-mix(in oklab, var(--brand) 13%, var(--glass-fill-strong));
+  box-shadow:
+    inset 0 1px 0 0 var(--glass-hi),
+    inset 0 0 0 1px color-mix(in oklab, var(--brand) 22%, transparent),
+    0 0 0 0.5px var(--glass-edge),
+    0 1px 2px rgb(15 23 42 / 0.06),
+    0 6px 14px -8px color-mix(in oklab, var(--brand) 45%, transparent);
+}
+/* Primary pill — solid accent + soft inner highlight. */
+@utility btn-solid {
+  background-color: var(--brand-solid);
+  background-image: linear-gradient(180deg, rgb(255 255 255 / 0.18), rgb(255 255 255 / 0) 55%);
+  color: var(--brand-solid-fg);
+  box-shadow:
+    inset 0 1px 0 0 rgb(255 255 255 / 0.32),
+    inset 0 -1px 0 0 rgb(0 0 0 / 0.12),
+    0 0 0 0.5px color-mix(in oklab, var(--brand-solid) 70%, black),
+    0 1px 2px rgb(15 23 42 / 0.12),
+    0 6px 14px -6px color-mix(in oklab, var(--brand-solid) 55%, transparent);
+}
+/* Text field: a recessed, near-opaque well with a hairline rim. */
+@utility field {
+  background-color: var(--field-bg);
+  box-shadow:
+    inset 0 0 0 1px var(--border-strong),
+    inset 0 1px 2px 0 rgb(15 23 42 / 0.05);
+}
+/* Canvas: static mesh on the opaque base. No animation. */
+@utility canvas-mesh {
+  background-color: var(--bg);
+  background-image: var(--mesh);
+  background-attachment: fixed;
+}
+
+/* Sonner toasts — glass capsules with the same rim as the rest. */
+[data-sonner-toaster] [data-sonner-toast].cn-toast {
+  -webkit-backdrop-filter: blur(30px) saturate(1.8);
+  backdrop-filter: blur(30px) saturate(1.8);
+  box-shadow:
+    inset 0 1px 0 0 var(--glass-hi),
+    0 0 0 0.5px var(--glass-edge),
+    var(--glass-shadow-lg);
+  font-family: var(--font-sans);
+}
+
 /* ---------- Base typography ---------- */
 body {
   font-family: var(--font-sans);
   font-size: 0.875rem; /* 14px base for app UI */
-  line-height: 1.6;
-  /* Numbers align in tables, stats, timestamps — app-wide instrument feel. */
+  line-height: 1.55;
+  letter-spacing: -0.003em;
   font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  background-color: var(--bg);
+  background-image: var(--mesh);
+  background-attachment: fixed;
 }
 
-/* Display headings track tighter — large Geist at default tracking reads
-   airy/marketing; tools read tight. */
+/* Titles: display cut, semibold, tight tracking. */
 h1, h2, h3 {
-  letter-spacing: -0.02em;
+  font-family: var(--font-display);
+  letter-spacing: -0.022em;
 }
 
-/* Lock the viewport — the AppShell sidebar + breadcrumb header are
-   global frame elements that must NEVER scroll out of view. Without
-   this, `html`/`body`/`#root` are auto-height by default; a tall portal,
-   absolutely-positioned overlay, or stray content can push body taller
-   than the viewport and let the whole document scroll, taking the
-   "fixed" frame with it. Pinning all three at exactly the viewport
-   height forces every scroll to happen inside `<main>` (the only
-   `overflow-y: auto` container in the shell). */
 html,
 body,
 #root {
@@ -231,31 +410,34 @@ body,
   overflow: hidden;
 }
 
-/* Focus ring — brand-colored. Wrapped in @layer base so Tailwind utility
-   variants (focus-visible:outline-none, etc.) can override per-element.
-   Unlayered rules win over layered rules regardless of specificity, which
-   would otherwise make this impossible to suppress on a per-element basis. */
 @layer base {
   *:focus-visible {
     outline: 2px solid var(--ring);
     outline-offset: 2px;
   }
+  ::selection {
+    background: color-mix(in oklab, var(--brand) 26%, transparent);
+  }
 }
 
-/* Scrollbar subtle styling */
+/* Scrollbar — thin capsule thumb. */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 10px;
+  height: 10px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
   background: var(--border-strong);
-  border-radius: 3px;
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover {
   background: var(--fg-subtle);
+  border: 3px solid transparent;
+  background-clip: padding-box;
 }
 
 /* Dark mode code highlights — github.css ships light-mode token colors
@@ -332,24 +514,65 @@ body,
    hand-rolled Modal (overlay = --dur-base, content = --dur-slow). */
 @keyframes modal-overlay-in  { from { opacity: 0 } to { opacity: 1 } }
 @keyframes modal-overlay-out { from { opacity: 1 } to { opacity: 0 } }
+/* Dialog content is centred with the `translate` property (Tailwind v4),
+   so these keyframes only touch `transform: scale` — the two compose. */
 @keyframes modal-content-in {
-  from { opacity: 0; transform: translate(-50%, -50%) scale(0.96); }
-  to   { opacity: 1; transform: translate(-50%, -50%) scale(1);    }
+  from { opacity: 0; transform: scale(0.92); }
+  to   { opacity: 1; transform: scale(1);    }
 }
 @keyframes modal-content-out {
-  from { opacity: 1; transform: translate(-50%, -50%) scale(1);    }
-  to   { opacity: 0; transform: translate(-50%, -50%) scale(0.96); }
+  from { opacity: 1; transform: scale(1);    }
+  to   { opacity: 0; transform: scale(0.97); }
 }
-.modal-overlay[data-state="open"]    { animation: modal-overlay-in  var(--dur-base) var(--ease-soft); }
-.modal-overlay[data-state="closed"]  { animation: modal-overlay-out var(--dur-base) var(--ease-soft); }
-.modal-content[data-state="open"]    { animation: modal-content-in  var(--dur-slow) var(--ease-soft); }
-.modal-content[data-state="closed"]  { animation: modal-content-out var(--dur-slow) var(--ease-soft); }
+.modal-overlay[data-state="open"],
+[data-slot="dialog-overlay"][data-state="open"]   { animation: modal-overlay-in  var(--dur-slow) var(--ease-soft); }
+.modal-overlay[data-state="closed"],
+[data-slot="dialog-overlay"][data-state="closed"] { animation: modal-overlay-out var(--dur-base) var(--ease-soft); }
+/* Sheet entrance: scale-and-fade on a spring (slight overshoot). */
+.modal-content[data-state="open"],
+[data-slot="dialog-content"][data-state="open"]   { animation: modal-content-in  420ms var(--ease-spring); }
+.modal-content[data-state="closed"],
+[data-slot="dialog-content"][data-state="closed"] { animation: modal-content-out var(--dur-base) var(--ease-soft); }
+
+/* Floating menus (dropdown, popover, select, hover-card, tooltip): grow
+   out of their trigger with a short spring. Radix exposes the origin. */
+@keyframes float-in {
+  from { opacity: 0; transform: scale(0.96) translateY(-2px); }
+  to   { opacity: 1; transform: scale(1) translateY(0); }
+}
+@keyframes float-out {
+  from { opacity: 1; transform: scale(1); }
+  to   { opacity: 0; transform: scale(0.98); }
+}
+[data-slot="dropdown-menu-content"][data-state="open"],
+[data-slot="dropdown-menu-sub-content"][data-state="open"],
+[data-slot="popover-content"][data-state="open"],
+[data-slot="select-content"][data-state="open"],
+[data-slot="hover-card-content"][data-state="open"] {
+  animation: float-in 260ms var(--ease-spring);
+}
+[data-slot="dropdown-menu-content"][data-state="closed"],
+[data-slot="popover-content"][data-state="closed"],
+[data-slot="select-content"][data-state="closed"],
+[data-slot="hover-card-content"][data-state="closed"] {
+  animation: float-out 120ms var(--ease-soft);
+}
+[data-slot="tooltip-content"][data-state="delayed-open"],
+[data-slot="tooltip-content"][data-state="instant-open"] {
+  animation: float-in 180ms var(--ease-soft);
+}
 @media (prefers-reduced-motion: reduce) {
-  .modal-overlay[data-state="open"],
-  .modal-overlay[data-state="closed"],
-  .modal-content[data-state="open"],
-  .modal-content[data-state="closed"] {
-    animation-duration: 1ms;
+  .modal-overlay[data-state],
+  .modal-content[data-state],
+  [data-slot="dialog-overlay"][data-state],
+  [data-slot="dialog-content"][data-state],
+  [data-slot="dropdown-menu-content"][data-state],
+  [data-slot="dropdown-menu-sub-content"][data-state],
+  [data-slot="popover-content"][data-state],
+  [data-slot="select-content"][data-state],
+  [data-slot="hover-card-content"][data-state],
+  [data-slot="tooltip-content"][data-state] {
+    animation-duration: 1ms !important;
   }
 }
 

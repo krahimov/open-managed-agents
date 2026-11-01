@@ -139,22 +139,19 @@ export function AppSidebar() {
           asChild
           isActive={active}
           tooltip={item.label}
-          // Decoration follows selection — same principle as the filter
-          // chips: inactive rows are completely transparent (no pill,
-          // no hover fill), only the active route gets the
-          // bg-sidebar-accent pill. The `!` overrides are necessary
-          // because Tailwind v4's `data-active:` variant matches the
-          // attribute regardless of value (true/false both fire), so
-          // shadcn's built-in `data-active:bg-sidebar-accent` would
-          // otherwise paint every row.
+          // Capsule nav. Inactive rows are bare text until hovered; the
+          // active route becomes a raised, accent-tinted glass capsule.
+          // The `!` overrides are needed because Tailwind v4's
+          // `data-active:` variant matches the attribute regardless of
+          // value, so shadcn's built-in active fill would paint every row.
           className={
             active
-              ? "border border-border bg-bg-surface text-fg font-medium shadow-[var(--shadow-sm)]"
-              : "border border-transparent !bg-transparent !text-fg-muted hover:!bg-bg-surface/70 hover:!text-fg"
+              ? "glass-tint !text-fg font-medium [&_svg]:!text-brand"
+              : "!bg-transparent !text-fg-muted hover:!bg-hover hover:!text-fg"
           }
         >
           <NavLink to={item.to} end={item.end}>
-            <item.icon className="size-4 opacity-80" />
+            <item.icon className="size-4" />
             <span>{item.label}</span>
           </NavLink>
         </SidebarMenuButton>
@@ -165,37 +162,34 @@ export function AppSidebar() {
   return (
     <Sidebar
       collapsible="icon"
-      className="bg-sidebar border-0 group-data-[side=left]:border-r-0"
+      variant="floating"
+      className="border-0"
     >
-      <SidebarHeader className="bg-sidebar h-12 px-3 flex-row items-center gap-2">
-        <Logo size="sm" />
-        <span className="text-sm font-semibold text-fg group-data-[collapsible=icon]:hidden">
+      <SidebarHeader className="h-14 px-4 pt-3 flex-row items-center gap-2.5 group-data-[collapsible=icon]:px-2 group-data-[collapsible=icon]:justify-center">
+        <Logo size="sm" className="!text-fg" />
+        <span className="font-display text-[15px] font-semibold tracking-[-0.015em] text-fg group-data-[collapsible=icon]:hidden">
           {BRAND_NAME}
         </span>
       </SidebarHeader>
 
-      {/* Tenant sits between brand row and nav content — same h-11 px-3
-          recipe as the brand row so the collapse animation pins its
-          icon at the same x=12 axis as the product mark above. `mt-2`
-          drops it 8 px below the brand row so its vertical center
-          aligns with the toolbar chips on the right (PageHeader's
-          py-3 pushes them down by the same amount). */}
-      <div className="mt-2">
+      {/* Workspace switcher — a recessed well under the brand. */}
+      <div className="px-2 pb-1">
         <TenantSwitcher />
       </div>
 
-      <SidebarContent className="bg-sidebar px-1 pb-2 [&::-webkit-scrollbar]:hidden [scrollbar-width:none]">
+      <SidebarContent className="px-1 pb-2 [&::-webkit-scrollbar]:hidden [scrollbar-width:none] [mask-image:linear-gradient(to_bottom,transparent,black_10px,black_calc(100%-14px),transparent)]">
         {groups.map((g) => (
-          <SidebarGroup key={g.label} className="py-1">
-            <SidebarGroupLabel className="h-6 px-2 text-[10px] font-semibold uppercase text-fg-subtle">
+          <SidebarGroup key={g.label} className="py-1.5 px-2">
+            <SidebarGroupLabel className="h-6 px-3 text-[11px] font-semibold tracking-[0.01em] text-fg-subtle">
               {g.label}
             </SidebarGroupLabel>
-            <SidebarMenu>{g.items.map(renderItem)}</SidebarMenu>
+            <SidebarMenu className="gap-px">{g.items.map(renderItem)}</SidebarMenu>
           </SidebarGroup>
         ))}
       </SidebarContent>
 
-      <SidebarFooter className="bg-sidebar p-0">
+      <SidebarFooter className="p-2 pt-0">
+        <div className="h-px mx-3 mb-2 bg-border group-data-[collapsible=icon]:mx-1" />
         <UserProfile />
       </SidebarFooter>
     </Sidebar>

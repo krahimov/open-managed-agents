@@ -22,6 +22,16 @@ const TONE_TEXT: Record<StatusTone, string> = {
   neutral: "text-fg-muted",
 };
 
+const TONE_BG: Record<StatusTone, string> = {
+  idle: "bg-hover",
+  running: "bg-info-subtle",
+  waiting: "bg-warning-subtle",
+  completed: "bg-success-subtle",
+  errored: "bg-danger-subtle",
+  terminated: "bg-danger-subtle",
+  neutral: "bg-hover",
+};
+
 const TONE_DOT: Record<StatusTone, string> = {
   idle: "bg-fg-subtle",
   running: "bg-info",
@@ -36,9 +46,11 @@ export function StatusPill({ status, label }: { status: StatusTone | string; lab
   const tone: StatusTone = (TONE_TEXT as Record<string, unknown>)[status] ? (status as StatusTone) : "neutral";
   const text = label ?? (status[0]?.toUpperCase() + status.slice(1));
   return (
-    <span className={`inline-flex items-center gap-1.5 text-[11px] font-medium ${TONE_TEXT[tone]}`}>
+    <span
+      className={`inline-flex items-center gap-1.5 h-[22px] pl-2 pr-2.5 rounded-full text-[11.5px] font-medium leading-none whitespace-nowrap ${TONE_BG[tone]} ${TONE_TEXT[tone]}`}
+    >
       <span
-        className={`inline-block w-1.5 h-1.5 rounded-full ${TONE_DOT[tone]} ${
+        className={`inline-block size-1.5 rounded-full ${TONE_DOT[tone]} ${
           tone === "running" ? "animate-pulse" : ""
         }`}
       />
@@ -76,7 +88,7 @@ export function Badge({
     return (
       <button
         onClick={onClick}
-        className="text-[11px] px-2 py-0.5 min-h-11 sm:min-h-0 rounded border border-border hover:border-border-strong hover:bg-bg-surface text-fg-muted flex items-center gap-1.5 font-mono max-w-xs"
+        className="text-[11.5px] h-7 px-2.5 min-h-11 sm:min-h-7 rounded-full glass-chip hover:bg-glass-strong text-fg-muted hover:text-fg flex items-center gap-1.5 font-mono max-w-xs transition-colors duration-200"
         title={title ?? (typeof label === "string" ? label : undefined)}
       >
         {inner}
@@ -85,7 +97,7 @@ export function Badge({
   }
   return (
     <span
-      className="text-[11px] px-2 py-0.5 text-fg-subtle font-mono flex items-center gap-1.5"
+      className="text-[11.5px] h-7 px-1.5 text-fg-subtle font-mono flex items-center gap-1.5"
       title={title}
     >
       {inner}

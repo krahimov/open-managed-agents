@@ -56,18 +56,21 @@ export function PageHeader({
   const hasTopRow = !!title || !!subtitle || !!actions;
   if (!hasTopRow && !toolbar && !tableHeader) return null;
 
+  // Transparent band over the mesh — it sits ABOVE the scroll context,
+  // so nothing ever slides under it and no blur is needed. Large title
+  // in the display cut; actions are pills on the right.
   return createPortal(
-    <div className={cn("bg-bg/92 backdrop-blur supports-[backdrop-filter]:bg-bg/86", className)}>
+    <div className={cn("", className)}>
       {hasTopRow && (
-        <div className="flex items-start gap-4 pl-4 pr-5 pt-3">
+        <div className="flex items-end gap-4 pl-6 pr-6 pt-5 pb-1">
           <div className="min-w-0 flex-1">
             {title && (
-              <h1 className="text-lg font-semibold truncate">
+              <h1 className="font-display text-[26px] leading-[1.15] font-semibold tracking-[-0.025em] text-fg truncate">
                 {title}
               </h1>
             )}
             {subtitle && (
-              <p className="text-sm text-fg-muted mt-0.5">{subtitle}</p>
+              <p className="text-[14px] text-fg-muted mt-1">{subtitle}</p>
             )}
           </div>
           {actions && (
@@ -76,12 +79,12 @@ export function PageHeader({
         </div>
       )}
       {toolbar && (
-        <div className="flex items-center gap-2 pl-4 pr-5 py-3 overflow-x-auto">
+        <div className="flex items-center gap-2 pl-6 pr-6 pt-4 pb-3 overflow-x-auto [scrollbar-width:none]">
           {toolbar}
         </div>
       )}
       {tableHeader && (
-        <div className="pl-4 pr-5">
+        <div className="pl-6 pr-6">
           {tableHeader}
         </div>
       )}

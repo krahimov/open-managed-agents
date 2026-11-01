@@ -233,8 +233,11 @@ export function DataTable<T>({
     // on this element — see the useEffect below. Without this sync,
     // wide tables (many columns / long URLs) horizontal-scroll the
     // body but the header stays put → cells lose alignment.
-    <div id="dt-header-scroll" className="overflow-x-hidden">
-      <table className="w-full table-fixed text-fg-muted">
+    <div
+      id="dt-header-scroll"
+      className="overflow-x-hidden rounded-t-[20px] bg-bg-surface bg-[image:var(--glass-sheen)] shadow-[inset_0_1px_0_var(--glass-hi),inset_1px_0_0_var(--glass-rim),inset_-1px_0_0_var(--glass-rim),inset_0_-1px_0_var(--border),0_0_0_0.5px_var(--glass-edge)]"
+    >
+      <table className="w-full table-fixed text-fg-subtle">
         {colgroup}
         <thead>
           {table.getHeaderGroups().map((headerGroup) => (
@@ -242,7 +245,7 @@ export function DataTable<T>({
               {headerGroup.headers.map((header) => (
                 <th
                   key={header.id}
-                  className="h-9 px-3 text-left text-xs font-medium align-middle whitespace-nowrap"
+                  className="h-10 px-4 text-left text-xs font-medium align-middle whitespace-nowrap"
                 >
                   {header.isPlaceholder ? null : (
                     <span className="font-medium">
@@ -283,7 +286,7 @@ export function DataTable<T>({
       {loading ? (
         <SkeletonRows colSpan={visibleColumnCount} />
       ) : isEmpty ? (
-        <div className="pl-4 pr-5 py-4">
+        <div className="px-6 py-4">
           <EmptyState
             title={emptyTitle}
             body={emptySubtitle}
@@ -294,14 +297,14 @@ export function DataTable<T>({
           />
         </div>
       ) : (
-        <div id="dt-body-scroll" className="pl-4 pr-5 pb-5 overflow-x-auto">
+        <div id="dt-body-scroll" className="px-6 pb-8 overflow-x-auto">
           {/* Body sits flush against the frozen header in the slot —
               no extra top padding so the gap between header and first
               row is only the row pill's own `border-spacing-y-1.5`
               (6 px). overflow-x-auto lets wide tables scroll
               horizontally; the useEffect above mirrors scrollLeft to
               the frozen header so column alignment is preserved. */}
-          <table className="w-full table-fixed border-separate border-spacing-y-1.5">
+          <table className={cn("w-full table-fixed border-separate border-spacing-0", GLASS_LIST_BODY)}>
             {colgroup}
             <tbody>
               {filteredRows.map((row) => {
@@ -310,13 +313,7 @@ export function DataTable<T>({
                   <tr
                     key={row.id}
                     onClick={onRowClick ? () => onRowClick(row.original) : undefined}
-                    className={cn(
-                      "bg-bg-surface shadow-[var(--shadow-sm)] hover:bg-brand-subtle/45 transition-colors",
-                      "[&>td]:bg-transparent [&>td]:px-3 [&>td]:py-2 [&>td]:align-middle [&>td]:text-sm",
-                      "[&>td:first-child]:rounded-l-md",
-                      "[&>td:last-child]:rounded-r-md",
-                      onRowClick && "cursor-pointer",
-                    )}
+                    className={cn(GLASS_LIST_ROW, onRowClick && "cursor-pointer")}
                   >
                     {cells.map((cell) => (
                       <td key={cell.id} className="truncate">
@@ -353,7 +350,7 @@ function ColumnVisibilityMenu<T>({ table }: { table: TanstackTable<T> }) {
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="outline" className="ml-auto shrink-0">
+        <Button variant="secondary" className="ml-auto shrink-0">
           <SettingsIcon className="size-3.5" />
           Columns
         </Button>
@@ -401,19 +398,11 @@ function ColumnVisibilityMenu<T>({ table }: { table: TanstackTable<T> }) {
 function SkeletonRows({ colSpan }: { colSpan: number }) {
   const cols = colSpan || 4;
   return (
-    <div className="pl-4 pr-5 pb-5">
-      <table className="w-full table-fixed border-separate border-spacing-y-1.5">
+    <div className="px-6 pt-1 pb-8">
+      <table className={cn("w-full table-fixed border-separate border-spacing-0 rounded-[20px]", GLASS_LIST_SKELETON)}>
         <tbody>
           {Array.from({ length: 10 }).map((_, rowIdx) => (
-            <tr
-              key={`sk-${rowIdx}`}
-              className={cn(
-                "bg-bg-surface",
-                "[&>td]:bg-transparent [&>td]:px-3 [&>td]:py-2 [&>td]:align-middle",
-                "[&>td:first-child]:rounded-l-md",
-                "[&>td:last-child]:rounded-r-md",
-              )}
-            >
+            <tr key={`sk-${rowIdx}`} className={GLASS_LIST_ROW}>
               {Array.from({ length: cols }).map((_, colIdx) => {
                 const widthClass = (() => {
                   if (colIdx === 0) return rowIdx % 2 === 0 ? "w-[55%]" : "w-[42%]";
@@ -463,12 +452,26 @@ function LoadMoreRow({
 
   return (
     <tr ref={ref}>
-      <td colSpan={colSpan} className="text-center py-4 text-xs text-fg-subtle">
+      <td colSpan={colSpan} className="text-center py-3 text-xs text-fg-subtle">
         {loading ? "Loading more…" : " "}
       </td>
     </tr>
   );
 }
+
+/* Glass list recipe — one translucent card whose frozen header cap
+ * lives in the PageHeader slot and whose body continues in the scroll
+ * area. Rows are flat (no per-row glass) with hairline separators. */
+const GLASS_LIST_BODY =
+  "rounded-b-[20px] bg-bg-surface shadow-[inset_0_-1px_0_var(--glass-lo),inset_1px_0_0_var(--glass-rim),inset_-1px_0_0_var(--glass-rim),0_0_0_0.5px_var(--glass-edge),var(--glass-shadow)]";
+const GLASS_LIST_SKELETON =
+  "bg-bg-surface shadow-[inset_0_1px_0_var(--glass-hi),inset_0_0_0_1px_var(--glass-rim),0_0_0_0.5px_var(--glass-edge),var(--glass-shadow)]";
+const GLASS_LIST_ROW = cn(
+  "group/row [&>td]:transition-colors [&>td]:duration-150 hover:[&>td]:bg-hover",
+  "[&>td]:h-12 [&>td]:px-4 [&>td]:py-2 [&>td]:align-middle [&>td]:text-sm",
+  "[&:not(:last-child)>td]:border-b [&:not(:last-child)>td]:border-border",
+  "[&:last-child>td:first-child]:rounded-bl-[20px] [&:last-child>td:last-child]:rounded-br-[20px]",
+);
 
 // Re-export for caller-side column definitions.
 export { type ColumnDef } from "@tanstack/react-table";

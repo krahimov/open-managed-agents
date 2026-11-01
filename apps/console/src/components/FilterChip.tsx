@@ -42,10 +42,10 @@ export function FilterChip({
     <Popover>
       <div
         className={cn(
-          "inline-flex items-center gap-1 h-8 text-sm shrink-0 transition-colors",
+          "inline-flex items-center gap-1 h-8 rounded-full text-[13px] shrink-0 transition-[background-color,color,box-shadow] duration-200",
           active
-            ? "rounded-full border border-brand text-brand bg-brand-subtle"
-            : "text-fg-muted hover:text-fg",
+            ? "glass-tint text-brand"
+            : "text-fg-muted shadow-[inset_0_0_0_1px_var(--border-strong)] hover:text-fg hover:bg-hover",
         )}
       >
         <PopoverTrigger asChild>
@@ -53,7 +53,7 @@ export function FilterChip({
             type="button"
             className={cn(
               "inline-flex items-center gap-1 h-full outline-none",
-              active ? "pl-3 pr-2" : "px-2",
+              active ? "pl-3.5 pr-1.5" : "pl-3.5 pr-3",
             )}
           >
             <span className="font-medium">{label}</span>
@@ -73,7 +73,7 @@ export function FilterChip({
               e.stopPropagation();
               onClear();
             }}
-            className="inline-flex items-center justify-center size-5 mr-1.5 rounded-full hover:bg-brand/10"
+            className="inline-flex items-center justify-center size-5 mr-1.5 rounded-full bg-brand/10 hover:bg-brand/20"
             aria-label={`Clear ${label} filter`}
           >
             <XIcon className="size-3" />
@@ -200,7 +200,7 @@ export function CreatedFilterChip({
         align="start"
         sideOffset={4}
         collisionPadding={8}
-        className="w-60 p-1"
+        className="w-60 p-1.5 gap-0.5"
       >
         {(Object.keys(CREATED_PRESET_LABELS) as CreatedPreset[]).map((p) => (
           <button
@@ -208,8 +208,8 @@ export function CreatedFilterChip({
             type="button"
             onClick={() => apply(p)}
             className={cn(
-              "w-full flex items-center justify-between gap-2 px-2 py-1.5 rounded text-sm",
-              "hover:bg-bg-surface",
+              "w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-[10px] text-sm",
+              "hover:bg-hover",
               preset === p && "text-fg font-medium",
             )}
           >
