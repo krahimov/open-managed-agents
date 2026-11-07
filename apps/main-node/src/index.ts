@@ -2547,7 +2547,7 @@ const connectionConsent = new ConnectionConsent({
     logger.info({ op: "connection.approved", session_id: sessionId, credential_id: binding.credential_id }, "connection explicitly approved");
     await sessionRouter.appendEvent(sessionId, {
       type: "user.message", id: generateEventId(), content: [{ type: "text",
-        text: `[access granted] ${service} was explicitly approved for this agent. Account: ${binding.account ?? "identity unavailable"}. Workspace: ${binding.workspace ?? "identity unavailable"}. Confirm this matches the requested workspace before using it.`,
+        text: `[access granted] ${service} was explicitly approved for this agent. Account: ${binding.account ?? "identity unavailable"}. Workspace: ${binding.workspace ?? (binding.account ? "not reported by this provider" : "identity unavailable")}. Confirm this matches the requested workspace before using it.`,
       }],
     } as SessionEvent);
   },
