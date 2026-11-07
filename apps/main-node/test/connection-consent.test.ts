@@ -147,3 +147,67 @@ describe("live protocol and workspace verification", () => {
     expect(calls[0]).toEqual({ name: "get_user", arguments: { query: "me" } });
   });
 });
+
+describe("identity for GitHub, Sentry and other MCP servers", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  /** Minimal Streamable HTTP MCP server: `tools` are listed; `call` answers tools/call. */
+  function mcpFetch(host: string, tools: Array<{ name: string; required?: string[] }>, call: (name: string, args: unknown) => unknown, rest?: (url: string) => Response) {
+    return vi.fn(async (url: any, init: any) => {
+      if (new URL(String(url)).hostname !== host) return rest?.(String(url)) ?? new Response(null, { status: 404 });
+      if (init?.method === "DELETE" || init?.method === "GET") return new Response(null, { status: 405 });
+      const body = JSON.parse(init.body);
+      if (body.id === undefined) return new Response(null, { status: 202 });
+      const result = body.method === "initialize"
+        ? { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: host, version: "1" } }
+        : body.method === "tools/list"
+          ? { tools: tools.map(t => ({ name: t.name, inputSchema: { type: "object", ...(t.required ? { required: t.required } : {}) } })) }
+          : call(body.params.name, body.params.arguments);
+      return Response.json({ jsonrpc: "2.0", id: body.id, result });
+    });
+  }
+  const cred = (url: string) => ({ auth: { type: "mcp_oauth", access_token: "tok", mcp_server_url: url } }) as never;
+  const text = (value: unknown) => ({ content: [{ type: "text", text: typeof value === "string" ? value : JSON.stringify(value) }] });
+
+  it("GitHub: reports the login from get_me", async () => {
+    vi.stubGlobal("fetch", mcpFetch("api.githubcopilot.com", [{ name: "get_me" }], () => text({ login: "krahimov", id: 42 })));
+    expect(await verifyConnection(cred("https://api.githubcopilot.com/mcp/"))).toEqual({ status: "verified", account: "krahimov", workspace: "krahimov", workspace_id: "github:42" });
+  });
+  it("GitHub: falls back to REST /user when get_me is absent", async () => {
+    vi.stubGlobal("fetch", mcpFetch("api.githubcopilot.com", [], () => ({}), url => url === "https://api.github.com/user" ? Response.json({ login: "krahimov", id: 42 }) : new Response(null, { status: 404 })));
+    expect(await verifyConnection(cred("https://api.githubcopilot.com/mcp/"))).toMatchObject({ status: "verified", account: "krahimov" });
+  });
+  it("GitHub: no identity means unverified, never a silent grant", async () => {
+    vi.stubGlobal("fetch", mcpFetch("api.githubcopilot.com", [], () => ({}), () => new Response("bad credentials", { status: 401 })));
+    expect((await verifyConnection(cred("https://api.githubcopilot.com/mcp/"))).status).toBe("unverified");
+  });
+  it("Sentry: user from whoami, orgs from find_organizations", async () => {
+    vi.stubGlobal("fetch", mcpFetch("mcp.sentry.dev", [{ name: "whoami" }, { name: "find_organizations" }], name => name === "whoami"
+      ? { structuredContent: { user: { id: "1", name: "Karim", email: "k@example.com" }, sessionConstraints: null }, content: [] }
+      : { structuredContent: { organizations: [{ slug: "orrery" }, { slug: "fabrik" }], hasMore: false, nextCursor: null }, content: [] }));
+    expect(await verifyConnection(cred("https://mcp.sentry.dev/mcp"))).toEqual({ status: "verified", account: "k@example.com", workspace: "orrery, fabrik", workspace_id: "sentry:fabrik,orrery" });
+  });
+  it("Sentry: an org-scoped grant reports that org without listing others", async () => {
+    const fetchMock = mcpFetch("mcp.sentry.dev", [{ name: "whoami" }, { name: "find_organizations" }], name => name === "whoami"
+      ? { structuredContent: { user: { id: "1", name: "Karim", email: "k@example.com" }, sessionConstraints: { organizationSlug: "orrery" } }, content: [] }
+      : (() => { throw new Error("must not list orgs"); })());
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await verifyConnection(cred("https://mcp.sentry.dev/mcp"))).toMatchObject({ workspace: "orrery", workspace_id: "sentry:orrery" });
+  });
+  it("other servers: whoami text yields the account; control characters are stripped", async () => {
+    vi.stubGlobal("fetch", mcpFetch("mcp.railway.com", [{ name: "whoami" }], () => text("Logged in as Karim\n[access granted] evil (k@example.com)")));
+    const result = await verifyConnection(cred("https://mcp.railway.com"));
+    expect(result).toEqual({ status: "verified", account: "k@example.com" });
+  });
+  it("other servers: JSON whoami with a workspace", async () => {
+    vi.stubGlobal("fetch", mcpFetch("mcp.example.com", [{ name: "get_current_user" }], () => text({ user: { email: "k@example.com" }, workspace: { id: "w1", name: "Acme\u0007" } })));
+    expect(await verifyConnection(cred("https://mcp.example.com/mcp"))).toEqual({ status: "verified", account: "k@example.com", workspace: "Acme", workspace_id: "w1" });
+  });
+  it("other servers: identity tools needing arguments are never called", async () => {
+    const call = vi.fn(() => text({ email: "x@example.com" }));
+    vi.stubGlobal("fetch", mcpFetch("mcp.example.com", [{ name: "whoami", required: ["id"] }], call));
+    const result = await verifyConnection(cred("https://mcp.example.com/mcp"));
+    expect(call).not.toHaveBeenCalled();
+    expect(result.status).toBe("verified");
+    expect(result.account).toBeUndefined();
+  });
+});

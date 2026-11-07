@@ -36,6 +36,71 @@ export interface ConnectionVerification {
   message?: string;
 }
 
+/** Argument-free identity tools tried on servers without a dedicated probe. */
+const GENERIC_IDENTITY_TOOLS = ["whoami", "get_me", "get_current_user", "get_viewer", "get_authenticated_user"];
+
+/** Provider-reported names end up in the UI and in the agent's grant message:
+ *  strip control characters (no injected lines) and cap the length. */
+function identityText(value: unknown): string | undefined {
+  if (typeof value !== "string" && typeof value !== "number") return undefined;
+  const text = String(value).replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 120);
+  return text || undefined;
+}
+
+function workspaceList(names: string[], provider: string): Pick<ConnectionVerification, "workspace" | "workspace_id"> {
+  if (!names.length) return {};
+  const shown = names.slice(0, 3).join(", ") + (names.length > 3 ? ` (+${names.length - 3} more)` : "");
+  return { workspace: shown, workspace_id: `${provider}:${[...names].sort().join(",")}` };
+}
+
+async function callIdentityTool(client: Client, name: string, args: Record<string, string>) {
+  const result = await client.callTool({ name, arguments: args }, undefined, { timeout: 10_000 });
+  if (result.isError) throw new Error("Identity query failed");
+  const texts = (result.content as Array<{ type: string; text?: string }>).flatMap(c => c.type === "text" && c.text ? [c.text] : []);
+  let json = result.structuredContent as Record<string, unknown> | undefined;
+  for (const text of texts) {
+    if (json) break;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) json = parsed;
+    } catch { /* Try the next text block. */ }
+  }
+  return { json, text: texts.join("\n") };
+}
+
+async function readIdentityJson(client: Client, name: string, args: Record<string, string>): Promise<Record<string, unknown>> {
+  const { json } = await callIdentityTool(client, name, args);
+  if (!json) throw new Error("Identity response unavailable");
+  return json;
+}
+
+/** Best-effort identity from an unknown server's whoami-style tool: common
+ *  JSON shapes first, then an email or "logged in as X" in plain text. */
+async function readIdentityAny(client: Client, name: string): Promise<Pick<ConnectionVerification, "account" | "workspace" | "workspace_id">> {
+  const { json, text } = await callIdentityTool(client, name, {});
+  if (json) {
+    const scopes = [json, ...["user", "viewer", "me", "data"].map(k => json[k]).filter((v): v is Record<string, unknown> => !!v && typeof v === "object")];
+    const pick = (keys: string[]) => {
+      for (const scope of scopes) for (const key of keys) { const v = identityText(scope[key]); if (v) return v; }
+      return undefined;
+    };
+    const account = pick(["email", "login", "username", "name"]);
+    for (const key of ["workspace", "organization", "org", "team"]) {
+      const ws = json[key];
+      const wsName = identityText(ws) ?? identityText((ws as Record<string, unknown> | undefined)?.name);
+      if (account && wsName) {
+        const wsId = identityText((ws as Record<string, unknown> | undefined)?.id);
+        return { account, workspace: wsName, ...(wsId ? { workspace_id: wsId } : {}) };
+      }
+    }
+    if (account) return { account };
+  }
+  const email = text.match(/[\w.+-]+@[\w-]+(?:\.[\w-]+)+/)?.[0];
+  const loggedInAs = text.match(/(?:logged in|signed in|authenticated) as\s+([^\n(]{1,80})/i)?.[1];
+  const account = identityText(email ?? loggedInAs);
+  return account ? { account } : {};
+}
+
 /** Only protocol discovery and fixed, read-only provider identity queries. */
 export async function verifyConnection(credential: CredentialRow): Promise<ConnectionVerification> {
   const auth = credential.auth as unknown as Record<string, string | undefined>;
@@ -68,19 +133,8 @@ export async function verifyConnection(credential: CredentialRow): Promise<Conne
       // rejected by the separate GraphQL API. Ask the authenticated MCP
       // server for the current user/workspace; never infer identity from labels.
       if (["get_user", "get_workspace"].every(name => toolList.tools.some(tool => tool.name === name))) {
-        const readIdentity = async (name: string, args: Record<string, string>) => {
-          const result = await client.callTool({ name, arguments: args }, undefined, { timeout: 10_000 });
-          if (result.isError) throw new Error("Identity query failed");
-          if (result.structuredContent) return result.structuredContent as Record<string, unknown>;
-          for (const content of result.content as Array<{ type: string; text?: string }>) {
-            if (content.type === "text" && content.text) {
-              try { return JSON.parse(content.text) as Record<string, unknown>; } catch { /* Try the next text block. */ }
-            }
-          }
-          throw new Error("Identity response unavailable");
-        };
-        const user = await readIdentity("get_user", { query: "me" });
-        const workspace = await readIdentity("get_workspace", {});
+        const user = await readIdentityJson(client, "get_user", { query: "me" });
+        const workspace = await readIdentityJson(client, "get_workspace", {});
         const account = user.email || user.name;
         if (typeof account !== "string" || !account || typeof workspace.id !== "string" || !workspace.id || typeof workspace.name !== "string" || !workspace.name.trim()) {
           return { status: "unverified", message: "Linear account and workspace could not be verified. Reconnect and try again." };
@@ -98,6 +152,45 @@ export async function verifyConnection(credential: CredentialRow): Promise<Conne
         return { status: "unverified", message: "Linear account and workspace could not be verified. Reconnect and try again." };
       }
       return { status: "verified", account, workspace: org.name, workspace_id: org.id };
+    }
+    const hasTool = (name: string) => toolList.tools.some(tool => tool.name === name);
+    if (host === "api.githubcopilot.com") {
+      // GitHub's MCP answers get_me for the token's user; the REST /user
+      // endpoint is the fallback for servers/toolsets that omit it.
+      let user = hasTool("get_me") ? await readIdentityJson(client, "get_me", {}).catch(() => undefined) : undefined;
+      if (!user) {
+        const response = await boundedFetch("https://api.github.com/user", {
+          headers: { authorization: `Bearer ${token}`, accept: "application/vnd.github+json", "user-agent": "orrery-connection-verification" },
+        });
+        user = response.ok ? await response.json() as Record<string, unknown> : undefined;
+      }
+      const login = identityText(user?.login);
+      const id = typeof user?.id === "number" || typeof user?.id === "string" ? String(user.id) : undefined;
+      if (!login || !id) return { status: "unverified", message: "GitHub account could not be verified. Reconnect and try again." };
+      return { status: "verified", account: login, workspace: login, workspace_id: `github:${id}` };
+    }
+    if (host === "mcp.sentry.dev" && hasTool("whoami")) {
+      // whoami carries the user plus the org when the grant is scoped to one;
+      // otherwise list the orgs this token can reach.
+      const me = await readIdentityJson(client, "whoami", {});
+      const user = me.user as Record<string, unknown> | undefined;
+      const account = identityText(user?.email) ?? identityText(user?.name);
+      if (!account) return { status: "unverified", message: "Sentry account could not be verified. Reconnect and try again." };
+      const scopedOrg = identityText((me.sessionConstraints as Record<string, unknown> | null | undefined)?.organizationSlug);
+      let orgs = scopedOrg ? [scopedOrg] : [];
+      if (!orgs.length && hasTool("find_organizations")) {
+        const found = await readIdentityJson(client, "find_organizations", {}).catch(() => undefined);
+        orgs = ((found?.organizations ?? []) as Array<{ slug?: unknown }>).flatMap(org => identityText(org.slug) ?? []);
+      }
+      return { status: "verified", account, ...workspaceList(orgs, "sentry") };
+    }
+    // Any other server: call one well-known, argument-free "who am I" tool.
+    // A missing or unreadable answer leaves identity unreported rather than
+    // guessed from labels or tool names.
+    const whoamiTool = toolList.tools.find(tool => GENERIC_IDENTITY_TOOLS.includes(tool.name) && !tool.inputSchema.required?.length);
+    if (whoamiTool) {
+      const identity = await readIdentityAny(client, whoamiTool.name).catch(() => undefined);
+      if (identity?.account) return { status: "verified", ...identity };
     }
     return { status: "verified", message: "Service access verified. This provider does not expose account/workspace identity here; confirm the selected connection is the one you intend." };
   } catch {

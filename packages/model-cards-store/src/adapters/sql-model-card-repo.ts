@@ -356,20 +356,38 @@ function msToIso(value: number | string | bigint | Date): string {
 }
 
 /**
- * Map a SQLite UNIQUE-constraint error into our domain errors. SQLite emits
- * messages like:
- *   "UNIQUE constraint failed: model_cards.tenant_id, model_cards.model_id"
- *   "UNIQUE constraint failed: idx_model_cards_default"  (named index)
- * We pattern-match the column / index name; otherwise rethrow.
+ * Map a UNIQUE-constraint error into our domain errors. Dialects word it
+ * differently:
+ *   SQLite:   "UNIQUE constraint failed: model_cards.tenant_id, model_cards.model_id"
+ *   Postgres: 'duplicate key value violates unique constraint "idx_model_cards_model_id"'
+ *             (code 23505, constraint_name on the error)
+ * Drizzle wraps driver errors in DrizzleQueryError ("Failed query: …") with
+ * the original on `.cause`, so walk the chain. Matching only the SQLite
+ * wording made every Postgres duplicate a 500 internal_error on prod.
  */
 function mapInsertError(err: unknown, modelId: string): unknown {
   if (!(err instanceof Error)) return err;
-  const msg = err.message;
-  if (!/unique constraint failed/i.test(msg)) return err;
-  if (/idx_model_cards_default/i.test(msg)) {
+  const parts: string[] = [];
+  let unique = false;
+  for (let e: unknown = err, depth = 0; e && depth < 5; e = (e as { cause?: unknown }).cause, depth++) {
+    const x = e as { message?: unknown; code?: unknown; constraint_name?: unknown };
+    const msg = typeof x.message === "string" ? x.message : "";
+    if (
+      x.code === "23505" ||
+      /unique constraint failed/i.test(msg) ||
+      /violates unique constraint/i.test(msg)
+    ) {
+      unique = true;
+      parts.push(msg);
+      if (typeof x.constraint_name === "string") parts.push(x.constraint_name);
+    }
+  }
+  if (!unique) return err;
+  const detail = parts.join(" ");
+  if (/idx_model_cards_default/i.test(detail)) {
     return new ModelCardDefaultConflictError();
   }
-  if (/model_id/i.test(msg) || /idx_model_cards_model_id/i.test(msg)) {
+  if (/model_id/i.test(detail)) {
     return new ModelCardDuplicateModelIdError(modelId);
   }
   return err;
