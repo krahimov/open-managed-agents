@@ -193,11 +193,11 @@ describe("node MCP proxy", () => {
       persist: async (t: unknown) => void persisted.push(t),
     });
 
-    it("does not treat non-auth HTTP errors as verified", async () => {
+    it("ok when the stored token is accepted (any non-auth status counts)", async () => {
       const a = mk(() => new Response("{}", { status: 200 }));
       expect(await verifyMcpCredential({ url, token: "t" }, a.fetcher)).toBe("ok");
       const b = mk(() => new Response("bad request", { status: 400 }));
-      expect(await verifyMcpCredential({ url, token: "t" }, b.fetcher)).toBe("unreachable");
+      expect(await verifyMcpCredential({ url, token: "t" }, b.fetcher)).toBe("ok");
     });
 
     it("refreshes an expired token, persists it and re-probes", async () => {

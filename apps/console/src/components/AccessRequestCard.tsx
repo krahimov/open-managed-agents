@@ -1,4 +1,3 @@
-import { ConnectionConsentCard, type ConnectionRequest } from "./ConnectionConsentCard";
 import { useEffect, useRef, useState } from "react";
 import { useParams, Link } from "react-router";
 import { toast } from "sonner";
@@ -25,15 +24,7 @@ import { OAuthAppSetupPanel, type OAuthAppRequirement } from "./OAuthAppSetupPan
  * "Connected Apps" vault either way. Shared by SessionDetail (working
  * sessions) and SessionChat (agent setup panel).
  */
-export function AccessRequestCard(props: { event: Event; sessionId?: string; vaultId?: string; granted?: boolean }) {
-  const request = props.event as unknown as ConnectionRequest;
-  if (request.mcp_server_url && request.request_id) {
-    return <ConnectionConsentCard request={request} sessionId={props.sessionId} granted={props.granted} />;
-  }
-  return <LegacyAccessRequestCard {...props} />;
-}
-
-function LegacyAccessRequestCard({
+export function AccessRequestCard({
   event,
   sessionId: sessionIdProp,
   vaultId,
