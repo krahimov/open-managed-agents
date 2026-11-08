@@ -105,8 +105,6 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     const sessionIdParam = c.req.query("session_id")?.trim() || undefined;
     const requestIdParam = c.req.query("request_id")?.trim() || undefined;
     const serviceParam = c.req.query("service")?.trim().toLowerCase() || undefined;
-    const popupError = (title: string, body: string, extra: Record<string, unknown> = {}) =>
-      closeHtml(title, body, { request_id: requestIdParam, session_id: sessionIdParam, ...extra });
 
     if (!mcpServerUrl || !vaultId) {
       return c.json({ error: "mcp_server_url and vault_id are required" }, 400);
@@ -136,7 +134,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       // all (API-key MCPs like Retell) or the host is a dead third-party
       // bridge — point the user at the working path instead of a bare 502.
       return c.html(
-        popupError(
+        closeHtml(
           "OAuth discovery failed",
           `${htmlEscape((err as Error).message)}<br><br>` +
             `This usually means the server does not use OAuth. If it authenticates ` +
@@ -203,7 +201,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
             configured: false,
           });
           return c.html(
-            popupError(
+            closeHtml(
               `${preset.label} needs a one-time app setup`,
               htmlEscape(
                 `${preset.label}'s MCP server doesn't support automatic client registration. Create a ${preset.label} OAuth app with callback ${callbackUri} and enter its Client ID and Client Secret in the connect card (or set ${preset.clientIdEnv} / ${preset.clientSecretEnv} on the server).`,
@@ -218,7 +216,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
 
     if (!clientId) {
       return c.html(
-        popupError(
+        closeHtml(
           "OAuth client unavailable",
           htmlEscape(
             `MCP server ${mcpServerUrl} does not support Dynamic Client Registration and no preset client_id is configured for issuer ${meta.authServer.issuer}.`,
@@ -279,12 +277,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
 
     if (error) {
       const desc = c.req.query("error_description") || error;
-      const saved = state ? await deps.services.kv.get(`oauth_state:${state}`) : null;
-      const flow = saved ? JSON.parse(saved) as OAuthState : null;
-      if (state && saved) await deps.services.kv.delete(`oauth_state:${state}`);
-      return c.html(closeHtml("Authorization failed", htmlEscape(desc), {
-        request_id: flow?.request_id, session_id: flow?.session_id,
-      }), 400);
+      return c.html(closeHtml("Authorization failed", htmlEscape(desc)), 400);
     }
     if (!code || !state) {
       return c.json({ error: "code and state are required" }, 400);
@@ -294,8 +287,6 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     const stateData = await deps.services.kv.get(stateKey);
     if (!stateData) return c.json({ error: "Invalid or expired OAuth state" }, 400);
     const oauthState = JSON.parse(stateData) as OAuthState;
-    const popupError = (title: string, body: string) =>
-      closeHtml(title, body, { request_id: oauthState.request_id, session_id: oauthState.session_id });
 
     const baseUrl = getBaseUrl(c.req.url);
     const tokenBody = new URLSearchParams({
@@ -325,13 +316,13 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       if (oauthState.dcr_cache_key && /invalid_client/i.test(errBody)) {
         await deps.services.kv.delete(oauthState.dcr_cache_key).catch(() => {});
       }
-      return c.html(popupError("Token exchange failed", htmlEscape(errBody || String(tokenRes.status))), 502);
+      return c.html(closeHtml("Token exchange failed", htmlEscape(errBody || String(tokenRes.status))), 502);
     }
 
     const tokens = await readTokenResponse(tokenRes);
     if (!tokens.access_token) {
       await deps.services.kv.delete(stateKey);
-      return c.html(popupError("Token exchange failed", "Provider did not return an access token."), 502);
+      return c.html(closeHtml("Token exchange failed", "Provider did not return an access token."), 502);
     }
 
     const expiresAt = tokens.expires_in
@@ -351,7 +342,6 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       authorization_server: oauthState.authorization_server,
     };
 
-    let storedCredentialId = oauthState.credential_id;
     try {
       let credentialId = oauthState.credential_id;
       if (!credentialId) {
@@ -383,19 +373,17 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
           auth: credAuth,
         });
       } else {
-        const created = await deps.services.credentials.create({
+        await deps.services.credentials.create({
           tenantId: oauthState.tenant_id,
           vaultId: oauthState.vault_id,
           displayName: `${serverName} (OAuth)`,
           auth: credAuth,
         });
-        credentialId = created.id;
       }
-      storedCredentialId = credentialId;
     } catch (err) {
       await deps.services.kv.delete(stateKey);
       return c.html(
-        popupError(
+        closeHtml(
           "Could not store the credential",
           htmlEscape(err instanceof Error ? err.message : "credential persistence failed"),
         ),
@@ -415,7 +403,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     // credential stored, agent still told "Sentry needs authorization").
     const grantService = oauthState.service ?? serverName;
     let grantRecorded = false;
-    if (oauthState.session_id && deps.onGranted && !oauthState.request_id) {
+    if (oauthState.session_id && deps.onGranted) {
       try {
         await deps.onGranted({
           tenantId: oauthState.tenant_id,
@@ -439,7 +427,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
 
     return c.html(`
       <html><body>
-      <p>Account saved for ${htmlEscape(serverName)}. Return to setup to verify and approve access for your agent.</p>
+      <p>Connected to ${htmlEscape(serverName)}. Closing...</p>
       <script>
         (function(){
           var msg = ${JSON.stringify({
@@ -447,8 +435,6 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
             service: grantService,
             server_name: serverName,
             vault_id: oauthState.vault_id,
-            credential_id: storedCredentialId,
-            requires_approval: !!oauthState.request_id,
             request_id: oauthState.request_id ?? null,
             session_id: oauthState.session_id ?? null,
             // true → the server already appended the grant + nudge; the
