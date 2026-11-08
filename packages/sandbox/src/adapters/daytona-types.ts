@@ -1,4 +1,4 @@
-// Structural types for the slice of @daytonaio/sdk 0.171.0 the Daytona
+// Structural types for the slice of @daytonaio/sdk 0.231.0 the Daytona
 // adapter, box providers, and the agent-machine manager use.
 //
 // They are deliberately structural (no import of the SDK's own types) so the
@@ -7,7 +7,7 @@
 // `loadDaytonaModule()`. Tests satisfy the same shapes with the in-memory
 // fake (`tests/fake-daytona.ts`) via the `daytonaModule` seam.
 //
-// Field/method names mirror the SDK exactly (verified against the 0.171.0
+// Field/method names mirror the SDK exactly (verified against the 0.231.0
 // .d.ts files): `sandbox.refreshActivity()`, `sandbox.setAutostopInterval(n)`
 // (lowercase "s"), `sandbox.getPreviewLink(port) → { url, token }`,
 // `process.executeSessionCommand(id, { command, runAsync }) → { cmdId }`.
@@ -133,7 +133,7 @@ export type DaytonaCreateParams = {
 export interface DaytonaClient {
   create(params: DaytonaCreateParams, options?: { timeout?: number }): Promise<DaytonaSandboxInstance>;
   get(sandboxIdOrName: string): Promise<DaytonaSandboxInstance>;
-  list(labels?: Record<string, string>): Promise<{ items: DaytonaSandboxInstance[] }>;
+  list(query?: { labels?: Record<string, string> }): AsyncIterable<DaytonaSandboxInstance>;
   delete(sandbox: DaytonaSandboxInstance, timeoutSec?: number): Promise<void>;
 }
 

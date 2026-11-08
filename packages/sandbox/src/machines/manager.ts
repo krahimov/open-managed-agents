@@ -150,8 +150,9 @@ export class AgentMachineManager {
         if (!sb) {
           // Recover the create→DB-write crash window by the immutable
           // machine label before creating another chargeable box.
-          const found = await client.list({ "oma-machine-id": current.id });
-          sb = found.items.find((s) => s.labels?.["oma-tenant-id"] === current.tenantId) ?? null;
+          for await (const s of client.list({ labels: { "oma-machine-id": current.id } })) {
+            if (s.labels?.["oma-tenant-id"] === current.tenantId) { sb = s; break; }
+          }
         }
         const previousRef = current.providerRef;
         if (!sb) {

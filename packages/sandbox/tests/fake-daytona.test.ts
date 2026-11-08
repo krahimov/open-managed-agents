@@ -26,6 +26,12 @@ const run = (sb: FakeSandboxInstance, cmd: string, cwd?: string, env?: Record<st
 
 const silent = { log() {}, warn() {} };
 
+async function listAll(fake: FakeDaytona, query?: { labels?: Record<string, string> }) {
+  const out: FakeSandboxInstance[] = [];
+  for await (const sb of fake.list(query)) out.push(sb);
+  return out;
+}
+
 describe("FakeDaytona shell interpreter", () => {
   it("mkdir -p / echo > / cat / test -f / find -printf round-trip", async () => {
     const { sb } = await box();
@@ -296,14 +302,14 @@ describe("FakeDaytona client", () => {
       ephemeral: false,
     });
     expect(fake.createOptions[1]).toEqual({ timeout: 60 });
-    expect((await fake.list({ "oma-machine-id": "m2" })).items).toEqual([b]);
-    expect((await fake.list()).items).toHaveLength(2);
+    expect(await listAll(fake, { labels: { "oma-machine-id": "m2" } })).toEqual([b]);
+    expect(await listAll(fake)).toHaveLength(2);
     expect(await fake.get("box-a")).toBe(a);
     expect(await fake.get("machine-a")).toBe(a);
     await fake.delete(b);
     expect(b.state).toBe("destroyed");
     expect(fake.deleteCalls).toEqual([b.id]);
-    expect((await fake.list()).items).toEqual([a]);
+    expect(await listAll(fake)).toEqual([a]);
     await expect(fake.get(b.id)).rejects.toBeInstanceOf(DaytonaNotFoundError);
     await expect(fake.create({ name: "machine-a" })).rejects.toMatchObject({ statusCode: 409 });
   });
@@ -325,7 +331,7 @@ describe("FakeDaytona client", () => {
     await expect(run(sb, "echo hi")).rejects.toThrow(sandboxGoneMessage(sb.id));
     await expect(sb.fs.downloadFile("/workspace/x")).rejects.toThrow(`not found: sandbox ${sb.id} not found (it has been deleted)`);
     await expect(sb.process.createSession("x")).rejects.toThrow(/has been deleted/);
-    expect((await fake.list()).items).toEqual([]);
+    expect(await listAll(fake)).toEqual([]);
     // the adapter's gone-detector recognises the fake's message verbatim
     const adapter = new DaytonaSandbox({ sessionId: "s", logger: silent }) as unknown as { isSandboxGone(e: unknown): boolean };
     const err = await run(sb, "true").catch((e: unknown) => e);

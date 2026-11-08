@@ -71,6 +71,28 @@ describe("persistent agent machines", () => {
     expect(fake.createCalls).toHaveLength(1);
   });
 
+  it("recovers a box by machine label after the create→DB-write crash window", async () => {
+    const { provider, manager, store, fake } = fixture();
+    const first = await provider("sess-a").acquire();
+    const row = await manager.get("tenant-a", "agent-a");
+    await store.update(row!.id, { providerRef: null }, Date.now());
+    const again = await provider("sess-a").acquire();
+    expect(again.sb.id).toBe(first.sb.id);
+    expect(fake.createCalls).toHaveLength(1);
+  });
+
+  it("does not adopt another tenant's box carrying the same machine label", async () => {
+    const { provider, manager, store, fake } = fixture();
+    const first = await provider("sess-a").acquire();
+    const row = await manager.get("tenant-a", "agent-a");
+    fake.vanish(first.sb.id);
+    await store.update(row!.id, { providerRef: null }, Date.now());
+    const foreign = await fake.create({ labels: { "oma-machine-id": row!.id, "oma-tenant-id": "tenant-b" } });
+    const again = await provider("sess-a").acquire();
+    expect(again.sb.id).not.toBe(foreign.id);
+    expect(again.sb.labels?.["oma-tenant-id"]).toBe("tenant-a");
+  });
+
   it("refuses stopping active turns, keeps them alive, then stops without losing files", async () => {
     const { provider, manager, fake } = fixture();
     const p = provider("sess-a");

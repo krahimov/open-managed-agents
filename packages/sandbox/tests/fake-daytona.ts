@@ -4,7 +4,7 @@
 // process sessions → self-heal) without a Daytona account, deterministically
 // and in milliseconds.
 //
-// Shape (structural, mirrors @daytonaio/sdk 0.171.0):
+// Shape (structural, mirrors @daytonaio/sdk 0.231.0):
 //   FakeDaytona          ≈ Daytona     (create / get / list / start / stop / delete)
 //   FakeSandboxInstance  ≈ Sandbox     (state, labels, autoStop, start/stop/
 //                                        refreshActivity, getPreviewLink, fs, process)
@@ -791,23 +791,13 @@ export class FakeDaytona {
     throw new DaytonaNotFoundError(`Sandbox with ID ${sandboxIdOrName} not found`);
   }
 
-  async list(
-    labels?: Record<string, string>,
-    page = 1,
-    limit = 100,
-  ): Promise<{ items: FakeSandboxInstance[]; total: number; page: number; totalPages: number }> {
-    const all = [...this.sandboxes.values()].filter((sb) => {
-      if (sb.state === "destroyed") return false;
-      if (!labels) return true;
-      return Object.entries(labels).every(([k, v]) => sb.labels[k] === v);
-    });
-    const start = (page - 1) * limit;
-    return {
-      items: all.slice(start, start + limit),
-      total: all.length,
-      page,
-      totalPages: Math.max(1, Math.ceil(all.length / limit)),
-    };
+  async *list(query?: { labels?: Record<string, string> }): AsyncGenerator<FakeSandboxInstance> {
+    const labels = query?.labels;
+    for (const sb of [...this.sandboxes.values()]) {
+      if (sb.state === "destroyed") continue;
+      if (labels && !Object.entries(labels).every(([k, v]) => sb.labels[k] === v)) continue;
+      yield sb;
+    }
   }
 
   async start(sandbox: FakeSandboxInstance, timeout?: number): Promise<void> {
