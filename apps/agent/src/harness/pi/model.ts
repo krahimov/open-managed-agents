@@ -11,10 +11,10 @@
  * API mapping mirrors resolveModel so behavior matches across harnesses:
  *   ant / ant-compatible → "anthropic-messages"
  *   oai-compatible       → "openai-completions" (gateways only speak chat)
- *   oai                  → "openai-completions", or "openai-responses" when
- *                          a reasoning level above instant is requested on
- *                          an OpenAI reasoning model (chat/completions 400s
- *                          on reasoning_effort + function tools).
+ *   oai                  → "openai-responses" for every OpenAI reasoning
+ *                          model (isOpenAiReasoningModel — chat/completions
+ *                          400s on reasoning_effort + function tools),
+ *                          "openai-completions" otherwise.
  */
 
 import type { LanguageModel } from "ai";
@@ -33,7 +33,12 @@ import { streamSimple as openaiResponsesStreamSimple } from "@earendil-works/pi-
 import { anthropicProvider } from "@earendil-works/pi-ai/providers/anthropic";
 import { openaiProvider } from "@earendil-works/pi-ai/providers/openai";
 import type { StreamFn } from "@earendil-works/pi-agent-core";
-import type { ReasoningLevel } from "@open-managed-agents/shared";
+import {
+  claudeReasoning,
+  isOpenAiReasoningModel,
+  openAiReasoningEffort,
+  type ReasoningLevel,
+} from "@open-managed-agents/api-types";
 import type { ApiCompat } from "../provider";
 
 /** Raw model credentials, same shape main-node's resolveNodeModelCredentials returns. */
@@ -58,7 +63,6 @@ export interface ResolvedPiModel {
   openAiToolNames: boolean;
 }
 
-const OPENAI_REASONING_MODEL_RE = /^(o[1-9]|gpt-5)/i;
 /** Same cap provider.ts applies to non-Claude models on the Anthropic path. */
 const DEFAULT_MAX_TOKENS = 32_768;
 const DEFAULT_CONTEXT_WINDOW = 200_000;
@@ -98,20 +102,14 @@ function openaiBaseUrl(baseURL?: string): string {
   return baseURL.replace(/\/+$/, "");
 }
 
-/** OMA reasoning_level → pi ThinkingLevel (before per-model clamping). */
-function reasoningToThinking(level: ReasoningLevel | undefined): ThinkingLevel | undefined {
-  switch (level) {
-    case "low":
-      return "low";
-    case "medium":
-      return "medium";
-    case "high":
-      return "high";
-    case "max":
-      return "max";
-    default:
-      return undefined; // "instant" / unset → no reasoning
-  }
+/** OMA reasoning_level → pi ThinkingLevel for a Claude model (before
+ *  per-model clamping), via the shared per-generation table. */
+function claudeThinking(id: string, level: ReasoningLevel | undefined): ThinkingLevel | undefined {
+  const r = claudeReasoning(id, level);
+  if (!r || r.mode === "off") return undefined;
+  if (r.mode === "adaptive") return r.effort;
+  // Legacy budget models: pi maps the level to its own budget table.
+  return level === undefined || level === "instant" ? "medium" : level;
 }
 
 /**
@@ -158,7 +156,6 @@ export function resolvePiModel(
 ): ResolvedPiModel {
   const id = bareModelId(creds.model);
   const known = catalogModel(id);
-  const requested = reasoningToThinking(opts.reasoningLevel);
 
   if (creds.apiCompat === "ant" || creds.apiCompat === "ant-compatible") {
     const official = creds.apiCompat === "ant";
@@ -181,9 +178,8 @@ export function resolvePiModel(
     };
     // Mirror provider.ts: third-party Anthropic-compatible endpoints don't
     // take the thinking parameter; only known Claude models get reasoning.
-    const reasoning = requested && id.startsWith("claude-") && base.reasoning
-      ? clampToOn(base, requested)
-      : undefined;
+    const requested = claudeThinking(id, opts.reasoningLevel);
+    const reasoning = requested && base.reasoning ? clampToOn(base, requested) : undefined;
     return {
       model: base as Model<Api>,
       streamFn: safeStream(anthropicStreamSimple as never),
@@ -194,10 +190,8 @@ export function resolvePiModel(
   }
 
   // OpenAI / OpenAI-compatible.
-  const useResponses =
-    creds.apiCompat === "oai" &&
-    requested !== undefined &&
-    OPENAI_REASONING_MODEL_RE.test(id);
+  const reasoningModel = isOpenAiReasoningModel(id);
+  const useResponses = creds.apiCompat === "oai" && reasoningModel;
   const api = useResponses ? "openai-responses" : "openai-completions";
   const model: Model<Api> = {
     id,
@@ -205,7 +199,7 @@ export function resolvePiModel(
     api,
     provider: creds.apiCompat === "oai" ? "openai" : "openai-compatible",
     baseUrl: openaiBaseUrl(creds.baseURL),
-    reasoning: known?.reasoning ?? OPENAI_REASONING_MODEL_RE.test(id),
+    reasoning: known?.reasoning ?? reasoningModel,
     input: known?.input ?? ["text", "image"],
     cost: known?.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: known?.contextWindow ?? DEFAULT_CONTEXT_WINDOW,
@@ -220,14 +214,14 @@ export function resolvePiModel(
   // reasoning_effort is 'none'. pi-ai's simple options can't express
   // 'none', so send it as a raw body param.
   const samplingParams =
-    !useResponses && OPENAI_REASONING_MODEL_RE.test(id) && opts.hasTools
+    !useResponses && reasoningModel && opts.hasTools
       ? { reasoning_effort: "none" }
       : undefined;
   return {
     model,
     streamFn: safeStream((useResponses ? openaiResponsesStreamSimple : openaiCompletionsStreamSimple) as never),
     apiKey: creds.apiKey,
-    reasoning: useResponses && requested ? clampToOn(model, requested) : undefined,
+    reasoning: useResponses ? clampToOn(model, openAiReasoningEffort(id, opts.reasoningLevel)) : undefined,
     samplingParams,
     openAiToolNames: true,
   };

@@ -7,10 +7,10 @@ import { resolveModel, reasoningProviderOptions, isOpenAiResponsesModel } from '
 
 afterEach(() => vi.unstubAllGlobals());
 describe('GPT-6 Astra provider', () => {
-  it.each([undefined, 'instant', 'low', 'medium', 'high', 'max'] as const)('uses Responses at reasoning level %s', (level) => {
+  it.each([undefined, 'instant', 'low', 'medium', 'high', 'xhigh', 'max'] as const)('uses Responses at reasoning level %s', (level) => {
     const model = resolveModel('gpt-6-astra', 'test', undefined, 'oai', undefined, level);
     expect(isOpenAiResponsesModel(model)).toBe(true);
-    expect(reasoningProviderOptions(model, 'gpt-6-astra', level, true)).toEqual({openai:{forceReasoning:true,store:false,reasoningEffort: level === 'max' ? 'xhigh' : level === undefined || level === 'instant' ? 'low' : level}});
+    expect(reasoningProviderOptions(model, 'gpt-6-astra', level, true)).toEqual({openai:{forceReasoning:true,store:false,reasoningEffort: level === 'max' ? 'xhigh' : level === undefined ? 'medium' : level === 'instant' ? 'low' : level}});
   });
   it('sends function calls and replays results through Responses', async () => {
     const bodies: any[] = [];
@@ -26,7 +26,7 @@ describe('GPT-6 Astra provider', () => {
     expect(execute).toHaveBeenCalledOnce();
     expect(bodies).toHaveLength(2);
     for (const body of bodies) {
-      expect(body.reasoning.effort).toBe('low');
+      expect(body.reasoning.effort).toBe('medium');
       expect(body.temperature).toBeUndefined();
       expect(body.top_p).toBeUndefined();
       expect(body.store).toBe(false);

@@ -45,7 +45,7 @@ import type {
   SessionEvent,
   UserMessageEvent,
 } from "@open-managed-agents/shared";
-import { REASONING_LEVELS } from "@open-managed-agents/shared";
+import { applySessionModelOverride } from "./lib/session-model-override.js";
 import { mountResources } from "@open-managed-agents/agent/runtime/resource-mounter";
 import type { LanguageModel } from "ai";
 import { getLogger } from "@open-managed-agents/observability";
@@ -95,6 +95,11 @@ export interface SessionRegistryDeps {
    *  receive it explicitly (deriving it from the agent object searched
    *  tenant "default" and broke multi-tenant turn-time resolution). */
   buildModel(agent: AgentConfig, tenantId: string): LanguageModel | Promise<LanguageModel>;
+
+  /** True when the tenant has a model card for `modelId`. Guards the
+   *  per-session `metadata.model` override; when absent every override is
+   *  honored. */
+  isKnownModel?(tenantId: string, modelId: string): Promise<boolean>;
 
   /** Build harness tools. Returns the tools dict the harness expects. */
   buildTools(
@@ -613,14 +618,14 @@ export class SessionRegistry {
       // loadAgent runs every turn; the snapshot never changes.
       let agentSnapshot: AgentConfig | null | undefined;
 
-      // Per-session reasoning override: `session.metadata.reasoning_level`
-      // beats the agent's configured level for THIS session (the pattern
-      // the reasoning plan reserved — same metadata channel ambient/
-      // mission spawns use). Read fresh each turn so a mid-session
-      // PUT /v1/sessions/:id metadata change applies on the next message.
-      // Overlaying on the loadAgent result means buildModel (endpoint
-      // routing) and the harness (providerOptions) both see the effective
-      // level with no extra plumbing. Invalid values are ignored.
+      // Per-session model / reasoning override (`session.metadata.model`
+      // + `session.metadata.reasoning_level`, written by the console
+      // composer picker) beats the agent's configured values for THIS
+      // session — see lib/session-model-override.ts. Read fresh each turn
+      // so a mid-session POST /v1/sessions/:id metadata change applies on
+      // the next message. Overlaying on the loadAgent result means
+      // buildModel (card lookup + endpoint routing), buildTools and the
+      // harness all see the effective values with no extra plumbing.
       const applySessionReasoningOverride = async (
         agent: AgentConfig | null,
       ): Promise<AgentConfig | null> => {
@@ -635,16 +640,14 @@ export class SessionRegistry {
             ? null
             : typeof raw === "string"
               ? JSON.parse(raw)
-              : raw) as { reasoning_level?: unknown } | null;
-          const rl = meta?.reasoning_level;
-          if (
-            typeof rl === "string" &&
-            (REASONING_LEVELS as readonly string[]).includes(rl)
-          ) {
-            if (agent.reasoning_level !== rl) {
-              return { ...agent, reasoning_level: rl as AgentConfig["reasoning_level"] };
-            }
-          }
+              : raw) as Record<string, unknown> | null;
+          return await applySessionModelOverride(
+            agent,
+            meta,
+            this.deps.isKnownModel
+              ? (modelId) => this.deps.isKnownModel!(tenantId, modelId)
+              : undefined,
+          );
         } catch {
           // Best-effort — a malformed metadata blob must not kill the turn.
         }

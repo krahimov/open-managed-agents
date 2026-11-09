@@ -32,6 +32,7 @@ export interface AgentRecord {
   _oma?: {
     aux_model?: { id: string; speed?: string };
     harness?: string;
+    reasoning_level?: import("@open-managed-agents/api-types").ReasoningLevel;
     runtime_binding?: { runtime_id: string; acp_agent_id: string };
     appendable_prompts?: string[];
     default_environment_id?: string;

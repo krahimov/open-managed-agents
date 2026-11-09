@@ -27,6 +27,7 @@ import {
   PromptInputTextarea,
   PromptInputTools,
 } from "../../components/ai-elements/prompt-input";
+import { SessionModelPicker } from "../../components/SessionModelPicker";
 
 /**
  * Lightweight, session-id-driven chat surface. Reuses the same ai-elements
@@ -375,7 +376,10 @@ export function SessionChat({
           />
           <PromptInputFooter>
             <PromptInputTools />
-            <PromptInputSubmit status={sending ? "submitted" : undefined} disabled={sending} />
+            <div className="flex items-center gap-1">
+              <SessionModelPicker sessionId={sessionId} />
+              <PromptInputSubmit status={sending ? "submitted" : undefined} disabled={sending} />
+            </div>
           </PromptInputFooter>
         </PromptInput>
       </div>

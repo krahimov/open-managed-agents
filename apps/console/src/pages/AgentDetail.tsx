@@ -15,6 +15,8 @@ import { Button } from "@/components/ui/button";
 import type { AgentRecord as Agent } from "../types/agent";
 import { AmbientTriggerControls } from "../components/AmbientTriggerControls";
 import { AgentComputerPanel } from "../components/AgentComputerPanel";
+import { AgentModelSwitcher } from "../components/AgentModelSwitcher";
+import { REASONING_LEVEL_LABELS, uiReasoningLevel } from "@open-managed-agents/api-types";
 import { AgentFormDialog } from "./agents/AgentFormDialog";
 import { useAgentFormAux } from "./agents/useAgentFormAux";
 import { openSetupSession, setupPath } from "./agents/setup-session";
@@ -243,7 +245,16 @@ export function AgentDetail() {
         {/* Properties grid */}
         <div className="grid grid-cols-[140px_1fr] gap-x-4 gap-y-2 max-w-2xl text-sm">
           <span className="text-fg-muted">ID</span><span className="font-mono text-xs">{agent.id}</span>
-          <span className="text-fg-muted">Model</span><span>{modelStr(agent.model)}</span>
+          <span className="text-fg-muted self-center">Model</span>
+          <span>
+            <AgentModelSwitcher
+              agent={agent}
+              onSaved={() => {
+                void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}`] });
+                void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}/versions`] });
+              }}
+            />
+          </span>
           <span className="text-fg-muted">Harness</span><span>{agent._oma?.harness || "default"}</span>
           {agent._oma?.default_environment_id && (
             <>
@@ -362,6 +373,7 @@ export function AgentDetail() {
                 <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase">
                   <th className="text-left px-4 py-2">Version</th>
                   <th className="text-left px-4 py-2">Model</th>
+                  <th className="text-left px-4 py-2">Reasoning</th>
                   <th className="text-left px-4 py-2">System Prompt</th>
                 </tr>
               </thead>
@@ -370,6 +382,9 @@ export function AgentDetail() {
                   <tr key={v.version} className="border-t border-border">
                     <td className="px-4 py-2">v{v.version}</td>
                     <td className="px-4 py-2 text-fg-muted">{modelStr(v.model)}</td>
+                    <td className="px-4 py-2 text-fg-muted">
+                      {REASONING_LEVEL_LABELS[uiReasoningLevel(v._oma?.reasoning_level)]}
+                    </td>
                     <td className="px-4 py-2 text-fg-muted max-w-xs truncate">{v.system || "—"}</td>
                   </tr>
                 ))}

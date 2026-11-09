@@ -11,6 +11,8 @@
  * otherwise. Bounded to 6s; failures NEVER roll back the card (already
  * persisted) — the purpose is upfront feedback, not gating.
  */
+const OUTPUT_LIMIT_RE = /max_tokens or model output limit|max_completion_tokens|output limit was reached/i;
+
 export async function probeModelCard(opts: {
   provider: string;
   model: string;
@@ -59,6 +61,10 @@ export async function probeModelCard(opts: {
     }
     if (res.status >= 200 && res.status < 300) return { ok: true };
     const upstream = await res.text().catch(() => "");
+    // Reasoning models (gpt-5+, o-series) spend the 1-token budget thinking
+    // and 400 with "max_tokens or model output limit was reached" — the key
+    // authenticated and the model ran, so that's a pass, not a bad key.
+    if (res.status === 400 && OUTPUT_LIMIT_RE.test(upstream)) return { ok: true };
     let detail = upstream.slice(0, 240).trim();
     try {
       const j = JSON.parse(upstream) as { error?: { message?: string } | string };

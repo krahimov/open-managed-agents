@@ -47,6 +47,7 @@ import {
   PromptInputButton,
   usePromptInputAttachments,
 } from "../components/ai-elements/prompt-input";
+import { SessionModelPicker } from "../components/SessionModelPicker";
 import { buildTimeline } from "../components/tool-calls/model";
 import {
   StreamingToolRow,
@@ -1208,10 +1209,13 @@ export function SessionDetail() {
                 <PromptInputTools>
                   <AttachButton />
                 </PromptInputTools>
-                <PromptInputSubmit
-                  status={sending ? "submitted" : undefined}
-                  disabled={sending}
-                />
+                <div className="flex items-center gap-1">
+                  {id && <SessionModelPicker sessionId={id} />}
+                  <PromptInputSubmit
+                    status={sending ? "submitted" : undefined}
+                    disabled={sending}
+                  />
+                </div>
               </PromptInputFooter>
             </PromptInput>
           </div>

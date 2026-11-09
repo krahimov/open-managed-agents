@@ -899,6 +899,8 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
       return parseVerifyExec(await entry.sandbox.exec(wrapVerifyCommand(cmd), timeoutMs));
     },
   }),
+  isKnownModel: async (tenantId, modelId) =>
+    (await modelCardService.findByModelId({ tenantId, modelId })) !== null,
   buildModel: async (agent, tenantId) => {
     const creds = await resolveNodeModelCredentials(agent, tenantId);
     return resolveModel(
