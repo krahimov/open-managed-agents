@@ -1,5 +1,5 @@
 import type { Event } from "../../lib/events";
-import { buildToolCallIndex, type ToolCallStatus } from "../../lib/tool-status";
+import { buildToolCallIndex, isErrorResult, type ToolCallStatus } from "../../lib/tool-status";
 
 /**
  * Pure view-model for the tool-call timeline shared by SessionChat and
@@ -559,7 +559,7 @@ export function buildTimeline(events: Event[], opts: BuildOptions = {}): Timelin
     if (RESULT_TYPES.has(ev.type)) {
       const uid = resultUseId(ev);
       if (uid && useIds.has(uid)) return; // folded into its call row
-      pushStep({ kind: "orphan", key, output: resultText(ev) ?? "", failed: (ev as { is_error?: unknown }).is_error === true });
+      pushStep({ kind: "orphan", key, output: resultText(ev) ?? "", failed: isErrorResult(ev) });
       return;
     }
     if (ev.type === "agent.thinking") {
