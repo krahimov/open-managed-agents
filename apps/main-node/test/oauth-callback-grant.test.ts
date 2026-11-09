@@ -61,6 +61,55 @@ const baseState = {
 
 afterEach(() => vi.unstubAllGlobals());
 
+describe("oauth authorize for Switch account", () => {
+  function stubDiscovery() {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.includes("oauth-protected-resource")) {
+          return Response.json({
+            resource: "https://mcp.sentry.dev/mcp",
+            authorization_servers: ["https://mcp.sentry.dev"],
+          });
+        }
+        if (url.includes("oauth-authorization-server")) {
+          return Response.json({
+            issuer: "https://mcp.sentry.dev",
+            authorization_endpoint: "https://mcp.sentry.dev/oauth/authorize",
+            token_endpoint: "https://mcp.sentry.dev/oauth/token",
+            registration_endpoint: "https://mcp.sentry.dev/oauth/register",
+          });
+        }
+        return Response.json({ client_id: "dcr-client" });
+      }),
+    );
+  }
+  const authorize = (query: string) => {
+    const f = fakeServices(baseState);
+    const app = new Hono().route("/v1/oauth", buildNodeOAuthRoutes({ services: f.services as never }));
+    return app.request(`https://api.example/v1/oauth/authorize?mcp_server_url=https://mcp.sentry.dev/mcp&${query}`);
+  };
+
+  it("asks the provider for an account choice when saving into a new vault", async () => {
+    stubDiscovery();
+    const res = await authorize("new_vault_name=sentry%20%C2%B7%20A");
+    expect(res.status).toBe(302);
+    expect(new URL(res.headers.get("location")!).searchParams.get("prompt")).toBe("select_account");
+  });
+
+  it("leaves a plain Connect flow's sign-in unchanged", async () => {
+    stubDiscovery();
+    const res = await authorize("vault_id=vlt-1");
+    expect(res.status).toBe(302);
+    expect(new URL(res.headers.get("location")!).searchParams.has("prompt")).toBe(false);
+  });
+
+  it("still requires somewhere to save the login", async () => {
+    expect((await authorize("service=sentry")).status).toBe(400);
+  });
+});
+
 describe("oauth callback grant recording", () => {
   it("calls onGranted with the session/request from the flow and tells the popup grant_recorded", async () => {
     stubUpstreams();
@@ -90,6 +139,54 @@ describe("oauth callback grant recording", () => {
     expect(html).toContain('"grant_recorded":true');
     expect(html).toContain('"request_id":"acreq-1"');
     expect(html).toContain('"service":"sentry"');
+  });
+
+  it("saves a switched account in a new vault and never touches the shared one", async () => {
+    stubUpstreams();
+    const grants: GrantNotification[] = [];
+    const f = fakeServices({
+      ...baseState,
+      vault_id: undefined,
+      new_vault_name: "sentry · Incident commander",
+      session_id: "sess-1",
+      request_id: "acreq-1",
+      service: "sentry",
+    });
+    const newVaults: unknown[] = [];
+    const update = vi.fn(async () => ({}));
+    const services = {
+      ...f.services,
+      credentials: { ...f.services.credentials, update },
+      vaults: {
+        ...f.services.vaults,
+        create: async (input: unknown) => {
+          newVaults.push(input);
+          return { id: "vlt-new" };
+        },
+      },
+    };
+    const app = new Hono().route(
+      "/v1/oauth",
+      buildNodeOAuthRoutes({ services: services as never, onGranted: async (g) => void grants.push(g) }),
+    );
+    const res = await app.request("https://api.example/v1/oauth/callback?code=abc&state=st1");
+    expect(res.status).toBe(200);
+    expect(newVaults).toEqual([{ tenantId: "t1", name: "sentry · Incident commander" }]);
+    expect(f.created).toEqual([expect.objectContaining({ vaultId: "vlt-new" })]);
+    expect(update).not.toHaveBeenCalled();
+    expect(grants[0]).toMatchObject({ vaultId: "vlt-new", requestId: "acreq-1" });
+    expect(await res.text()).toContain('"vault_id":"vlt-new"');
+  });
+
+  it("creates no vault when the provider refuses a switch", async () => {
+    stubUpstreams();
+    const f = fakeServices({ ...baseState, vault_id: undefined, new_vault_name: "sentry · A" });
+    const create = vi.fn(async () => ({ id: "vlt-new" }));
+    const services = { ...f.services, vaults: { ...f.services.vaults, create } };
+    const app = new Hono().route("/v1/oauth", buildNodeOAuthRoutes({ services: services as never }));
+    const res = await app.request("https://api.example/v1/oauth/callback?error=access_denied&state=st1");
+    expect(res.status).toBe(400);
+    expect(create).not.toHaveBeenCalled();
   });
 
   it("skips onGranted (grant_recorded:false) for flows started outside a session, e.g. the vault page", async () => {

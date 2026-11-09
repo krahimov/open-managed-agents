@@ -9,6 +9,7 @@ import { formatDuration, formatRelative, shortenId } from "../lib/format";
 import { Badge, StatusPill } from "../components/Badge";
 import { Modal } from "../components/Modal";
 import { AccessRequestCard } from "../components/AccessRequestCard";
+import { SavedLoginLine } from "../components/SavedLoginLine";
 import { grantedRequestIdsOf } from "./agents/SessionChat";
 import { AmbientRuleCard } from "../components/AmbientRuleCard";
 import { SkillRequestCard } from "../components/SkillRequestCard";
@@ -1865,6 +1866,14 @@ function EventRender({
         <AccessRequestCard
           event={event}
           granted={grantedRequestIds?.has(String(event.request_id ?? "")) === true}
+        />
+      );
+
+    case "system.saved_login_attached":
+      return (
+        <SavedLoginLine
+          event={event}
+          switched={grantedRequestIds?.has(String(event.request_id ?? "")) === true}
         />
       );
 

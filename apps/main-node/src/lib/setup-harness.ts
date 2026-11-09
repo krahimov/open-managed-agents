@@ -125,8 +125,12 @@ export interface SetupToolsDeps {
   /** Vault id holding an active credential for this MCP server URL, or
    *  null. Lets update_harness skip the card and just attach the vault. */
   findCredentialVault?: (mcpServerUrl: string) => Promise<string | null>;
-  /** Attach a vault to the agent's default vaults (idempotent). */
-  attachVault?: (vaultId: string) => Promise<void>;
+  /** Attach a vault to the agent's default vaults (idempotent) and make it
+   *  the one this agent uses for `mcpServerUrl`. */
+  attachVault?: (vaultId: string, mcpServerUrl: string) => Promise<void>;
+  /** Tell the user which saved login a server was just given, so the attach
+   *  is visible and they can switch account. Best effort. */
+  reportSavedLogin?: (login: { service: string; mcpServerUrl: string; vaultId: string }) => Promise<void>;
   /** Create a standing ambient (scheduled) rule on this agent
    *  (createAmbientRuleFromSession). Absent → tool not offered. */
   createAmbientRule?: (args: {
@@ -150,6 +154,38 @@ function normalizeMcpUrl(raw: string): string {
   } catch {
     return raw.trim().replace(/\/+$/, "").toLowerCase();
   }
+}
+
+/** The vault an agent uses for one MCP server when several attached vaults
+ *  hold a login for it, from `metadata.mcp_vault_bindings`. Null → unbound. */
+export function boundVaultId(metadata: unknown, mcpServerUrl: string): string | null {
+  const bindings = (metadata as { mcp_vault_bindings?: unknown } | null | undefined)?.mcp_vault_bindings;
+  if (!bindings || typeof bindings !== "object") return null;
+  const value = (bindings as Record<string, unknown>)[normalizeMcpUrl(mcpServerUrl)];
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/** `metadata.mcp_vault_bindings` with `mcpServerUrl` now pointing at `vaultId`. */
+export function withVaultBinding(
+  metadata: unknown,
+  mcpServerUrl: string,
+  vaultId: string,
+): Record<string, string> {
+  const bindings = (metadata as { mcp_vault_bindings?: unknown } | null | undefined)?.mcp_vault_bindings;
+  return {
+    ...(bindings && typeof bindings === "object" ? (bindings as Record<string, string>) : {}),
+    [normalizeMcpUrl(mcpServerUrl)]: vaultId,
+  };
+}
+
+/** Reorder vault groups so `preferred` ids come first, in that order. Other
+ *  groups keep their relative order. */
+export function preferVaults<T extends { vault_id: string }>(groups: T[], preferred: string[]): T[] {
+  const rank = (id: string) => {
+    const i = preferred.indexOf(id);
+    return i === -1 ? preferred.length : i;
+  };
+  return [...groups].sort((a, b) => rank(a.vault_id) - rank(b.vault_id));
 }
 
 /** URL-type MCP servers in `after` that were not in `before` (by URL). */
@@ -194,15 +230,20 @@ export interface AutoAccessResult {
 export async function autoRequestAccessForNewServers(
   before: unknown,
   after: unknown,
-  deps: Pick<SetupToolsDeps, "requestAccess" | "findCredentialVault" | "attachVault">,
+  deps: Pick<SetupToolsDeps, "requestAccess" | "findCredentialVault" | "attachVault" | "reportSavedLogin">,
 ): Promise<AutoAccessResult> {
   const result: AutoAccessResult = { requested: [], connected: [], failed: [] };
   for (const server of newlyAddedMcpServers(before, after)) {
     try {
       const vaultId = deps.findCredentialVault ? await deps.findCredentialVault(server.url) : null;
       if (vaultId) {
-        await deps.attachVault?.(vaultId);
+        await deps.attachVault?.(vaultId, server.url);
         result.connected.push(server.name);
+        // The login is attached either way — a lost line must not turn a
+        // working connection into a failed one.
+        await deps
+          .reportSavedLogin?.({ service: server.name, mcpServerUrl: server.url, vaultId })
+          .catch(() => {});
         continue;
       }
       const res = await deps.requestAccess({

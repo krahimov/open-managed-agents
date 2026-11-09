@@ -14,6 +14,7 @@ import {
 } from "../../components/ai-elements/conversation";
 import { Message, MessageContent } from "../../components/ai-elements/message";
 import { AccessRequestCard } from "../../components/AccessRequestCard";
+import { SavedLoginLine } from "../../components/SavedLoginLine";
 import { HarnessDiffCard } from "../../components/HarnessDiffCard";
 import { AmbientRuleCard } from "../../components/AmbientRuleCard";
 import { SkillRequestCard } from "../../components/SkillRequestCard";
@@ -80,6 +81,7 @@ function isRenderable(ev: Event): boolean {
   // setup this is how the agent hands the user the OAuth popups for the
   // servers it just added to its own harness.
   if (ev.type === "system.access_request") return true;
+  if (ev.type === "system.saved_login_attached") return true;
   // Not drawn itself, but kept in state so the matching request card can
   // read the durable grant (grantedRequestIdsOf).
   if (ev.type === "system.access_granted") return true;
@@ -276,6 +278,16 @@ export function SessionChat({
                   event={ev}
                   sessionId={sessionId}
                   granted={grantedRequestIds.has(String(ev.request_id ?? ""))}
+                />
+              );
+            }
+            if (ev.type === "system.saved_login_attached") {
+              return (
+                <SavedLoginLine
+                  key={key}
+                  event={ev}
+                  sessionId={sessionId}
+                  switched={grantedRequestIds.has(String(ev.request_id ?? ""))}
                 />
               );
             }
