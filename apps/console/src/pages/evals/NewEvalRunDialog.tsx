@@ -32,7 +32,7 @@ interface EnvironmentRow {
 // Radix Select items can't carry an empty-string value.
 const AUTO_JUDGE = "__auto__";
 
-const REASONING_LEVELS = ["instant", "low", "medium", "high", "max"] as const;
+const REASONING_LEVELS = ["instant", "low", "medium", "high", "xhigh", "max"] as const;
 
 // JSON carries no comments — the rubric string doubles as the §4.3
 // template (per-criterion ids, evidence demanded, ignore + anticipated

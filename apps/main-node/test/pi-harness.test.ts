@@ -155,7 +155,9 @@ describe("pi harness: model resolution", () => {
     const r = resolvePiModel({ model: "claude-sonnet-4.6", apiKey: "k", baseURL: "https://gw.example/v1", apiCompat: "ant", customHeaders: { "x-a": "1" } });
     expect(r.model).toMatchObject({ id: "claude-sonnet-4-6", api: "anthropic-messages", baseUrl: "https://gw.example", headers: { "x-a": "1" } });
     expect(r.model.contextWindow).toBeGreaterThan(100_000);
-    expect(r.reasoning).toBeUndefined();
+    // Unset level = medium; legacy instant = thinking off on 4.6.
+    expect(r.reasoning).toBe("medium");
+    expect(resolvePiModel({ model: "claude-sonnet-4-6", apiKey: "k", apiCompat: "ant" }, { reasoningLevel: "instant" }).reasoning).toBeUndefined();
     expect(resolvePiModel({ model: "claude-sonnet-4-6", apiKey: "k", apiCompat: "ant" }, { reasoningLevel: "high" }).reasoning).toBe("high");
   });
 
@@ -166,8 +168,13 @@ describe("pi harness: model resolution", () => {
   });
 
   it("mirrors the OpenAI reasoning endpoint split", () => {
-    expect(resolvePiModel({ model: "gpt-5", apiKey: "k", apiCompat: "oai" }, { reasoningLevel: "high", hasTools: true }).model.api).toBe("openai-responses");
-    const chat = resolvePiModel({ model: "gpt-5", apiKey: "k", apiCompat: "oai" }, { hasTools: true });
+    // Every official reasoning model rides Responses, at every level.
+    for (const model of ["gpt-5", "gpt-6.1-sol", "gpt-7"]) {
+      expect(resolvePiModel({ model, apiKey: "k", apiCompat: "oai" }, { hasTools: true }).model.api).toBe("openai-responses");
+    }
+    expect(resolvePiModel({ model: "gpt-6.1-sol", apiKey: "k", apiCompat: "oai" }, { hasTools: true }).reasoning).toBe("medium");
+    // Gateways stay on chat with the 'none' floor.
+    const chat = resolvePiModel({ model: "gpt-5", apiKey: "k", baseURL: "https://gw.example/v1", apiCompat: "oai-compatible" }, { hasTools: true });
     expect(chat.model.api).toBe("openai-completions");
     expect(chat.samplingParams).toEqual({ reasoning_effort: "none" });
   });

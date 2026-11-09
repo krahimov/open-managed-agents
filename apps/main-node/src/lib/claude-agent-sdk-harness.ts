@@ -33,6 +33,8 @@ import {
   OMA_SETUP_HARNESS,
   OMA_SETUP_KIND_HARNESS_UPDATED,
   type SessionEvent,
+  claudeReasoning,
+  type ReasoningLevel,
 } from "@open-managed-agents/api-types";
 import type { AgentConfig } from "@open-managed-agents/shared";
 import {
@@ -201,6 +203,25 @@ export interface ClaudeAgentSdkHarnessDeps {
     sessionId: string,
     args: { skill_name: string; reason: string },
   ) => Promise<{ request_id: string; status: string; note?: string }>;
+}
+
+/** reasoning_level → claude-agent-sdk `thinking` / `effort` options via
+ *  the shared Claude table (adaptive + effort on 4.6+, budget on ≤4.5,
+ *  thinking off for legacy `instant` where the model allows it). With no
+ *  card model (subscription default) only `effort` is sent — the SDK
+ *  downgrades levels the model lacks (xhigh → high) itself. */
+export function claudeSdkReasoningOptions(
+  model: string | undefined,
+  level: ReasoningLevel | undefined,
+): {
+  thinking?: { type: "adaptive" } | { type: "enabled"; budgetTokens: number } | { type: "disabled" };
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+} {
+  const r = claudeReasoning(model ?? "claude-opus-5-5", level);
+  if (!r) return {};
+  if (r.mode === "off") return { thinking: { type: "disabled" } };
+  if (r.mode === "budget") return { thinking: { type: "enabled", budgetTokens: r.budgetTokens } };
+  return model ? { thinking: { type: "adaptive" }, effort: r.effort } : { effort: r.effort };
 }
 
 function workdirFor(sessionId: string): string {
@@ -628,6 +649,7 @@ export class ClaudeAgentSdkHarness {
           abortController: abort,
           resume: sdkSessions.get(sessionId),
           model,
+          ...claudeSdkReasoningOptions(model, ctx.agent.reasoning_level),
           mcpServers: mcpServersForTurn,
           systemPrompt: isSetup
             ? buildSetupPrompt(ctx.agent, {

@@ -19,6 +19,8 @@ import {
   generateFileId,
   generateEventId,
   guessSessionOutputMime,
+  REASONING_LEVELS,
+  isReasoningLevel,
 } from "@open-managed-agents/shared";
 import type {
   AgentConfig,
@@ -419,6 +421,25 @@ function normalizeMcpUrlForSessionSnapshot(raw: string): string | null {
   }
 }
 
+/** Validate the per-session model / reasoning override keys in a metadata
+ *  write (`metadata.model` = a model-card model_id, `metadata.reasoning_level`
+ *  = a level). `null` clears a key (merge semantics). Returns an error
+ *  string or null. */
+export function invalidSessionModelOverride(
+  metadata: Record<string, unknown> | undefined | null,
+): string | null {
+  if (!metadata || typeof metadata !== "object") return null;
+  const rl = metadata.reasoning_level;
+  if (rl !== undefined && rl !== null && !isReasoningLevel(rl)) {
+    return `metadata.reasoning_level must be one of ${REASONING_LEVELS.join("|")}`;
+  }
+  const m = metadata.model;
+  if (m !== undefined && m !== null && (typeof m !== "string" || !m.trim())) {
+    return "metadata.model must be a non-empty model card model_id";
+  }
+  return null;
+}
+
 function toApiSession(row: {
   id: string;
   tenant_id?: string;
@@ -506,6 +527,8 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
     const wrappedEnv =
       typeof body.environment === "string" ? body.environment : body.environment?.id;
     if (!agentId) return c.json({ error: "agent is required" }, 400);
+    const overrideError = invalidSessionModelOverride(body.metadata);
+    if (overrideError) return c.json({ error: overrideError }, 400);
 
     const memCount = (body.resources ?? []).filter((r) => r.type === "memory_store").length;
     if (memCount > 8) {
@@ -845,6 +868,8 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
       title?: string;
       metadata?: Record<string, unknown>;
     }>();
+    const overrideError = invalidSessionModelOverride(body.metadata);
+    if (overrideError) return c.json({ error: overrideError }, 400);
     try {
       const updated = await services.sessions.update({
         tenantId: c.var.tenant_id,

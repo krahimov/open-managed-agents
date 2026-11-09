@@ -1,3 +1,7 @@
+// Reasoning levels + per-provider mapping live in ./reasoning (single
+// source of truth for the harness, routes and console).
+import type { ReasoningLevel } from "./reasoning";
+
 // --- Model Card ---
 
 export interface ModelCard {
@@ -40,28 +44,6 @@ export interface CustomToolConfig {
 
 export type ToolConfig = ToolsetConfig | CustomToolConfig;
 
-/**
- * Unified per-agent reasoning control, mapped per provider by the harness:
- *   - OpenAI reasoning models (gpt-5*, o-series): reasoning_effort
- *     none|low|medium|high|xhigh. Levels above "instant" route
- *     official-OpenAI cards to the Responses API (chat/completions 400s on
- *     any effort above 'none' when function tools are attached).
- *   - Anthropic Claude: extended thinking budgetTokens
- *     (disabled/4k/16k/32k/64k) on the normal Messages API; 4.8+/5.x take
- *     adaptive thinking + effort instead.
- * Non-reasoning models and third-party gateways ignore the level (the
- * harness clamps to the safe no-reasoning behavior).
- */
-export type ReasoningLevel = "instant" | "low" | "medium" | "high" | "max";
-
-export const REASONING_LEVELS: readonly ReasoningLevel[] = [
-  "instant",
-  "low",
-  "medium",
-  "high",
-  "max",
-];
-
 export interface AgentConfig {
   id: string;
   name: string;
@@ -99,11 +81,12 @@ export interface AgentConfig {
   aux_model?: string | { id: string; speed?: "standard" | "fast" };
   harness?: string;
   /**
-   * How hard the model should reason on this agent's turns. Default
-   * (unset) = "instant" — no reasoning, the safe tier for every model.
-   * See {@link ReasoningLevel} for the per-provider mapping. Applied by
-   * the DefaultHarness; harnesses that delegate the loop elsewhere
-   * (claude-agent-sdk, acp-proxy) ignore it.
+   * How hard the model should reason on this agent's turns
+   * (low|medium|high|xhigh|max; legacy "instant" still accepted). Unset =
+   * "medium". See ./reasoning for the per-provider mapping. A session can
+   * override it via `session.metadata.reasoning_level`. Honored by the
+   * DefaultHarness, pi and codex-sdk; claude-agent-sdk maps it to the
+   * SDK's effort option.
    */
   reasoning_level?: ReasoningLevel;
   /**

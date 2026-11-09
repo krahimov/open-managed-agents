@@ -1,7 +1,12 @@
 import { createAnthropic } from "@ai-sdk/anthropic";
 import { createOpenAI } from "@ai-sdk/openai";
 import type { LanguageModel } from "ai";
-import type { ReasoningLevel } from "@open-managed-agents/shared";
+import {
+  claudeReasoning,
+  isOpenAiReasoningModel,
+  openAiReasoningEffort,
+  type ReasoningLevel,
+} from "@open-managed-agents/api-types";
 
 /**
  * API compatibility types:
@@ -49,6 +54,23 @@ async function setMaxTokensFetch(url: RequestInfo | URL, init?: RequestInit): Pr
     return init;
   })();
   return observingFetch(url, finalInit);
+}
+
+/** Rewrites output_config.effort "high" → "xhigh" on the wire (see the
+ *  createAnthropic call in resolveModel for why). */
+async function xhighEffortFetch(url: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  if (init?.body && typeof init.body === "string") {
+    try {
+      const body = JSON.parse(init.body);
+      if (body?.output_config?.effort === "high") {
+        body.output_config.effort = "xhigh";
+        return observingFetch(url, { ...init, body: JSON.stringify(body) });
+      }
+    } catch {
+      // not JSON — pass through
+    }
+  }
+  return observingFetch(url, init);
 }
 
 /**
@@ -146,34 +168,25 @@ export function resolveModel(
       headers: customHeaders,
       fetch: observingFetch,
     });
-    // Astra requires Responses for function tools and supports low or higher
-    // reasoning. It cannot use the legacy chat/none fallback below.
-    if (effectiveCompat === "oai" && modelId === "gpt-6-astra") {
-      return openai.responses(modelId);
-    }
     // Default to the chat/completions endpoint, not the Responses API.
     // Reasons:
     //   - Third-party OpenAI-compat gateways (CF AI Gateway, Groq, DeepSeek,
     //     xAI Grok, etc.) only support /v1/chat/completions
-    //   - Responses API requires server-side persistence of function call IDs;
-    //     orgs with Zero Data Retention enabled get "Item with id 'fc_...' not
-    //     found" errors mid-loop
     //   - chat/completions is the de-facto standard contract for OpenAI-compat
     //
-    // The one exception: reasoning_level above "instant" on an OFFICIAL
-    // OpenAI reasoning model. chat/completions hard-400s on any
-    // reasoning_effort above 'none' when function tools are attached, so
-    // reasoning turns must ride /v1/responses. Gateways stay on chat (they
-    // don't serve /v1/responses), and the ZDR failure mode is handled by
-    // the fallback wrapper: on "Item with id 'fc_...' not found" the model
-    // clamps to chat + reasoning_effort:'none' and retries, so the turn
-    // never dies.
-    if (
-      effectiveCompat === "oai" &&
-      reasoningLevel !== undefined &&
-      reasoningLevel !== "instant" &&
-      OPENAI_REASONING_MODEL_RE.test(modelId)
-    ) {
+    // The exception: every OFFICIAL OpenAI reasoning model (o-series and
+    // gpt-N for N >= 5 — see isOpenAiReasoningModel) rides /v1/responses.
+    // chat/completions hard-400s on any reasoning_effort above 'none' once
+    // function tools are attached ("Function tools with reasoning_effort
+    // are not supported for gpt-6.1-sol in /v1/chat/completions"), and
+    // some models (gpt-6-astra) don't accept 'none' at all. Gateways stay
+    // on chat (they don't serve /v1/responses). The ZDR failure mode
+    // ("Item with id 'fc_...' not found") is handled by the fallback
+    // wrapper: it clamps to chat + reasoning_effort:'none' and retries, so
+    // the turn never dies — reasoningProviderOptions also sends
+    // store:false, which avoids server-side item references in the first
+    // place.
+    if (effectiveCompat === "oai" && isOpenAiReasoningModel(modelId)) {
       return withZdrChatFallback(
         openai.responses(modelId),
         openai.chat(modelId),
@@ -204,6 +217,17 @@ export function resolveModel(
       : `${baseURL.replace(/\/$/, "")}/v1`
     : "https://api.anthropic.com/v1";
 
+  // @ai-sdk/anthropic's `effort` enum predates "xhigh" (low|medium|high|
+  // max). reasoningProviderOptions sends "high" for an xhigh turn; this
+  // fetch upgrades the wire value for models that accept xhigh (4.7+).
+  const xhighEffort =
+    isKnownClaude &&
+    reasoningLevel !== undefined &&
+    (() => {
+      const r = claudeReasoning(modelId, reasoningLevel);
+      return r?.mode === "adaptive" && r.effort === "xhigh";
+    })();
+
   const anthropic = createAnthropic({
     apiKey,
     baseURL: normalizedBaseURL,
@@ -211,7 +235,11 @@ export function resolveModel(
     // setMaxTokensFetch composes observingFetch internally for non-Claude;
     // Claude path uses observingFetch directly so 429/rate-limit logging
     // applies regardless of which provider/model we're talking to.
-    fetch: isKnownClaude ? observingFetch : setMaxTokensFetch,
+    fetch: isKnownClaude
+      ? xhighEffort
+        ? xhighEffortFetch
+        : observingFetch
+      : setMaxTokensFetch,
   });
 
   return anthropic(modelId);
@@ -253,89 +281,25 @@ export function openAiSafeToolName(name: string): string {
 
 // ─── Unified reasoning-level → provider knobs ────────────────────────────
 //
-// One user-facing enum (AgentConfig.reasoning_level, default "instant")
-// mapped per provider:
+// The level → knob tables live in @open-managed-agents/api-types
+// (reasoning.ts) so every harness, route and the console agree. This
+// function only adapts them to AI SDK providerOptions for the resolved
+// model:
 //
-//   level   | OpenAI reasoning_effort | Anthropic thinking.budgetTokens
-//   --------|-------------------------|--------------------------------
-//   instant | none                    | disabled
-//   low     | low                     | 4k
-//   medium  | medium                  | 16k
-//   high    | high                    | 32k
-//   max     | xhigh                   | 64k, clamped below the model's
-//                                       output cap (4.8+/5.x: effort "max")
+//   - Official OpenAI reasoning model on the Responses API →
+//     { reasoningEffort, forceReasoning, store:false }. forceReasoning
+//     because the installed SDK's capability table only knows gpt-5/o*
+//     (it would drop the effort for gpt-6*/gpt-7); store:false so history
+//     replays as full items + encrypted reasoning (ZDR-safe).
+//   - Anything still on chat/completions (gateways, the ZDR clamp) that
+//     is a reasoning model → the shipped floor: reasoning_effort 'none'
+//     whenever tools ride along (the only effort chat accepts with tools).
+//   - Known Claude → adaptive thinking + effort (4.6+) or legacy
+//     enabled + budgetTokens (≤4.5). xhigh is sent as "high" and
+//     upgraded on the wire by resolveModel's fetch (SDK enum lacks it).
+//   - Third-party ant-compatible / non-reasoning models → undefined.
 //
-// OpenAI constraint (the reason resolveModel forks endpoints): reasoning
-// models (gpt-5*, o-series) reject any reasoning_effort above 'none' on
-// /v1/chat/completions the moment function tools are attached:
-//   "Function tools with reasoning_effort are not supported for
-//    gpt-5.6-sol in /v1/chat/completions. To use function tools, use
-//    /v1/responses or set reasoning_effort to 'none'." [400]
-// So levels above instant only apply when the resolved model actually
-// rides the Responses API (official OpenAI); everything still on chat —
-// gateways, instant, the ZDR clamp — gets the forced-'none' floor
-// whenever the turn carries tools (agent turns always do). Scoped by
-// model-id pattern so non-reasoning models (gpt-4o) and third-party
-// gateways serving non-gpt-5/o models are left untouched.
-//
-// Anthropic has no endpoint split: extended thinking works on the normal
-// Messages API with tools. Scoped to known Claude models — third-party
-// ant-compatible providers (MiniMax, DeepSeek) don't take the parameter.
-// @ai-sdk/anthropic adds budgetTokens on top of max_tokens itself and
-// caps at the model's known max output, so no maxOutputTokens plumbing
-// is needed here.
-const OPENAI_REASONING_MODEL_RE = /^(o[1-9]|gpt-5)/i;
-
-const OPENAI_REASONING_EFFORT: Record<
-  Exclude<ReasoningLevel, "instant">,
-  "low" | "medium" | "high" | "xhigh"
-> = { low: "low", medium: "medium", high: "high", max: "xhigh" };
-
-const ANTHROPIC_THINKING_BUDGET: Record<
-  Exclude<ReasoningLevel, "instant">,
-  number
-> = { low: 4096, medium: 16384, high: 32768, max: 65536 };
-
-/** Known max-output caps for legacy (pre-adaptive) Claude models.
- *  @ai-sdk/anthropic clamps max_tokens to the model's known cap WITHOUT
- *  shrinking thinking.budget_tokens, and the API rejects
- *  budget_tokens >= max_tokens — so a 65536 "max" budget on a 64k-cap
- *  model (sonnet/opus/haiku-4-5), or high's 32768 on a 32k-cap model
- *  (opus-4 / opus-4-1), 400s on every call. Conservative 64k default for
- *  unlisted ids. */
-function anthropicLegacyMaxOutput(bare: string): number {
-  if (/^claude-(sonnet|opus)-4-6/.test(bare)) return 128_000;
-  // opus-4 / opus-4-1 (optionally date-stamped, e.g. claude-opus-4-20250514).
-  if (/^claude-opus-4(-1)?($|-\d{6,})/.test(bare)) return 32_000;
-  if (/^claude-3-5-/.test(bare)) return 8_192;
-  return 64_000;
-}
-
-/** Headroom kept below the cap so the visible answer isn't starved when
- *  the SDK clamps max_tokens to the model cap. */
-const ANTHROPIC_THINKING_HEADROOM = 8_192;
-
-function anthropicLegacyThinkingBudget(
-  level: Exclude<ReasoningLevel, "instant">,
-  bare: string,
-): number {
-  const ceiling = anthropicLegacyMaxOutput(bare) - ANTHROPIC_THINKING_HEADROOM;
-  // 1024 is Anthropic's minimum thinking budget.
-  return Math.max(1024, Math.min(ANTHROPIC_THINKING_BUDGET[level], ceiling));
-}
-
-/** Claude 4.8+ / 5.x reject the legacy thinking shape with a 400
- *  ('"thinking.type.enabled" is not supported for this model — use
- *  "thinking.type.adaptive" and "output_config.effort"', observed live on
- *  claude-opus-4.8). Older models (sonnet/opus ≤4.7) only take the legacy
- *  enabled+budgetTokens form. Version-gate on the wire id. */
-function anthropicUsesAdaptiveThinking(bareModelId: string): boolean {
-  const m = /^claude-[a-z]+(?:-[a-z]+)*-(\d+)(?:-(\d+))?/.exec(bareModelId);
-  if (!m) return false;
-  const major = Number(m[1]);
-  const minor = m[2] !== undefined ? Number(m[2]) : 0;
-  return major >= 5 || (major === 4 && minor >= 8);
-}
+// `level` unset = "medium" (DEFAULT_REASONING_LEVEL).
 
 export function reasoningProviderOptions(
   model: LanguageModel,
@@ -347,7 +311,6 @@ export function reasoningProviderOptions(
   | { anthropic: { thinking: { type: "enabled"; budgetTokens: number } } }
   | { anthropic: { thinking: { type: "adaptive" }; effort: "low" | "medium" | "high" | "max" } }
   | undefined {
-  const effective: ReasoningLevel = level ?? "instant";
   // Prefer the resolved model's wire-level id — the `modelId` arg is the
   // agent's model-card HANDLE, which usually matches the wire model but
   // isn't required to.
@@ -358,45 +321,34 @@ export function reasoningProviderOptions(
   const bare = wireId.includes("/") ? wireId.split("/").slice(1).join("/") : wireId;
 
   if (isOpenAiCompatModel(model)) {
-    if (bare === "gpt-6-astra" && isOpenAiResponsesModel(model)) {
-      // The installed SDK predates Astra's capability table. Its supported
-      // override enables reasoning serialization. Replay full local history
-      // instead of depending on provider-side stored function-call items.
-      return { openai: {
-        reasoningEffort: effective === "instant" ? "low" : OPENAI_REASONING_EFFORT[effective],
-        forceReasoning: true,
-        store: false,
-      } };
+    if (!isOpenAiReasoningModel(bare)) return undefined;
+    if (isOpenAiResponsesModel(model)) {
+      return {
+        openai: {
+          reasoningEffort: openAiReasoningEffort(bare, level),
+          forceReasoning: true,
+          store: false,
+        },
+      };
     }
-    if (!OPENAI_REASONING_MODEL_RE.test(bare)) return undefined;
-    if (effective !== "instant" && isOpenAiResponsesModel(model)) {
-      return { openai: { reasoningEffort: OPENAI_REASONING_EFFORT[effective] } };
-    }
-    // Still on chat/completions (instant, gateway, or ZDR clamp) → the
-    // shipped floor: force 'none' whenever tools are present.
+    // Still on chat/completions (gateway or ZDR clamp) → the shipped
+    // floor: force 'none' whenever tools are present.
     return hasTools ? { openai: { reasoningEffort: "none" } } : undefined;
   }
 
-  if (
-    effective !== "instant" &&
-    isAnthropicModel(model) &&
-    bare.startsWith(KNOWN_CLAUDE_PREFIX)
-  ) {
-    if (anthropicUsesAdaptiveThinking(bare)) {
+  if (isAnthropicModel(model) && bare.startsWith(KNOWN_CLAUDE_PREFIX)) {
+    const r = claudeReasoning(bare, level);
+    if (!r || r.mode === "off") return undefined;
+    if (r.mode === "adaptive") {
       return {
         anthropic: {
           thinking: { type: "adaptive" },
-          effort: effective,
+          effort: r.effort === "xhigh" ? "high" : r.effort,
         },
       };
     }
     return {
-      anthropic: {
-        thinking: {
-          type: "enabled",
-          budgetTokens: anthropicLegacyThinkingBudget(effective, bare),
-        },
-      },
+      anthropic: { thinking: { type: "enabled", budgetTokens: r.budgetTokens } },
     };
   }
 

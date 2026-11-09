@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import type { AgentRecord as Agent } from "../types/agent";
 import { AmbientTriggerControls } from "../components/AmbientTriggerControls";
 import { AgentComputerPanel } from "../components/AgentComputerPanel";
+import { AgentModelSwitcher } from "../components/AgentModelSwitcher";
 import { AgentFormDialog } from "./agents/AgentFormDialog";
 import { useAgentFormAux } from "./agents/useAgentFormAux";
 import { openSetupSession, setupPath } from "./agents/setup-session";
@@ -243,7 +244,16 @@ export function AgentDetail() {
         {/* Properties grid */}
         <div className="grid grid-cols-[140px_1fr] gap-x-4 gap-y-2 max-w-2xl text-sm">
           <span className="text-fg-muted">ID</span><span className="font-mono text-xs">{agent.id}</span>
-          <span className="text-fg-muted">Model</span><span>{modelStr(agent.model)}</span>
+          <span className="text-fg-muted self-center">Model</span>
+          <span>
+            <AgentModelSwitcher
+              agent={agent}
+              onSaved={() => {
+                void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}`] });
+                void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}/versions`] });
+              }}
+            />
+          </span>
           <span className="text-fg-muted">Harness</span><span>{agent._oma?.harness || "default"}</span>
           {agent._oma?.default_environment_id && (
             <>

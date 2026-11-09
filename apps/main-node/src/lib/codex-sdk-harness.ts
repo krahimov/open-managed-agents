@@ -52,6 +52,7 @@ import type { HarnessContext } from "@open-managed-agents/agent/harness/interfac
 import {
   OMA_SETUP_HARNESS,
   OMA_SETUP_KIND_HARNESS_UPDATED,
+  openAiReasoningEffort,
   type ReasoningLevel,
   type SessionEvent,
 } from "@open-managed-agents/api-types";
@@ -218,15 +219,16 @@ export function codexModelFor(model: unknown): string | undefined {
   return typeof model === "string" && /^(gpt-|o[0-9]|codex)/i.test(model) ? model : undefined;
 }
 
-/** reasoning_level → codex effort, mirroring the DefaultHarness OpenAI
- *  mapping (provider.ts: max → xhigh). Unset = codex default. */
-const CODEX_REASONING_EFFORT: Record<ReasoningLevel, ModelReasoningEffort> = {
-  instant: "minimal",
-  low: "low",
-  medium: "medium",
-  high: "high",
-  max: "xhigh",
-};
+/** reasoning_level → codex effort via the shared OpenAI mapping (same
+ *  table as the DefaultHarness: max → the model's highest effort, unset →
+ *  medium). The subscription default model (no card model) is a current
+ *  gpt-5.x codex model, which takes xhigh. */
+export function codexReasoningEffort(
+  model: string | undefined,
+  level: ReasoningLevel | undefined,
+): ModelReasoningEffort {
+  return openAiReasoningEffort(model ?? "gpt-5.5", level);
+}
 
 /** Server names under [mcp_servers.*] in the host operator's codex config.
  *  Best-effort regex scan — enough to enumerate names for enabled=false. */
@@ -722,9 +724,10 @@ export class CodexSdkHarness {
 
     const threadOptions: ThreadOptions = {
       model: codexModelFor(ctx.agent.model),
-      ...(ctx.agent.reasoning_level
-        ? { modelReasoningEffort: CODEX_REASONING_EFFORT[ctx.agent.reasoning_level] }
-        : {}),
+      modelReasoningEffort: codexReasoningEffort(
+        codexModelFor(ctx.agent.model),
+        ctx.agent.reasoning_level,
+      ),
       workingDirectory: cwd,
       skipGitRepoCheck: true,
       // Headless: no confirmation round-trip on this path; the child is

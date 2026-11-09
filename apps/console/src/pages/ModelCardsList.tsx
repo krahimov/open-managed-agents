@@ -9,6 +9,7 @@ import { FacetedFilter } from "../components/FacetedFilter";
 import { FilterChip, CreatedFilterChip } from "../components/FilterChip";
 import { TextInput, SecretInput } from "../components/Input";
 import { toast } from "sonner";
+import { useAsyncAction } from "../hooks/useAsyncAction";
 import type { ModelCard } from "@open-managed-agents/api-types";
 
 // Provider enum — mirrors the whitelist on the server
@@ -101,7 +102,9 @@ export function ModelCardsList() {
     }
   }, [api]);
 
-  const save = async () => {
+  // Re-entrancy guarded: a double click on Create used to send two POSTs —
+  // the first succeeded and the second 409'd "model_id … already used".
+  const saveAction = useAsyncAction(async () => {
     setError("");
     if (!form.model_id || (!editingId && !form.api_key)) {
       setError("Model ID and API Key are required.");
@@ -150,7 +153,7 @@ export function ModelCardsList() {
       }
       closeDialog(); load();
     } catch (e: any) { setError(e?.message || "Failed to save"); }
-  };
+  });
 
   const remove = async (id: string) => {
     try { await api(`/v1/model_cards/${id}`, { method: "DELETE" }); load(); } catch {}
@@ -368,7 +371,14 @@ export function ModelCardsList() {
               </Button>
             )}
             <Button variant="ghost" onClick={closeDialog}>Cancel</Button>
-            <Button onClick={save} disabled={!form.model_id || (!editingId && !form.api_key)}>{editingId ? "Save" : "Create"}</Button>
+            <Button
+              onClick={() => void saveAction.run()}
+              loading={saveAction.loading}
+              loadingLabel={editingId ? "Saving…" : "Creating…"}
+              disabled={!form.model_id || (!editingId && !form.api_key)}
+            >
+              {editingId ? "Save" : "Create"}
+            </Button>
           </>
         }>
         <form autoComplete="off" onSubmit={(e) => e.preventDefault()} className="space-y-3">
