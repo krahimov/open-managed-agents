@@ -16,6 +16,18 @@ const result = (id: string, extra: Record<string, unknown> = {}) => ({ type: "ag
 const index = (events: unknown[]) => buildToolCallIndex(events as Event[]);
 
 describe("buildToolCallIndex", () => {
+  it("treats a bash result with a non-zero exit code as failed", () => {
+    const bash = { type: "agent.tool_use", id: "b1", name: "bash", input: { command: "ls /nope" } };
+    const failed = index([user, bash, result("b1", { content: "exit=1\nstderr: ls: /nope: No such file or directory\n" }), idleEnd]);
+    expect(failed.info("b1").status).toBe("failed");
+    const blocks = index([user, bash, result("b1", { content: [{ type: "text", text: "exit=143\nCommand timed out after 120s" }] }), idleEnd]);
+    expect(blocks.info("b1").status).toBe("failed");
+    const ok = index([user, bash, result("b1", { content: "exit=0\ntotal 10" }), idleEnd]);
+    expect(ok.info("b1").status).toBe("completed");
+    const prose = index([user, bash, result("b1", { content: "the exit=1 line in the log" }), idleEnd]);
+    expect(prose.info("b1").status).toBe("completed");
+  });
+
   it("marks an ask-gated call awaiting approval while the session idles on requires_action", () => {
     const idx = index([user, askBash("c1"), idleRequires(["c1"])]);
     expect(idx.info("c1").status).toBe("awaiting_approval");
