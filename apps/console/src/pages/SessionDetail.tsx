@@ -25,31 +25,19 @@ import { TimelineView } from "../components/timeline/TimelineView";
 import { SaveAsEvalDialog } from "./evals/SaveAsEvalDialog";
 import type { Event } from "../lib/events";
 import { eventKey } from "../lib/event-key";
-import { buildToolCallIndex, type ToolCallInfo } from "../lib/tool-status";
-import { ToolConfirmationControls } from "../components/ToolConfirmationControls";
+import { buildToolCallIndex } from "../lib/tool-status";
 import type { Trajectory, TrajectoryOutcome } from "../lib/trajectory";
 import { rewardHeadline, outcomeToStatusTone } from "../lib/trajectory";
 // ai-elements primitives — used to render the chat surface (messages,
-// reasoning blocks, tool calls, prompt input). The components/ai-elements/
-// directory is shadcn-style copy-paste so we own + customize them locally.
+// prompt input; tool calls + reasoning use components/tool-calls). The
+// components/ai-elements/ directory is shadcn-style copy-paste so we own +
+// customize them locally.
 import {
   Conversation,
   ConversationContent,
   ConversationScrollButton,
 } from "../components/ai-elements/conversation";
 import { Message, MessageContent } from "../components/ai-elements/message";
-import {
-  Reasoning,
-  ReasoningTrigger,
-  ReasoningContent,
-} from "../components/ai-elements/reasoning";
-import {
-  Tool,
-  ToolHeader,
-  ToolContent,
-  ToolInput,
-  ToolOutput,
-} from "../components/ai-elements/tool";
 import {
   PromptInput,
   PromptInputTextarea,
@@ -59,7 +47,13 @@ import {
   PromptInputButton,
   usePromptInputAttachments,
 } from "../components/ai-elements/prompt-input";
-import { CodeBlock } from "../components/ai-elements/code-block";
+import { buildTimeline } from "../components/tool-calls/model";
+import {
+  StreamingToolRow,
+  ThinkingRow,
+  WorkTimeline,
+  WorkingRow,
+} from "../components/tool-calls/ToolCalls";
 
 type View = "chat" | "timeline";
 
@@ -166,6 +160,17 @@ export function SessionDetail() {
    *  the events array at render time. SSE-driven new threads don't
    *  auto-switch — the operator stays on whatever they're watching. */
   const [activeThreadId, setActiveThreadId] = useState<string>("sthr_primary");
+  /** Active thread's tool-call timeline (paired calls, groups, turn folds). */
+  const timeline = useMemo(
+    () =>
+      buildTimeline(
+        events.filter(
+          (e) => ((e as { session_thread_id?: string }).session_thread_id ?? "sthr_primary") === activeThreadId,
+        ),
+        { isSilent: isSetupHarnessMarker },
+      ),
+    [events, activeThreadId],
+  );
   /** Server-mirrored pending queue, keyed by event_id. Populated from
    *  the initial GET /pending plus live system.user_message_pending /
    *  _promoted / _cancelled SSE frames. Pending entries render as a
@@ -1030,16 +1035,10 @@ export function SessionDetail() {
                   const tid = (e as { session_thread_id?: string }).session_thread_id ?? "sthr_primary";
                   return tid === activeThreadId;
                 });
-                // Pre-pair tool_use ↔ result events. Three flavors per the
-                // wire spec emitted in default-loop.ts:emitToolCallEvent /
-                // emitToolResultEvent:
-                //   • builtin tools  → agent.tool_use         + agent.tool_result        (key: tool_use_id)
-                //   • custom tools   → agent.custom_tool_use  + agent.tool_result        (key: tool_use_id) ← same result type
-                //   • MCP tools      → agent.mcp_tool_use     + agent.mcp_tool_result    (key: mcp_tool_use_id)
-                // The previous pairing only covered builtin → custom tools
-                // (e.g. general_subagent) showed their result as an "unpaired"
-                // orphan block because the use side was custom_tool_use.
-                const resultByToolUseId = new Map<string, typeof filtered[number]>();
+                // Tool uses pair with their results (tool_use_id /
+                // mcp_tool_use_id) inside buildTimeline, which also groups
+                // consecutive calls and folds finished turns.
+                //
                 // session.error → upstream model_request_end error_message
                 // map. session.error's payload from SSE only carries the
                 // generic "No output generated. Check the stream for errors."
@@ -1054,13 +1053,7 @@ export function SessionDetail() {
                 const sessionErrorCause = new Map<string, { error: string; model?: string }>();
                 let pendingModelErr: { error: string; model?: string } | null = null;
                 for (const ev of filtered) {
-                  if (ev.type === "agent.tool_result") {
-                    const id = (ev as { tool_use_id?: string }).tool_use_id;
-                    if (id) resultByToolUseId.set(id, ev);
-                  } else if (ev.type === "agent.mcp_tool_result") {
-                    const id = (ev as { mcp_tool_use_id?: string }).mcp_tool_use_id;
-                    if (id) resultByToolUseId.set(id, ev);
-                  } else if (ev.type === "span.model_request_end") {
+                  if (ev.type === "span.model_request_end") {
                     const d = (ev as { data?: { finish_reason?: string; error_message?: string; model?: string }; finish_reason?: string; error_message?: string; model?: string });
                     const finish = d.data?.finish_reason ?? d.finish_reason;
                     const errMsg = d.data?.error_message ?? d.error_message;
@@ -1078,70 +1071,30 @@ export function SessionDetail() {
                     }
                   }
                 }
-                const pairedResultIds = new Set<string>();
-                const toolIndex = buildToolCallIndex(filtered);
-                return filtered.map((e, i) => {
-                  // Stable React key — `e.id` (sevt_*) lives on every event
-                  // server-side via the stamp callback in session-do.ts, so
-                  // SSE-arrived rows already have it. Fall back to seq for
-                  // legacy events that pre-date the stamp, and to a synthetic
-                  // marker (type + index) as last resort. Index alone broke
-                  // because new events appended mid-list re-keyed every later
-                  // bubble → React unmount/remount → the entire conversation
-                  // appeared to flicker on every chunk delivery.
-                  const stableKey =
-                    (e as { id?: string }).id
-                    ?? (e as { seq?: number }).seq
-                    ?? `idx-${e.type}-${i}`;
-                  // Tool-result that's been folded into its use card —
-                  // skip standalone render. Both wire shapes: agent.tool_result
-                  // (covers builtin + custom) keys on tool_use_id;
-                  // agent.mcp_tool_result keys on mcp_tool_use_id.
-                  if (e.type === "agent.tool_result") {
-                    const tuid = (e as { tool_use_id?: string }).tool_use_id;
-                    if (tuid && pairedResultIds.has(tuid)) return null;
-                  }
-                  if (e.type === "agent.mcp_tool_result") {
-                    const tuid = (e as { mcp_tool_use_id?: string }).mcp_tool_use_id;
-                    if (tuid && pairedResultIds.has(tuid)) return null;
-                  }
-                  // Tool-use of any flavor: pair with its result if present,
-                  // render as one card. All three use-types carry the
-                  // call id on EventBase.id (overrides the inherited field
-                  // per emitToolCallEvent), so the lookup is uniform.
-                  let pairedResult: typeof filtered[number] | undefined;
-                  let toolInfo: ToolCallInfo | undefined;
-                  if (
-                    e.type === "agent.tool_use"
-                    || e.type === "agent.custom_tool_use"
-                    || e.type === "agent.mcp_tool_use"
-                  ) {
-                    const tuid = (e as { id?: string }).id;
-                    if (tuid && resultByToolUseId.has(tuid)) {
-                      pairedResult = resultByToolUseId.get(tuid);
-                      pairedResultIds.add(tuid);
-                    }
-                    toolInfo = toolIndex.info(tuid);
-                  }
-                  return (
-                    <EventRender
-                      grantedRequestIds={grantedRequestIds}
-                      key={stableKey}
-                      event={e}
-                      livePending={false}
-                      pairedResult={pairedResult}
-                      toolInfo={toolInfo}
-                      sessionId={id}
-                      threadId={activeThreadId}
-                      modelErrorCause={
-                        e.type === "session.error"
-                          ? sessionErrorCause.get((e as { id?: string }).id ?? "")
-                          : undefined
-                      }
-                      onApproveEnvironmentYaml={approveEnvironmentYaml}
-                    />
-                  );
-                });
+                return (
+                  <WorkTimeline
+                    items={timeline.items}
+                    sessionId={id}
+                    threadId={activeThreadId}
+                    renderEvent={(e, key) => (
+                      // Stable React key — `e.id` (sevt_*) lives on every
+                      // event server-side via the stamp callback in
+                      // session-do.ts; seq / type+index are fallbacks.
+                      <EventRender
+                        grantedRequestIds={grantedRequestIds}
+                        key={key}
+                        event={e}
+                        livePending={false}
+                        modelErrorCause={
+                          e.type === "session.error"
+                            ? sessionErrorCause.get((e as { id?: string }).id ?? "")
+                            : undefined
+                        }
+                        onApproveEnvironmentYaml={approveEnvironmentYaml}
+                      />
+                    )}
+                  />
+                );
               })()}
               {/* Optimistic outbox slot — what the user just typed before
                   the server's system.user_message_pending broadcast lands.
@@ -1178,42 +1131,17 @@ export function SessionDetail() {
                   />
                 ));
               })()}
-              {/* In-flight thinking streams. Render before message/tool
-                  streams so the visual order roughly matches what the
-                  LLM produced (Anthropic emits reasoning before text/tool).
-                  <Reasoning isStreaming> auto-opens, shows a shimmering
-                  "Thinking…" trigger, computes the duration when streaming
-                  ends, and auto-collapses on completion. */}
+              {/* In-flight thinking streams, then tool inputs still
+                  streaming in — live rows in the same shape as the
+                  committed ones, replaced when the canonical
+                  agent.thinking / tool_use lands. */}
               {Array.from(thinkingStreams.entries()).map(([tid, text]) => (
-                <Reasoning key={`think-${tid}`} isStreaming defaultOpen>
-                  <ReasoningTrigger />
-                  <ReasoningContent>{text}</ReasoningContent>
-                </Reasoning>
+                <div key={`think-${tid}`} className="flex max-w-2xl flex-col">
+                  <ThinkingRow text={text} active />
+                </div>
               ))}
-              {/* In-flight tool inputs — partial JSON shown in a code box
-                  inside a Tool card with state="input-streaming" ("Pending"
-                  badge). Replaced by the canonical tool_use card the
-                  moment the matching agent.tool_use lands. */}
               {Array.from(toolInputStreams.entries()).map(([tid, { name, partial }]) => (
-                <Tool key={`tin-${tid}`} defaultOpen>
-                  <ToolHeader
-                    type="dynamic-tool"
-                    toolName={name ?? "tool"}
-                    state="input-streaming"
-                  />
-                  <ToolContent>
-                    {partial && (
-                      <div className="space-y-2 overflow-hidden">
-                        <h4 className="font-medium text-muted-foreground text-xs uppercase">
-                          Streaming input
-                        </h4>
-                        <div className="rounded-md bg-muted/50">
-                          <CodeBlock code={partial} language="json" />
-                        </div>
-                      </div>
-                    )}
-                  </ToolContent>
-                </Tool>
+                <StreamingToolRow key={`tin-${tid}`} toolUseId={tid} name={name ?? "tool"} partial={partial ?? ""} />
               ))}
               {/* In-flight assistant message text streams — rendered as a
                   regular assistant Message whose body grows as chunks
@@ -1227,17 +1155,13 @@ export function SessionDetail() {
                   </MessageContent>
                 </Message>
               ))}
-              {/* Typing dots only when the agent is running and nothing
+              {/* "Working for …" only when the agent is running and nothing
                   else is streaming — avoids duplicate activity indicators. */}
               {status === "running"
                 && streams.size === 0
                 && thinkingStreams.size === 0
                 && toolInputStreams.size === 0 && (
-                <div className="flex gap-1 py-2">
-                  <span className="w-1.5 h-1.5 bg-fg-subtle rounded-full animate-pulse" style={{ animationDelay: "0ms" }} />
-                  <span className="w-1.5 h-1.5 bg-fg-subtle rounded-full animate-pulse" style={{ animationDelay: "150ms" }} />
-                  <span className="w-1.5 h-1.5 bg-fg-subtle rounded-full animate-pulse" style={{ animationDelay: "300ms" }} />
-                </div>
+                <WorkingRow sinceMs={timeline.openTurnStartMs} />
               )}
             </ConversationContent>
             <ConversationScrollButton />
@@ -1501,18 +1425,14 @@ function RelativeTimeBadge({ iso }: { iso: string }) {
 /**
  * Renders a single canonical event using ai-elements primitives. Replaces
  * the pre-migration EventBubble + StreamingBubble + ThinkingStreamingBubble
- * + ToolInputStreamingBubble quartet — the in-flight streaming bubbles are
- * now inlined where they're consumed (using Reasoning isStreaming, Tool
- * input-streaming state, and an assistant Message with a cursor) so this
- * function only needs to handle the canonical event shapes.
+ * + ToolInputStreamingBubble quartet. Tool calls, tool results and
+ * thinking never reach it: buildTimeline turns those into the shared
+ * tool-call rows (components/tool-calls), so this handles messages,
+ * errors and the system.* cards.
  *
  * Type mapping:
  *   user.message              → <Message from="user|system">  (system for wakeups)
  *   agent.message             → <Message from="assistant"> + <Markdown>
- *   agent.thinking            → <Reasoning> + <ReasoningContent>
- *   agent.{tool_use,custom_tool_use,mcp_tool_use} → <Tool> + <ToolHeader> + <ToolInput> + <ToolOutput>
- *   agent.tool_result (orphan only, paired ones folded into use above)
- *                             → <Tool state="output-available"> with only ToolOutput
  *   session.error             → red alert div  (no ai-elements equivalent)
  *   session.warning           → amber alert div  (same)
  *   anything else             → null  (timeline-only events that shouldn't appear in chat)
@@ -1545,21 +1465,11 @@ function AttachButton() {
 function EventRender({
   event,
   livePending = false,
-  pairedResult,
-  toolInfo,
-  sessionId,
-  threadId,
   modelErrorCause,
   onApproveEnvironmentYaml,
   grantedRequestIds,
 }: {
   event: Event;
-  /** Derived lifecycle for tool-use events (lib/tool-status). Drives the
-   *  card state and the human-in-the-loop controls. */
-  toolInfo?: ToolCallInfo;
-  /** Needed to post user.tool_confirmation from the card. */
-  sessionId?: string;
-  threadId?: string;
   /** request_ids with a server-recorded system.access_granted. */
   grantedRequestIds?: Set<string>;
   /**
@@ -1573,15 +1483,6 @@ function EventRender({
    * for the entire turn even while the agent is mid-stream.
    */
   livePending?: boolean;
-  /**
-   * The matching `agent.tool_result` (or `agent.mcp_tool_result`) for
-   * an `agent.tool_use` (or `custom_tool_use` / `mcp_tool_use`) event,
-   * when present in the same filtered list. Caller pre-pairs by id and
-   * suppresses the orphan tool_result render. Lets the Tool card show
-   * input + output in one collapsible block instead of two disconnected
-   * bubbles.
-   */
-  pairedResult?: Event;
   /**
    * Upstream model error context for `session.error` events. The
    * SSE-delivered session.error payload only carries a generic
@@ -1711,124 +1612,6 @@ function EventRender({
       );
     }
 
-    case "agent.thinking": {
-      // Canonical reasoning block — keep it visible after streaming
-      // finishes. <Reasoning> defaults closed unless isStreaming; we
-      // pass defaultOpen={false} so committed thoughts don't push the
-      // active conversation off-screen but stay one click away.
-      const text = (event as { text?: string }).text ?? "";
-      if (!text) return null;
-      return (
-        <Reasoning isStreaming={false} defaultOpen={false}>
-          <ReasoningTrigger />
-          <ReasoningContent>{text}</ReasoningContent>
-        </Reasoning>
-      );
-    }
-
-    case "agent.tool_use":
-    case "agent.custom_tool_use":
-    case "agent.mcp_tool_use": {
-      // All three use-types share the same shape (id + name + input);
-      // MCP additionally carries mcp_server_name which we append to
-      // the title so operators can tell built-in vs MCP at a glance.
-      const mcpServerName =
-        event.type === "agent.mcp_tool_use"
-          ? (event as { mcp_server_name?: string }).mcp_server_name
-          : undefined;
-      const baseName = event.name ?? "tool";
-      const title = mcpServerName ? `${baseName} (mcp · ${mcpServerName})` : baseName;
-      // Result text — Tool's <ToolOutput> takes the raw value and will
-      // either CodeBlock-stringify an object or render a string in a
-      // CodeBlock. We pre-stringify content arrays since they're an
-      // OMA-specific shape, not a JSON-friendly object.
-      const rawContent = pairedResult
-        ? (pairedResult as { content?: unknown }).content
-        : undefined;
-      const output: unknown = rawContent === undefined
-        ? undefined
-        : typeof rawContent === "string"
-          ? rawContent
-          : JSON.stringify(rawContent, null, 2);
-      // is_error is set by the agent runtime when a tool call failed
-      // (bash non-zero exit + stderr surfaced, mcp tool returned an
-      // error envelope, crash recovery injected an "outcome unknown"
-      // placeholder, the call was interrupted, ...). Denied calls are
-      // recognised from the user.tool_confirmation itself, so they render
-      // as Denied even when the runtime didn't stamp is_error. Error and
-      // denied payloads go through ToolOutput.errorText so the block
-      // renders in destructive styling instead of looking like success.
-      const info: ToolCallInfo = toolInfo ?? (pairedResult
-        ? { status: (pairedResult as { is_error?: boolean }).is_error === true ? "failed" : "completed", result: pairedResult }
-        : { status: "running" });
-      const isError = info.status === "failed" || info.status === "denied";
-      const errorText = isError
-        ? (typeof output === "string" ? output : JSON.stringify(output ?? null))
-        : undefined;
-      const header = toolHeaderState(info.status);
-      return (
-        <Tool defaultOpen={info.status === "awaiting_approval" || info.status === "awaiting_client"}>
-          <ToolHeader
-            type="dynamic-tool"
-            toolName={title}
-            state={header.state}
-            statusLabel={header.label}
-          />
-          <ToolContent>
-            <ToolInput input={event.input ?? {}} />
-            <ToolOutput
-              output={isError ? undefined : output}
-              errorText={errorText}
-            />
-            {info.status === "awaiting_approval" && sessionId && event.id && (
-              <ToolConfirmationControls
-                sessionId={sessionId}
-                toolUseId={event.id}
-                threadId={threadId}
-              />
-            )}
-            {info.status === "awaiting_client" && (
-              <div className="text-xs text-fg-subtle" role="status">
-                Waiting for the client to post a <span className="font-mono">user.custom_tool_result</span> for this call.
-              </div>
-            )}
-          </ToolContent>
-        </Tool>
-      );
-    }
-
-    case "agent.tool_result":
-    case "agent.mcp_tool_result": {
-      // Orphan tool_result — caller couldn't pair it with a tool_use
-      // (race / out-of-order delivery, or recovery-injected placeholder).
-      // Render a degenerate Tool with output-only so the visual is still
-      // a "tool" card (matching the rest of the timeline) but the header
-      // signals it stands alone.
-      const rawContent = (event as { content?: unknown }).content;
-      const output: unknown = rawContent === undefined
-        ? undefined
-        : typeof rawContent === "string"
-          ? rawContent
-          : JSON.stringify(rawContent, null, 2);
-      const orphanIsError = (event as { is_error?: boolean }).is_error === true;
-      return (
-        <Tool>
-          <ToolHeader
-            type="dynamic-tool"
-            toolName="tool result (unpaired)"
-            state={orphanIsError ? "output-error" : "output-available"}
-            statusLabel={orphanIsError ? "Failed" : undefined}
-          />
-          <ToolContent>
-            <ToolOutput
-              output={orphanIsError ? undefined : output}
-              errorText={orphanIsError ? (typeof output === "string" ? output : JSON.stringify(output ?? null)) : undefined}
-            />
-          </ToolContent>
-        </Tool>
-      );
-    }
-
     case "session.error":
       return (
         <div className="max-w-2xl bg-danger-subtle rounded-lg px-4 py-2.5 text-sm text-danger">
@@ -1888,21 +1671,6 @@ function EventRender({
   }
 }
 
-/** Map a derived tool status onto the ai-elements Tool header visuals. */
-function toolHeaderState(status: ToolCallInfo["status"]): {
-  state: "input-available" | "approval-requested" | "approval-responded" | "output-available" | "output-error" | "output-denied";
-  label?: string;
-} {
-  switch (status) {
-    case "completed": return { state: "output-available" };
-    case "failed": return { state: "output-error", label: "Failed" };
-    case "denied": return { state: "output-denied" };
-    case "awaiting_approval": return { state: "approval-requested" };
-    case "awaiting_client": return { state: "approval-requested", label: "Waiting for client result" };
-    case "responded": return { state: "approval-responded" };
-    case "running": return { state: "input-available" };
-  }
-}
 
 interface EnvironmentApprovalPayload {
   name: string;
@@ -1977,4 +1745,11 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+/** Agent setup harness markers ride on agent.message (empty content +
+ *  metadata.harness) — never drawn, so they mustn't split tool groups. */
+function isSetupHarnessMarker(ev: Event): boolean {
+  return ev.type === "agent.message"
+    && (ev.metadata as { harness?: string } | undefined)?.harness === OMA_SETUP_HARNESS;
 }
