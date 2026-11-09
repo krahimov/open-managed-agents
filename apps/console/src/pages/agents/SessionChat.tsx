@@ -18,6 +18,8 @@ import { SavedLoginLine } from "../../components/SavedLoginLine";
 import { HarnessDiffCard } from "../../components/HarnessDiffCard";
 import { AmbientRuleCard } from "../../components/AmbientRuleCard";
 import { SkillRequestCard } from "../../components/SkillRequestCard";
+import { buildTimeline } from "../../components/tool-calls/model";
+import { WorkTimeline, WorkingRow } from "../../components/tool-calls/ToolCalls";
 import {
   PromptInput,
   PromptInputFooter,
@@ -33,7 +35,7 @@ import {
  * Agent Builder: once for the builder interview, once for the test-run preview.
  *
  * It deliberately renders only the canonical events (user/assistant text +
- * non-setup tool calls). Setup harness markers ride on `agent.message`
+ * non-setup tool calls, as the shared tool-call rows). Setup harness markers ride on `agent.message`
  * tagged `metadata.harness === OMA_SETUP_HARNESS` (per the EventBase metadata
  * convention) — those are surfaced to the parent via `onEvent` and never shown
  * as chat bubbles.
@@ -67,16 +69,40 @@ function isHarnessUpdate(ev: Event): boolean {
   );
 }
 
-/** Events worth showing as chat bubbles/chips (everything else — stream deltas,
- *  status, span, results, builder markers — is filtered out). */
+/** Setup harness tools (the builder editing its own draft) stay hidden. */
+function isSetupTool(ev: Event): boolean {
+  return (
+    (typeof ev.name === "string" && ev.name.startsWith("mcp__oma_setup__")) ||
+    ev.mcp_server_name === "oma_setup"
+  );
+}
+
+/** Tool calls/results, thinking and the turn-boundary events the tool-call
+ *  timeline needs to pair results, derive status and fold finished turns. */
+const WORK_TYPES = new Set([
+  "agent.tool_use",
+  "agent.custom_tool_use",
+  "agent.mcp_tool_use",
+  "agent.tool_result",
+  "agent.mcp_tool_result",
+  "agent.thinking",
+  "user.tool_confirmation",
+  "user.custom_tool_result",
+  "user.interrupt",
+  "session.status_running",
+  "session.status_idle",
+  "session.status_terminated",
+  "session.error",
+]);
+
+/** Events kept in state (everything else — stream deltas, spans, builder
+ *  markers — is filtered out). */
 function isRenderable(ev: Event): boolean {
   if (isHarnessUpdate(ev)) return true;
   if (isSetupMarker(ev)) return false;
   if (ev.type === "user.message") return eventText(ev).length > 0;
   if (ev.type === "agent.message") return eventText(ev).trim().length > 0;
-  if (ev.type === "agent.tool_use") {
-    return typeof ev.name === "string" && !ev.name.startsWith("mcp__oma_setup__");
-  }
+  if (WORK_TYPES.has(ev.type)) return true;
   // Agent-initiated credential requests render as a connect card — during
   // setup this is how the agent hands the user the OAuth popups for the
   // servers it just added to its own harness.
@@ -236,8 +262,10 @@ export function SessionChat({
     [api, sessionId],
   );
 
-  const isEmpty = events.length === 0 && !pending;
   const grantedRequestIds = useMemo(() => grantedRequestIdsOf(events), [events]);
+  const timeline = useMemo(() => buildTimeline(events, { hideTool: isSetupTool }), [events]);
+  // Status/bookkeeping events live in state too; only drawn items count.
+  const isEmpty = timeline.items.length === 0 && !pending;
 
   return (
     <div className="flex flex-col h-full min-h-0">
@@ -249,65 +277,60 @@ export function SessionChat({
               description={emptyDescription ?? "Send a message to get started."}
             />
           )}
-          {events.map((ev, i) => {
-            const key = ev.seq != null ? `seq:${ev.seq}` : ev.id ?? `i${i}`;
-            if (ev.type === "user.message") {
-              return (
-                <Message from="user" key={key}>
-                  <MessageContent>{eventText(ev)}</MessageContent>
-                </Message>
-              );
-            }
-            if (ev.type === "agent.message") {
-              if (isHarnessUpdate(ev)) {
-                return <HarnessDiffCard key={key} event={ev} />;
+          <WorkTimeline
+            items={timeline.items}
+            sessionId={sessionId}
+            renderEvent={(ev, key) => {
+              if (ev.type === "user.message") {
+                return (
+                  <Message from="user" key={key}>
+                    <MessageContent>{eventText(ev)}</MessageContent>
+                  </Message>
+                );
               }
-              return (
-                <Message from="assistant" key={key}>
-                  <MessageContent>
-                    <Markdown>{eventText(ev)}</Markdown>
-                  </MessageContent>
-                </Message>
-              );
-            }
-            if (ev.type === "system.access_granted") return null;
-            if (ev.type === "system.access_request") {
-              return (
-                <AccessRequestCard
-                  key={key}
-                  event={ev}
-                  sessionId={sessionId}
-                  granted={grantedRequestIds.has(String(ev.request_id ?? ""))}
-                />
-              );
-            }
-            if (ev.type === "system.saved_login_attached") {
-              return (
-                <SavedLoginLine
-                  key={key}
-                  event={ev}
-                  sessionId={sessionId}
-                  switched={grantedRequestIds.has(String(ev.request_id ?? ""))}
-                />
-              );
-            }
-            if (ev.type === "system.ambient_rule_created") {
-              return <AmbientRuleCard key={key} event={ev} />;
-            }
-            if (ev.type === "system.skill_request") {
-              return <SkillRequestCard key={key} event={ev} sessionId={sessionId} />;
-            }
-            // agent.tool_use → compact chip
-            return (
-              <div
-                key={key}
-                className="text-xs text-fg-subtle inline-flex items-center gap-1.5"
-              >
-                <span aria-hidden>🔧</span>
-                <span className="font-mono">{ev.name}</span>
-              </div>
-            );
-          })}
+              if (ev.type === "agent.message") {
+                if (isHarnessUpdate(ev)) {
+                  return <HarnessDiffCard key={key} event={ev} />;
+                }
+                return (
+                  <Message from="assistant" key={key}>
+                    <MessageContent>
+                      <Markdown>{eventText(ev)}</Markdown>
+                    </MessageContent>
+                  </Message>
+                );
+              }
+              if (ev.type === "system.access_request") {
+                return (
+                  <AccessRequestCard
+                    key={key}
+                    event={ev}
+                    sessionId={sessionId}
+                    granted={grantedRequestIds.has(String(ev.request_id ?? ""))}
+                  />
+                );
+              }
+              if (ev.type === "system.saved_login_attached") {
+                return (
+                  <SavedLoginLine
+                    key={key}
+                    event={ev}
+                    sessionId={sessionId}
+                    switched={grantedRequestIds.has(String(ev.request_id ?? ""))}
+                  />
+                );
+              }
+              if (ev.type === "system.ambient_rule_created") {
+                return <AmbientRuleCard key={key} event={ev} />;
+              }
+              if (ev.type === "system.skill_request") {
+                return <SkillRequestCard key={key} event={ev} sessionId={sessionId} />;
+              }
+              // session.error renders as the turn-failed banner below;
+              // system.access_granted is state for the request cards.
+              return null;
+            }}
+          />
           {pending && (
             <Message from="user">
               <MessageContent className="opacity-70">{pending}</MessageContent>
@@ -335,7 +358,7 @@ export function SessionChat({
             </div>
           )}
           {status === "running" && Object.keys(streams).length === 0 && (
-            <div className="text-xs text-fg-subtle">Working…</div>
+            <WorkingRow sinceMs={timeline.openTurnStartMs} />
           )}
         </ConversationContent>
         <ConversationScrollButton />

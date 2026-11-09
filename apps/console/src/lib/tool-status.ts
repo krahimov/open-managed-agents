@@ -16,6 +16,7 @@ import type { Event } from "./events";
  *   completed          result present, not an error
  *   failed             result present with `is_error: true` (tool error,
  *                      crash-recovery placeholder, interrupted call, ...)
+ *                      or a bash result reporting a non-zero `exit=N`
  *   denied             the user denied the call (user.tool_confirmation
  *                      result "deny"); the result carries the reason
  */
@@ -43,8 +44,24 @@ export interface ToolCallIndex {
 
 const USE_TYPES = new Set(["agent.tool_use", "agent.custom_tool_use", "agent.mcp_tool_use"]);
 
+/** The bash tool reports a non-zero exit as plain text (`exit=1\n<output>`)
+ *  rather than `is_error`, so a failed command would otherwise read as done. */
+const NONZERO_EXIT_RE = /^exit=(?!0\b)\d+\b/;
+
+function firstResultText(result: Event): string {
+  const content = (result as { content?: unknown }).content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    const block = content[0] as { type?: string; text?: unknown } | undefined;
+    if (block?.type === "text" && typeof block.text === "string") return block.text;
+  }
+  return "";
+}
+
 export function isErrorResult(result: Event | undefined): boolean {
-  return Boolean(result && (result as { is_error?: unknown }).is_error === true);
+  if (!result) return false;
+  if ((result as { is_error?: unknown }).is_error === true) return true;
+  return NONZERO_EXIT_RE.test(firstResultText(result));
 }
 
 export function buildToolCallIndex(events: Event[]): ToolCallIndex {
