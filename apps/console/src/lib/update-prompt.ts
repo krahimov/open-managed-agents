@@ -1,7 +1,10 @@
 import { toast } from "sonner";
 import { createUpdateChecker, currentEntryScript } from "./app-version";
+import { sessionStoreOf, stashDrafts } from "./composer-draft";
 
 const POLL_INTERVAL_MS = 5 * 60_000;
+/** How long "Later" / close keeps the prompt away before it comes back. */
+const SNOOZE_MS = 15 * 60_000;
 const TOAST_ID = "oma-app-update";
 
 interface RouterLike {
@@ -18,14 +21,47 @@ async function fetchIndexHtml(): Promise<string> {
   return res.text();
 }
 
-function showUpdateToast() {
-  // Persistent and non-blocking: the user reloads when they're ready, so
-  // nothing they're typing gets thrown away. Same id → never stacks.
+/**
+ * Reloads the tab without losing unsent composer text: drafts are stashed
+ * in sessionStorage and restored by the composer after the reload. If a
+ * draft can't be stashed (storage blocked/full), asks first. Returns false
+ * when the user chose to stay.
+ */
+export function reloadKeepingDrafts(win: Window = window): boolean {
+  if (
+    !stashDrafts(win.document, sessionStoreOf(win)) &&
+    !win.confirm("Your unsent message can't be kept across a reload. Reload anyway?")
+  ) {
+    return false;
+  }
+  win.location.reload();
+  return true;
+}
+
+/**
+ * Persistent, non-blocking "new version" prompt. The user reloads when
+ * they're ready (unsent text is kept), or dismisses it with "Later" / the
+ * close button — `onSnooze` then lets the checker bring it back. Shown at
+ * the top so it never covers the composer / model picker at the bottom
+ * right. Same id → never stacks.
+ */
+export function showUpdateToast(opts: { onSnooze?: () => void } = {}) {
   toast("Orrery was updated", {
     id: TOAST_ID,
-    description: "Reload to get the latest version.",
+    description: "A new version is available. Reload when you're ready — your unsent message is kept.",
     duration: Infinity,
-    action: { label: "Reload", onClick: () => window.location.reload() },
+    position: "top-center",
+    closeButton: true,
+    action: {
+      label: "Reload",
+      onClick: (event) => {
+        // Staying (declined confirm) keeps the prompt up.
+        if (!reloadKeepingDrafts()) event.preventDefault();
+      },
+    },
+    cancel: { label: "Later", onClick: () => opts.onSnooze?.() },
+    // Close button / swipe. ("Later" doesn't fire onDismiss in sonner.)
+    onDismiss: () => opts.onSnooze?.(),
   });
 }
 
@@ -40,7 +76,7 @@ export function installUpdatePrompt(router: RouterLike): () => void {
   const checker = createUpdateChecker({
     current: currentEntryScript(),
     fetchHtml: fetchIndexHtml,
-    onUpdate: showUpdateToast,
+    onUpdate: (remote) => showUpdateToast({ onSnooze: () => checker.snooze(remote, SNOOZE_MS) }),
   });
   const visible = () => document.visibilityState === "visible";
   const onVisible = () => {

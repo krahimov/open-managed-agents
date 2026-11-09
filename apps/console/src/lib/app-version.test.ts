@@ -30,9 +30,17 @@ describe("extractEntryScript", () => {
     expect(extractEntryScript(html)).toBe("/assets/index-AAA.js");
   });
 
-  it("normalizes absolute URLs to a pathname", () => {
+  it("normalizes same-origin absolute URLs to a pathname", () => {
     const html = `<script type="module" src="https://app.example.com/assets/index-X.js"></script>`;
-    expect(extractEntryScript(html)).toBe("/assets/index-X.js");
+    expect(extractEntryScript(html, "https://app.example.com/")).toBe("/assets/index-X.js");
+  });
+
+  it("skips module scripts that aren't same-origin /assets/ chunks", () => {
+    const html = `<script type="module" src="chrome-extension://abc/inject.js"></script>
+      <script type="module" src="https://cdn.example.net/assets/widget.js"></script>
+      <script type="module" src="/inject.js"></script>
+      <script type="module" crossorigin src="/assets/index-REAL.js"></script>`;
+    expect(extractEntryScript(html, "https://app.example.com/sessions/x")).toBe("/assets/index-REAL.js");
   });
 
   it("returns null when there is no module entry (error page, JSON)", () => {
@@ -51,6 +59,19 @@ describe("currentEntryScript", () => {
   it("returns null without a module script", () => {
     const doc = document.implementation.createHTMLDocument("t");
     expect(currentEntryScript(doc)).toBeNull();
+  });
+
+  it("ignores a foreign module script injected before the entry", () => {
+    // e.g. an extension content script that runs at document_start.
+    const doc = document.implementation.createHTMLDocument("t");
+    doc.head.innerHTML = `<script type="module" src="chrome-extension://abc/inject.js"></script>
+      <script type="module" src="/inject.js"></script>
+      <script type="module" crossorigin src="/assets/index-OLD.js"></script>`;
+    const base = "https://app.example.com/agents";
+    expect(currentEntryScript(doc, base)).toBe("/assets/index-OLD.js");
+    // Same rule as the fetched side → no false "updated" prompt.
+    const fetched = `<script type="module" crossorigin src="/assets/index-OLD.js"></script>`;
+    expect(isNewVersion(currentEntryScript(doc, base), extractEntryScript(fetched, base))).toBe(false);
   });
 });
 
@@ -104,6 +125,33 @@ describe("createUpdateChecker", () => {
     let hash = "NEW1";
     const { checker, onUpdate } = setup({ html: () => builtIndex(hash) });
     await checker.check({ force: true });
+    hash = "NEW2";
+    await checker.check({ force: true });
+    expect(onUpdate.mock.calls).toEqual([["/assets/index-NEW1.js"], ["/assets/index-NEW2.js"]]);
+  });
+
+  it("announces a snoozed build again once the snooze expires", async () => {
+    const { checker, onUpdate, advance } = setup();
+    await checker.check({ force: true });
+    expect(onUpdate).toHaveBeenCalledTimes(1);
+    checker.snooze("/assets/index-NEW.js", 10_000);
+    advance(5000);
+    await checker.check({ force: true });
+    expect(onUpdate).toHaveBeenCalledTimes(1);
+    advance(5000);
+    await checker.check({ force: true });
+    expect(onUpdate).toHaveBeenCalledTimes(2);
+    // Re-announced → quiet again until the next dismissal.
+    advance(60_000);
+    await checker.check({ force: true });
+    expect(onUpdate).toHaveBeenCalledTimes(2);
+  });
+
+  it("a snooze doesn't hide a newer build", async () => {
+    let hash = "NEW1";
+    const { checker, onUpdate } = setup({ html: () => builtIndex(hash) });
+    await checker.check({ force: true });
+    checker.snooze("/assets/index-NEW1.js", 60_000);
     hash = "NEW2";
     await checker.check({ force: true });
     expect(onUpdate.mock.calls).toEqual([["/assets/index-NEW1.js"], ["/assets/index-NEW2.js"]]);

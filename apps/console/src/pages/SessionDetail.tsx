@@ -48,6 +48,7 @@ import {
   usePromptInputAttachments,
 } from "../components/ai-elements/prompt-input";
 import { SessionModelPicker } from "../components/SessionModelPicker";
+import { useComposerDraft } from "../lib/composer-draft";
 import { buildTimeline } from "../components/tool-calls/model";
 import {
   StreamingToolRow,
@@ -100,6 +101,8 @@ export function SessionDetail() {
   const [toolInputStreams, setToolInputStreams] = useState<Map<string, { name?: string; partial: string }>>(new Map());
   const [view, setView] = useState<View>("chat");
   const [input, setInput] = useState("");
+  // Unsent text survives an update-prompt reload (lib/composer-draft).
+  const draft = useComposerDraft(id ? `session:${id}` : undefined, setInput);
   const [sending, setSending] = useState(false);
   // Optimistic outbox slot — what the user typed, between hitting Send
   // and the server-side pending broadcast (system.user_message_pending)
@@ -1201,6 +1204,7 @@ export function SessionDetail() {
               }}
             >
               <PromptInputTextarea
+                {...draft}
                 placeholder="Send a message…  (drag an image in or click ＋)"
                 disabled={sending}
                 onChange={(e) => setInput(e.currentTarget.value)}

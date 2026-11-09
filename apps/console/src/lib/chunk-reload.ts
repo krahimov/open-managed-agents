@@ -1,10 +1,20 @@
 /**
  * Stale-chunk recovery. After a deploy every hashed chunk is replaced; a tab
- * opened before it still references the old ones, and lazy routes (Session
- * detail, Agent setup, ...) fail to load. main-node returns 404 for unknown
- * /assets/* paths, so the import fails loudly — we then reload once to pick
- * up the fresh index.html. A sessionStorage timestamp keeps a persistently
- * broken deploy from turning into a reload loop.
+ * opened before it still references the old ones, and lazy imports fail.
+ * main-node returns 404 for unknown /assets/* paths, so the import fails
+ * loudly.
+ *
+ * Route chunks and in-page chunks are handled differently:
+ *   - A failure while the router is navigating (lazy route: Session detail,
+ *     Agent setup, ...) or still booting: the user is leaving the page
+ *     anyway, so we load the URL they were going to - a full page load that
+ *     picks up the fresh index.html.
+ *   - Any other chunk (Shiki grammars, mermaid diagram types, the noVNC
+ *     desktop viewer, ... loaded mid-session) never reloads: that would
+ *     drop composer text and kill in-flight OAuth popups. The component
+ *     degrades and `onStaleChunk` shows the update prompt instead.
+ * A sessionStorage timestamp keeps a persistently broken deploy from
+ * turning into a reload loop.
  */
 
 export const CHUNK_RELOAD_KEY = "oma-chunk-reload-at";
@@ -59,22 +69,68 @@ function safeSessionStorage(win: Window): Storage | null {
   }
 }
 
-/** Wires `vite:preloadError` and unhandled dynamic-import rejections to a
- *  guarded single reload. Returns an uninstall function. */
-export function installChunkReloadHandlers(win: Window = window): () => void {
-  const tryReload = (): boolean => {
+/** The bits of a react-router data router this module reads. */
+export interface ChunkReloadRouter {
+  state: {
+    initialized: boolean;
+    navigation: { state: string; location?: unknown };
+  };
+  createHref: (location: never) => string;
+}
+
+/**
+ * Where a chunk-error reload should land, or null when it must not reload:
+ * the pending navigation's target while the router is navigating, the
+ * current URL while it is still booting (nothing typed yet), otherwise null.
+ */
+export function chunkReloadTarget(
+  router: ChunkReloadRouter | null | undefined,
+  currentHref: string,
+): string | null {
+  if (!router) return null;
+  if (!router.state.initialized) return currentHref;
+  const nav = router.state.navigation;
+  if (nav.state === "idle" || !nav.location) return null;
+  try {
+    return router.createHref(nav.location as never);
+  } catch {
+    return null;
+  }
+}
+
+export interface ChunkReloadOptions {
+  win?: Window;
+  router?: ChunkReloadRouter | null;
+  /** A chunk failed outside a navigation: tell the user a new version is
+   *  live instead of reloading under them. */
+  onStaleChunk?: () => void;
+}
+
+/** Wires `vite:preloadError` and unhandled dynamic-import rejections to
+ *  navigation-only, loop-guarded reloads. Returns an uninstall function. */
+export function installChunkReloadHandlers({
+  win = window,
+  router = null,
+  onStaleChunk,
+}: ChunkReloadOptions = {}): () => void {
+  const handle = (): boolean => {
+    const target = chunkReloadTarget(router, win.location.href);
+    if (target == null) {
+      onStaleChunk?.();
+      return false;
+    }
     if (!claimChunkReload(safeSessionStorage(win))) return false;
-    win.location.reload();
+    win.location.assign(target);
     return true;
   };
 
   const onPreloadError = (event: Event) => {
     // Only swallow the error when we actually reload; otherwise let it
-    // reach the route error UI so the user sees something.
-    if (tryReload()) event.preventDefault();
+    // reach the route error UI / component so the user sees something.
+    if (handle()) event.preventDefault();
   };
   const onRejection = (event: PromiseRejectionEvent) => {
-    if (isChunkLoadError(event.reason) && tryReload()) event.preventDefault();
+    if (isChunkLoadError(event.reason) && handle()) event.preventDefault();
   };
 
   win.addEventListener("vite:preloadError", onPreloadError);

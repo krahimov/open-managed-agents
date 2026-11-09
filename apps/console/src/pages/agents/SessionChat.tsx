@@ -28,6 +28,7 @@ import {
   PromptInputTools,
 } from "../../components/ai-elements/prompt-input";
 import { SessionModelPicker } from "../../components/SessionModelPicker";
+import { useComposerDraft } from "../../lib/composer-draft";
 
 /**
  * Lightweight, session-id-driven chat surface. Reuses the same ai-elements
@@ -136,6 +137,8 @@ export function SessionChat({
   emptyDescription,
 }: SessionChatProps) {
   const { api, streamEvents } = useApi();
+  // Unsent text survives an update-prompt reload (lib/composer-draft).
+  const draft = useComposerDraft(`session:${sessionId}`);
   const [events, setEvents] = useState<Event[]>([]);
   const [pending, setPending] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
@@ -371,6 +374,7 @@ export function SessionChat({
           }}
         >
           <PromptInputTextarea
+            {...draft}
             placeholder={placeholder ?? "Send a message…"}
             disabled={sending}
           />

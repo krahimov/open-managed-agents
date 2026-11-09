@@ -22,9 +22,15 @@ function parseAttrs(raw: string): Record<string, string> {
   return out;
 }
 
+const DEFAULT_BASE = "http://localhost/";
+
+function pageBase(): string {
+  return globalThis.location?.href ?? DEFAULT_BASE;
+}
+
 /** Normalize a script src to its pathname so "/assets/x.js" and
  *  "https://host/assets/x.js" compare equal. */
-export function normalizeScriptSrc(src: string, base = "http://localhost/"): string {
+export function normalizeScriptSrc(src: string, base = DEFAULT_BASE): string {
   try {
     return new URL(src, base).pathname;
   } catch {
@@ -32,23 +38,48 @@ export function normalizeScriptSrc(src: string, base = "http://localhost/"): str
   }
 }
 
-/** The src of the first `<script type="module" src=...>` in `html`
- *  (Vite's entry chunk), normalized to a pathname. null if none. */
-export function extractEntryScript(html: string): string | null {
+/**
+ * The one rule both sides use to pick Vite's entry chunk: a module script
+ * served from this origin under /assets/. Anything else — an extension's
+ * injected `chrome-extension://.../inject.js`, a third-party widget, a dev
+ * `/src/main.tsx` — is not a build id. Returns the normalized pathname, or
+ * null when `src` isn't an entry candidate.
+ */
+export function entryScriptPath(src: string, base = DEFAULT_BASE): string | null {
+  let url: URL;
+  let origin: string;
+  try {
+    url = new URL(src, base);
+    origin = new URL(base).origin;
+  } catch {
+    return null;
+  }
+  if (url.origin !== origin || !url.pathname.startsWith("/assets/")) return null;
+  return url.pathname;
+}
+
+/** The first same-origin `/assets/` module script in `html` (Vite's entry
+ *  chunk), normalized to a pathname. null if none. `base` is the URL the
+ *  HTML was fetched from. */
+export function extractEntryScript(html: string, base = DEFAULT_BASE): string | null {
   for (const m of html.matchAll(SCRIPT_TAG_RE)) {
     const attrs = parseAttrs(m[1]);
-    if (attrs.type?.toLowerCase() === "module" && attrs.src) {
-      return normalizeScriptSrc(attrs.src);
-    }
+    if (attrs.type?.toLowerCase() !== "module" || !attrs.src) continue;
+    const path = entryScriptPath(attrs.src, base);
+    if (path) return path;
   }
   return null;
 }
 
-/** The entry script this tab was loaded with. */
-export function currentEntryScript(doc: Document = document): string | null {
-  const el = doc.querySelector<HTMLScriptElement>('script[type="module"][src]');
-  const src = el?.getAttribute("src");
-  return src ? normalizeScriptSrc(src) : null;
+/** The entry script this tab was loaded with — same matching rule as
+ *  extractEntryScript, so injected module scripts never count. */
+export function currentEntryScript(doc: Document = document, base = pageBase()): string | null {
+  for (const el of doc.querySelectorAll<HTMLScriptElement>('script[type="module"][src]')) {
+    const src = el.getAttribute("src");
+    const path = src ? entryScriptPath(src, base) : null;
+    if (path) return path;
+  }
+  return null;
 }
 
 /** True only when both builds are known and differ. An unparseable
@@ -62,7 +93,11 @@ export interface UpdateCheckerOptions {
   current: string | null;
   /** Fetches the live index.html. */
   fetchHtml: () => Promise<string>;
-  /** Called once per newly-seen remote build id. */
+  /** URL the HTML is fetched from (resolves relative script srcs).
+   *  Defaults to the page's own location. */
+  base?: string;
+  /** Called when a newer remote build is seen and isn't already announced
+   *  or snoozed. */
   onUpdate: (remote: string) => void;
   /** Minimum gap between non-forced checks (focus/nav storms). */
   minIntervalMs?: number;
@@ -72,6 +107,10 @@ export interface UpdateCheckerOptions {
 export interface UpdateChecker {
   /** Checks for a newer build. Non-forced calls are throttled. Never throws. */
   check: (opts?: { force?: boolean }) => Promise<void>;
+  /** The user dismissed the prompt for `remote`: stay quiet about it for
+   *  `ms`, then announce it again on the next check. A different, newer
+   *  build is announced right away. */
+  snooze: (remote: string, ms: number) => void;
 }
 
 export function createUpdateChecker(opts: UpdateCheckerOptions): UpdateChecker {
@@ -79,8 +118,10 @@ export function createUpdateChecker(opts: UpdateCheckerOptions): UpdateChecker {
   const now = opts.now ?? Date.now;
   let lastCheckAt = -Infinity;
   let inFlight: Promise<void> | null = null;
-  // Remote ids we've already announced — never toast the same build twice.
-  const announced = new Set<string>();
+  // Remote id → time until which it must not be announced again. An
+  // announced build stays quiet (Infinity) while its prompt is up; a
+  // dismissal turns that into a finite snooze so the prompt comes back.
+  const quietUntil = new Map<string, number>();
 
   async function run(): Promise<void> {
     let html: string;
@@ -89,9 +130,10 @@ export function createUpdateChecker(opts: UpdateCheckerOptions): UpdateChecker {
     } catch {
       return; // offline / mid-deploy — try again on the next trigger
     }
-    const remote = extractEntryScript(html);
-    if (!remote || !isNewVersion(opts.current, remote) || announced.has(remote)) return;
-    announced.add(remote);
+    const remote = extractEntryScript(html, opts.base ?? pageBase());
+    if (!remote || !isNewVersion(opts.current, remote)) return;
+    if (now() < (quietUntil.get(remote) ?? -Infinity)) return;
+    quietUntil.set(remote, Infinity);
     opts.onUpdate(remote);
   }
 
@@ -106,6 +148,9 @@ export function createUpdateChecker(opts: UpdateCheckerOptions): UpdateChecker {
         inFlight = null;
       });
       return inFlight;
+    },
+    snooze(remote, ms) {
+      quietUntil.set(remote, now() + ms);
     },
   };
 }

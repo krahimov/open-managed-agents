@@ -19,7 +19,7 @@ import { AppShell } from "./components/AppShell";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { queryClient } from "./lib/query-client";
 import { installChunkReloadHandlers } from "./lib/chunk-reload";
-import { installUpdatePrompt } from "./lib/update-prompt";
+import { installUpdatePrompt, showUpdateToast } from "./lib/update-prompt";
 import { Login } from "./pages/Login";
 import { Dashboard } from "./pages/Dashboard";
 import { AgentsList } from "./pages/AgentsList";
@@ -292,9 +292,11 @@ const router = createBrowserRouter([
 ]);
 
 // A deploy replaces every hashed chunk; tabs opened before it still hold
-// the old index.html and fail to lazy-load route chunks. Reload once
-// (loop-guarded) to pick up the fresh manifest.
-installChunkReloadHandlers();
+// the old index.html and fail to lazy-load chunks. A failed route chunk
+// loads the target URL fresh (loop-guarded); any other chunk (grammars,
+// diagrams, desktop viewer) just shows the update prompt - never a forced
+// reload mid-session.
+installChunkReloadHandlers({ router, onStaleChunk: () => showUpdateToast() });
 // Long-lived tabs otherwise keep running the old build forever — prompt
 // (never force) a reload when a newer deploy is live.
 installUpdatePrompt(router);

@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   CHUNK_RELOAD_KEY,
+  chunkReloadTarget,
   claimChunkReload,
+  type ChunkReloadRouter,
   installChunkReloadHandlers,
   isChunkLoadError,
 } from "./chunk-reload";
@@ -70,47 +72,110 @@ describe("isChunkLoadError", () => {
   });
 });
 
+function fakeRouter(
+  state: { initialized?: boolean; navigation?: { state: string; location?: unknown } } = {},
+): ChunkReloadRouter & { state: { initialized: boolean; navigation: { state: string; location?: unknown } } } {
+  return {
+    state: {
+      initialized: state.initialized ?? true,
+      navigation: state.navigation ?? { state: "idle" },
+    },
+    createHref: ((loc: { pathname: string; search?: string; hash?: string }) =>
+      `${loc.pathname}${loc.search ?? ""}${loc.hash ?? ""}`) as never,
+  };
+}
+
+const navigatingTo = (pathname: string, search = "") =>
+  ({ state: "loading", location: { pathname, search, hash: "" } }) as const;
+
+describe("chunkReloadTarget", () => {
+  it("targets the pending navigation's URL", () => {
+    expect(chunkReloadTarget(fakeRouter({ navigation: navigatingTo("/sessions/s1", "?v=1") }), "http://x/agents")).toBe(
+      "/sessions/s1?v=1",
+    );
+  });
+
+  it("reloads the current URL while the router is still booting", () => {
+    expect(chunkReloadTarget(fakeRouter({ initialized: false }), "http://x/sessions/s1")).toBe("http://x/sessions/s1");
+  });
+
+  it("refuses when idle (in-page chunk) or without a router", () => {
+    expect(chunkReloadTarget(fakeRouter(), "http://x/sessions/s1")).toBeNull();
+    expect(chunkReloadTarget(null, "http://x/sessions/s1")).toBeNull();
+  });
+});
+
 describe("installChunkReloadHandlers", () => {
   function fakeWindow() {
     const target = new EventTarget();
     const storage = memoryStorage();
+    const assign = vi.fn();
     const reload = vi.fn();
     const win = Object.assign(target, {
       sessionStorage: storage,
-      location: { reload },
+      location: { href: "http://x/agents", assign, reload },
     }) as unknown as Window;
-    return { win, reload };
+    return { win, assign, reload };
   }
 
-  it("reloads once on vite:preloadError and then stops", () => {
-    const { win, reload } = fakeWindow();
-    const uninstall = installChunkReloadHandlers(win);
+  const rejection = (reason: unknown) => {
+    const e = new Event("unhandledrejection", { cancelable: true });
+    Object.defineProperty(e, "reason", { value: reason });
+    return e;
+  };
+
+  it("loads the navigation target on a route-chunk failure, once", () => {
+    const { win, assign, reload } = fakeWindow();
+    const router = fakeRouter({ navigation: navigatingTo("/sessions/s1") });
+    const onStaleChunk = vi.fn();
+    const uninstall = installChunkReloadHandlers({ win, router, onStaleChunk });
     const first = new Event("vite:preloadError", { cancelable: true });
     win.dispatchEvent(first);
-    expect(reload).toHaveBeenCalledTimes(1);
+    expect(assign).toHaveBeenCalledWith("/sessions/s1");
+    expect(reload).not.toHaveBeenCalled();
     expect(first.defaultPrevented).toBe(true);
 
-    // A second failure right after the reload must not loop — and the
-    // error is left to propagate to the route error UI.
+    // A second failure right after must not loop — and the error is left
+    // to propagate to the route error UI.
     const second = new Event("vite:preloadError", { cancelable: true });
     win.dispatchEvent(second);
-    expect(reload).toHaveBeenCalledTimes(1);
+    expect(assign).toHaveBeenCalledTimes(1);
     expect(second.defaultPrevented).toBe(false);
+    expect(onStaleChunk).not.toHaveBeenCalled();
     uninstall();
   });
 
-  it("reloads on an unhandled dynamic-import rejection only", () => {
-    const { win, reload } = fakeWindow();
-    const uninstall = installChunkReloadHandlers(win);
-    const rejection = (reason: unknown) => {
-      const e = new Event("unhandledrejection", { cancelable: true });
-      Object.defineProperty(e, "reason", { value: reason });
-      return e;
-    };
-    win.dispatchEvent(rejection(new Error("boom")));
+  it("never reloads for an in-page chunk (grammar, diagram, viewer) — prompts instead", () => {
+    const { win, assign, reload } = fakeWindow();
+    const onStaleChunk = vi.fn();
+    const uninstall = installChunkReloadHandlers({ win, router: fakeRouter(), onStaleChunk });
+    const e = new Event("vite:preloadError", { cancelable: true });
+    win.dispatchEvent(e);
+    win.dispatchEvent(rejection(new TypeError("Failed to fetch dynamically imported module: /assets/python-X.js")));
+    expect(assign).not.toHaveBeenCalled();
     expect(reload).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(false);
+    expect(onStaleChunk).toHaveBeenCalledTimes(2);
+    uninstall();
+  });
+
+  it("handles unhandled dynamic-import rejections during navigation only", () => {
+    const { win, assign } = fakeWindow();
+    const router = fakeRouter({ navigation: navigatingTo("/agents/a1/setup") });
+    const uninstall = installChunkReloadHandlers({ win, router });
+    win.dispatchEvent(rejection(new Error("boom")));
+    expect(assign).not.toHaveBeenCalled();
     win.dispatchEvent(rejection(new TypeError("Failed to fetch dynamically imported module: /assets/x.js")));
-    expect(reload).toHaveBeenCalledTimes(1);
+    expect(assign).toHaveBeenCalledWith("/agents/a1/setup");
+    uninstall();
+  });
+
+  it("does nothing without a router", () => {
+    const { win, assign, reload } = fakeWindow();
+    const uninstall = installChunkReloadHandlers({ win });
+    win.dispatchEvent(new Event("vite:preloadError", { cancelable: true }));
+    expect(assign).not.toHaveBeenCalled();
+    expect(reload).not.toHaveBeenCalled();
     uninstall();
   });
 });
