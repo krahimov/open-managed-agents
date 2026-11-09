@@ -5,7 +5,12 @@ import type { RouteServices } from "@open-managed-agents/http-routes";
 interface OAuthState {
   completion_key?: string;
   tenant_id: string;
-  vault_id: string;
+  /** Absent when the flow saves into a new vault (`new_vault_name`). */
+  vault_id?: string;
+  /** Switch account: save this login in a new vault of this name, created
+   *  only once sign-in succeeds, so the login other agents share is kept and
+   *  an abandoned popup leaves nothing behind. */
+  new_vault_name?: string;
   credential_id?: string;
   mcp_server_url: string;
   code_verifier: string;
@@ -105,8 +110,9 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     const sessionIdParam = c.req.query("session_id")?.trim() || undefined;
     const requestIdParam = c.req.query("request_id")?.trim() || undefined;
     const serviceParam = c.req.query("service")?.trim().toLowerCase() || undefined;
+    const newVaultName = c.req.query("new_vault_name")?.trim().slice(0, 120) || undefined;
 
-    if (!mcpServerUrl || !vaultId) {
+    if (!mcpServerUrl || (!vaultId && !newVaultName)) {
       return c.json({ error: "mcp_server_url and vault_id are required" }, 400);
     }
 
@@ -121,8 +127,10 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     }
 
     const tenantId = c.get("tenant_id");
-    const vault = await deps.services.vaults.get({ tenantId, vaultId });
-    if (!vault) return c.json({ error: "Vault not found" }, 404);
+    if (vaultId) {
+      const vault = await deps.services.vaults.get({ tenantId, vaultId });
+      if (!vault) return c.json({ error: "Vault not found" }, 404);
+    }
 
     const baseUrl = getBaseUrl(c.req.url);
     const callbackUri = `${baseUrl}/v1/oauth/callback`;
@@ -233,6 +241,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       completion_key: deps.completionKey,
       tenant_id: tenantId,
       vault_id: vaultId,
+      new_vault_name: vaultId ? undefined : newVaultName,
       credential_id: credentialId,
       mcp_server_url: mcpServerUrl,
       code_verifier: codeVerifier,
@@ -266,6 +275,9 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     } else if (meta.resource.scopes_supported?.length) {
       authUrl.searchParams.set("scope", meta.resource.scopes_supported.join(" "));
     }
+    // Switching account is pointless if the provider silently reuses the
+    // browser's current login. Providers without this parameter ignore it.
+    if (oauthState.new_vault_name) authUrl.searchParams.set("prompt", "select_account");
 
     return c.redirect(authUrl.toString());
   });
@@ -342,7 +354,15 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       authorization_server: oauthState.authorization_server,
     };
 
+    let targetVaultId = oauthState.vault_id ?? "";
     try {
+      if (!targetVaultId) {
+        const created = await deps.services.vaults.create({
+          tenantId: oauthState.tenant_id,
+          name: oauthState.new_vault_name ?? `${serverName} login`,
+        });
+        targetVaultId = created.id;
+      }
       let credentialId = oauthState.credential_id;
       if (!credentialId) {
         // Reconnects are the common case: an earlier attempt (or the agent
@@ -352,7 +372,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
         const groups = await deps.services.credentials
           .listByVaults({
             tenantId: oauthState.tenant_id,
-            vaultIds: [oauthState.vault_id],
+            vaultIds: [targetVaultId],
           })
           .catch(() => []);
         const existing = groups
@@ -368,14 +388,14 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       if (credentialId) {
         await deps.services.credentials.update({
           tenantId: oauthState.tenant_id,
-          vaultId: oauthState.vault_id,
+          vaultId: targetVaultId,
           credentialId,
           auth: credAuth,
         });
       } else {
         await deps.services.credentials.create({
           tenantId: oauthState.tenant_id,
-          vaultId: oauthState.vault_id,
+          vaultId: targetVaultId,
           displayName: `${serverName} (OAuth)`,
           auth: credAuth,
         });
@@ -410,7 +430,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
           sessionId: oauthState.session_id,
           requestId: oauthState.request_id,
           service: grantService,
-          vaultId: oauthState.vault_id,
+          vaultId: targetVaultId,
           mcpServerUrl: oauthState.mcp_server_url,
         });
         grantRecorded = true;
@@ -434,7 +454,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
             type: "oauth_complete",
             service: grantService,
             server_name: serverName,
-            vault_id: oauthState.vault_id,
+            vault_id: targetVaultId,
             request_id: oauthState.request_id ?? null,
             session_id: oauthState.session_id ?? null,
             // true → the server already appended the grant + nudge; the

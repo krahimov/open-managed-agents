@@ -1045,6 +1045,26 @@ export interface SystemAccessGrantedEvent extends EventBase {
   mcp_server_url?: string;
 }
 
+// Setup found a working login for one of the agent's MCP servers in the
+// workspace's vaults and attached that vault instead of posting a connect
+// card. Consumers show which vault the agent got, with a way to switch
+// account; a later system.access_granted with this request_id means the user
+// did. Carries names only — credentials never appear in events.
+export interface SystemSavedLoginAttachedEvent extends EventBase {
+  type: "system.saved_login_attached";
+  /** Matched by the system.access_granted a Switch account flow records. */
+  request_id: string;
+  service: string;
+  mcp_server_url: string;
+  vault_id: string;
+  vault_name: string;
+  /** Names the new vault a Switch account flow saves into. */
+  agent_name: string;
+  /** False for logins OAuth can't replace (API keys, Composio): manage those
+   *  in the vault. */
+  can_switch: boolean;
+}
+
 // Agent-created ambient rule. Emitted alongside the create_ambient_rule
 // tool result so live consumers (Console) render the new standing rule as a
 // card — cadence, wake mode, opening prompt, first wake — instead of a raw
@@ -1154,6 +1174,7 @@ export type SessionEvent =
   | SystemPolicyDecisionEvent
   | SystemAccessRequestEvent
   | SystemAccessGrantedEvent
+  | SystemSavedLoginAttachedEvent
   | SystemAmbientRuleCreatedEvent
   | SystemSkillRequestEvent
   | SystemTurnResumeEvent;

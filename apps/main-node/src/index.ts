@@ -91,6 +91,9 @@ import {
   buildSetupPrompt,
   buildSetupTools,
   autoRequestAccessForNewServers,
+  boundVaultId,
+  preferVaults,
+  withVaultBinding,
   describeSetupAccessStatus,
 } from "./lib/setup-harness.js";
 import { ALL_TOOLS, buildTools, getEnabledTools } from "@open-managed-agents/agent/harness/tools";
@@ -934,8 +937,9 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
             ...a,
             mcp_server_url: a.mcp_server_url ?? matchAgentMcpServer(agent, a.service),
           }),
-        findCredentialVault: (url) => findCredentialVaultForUrl(context.tenantId, url),
-        attachVault: (vaultId) => attachVaultToAgent(context.tenantId, agent.id, vaultId),
+        findCredentialVault: (url) => findCredentialVaultForUrl(context.tenantId, url, agent.id),
+        attachVault: (vaultId, url) => attachVaultToAgent(context.tenantId, agent.id, vaultId, url),
+        reportSavedLogin: (login) => postSavedLoginLine(context.tenantId, context.sessionId, agent.id, login),
         createAmbientRule: (a) =>
           createAmbientRuleFromSession(context.tenantId, agent.id, context.sessionId, a),
         env: { TAVILY_API_KEY: process.env.TAVILY_API_KEY },
@@ -1107,6 +1111,7 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
         postAccessRequest(tenantId, sessionId, a),
       findCredentialVault: findCredentialVaultForUrl,
       attachVaultToAgent,
+      reportSavedLogin: postSavedLoginLine,
       setupAccessStatus: ensureSetupAccessReconciled,
       createAmbientRule: (tenantId, sessionId, agentId, a) =>
         createAmbientRuleFromSession(tenantId, agentId, sessionId, a),
@@ -2568,8 +2573,9 @@ async function ensureSetupAccessReconciled(
       if (servers.length === 0) return undefined;
       const result = await autoRequestAccessForNewServers(undefined, servers, {
         requestAccess: (a) => postAccessRequest(tenantId, sessionId, a),
-        findCredentialVault: (url) => findCredentialVaultForUrl(tenantId, url),
-        attachVault: (vaultId) => attachVaultToAgent(tenantId, agent.id, vaultId),
+        findCredentialVault: (url) => findCredentialVaultForUrl(tenantId, url, agent.id),
+        attachVault: (vaultId, url) => attachVaultToAgent(tenantId, agent.id, vaultId, url),
+        reportSavedLogin: (login) => postSavedLoginLine(tenantId, sessionId, agent.id, login),
       });
       const record: SetupAccessRecord = { ...result, checked_at: Date.now() };
       await sessionsService
@@ -2591,37 +2597,108 @@ async function ensureSetupAccessReconciled(
   return run;
 }
 
-/** Union `vaultId` into the agent's default_vault_ids (metadata merge). */
-async function attachVaultToAgent(tenantId: string, agentId: string, vaultId: string): Promise<void> {
-  const agent = await agentsService.get({ tenantId, agentId });
-  if (!agent) return;
-  const current = (agent.metadata as { default_vault_ids?: unknown } | undefined)?.default_vault_ids;
-  const ids = Array.isArray(current)
+function agentDefaultVaultIds(agent: { metadata?: unknown } | null | undefined): string[] {
+  const current = (agent?.metadata as { default_vault_ids?: unknown } | undefined)?.default_vault_ids;
+  return Array.isArray(current)
     ? current.filter((id): id is string => typeof id === "string" && id.length > 0)
     : [];
-  if (ids.includes(vaultId)) return;
+}
+
+/** Union `vaultId` into the agent's default_vault_ids (metadata merge). With
+ *  `mcpServerUrl`, also make it the vault this agent uses for that server, so
+ *  another attached vault holding a login for the same server can't win. */
+async function attachVaultToAgent(
+  tenantId: string,
+  agentId: string,
+  vaultId: string,
+  mcpServerUrl?: string,
+): Promise<void> {
+  const agent = await agentsService.get({ tenantId, agentId });
+  if (!agent) return;
+  const ids = agentDefaultVaultIds(agent);
+  const attached = ids.includes(vaultId);
+  const bound = !mcpServerUrl || boundVaultId(agent.metadata, mcpServerUrl) === vaultId;
+  if (attached && bound) return;
   await agentsService.update({
     tenantId,
     agentId,
-    input: { metadata: { default_vault_ids: [...ids, vaultId] } },
+    input: {
+      metadata: {
+        default_vault_ids: attached ? ids : [...ids, vaultId],
+        ...(mcpServerUrl
+          ? { mcp_vault_bindings: withVaultBinding(agent.metadata, mcpServerUrl, vaultId) }
+          : {}),
+      },
+    },
   });
 }
 
-/** Vault id holding a WORKING credential bound to `mcpServerUrl` (any of the
- *  tenant's vaults), or null. Setup uses it to skip the connect card for a
- *  server the workspace already authorized (e.g. Sentry connected by an
- *  earlier agent) and just attach that vault. "Working" is verified live:
- *  the token is probed, expired OAuth tokens are refreshed (and persisted)
- *  first, and a credential the provider rejects does NOT count — the card
- *  is posted instead and the OAuth callback upserts the row. */
-async function findCredentialVaultForUrl(tenantId: string, mcpServerUrl: string): Promise<string | null> {
+/**
+ * Post the "using the saved login from <vault>" line for a server setup just
+ * attached a vault for. Only the credential's type leaves the vault: it
+ * decides whether the line can offer Switch account (OAuth) or only link to
+ * the vault (API keys, Composio).
+ */
+async function postSavedLoginLine(
+  tenantId: string,
+  sessionId: string,
+  agentId: string,
+  login: { service: string; mcpServerUrl: string; vaultId: string },
+): Promise<void> {
+  const [vault, agent, grouped] = await Promise.all([
+    vaultService.get({ tenantId, vaultId: login.vaultId }),
+    agentsService.get({ tenantId, agentId }),
+    credentialService.listByVaults({ tenantId, vaultIds: [login.vaultId] }),
+  ]);
+  const target = normalizeMcpUrlForMatch(login.mcpServerUrl);
+  const credential = grouped
+    .flatMap((g) => g.credentials)
+    .find((cred) => {
+      if ((cred as { archived_at?: string | null }).archived_at) return false;
+      const url = (cred as unknown as { auth?: { mcp_server_url?: unknown } }).auth?.mcp_server_url;
+      return typeof url === "string" && normalizeMcpUrlForMatch(url) === target;
+    });
+  const authType = (credential as unknown as { auth?: { type?: string } } | undefined)?.auth?.type;
+  await sessionRouter.appendEvent(sessionId, {
+    type: "system.saved_login_attached",
+    id: generateEventId(),
+    request_id: `acreq-${generateEventId().replace(/^sevt-/, "")}`,
+    service: login.service,
+    mcp_server_url: login.mcpServerUrl,
+    vault_id: login.vaultId,
+    vault_name: vault?.name ?? login.vaultId,
+    agent_name: agent?.name ?? "",
+    can_switch: authType === "mcp_oauth",
+  } as SessionEvent);
+}
+
+/** Vault id holding a WORKING credential bound to `mcpServerUrl`, or null.
+ *  Setup uses it to skip the connect card for a server the workspace already
+ *  authorized (e.g. Sentry connected by an earlier agent) and just attach
+ *  that vault. With `agentId`, that agent's own choice is checked first — the
+ *  vault it's bound to for this server, then its other attached vaults — so
+ *  a switched account stays switched; the rest of the tenant's vaults are the
+ *  fallback. "Working" is verified live: the token is probed, expired OAuth
+ *  tokens are refreshed (and persisted) first, and a credential the provider
+ *  rejects does NOT count — the card is posted instead and the OAuth callback
+ *  upserts the row. */
+async function findCredentialVaultForUrl(
+  tenantId: string,
+  mcpServerUrl: string,
+  agentId?: string,
+): Promise<string | null> {
   const target = normalizeMcpUrlForMatch(mcpServerUrl);
   if (!target) return null;
   const vaults = await vaultService.list({ tenantId, includeArchived: false }).catch(() => []);
   const vaultIds = vaults.map((v) => v.id);
   if (vaultIds.length === 0) return null;
   const grouped = await credentialService.listByVaults({ tenantId, vaultIds }).catch(() => []);
-  for (const group of grouped) {
+  const agent = agentId ? await agentsService.get({ tenantId, agentId }).catch(() => null) : null;
+  const attached = agentDefaultVaultIds(agent);
+  // A binding to a vault the user has since removed from the agent no longer counts.
+  const bound = boundVaultId(agent?.metadata, mcpServerUrl);
+  const preferred = bound && attached.includes(bound) ? [bound, ...attached] : attached;
+  for (const group of preferVaults(grouped, preferred)) {
     for (const cred of group.credentials) {
       if ((cred as { archived_at?: string | null }).archived_at) continue;
       const auth = (cred as unknown as { auth?: Record<string, unknown> }).auth ?? {};
@@ -2701,7 +2778,7 @@ async function recordAccessGrant(grant: GrantNotification): Promise<void> {
 
   if (session.agent_id) {
     try {
-      await attachVaultToAgent(grant.tenantId, session.agent_id, grant.vaultId);
+      await attachVaultToAgent(grant.tenantId, session.agent_id, grant.vaultId, grant.mcpServerUrl);
     } catch (err) {
       logger.warn(
         { err, op: "oauth.grant_vault_graft_failed", session_id: grant.sessionId },
@@ -3795,9 +3872,13 @@ async function resolveNodeMcpProxyTarget(
   const vaultIds = session.vault_ids ?? [];
   if (vaultIds.length === 0) return null;
 
-  const grouped = await credentialService
+  const listed = await credentialService
     .listByVaults({ tenantId, vaultIds })
     .catch(() => []);
+  // First match wins below, so the vault this agent is bound to for this
+  // server (Switch account, the saved-login line) has to come first.
+  const bound = boundVaultId(agent?.metadata, server.url);
+  const grouped = bound ? preferVaults(listed, [bound]) : listed;
   const composioCandidates: NodeMcpProxyTarget[] = [];
   for (const group of grouped) {
     for (const credential of group.credentials) {

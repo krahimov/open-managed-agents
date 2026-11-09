@@ -150,9 +150,17 @@ export interface ClaudeAgentSdkHarnessDeps {
   ) => Promise<{ request_id: string; status: string; note?: string }>;
   /** Vault holding an active credential for an MCP server URL (setup:
    *  lets update_harness attach the vault instead of posting a card). */
-  findCredentialVault?: (tenantId: string, mcpServerUrl: string) => Promise<string | null>;
-  /** Attach a vault to an agent's default vaults (idempotent). */
-  attachVaultToAgent?: (tenantId: string, agentId: string, vaultId: string) => Promise<void>;
+  findCredentialVault?: (tenantId: string, mcpServerUrl: string, agentId?: string) => Promise<string | null>;
+  /** Attach a vault to an agent's default vaults (idempotent) and make it the
+   *  one the agent uses for `mcpServerUrl`. */
+  attachVaultToAgent?: (tenantId: string, agentId: string, vaultId: string, mcpServerUrl?: string) => Promise<void>;
+  /** Post the "using the saved login from <vault>" line for an attached vault. */
+  reportSavedLogin?: (
+    tenantId: string,
+    sessionId: string,
+    agentId: string,
+    login: { service: string; mcpServerUrl: string; vaultId: string },
+  ) => Promise<void>;
   /** Setup sessions: reconcile the servers already on the harness (cards /
    *  vault attach) once and return the status block for the preamble. */
   setupAccessStatus?: (
@@ -359,10 +367,13 @@ export class ClaudeAgentSdkHarness {
           const auto = await autoRequestAccessForNewServers(before.mcp_servers, after.mcp_servers, {
             requestAccess: (a) => this.#deps.requestServiceAccess!(tenantId, sessionId, a),
             findCredentialVault: this.#deps.findCredentialVault
-              ? (url) => this.#deps.findCredentialVault!(tenantId, url)
+              ? (url) => this.#deps.findCredentialVault!(tenantId, url, agentId)
               : undefined,
             attachVault: this.#deps.attachVaultToAgent
-              ? (vaultId) => this.#deps.attachVaultToAgent!(tenantId, agentId, vaultId)
+              ? (vaultId, url) => this.#deps.attachVaultToAgent!(tenantId, agentId, vaultId, url)
+              : undefined,
+            reportSavedLogin: this.#deps.reportSavedLogin
+              ? (login) => this.#deps.reportSavedLogin!(tenantId, sessionId, agentId, login)
               : undefined,
           });
           const line = describeAutoAccess(auto);

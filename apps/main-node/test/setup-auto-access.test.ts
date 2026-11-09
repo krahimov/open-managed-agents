@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
   autoRequestAccessForNewServers,
+  boundVaultId,
   describeAutoAccess,
   newlyAddedMcpServers,
+  preferVaults,
+  withVaultBinding,
 } from "../src/lib/setup-harness";
 
 // update_harness must post connect cards for newly added MCP servers ITSELF.
@@ -30,6 +33,32 @@ describe("newlyAddedMcpServers", () => {
   it("handles undefined before/after", () => {
     expect(newlyAddedMcpServers(undefined, undefined)).toEqual([]);
     expect(newlyAddedMcpServers(undefined, [slack])).toEqual([{ name: "slack", url: slack.url }]);
+  });
+});
+
+describe("per-server vault bindings", () => {
+  it("round-trips a binding across URL spellings and keeps other servers' bindings", () => {
+    const first = { mcp_vault_bindings: withVaultBinding({}, sentry.url, "vlt-a") };
+    const both = { mcp_vault_bindings: withVaultBinding(first, "https://MCP.linear.app/mcp/", "vlt-b") };
+    expect(boundVaultId(both, sentry.url)).toBe("vlt-a");
+    expect(boundVaultId(both, linear.url)).toBe("vlt-b");
+    expect(boundVaultId(both, slack.url)).toBeNull();
+  });
+  it("rebinding a server replaces its vault", () => {
+    const first = { mcp_vault_bindings: withVaultBinding({}, linear.url, "vlt-a") };
+    const next = { mcp_vault_bindings: withVaultBinding(first, linear.url, "vlt-b") };
+    expect(boundVaultId(next, linear.url)).toBe("vlt-b");
+  });
+  it("treats missing or malformed metadata as unbound", () => {
+    expect(boundVaultId(undefined, linear.url)).toBeNull();
+    expect(boundVaultId({ mcp_vault_bindings: "nope" }, linear.url)).toBeNull();
+    expect(boundVaultId({ mcp_vault_bindings: { [linear.url]: 7 } }, linear.url)).toBeNull();
+  });
+  it("puts preferred vaults first, in order, and keeps the rest stable", () => {
+    const groups = ["a", "b", "c", "d"].map((vault_id) => ({ vault_id }));
+    expect(preferVaults(groups, ["c", "b"]).map((g) => g.vault_id)).toEqual(["c", "b", "a", "d"]);
+    expect(preferVaults(groups, []).map((g) => g.vault_id)).toEqual(["a", "b", "c", "d"]);
+    expect(preferVaults(groups, ["gone"]).map((g) => g.vault_id)).toEqual(["a", "b", "c", "d"]);
   });
 });
 
@@ -70,6 +99,32 @@ describe("autoRequestAccessForNewServers", () => {
     expect(attached).toEqual(["vlt-connected"]);
     expect(r.connected).toEqual(["sentry"]);
     expect(describeAutoAccess(r)).toContain("Already connected via an existing vault credential (vault attached): sentry");
+  });
+
+  it("binds the attached vault to the server and reports which login it used", async () => {
+    const attached: Array<[string, string]> = [];
+    const reported: unknown[] = [];
+    await autoRequestAccessForNewServers([], [sentry], {
+      requestAccess: async () => ({ request_id: "x", status: "pending" }),
+      findCredentialVault: async () => "vlt-connected",
+      attachVault: async (id, url) => void attached.push([id, url]),
+      reportSavedLogin: async (login) => void reported.push(login),
+    });
+    expect(attached).toEqual([["vlt-connected", sentry.url]]);
+    expect(reported).toEqual([{ service: "sentry", mcpServerUrl: sentry.url, vaultId: "vlt-connected" }]);
+  });
+
+  it("keeps a working connection when the saved-login line can't be posted", async () => {
+    const r = await autoRequestAccessForNewServers([], [sentry], {
+      requestAccess: async () => ({ request_id: "x", status: "pending" }),
+      findCredentialVault: async () => "vlt-connected",
+      attachVault: async () => {},
+      reportSavedLogin: async () => {
+        throw new Error("router down");
+      },
+    });
+    expect(r.connected).toEqual(["sentry"]);
+    expect(r.failed).toEqual([]);
   });
 
   it("reports servers whose card could not be posted instead of throwing", async () => {
