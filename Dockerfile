@@ -19,7 +19,14 @@ RUN corepack enable
 
 WORKDIR /app
 COPY . .
-RUN pnpm install --frozen-lockfile
+# better-sqlite3 downloads a prebuilt binary from GitHub during install and
+# falls back to compiling from source, which this image can't do (no
+# python/make/g++). A timed-out download failed a prod deploy, so retry
+# the install rather than ship a compiler toolchain in the runtime image.
+RUN for attempt in 1 2 3; do \
+      pnpm install --frozen-lockfile && exit 0; \
+      echo "pnpm install failed (attempt $attempt), retrying" >&2; sleep $((attempt * 15)); \
+    done; exit 1
 
 # Console is a Vite build — VITE_* vars are baked in at BUILD time, not
 # read at runtime. Railway exposes service variables to Dockerfile builds
