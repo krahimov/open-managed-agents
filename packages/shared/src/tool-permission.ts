@@ -190,8 +190,33 @@ export function resolveConfirmedToolCall<T>(
   return { tool: lookupBuilt(built, name), name, input };
 }
 
-type ParkableEvent = { type: string; id?: string; name?: string; input?: unknown };
+type ParkableEvent = {
+  type: string;
+  id?: string;
+  name?: string;
+  input?: unknown;
+  tool_use_id?: string;
+  mcp_tool_use_id?: string;
+  custom_tool_use_id?: string;
+  cancelled_at_ms?: number | null;
+};
 const PARKABLE_TYPES = new Set(["agent.tool_use", "agent.mcp_tool_use", "agent.custom_tool_use"]);
+
+/** Ids of tool uses that already have a result in `events` — same pairing
+ *  as findUnresolvedToolUses (session-runtime/tool-actions.ts). */
+function resolvedToolUseIds(events: readonly ParkableEvent[]): Set<string> {
+  const done = new Set<string>();
+  for (const e of events) {
+    if (e.cancelled_at_ms != null) continue;
+    const id =
+      e.type === "agent.tool_result" ? e.tool_use_id
+      : e.type === "agent.mcp_tool_result" ? e.mcp_tool_use_id
+      : e.type === "user.custom_tool_result" ? e.custom_tool_use_id
+      : undefined;
+    if (typeof id === "string") done.add(id);
+  }
+  return done;
+}
 
 /**
  * A delegated (sub-agent) run that stopped on calls only a user could
@@ -199,7 +224,9 @@ const PARKABLE_TYPES = new Set(["agent.tool_use", "agent.mcp_tool_use", "agent.c
  * no requires_action path, so those calls would sit unresolved forever and
  * the delegation would come back empty. Returns the parked tool_use events
  * (to close out) and the notice the delegating agent gets instead, or null
- * when nothing parked.
+ * when nothing parked. A pending id that already has a result (a sibling
+ * call whose tool threw is pending to the harness but has its is_error
+ * result in the log) ran — it is neither closed again nor named.
  */
 export function subAgentParkedCalls(
   events: readonly ParkableEvent[],
@@ -207,8 +234,16 @@ export function subAgentParkedCalls(
 ): { parked: Array<{ id: string; type: string; name: string }>; notice: string } | null {
   if (!pendingIds.length) return null;
   const ids = new Set(pendingIds);
+  const resolved = resolvedToolUseIds(events);
   const parked = events
-    .filter((e): e is ParkableEvent & { id: string } => PARKABLE_TYPES.has(e.type) && typeof e.id === "string" && ids.has(e.id))
+    .filter(
+      (e): e is ParkableEvent & { id: string } =>
+        PARKABLE_TYPES.has(e.type) &&
+        e.cancelled_at_ms == null &&
+        typeof e.id === "string" &&
+        ids.has(e.id) &&
+        !resolved.has(e.id),
+    )
     .map((e) => {
       const target = e.name === CALL_MCP_TOOL_NAME ? (e.input as { name?: unknown } | undefined)?.name : undefined;
       return { id: e.id, type: e.type, name: typeof target === "string" ? target : e.name ?? "tool" };

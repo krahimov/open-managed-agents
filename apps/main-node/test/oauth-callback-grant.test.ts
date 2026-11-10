@@ -150,6 +150,48 @@ describe("oauth callback grant recording", () => {
     expect(html).toContain('"service":"sentry"');
   });
 
+  /** Run the success page's script in a stand-in browser window. */
+  function runCallbackScript(html: string, opener: unknown) {
+    const script = /<script>([\s\S]*?)<\/script>/.exec(html)![1]!;
+    const win = { opener, close: vi.fn(), location: { href: "" } };
+    const posted: unknown[] = [];
+    class FakeChannel {
+      postMessage(m: unknown) { posted.push(m); }
+      close() {}
+    }
+    new Function("window", "BroadcastChannel", script)(win, FakeChannel);
+    return { win, posted };
+  }
+
+  it("oma connect: the success page still navigates to the CLI's localhost redirect after broadcasting", async () => {
+    stubUpstreams();
+    const f = fakeServices({ ...baseState, redirect_uri: "http://localhost:19300/callback" });
+    const res = await mount(buildNodeOAuthRoutes({ services: f.services as never })).request(
+      "https://api.example/v1/oauth/callback?code=abc&state=st1",
+    );
+    expect(res.status).toBe(200);
+    // OS-opened tab: no opener, BroadcastChannel available (every modern browser).
+    const { win, posted } = runCallbackScript(await res.text(), null);
+    expect(posted).toHaveLength(1);
+    expect(win.close).not.toHaveBeenCalled();
+    const to = new URL(win.location.href);
+    expect(`${to.origin}${to.pathname}`).toBe("http://localhost:19300/callback");
+    expect(to.searchParams.get("oauth")).toBe("success");
+  });
+
+  it("console popup: the success page notifies and closes instead of navigating", async () => {
+    stubUpstreams();
+    const f = fakeServices(baseState);
+    const res = await mount(buildNodeOAuthRoutes({ services: f.services as never })).request(
+      "https://api.example/v1/oauth/callback?code=abc&state=st1",
+    );
+    const opener = { closed: false, postMessage: vi.fn() };
+    const { win } = runCallbackScript(await res.text(), opener);
+    expect(opener.postMessage).toHaveBeenCalledTimes(1);
+    expect(win.close).toHaveBeenCalledTimes(1);
+    expect(win.location.href).toBe("");
+  });
+
   it("saves a switched account in a new vault and never touches the shared one", async () => {
     stubUpstreams();
     const grants: GrantNotification[] = [];
@@ -301,15 +343,36 @@ describe("oauth callback is bound to the initiator", () => {
     );
   }
 
+  const startQuery = "mcp_server_url=https%3A%2F%2Fmcp.sentry.dev%2Fmcp&vault_id=vlt-1";
+
+  /** POST /start-token as the console does (fetch, JSON, same-origin). */
+  async function mintToken(
+    routes: ReturnType<typeof buildNodeOAuthRoutes>,
+    vars: Record<string, string>,
+    query = startQuery,
+    headers: Record<string, string> = { "content-type": "application/json", "sec-fetch-site": "same-origin" },
+  ) {
+    return mount(routes, vars).request("https://api.example/v1/oauth/start-token", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ query }),
+    });
+  }
+
   /** Start a flow as `vars` and return what the browser walks away with. */
   async function start(vars: Record<string, string>) {
     const f = fakeServices(baseState);
     f.kv.delete("oauth_state:st1");
     const routes = buildNodeOAuthRoutes({ services: f.services as never });
-    const res = await mount(routes, vars).request(
-      "https://api.example/v1/oauth/authorize?mcp_server_url=https://mcp.sentry.dev/mcp&vault_id=vlt-1",
-      { headers: { "sec-fetch-site": "same-origin" } },
-    );
+    let url = `https://api.example/v1/oauth/authorize?${startQuery}`;
+    if (vars.auth_type === "session") {
+      const minted = await mintToken(routes, vars);
+      expect(minted.status).toBe(200);
+      url += `&oauth_confirm=${encodeURIComponent(((await minted.json()) as { token: string }).token)}`;
+    }
+    const res = await mount(routes, vars).request(url, {
+      headers: { "sec-fetch-site": "same-origin", "sec-fetch-dest": "document" },
+    });
     expect(res.status).toBe(302);
     const state = new URL(res.headers.get("location")!).searchParams.get("state")!;
     const setCookie = res.headers.get("set-cookie");
@@ -421,11 +484,75 @@ describe("oauth callback is bound to the initiator", () => {
     expect(crossSite.status).toBe(403);
     expect(crossSite.headers.get("set-cookie")).toBeNull();
     expect((await mount(routes, alice).request(url, { headers: { "sec-fetch-site": "same-site" } })).status).toBe(403);
-    // The console popup (same-origin) still starts.
-    expect((await mount(routes, alice).request(url, { headers: { "sec-fetch-site": "same-origin" } })).status).toBe(302);
     // API-key starts aren't browser navigations; the header doesn't apply.
     const viaKey = { tenant_id: "t1", user_id: "alice", auth_type: "api_key" };
     expect((await mount(routes, viaKey).request(url, { headers: { "sec-fetch-site": "cross-site" } })).status).toBe(302);
+  });
+
+  describe("same-origin is not proof the console started it (agent-written links in chat)", () => {
+    const url = `https://api.example/v1/oauth/authorize?mcp_server_url=https://evil.example/mcp&new_vault_name=r&session_id=s1`;
+
+    it("a same-origin link click without a start token gets the confirm page, never a 302", async () => {
+      stubAll();
+      const f = fakeServices(baseState);
+      f.kv.delete("oauth_state:st1");
+      const routes = buildNodeOAuthRoutes({ services: f.services as never });
+      const res = await mount(routes, alice).request(url, {
+        headers: { "sec-fetch-site": "same-origin", "sec-fetch-dest": "document" },
+      });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("set-cookie")).toBeNull();
+      expect(await res.text()).toContain("Connect evil.example?");
+      expect([...f.kv.keys()].some((k) => k.startsWith("oauth_state:"))).toBe(false);
+    });
+
+    it("an <img>, fetch or iframe request to /authorize is refused outright", async () => {
+      stubAll();
+      const f = fakeServices(baseState);
+      f.kv.delete("oauth_state:st1");
+      const routes = buildNodeOAuthRoutes({ services: f.services as never });
+      for (const dest of ["image", "empty", "iframe"]) {
+        const res = await mount(routes, alice).request(url, {
+          headers: { "sec-fetch-site": "same-origin", "sec-fetch-dest": dest },
+        });
+        expect(res.status).toBe(403);
+      }
+      // No confirm token was minted for any of them either.
+      expect([...f.kv.keys()].some((k) => k.startsWith("oauth_start:") || k.startsWith("oauth_state:"))).toBe(false);
+    });
+
+    it("the console's fetch-minted token starts the flow once, for that exact query only", async () => {
+      stubAll();
+      const routes = buildNodeOAuthRoutes({ services: fakeServices(baseState).services as never });
+      // Param order doesn't matter; the token is bound to the parameters.
+      const minted = await mintToken(routes, alice, "vault_id=vlt-1&mcp_server_url=https%3A%2F%2Fmcp.sentry.dev%2Fmcp");
+      expect(minted.status).toBe(200);
+      expect(minted.headers.get("cache-control")).toBe("no-store");
+      const { token } = (await minted.json()) as { token: string };
+      const go = `https://api.example/v1/oauth/authorize?${startQuery}&oauth_confirm=${encodeURIComponent(token)}`;
+      expect((await mount(routes, alice).request(go, { headers: { "sec-fetch-site": "same-origin" } })).status).toBe(302);
+      expect((await mount(routes, alice).request(go, { headers: { "sec-fetch-site": "same-origin" } })).status).toBe(403);
+
+      const other = (await (await mintToken(routes, alice)).json()) as { token: string };
+      const swapped = `https://api.example/v1/oauth/authorize?mcp_server_url=https%3A%2F%2Fevil.example%2Fmcp&vault_id=vlt-1&oauth_confirm=${encodeURIComponent(other.token)}`;
+      expect((await mount(routes, alice).request(swapped)).status).toBe(403);
+      const mallory = { tenant_id: "t1", user_id: "mallory", auth_type: "session" };
+      const forAlice = (await (await mintToken(routes, alice)).json()) as { token: string };
+      expect((await mount(routes, mallory).request(
+        `https://api.example/v1/oauth/authorize?${startQuery}&oauth_confirm=${encodeURIComponent(forAlice.token)}`,
+      )).status).toBe(403);
+    });
+
+    it("start tokens are minted only for a same-origin JSON POST from a console session", async () => {
+      const routes = buildNodeOAuthRoutes({ services: fakeServices(baseState).services as never });
+      expect((await mintToken(routes, alice, startQuery, { "content-type": "application/json", "sec-fetch-site": "cross-site" })).status).toBe(403);
+      expect((await mintToken(routes, alice, startQuery, { "content-type": "application/json", "sec-fetch-site": "same-site" })).status).toBe(403);
+      expect((await mintToken(routes, alice, startQuery, { "content-type": "text/plain", "sec-fetch-site": "same-origin" })).status).toBe(415);
+      expect((await mintToken(routes, alice, "vault_id=vlt-1")).status).toBe(400);
+      expect((await mintToken(routes, { tenant_id: "t1", user_id: "alice", auth_type: "api_key" })).status).toBe(400);
+      // A browser without Sec-Fetch-* headers can still mint.
+      expect((await mintToken(routes, alice, startQuery, { "content-type": "application/json" })).status).toBe(200);
+    });
   });
 
   describe("a start with no web initiator (Sec-Fetch-Site none / missing) must be confirmed", () => {

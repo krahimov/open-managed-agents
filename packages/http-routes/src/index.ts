@@ -48,6 +48,8 @@ export {
   bindOAuthInitiator,
   gateOAuthStart,
   inlineScriptJson,
+  isLoopbackRedirect,
+  mintOAuthStartToken,
   verifyOAuthInitiator,
   OAUTH_START_CONFIRM_PARAM,
   OAUTH_STATE_TTL_SECONDS,
@@ -58,6 +60,7 @@ export type {
   OAuthInitiatorCheck,
   OAuthStartGate,
   OAuthStartKv,
+  OAuthStartTokenResult,
 } from "./oauth-initiator";
 export type {
   ApiKeyRoutesDeps,

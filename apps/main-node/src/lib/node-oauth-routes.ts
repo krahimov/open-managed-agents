@@ -4,6 +4,8 @@ import {
   bindOAuthInitiator,
   gateOAuthStart,
   inlineScriptJson,
+  isLoopbackRedirect,
+  mintOAuthStartToken,
   verifyOAuthInitiator,
   OAUTH_STATE_TTL_SECONDS,
   type OAuthInitiator,
@@ -112,6 +114,18 @@ type NodeOAuthVars = {
 
 export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthVars> {
   const app = new Hono<NodeOAuthVars>();
+
+  // One-time start token for the console's popup (see gateOAuthStart).
+  app.post("/start-token", async (c) => {
+    const r = await mintOAuthStartToken(c, {
+      authType: c.get("auth_type"),
+      tenantId: c.get("tenant_id"),
+      userId: c.get("user_id"),
+      kv: deps.services.kv,
+    });
+    if (!r.ok) return c.json({ error: r.message }, r.status);
+    return c.json({ token: r.token, expires_in: r.expires_in }, 200, { "Cache-Control": "no-store" });
+  });
 
   app.get("/authorize", async (c) => {
     const mcpServerUrl = c.req.query("mcp_server_url");
@@ -513,7 +527,8 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
             bc.close();
             notified = true;
           } catch (e) {}
-          if (notified) window.close();
+          // oma connect: only a hit on its localhost /callback ends the CLI's wait.
+          if (notified && !${inlineScriptJson(isLoopbackRedirect(oauthState.redirect_uri))}) window.close();
           else window.location.href = ${inlineScriptJson(redirectUrl.toString())};
         })();
       </script>

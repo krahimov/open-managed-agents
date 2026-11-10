@@ -317,6 +317,25 @@ describe("sub-agent parked calls (CF runSubAgent has no requires_action path)", 
     expect(subAgentParkedCalls(events, [])).toBeNull();
     expect(subAgentParkedCalls(events, ["unknown"])).toBeNull();
   });
+
+  it("skips pending ids that already have a result (a sibling that threw ran; it isn't parked)", () => {
+    const events = [
+      { type: "agent.tool_use", id: "toolu_M", name: "call_mcp_tool", input: { name: "mcp__linear__create_issue" } },
+      { type: "agent.tool_use", id: "toolu_E", name: "t0", input: {} },
+      { type: "agent.tool_result", tool_use_id: "toolu_E", content: "Error: boom", is_error: true },
+      { type: "agent.mcp_tool_use", id: "c_mcp", name: "mcp__github__get", input: {} },
+      { type: "agent.mcp_tool_result", mcp_tool_use_id: "c_mcp", content: [] },
+      { type: "agent.custom_tool_use", id: "c_custom", name: "pick_file", input: {} },
+      { type: "user.custom_tool_result", custom_tool_use_id: "c_custom", content: [] },
+      { type: "agent.tool_use", id: "c_cancelled", name: "bash", input: {}, cancelled_at_ms: 1 },
+    ];
+    const out = subAgentParkedCalls(events, ["toolu_M", "toolu_E", "c_mcp", "c_custom", "c_cancelled"])!;
+    expect(out.parked).toEqual([{ id: "toolu_M", type: "agent.tool_use", name: "mcp__linear__create_issue" }]);
+    expect(out.notice).toMatch(/^\[sub-agent stopped\] mcp__linear__create_issue needs/);
+    expect(out.notice).not.toContain("t0");
+    // Every pending call already resolved (e.g. a step-limit stop on a step whose call threw) → nothing parked.
+    expect(subAgentParkedCalls(events, ["toolu_E"])).toBeNull();
+  });
 });
 
 describe("DefaultHarness parks a gated call_mcp_tool end to end", () => {
@@ -378,6 +397,64 @@ describe("DefaultHarness parks a gated call_mcp_tool end to end", () => {
     expect(runtime.pendingConfirmations).toEqual(["toolu_M"]);
     expect(events.some((e) => e.type === "agent.tool_result" && e.tool_use_id === "toolu_M")).toBe(false);
     expect(ran).not.toHaveBeenCalled();
+  });
+
+  it("a parallel sibling that threw has its error result and is not pending; a sub-agent closes only the parked call", async () => {
+    const { MockLanguageModelV3 } = await import("ai/test");
+    const { DefaultHarness } = await import("@open-managed-agents/agent/harness/default-loop");
+    const usage = { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 1, text: 1, reasoning: 0 } };
+    const finish = (unified: string) => ({ type: "finish", finishReason: { unified, raw: unified }, usage });
+    const stream = (parts: unknown[]) => new ReadableStream({ start(c) { parts.forEach((p) => c.enqueue(p)); c.close(); } });
+    let modelCalls = 0;
+    const model = new MockLanguageModelV3({
+      provider: "openai.chat",
+      doStream: async () => ({
+        stream: stream(++modelCalls === 1
+          ? [
+              { type: "stream-start", warnings: [] },
+              { type: "tool-call", toolCallId: "toolu_M", toolName: CALL_TOOL_NAME, input: JSON.stringify({ name: "mcp__linear__create_issue", arguments: { title: "Bug" } }) },
+              { type: "tool-call", toolCallId: "toolu_E", toolName: "t0", input: "{}" },
+              finish("tool-calls"),
+            ]
+          : [{ type: "stream-start", warnings: [] }, finish("stop")]),
+      }) as never,
+    });
+
+    const ran = vi.fn(async () => "ran");
+    const tools: ToolSet = {};
+    tools.t0 = tool({ inputSchema: z.object({}), execute: async () => { throw new Error("boom"); } });
+    for (let i = 1; i < 126; i++) tools[`t${i}`] = tool({ inputSchema: z.object({}), execute: ran });
+    tools.mcp__linear__create_issue = tool({ description: "Create a Linear issue", inputSchema: z.object({ title: z.string() }) });
+    tools.mcp__linear__list_issues = tool({ description: "List Linear issues", inputSchema: z.object({}), execute: ran });
+    tools.mcp__linear__get_team = tool({ description: "Get a Linear team", inputSchema: z.object({}), execute: ran });
+
+    const events: Array<Record<string, any>> = [{ type: "user.message", content: [{ type: "text", text: "file it" }] }];
+    const noop = vi.fn(async () => {});
+    const runtime = {
+      history: { getEvents: () => events.slice() },
+      broadcast: vi.fn((e: Record<string, any>) => void events.push(e)),
+      persist: vi.fn(async (e: Record<string, any>) => void events.push(e)),
+      broadcastStreamStart: noop, broadcastStreamEnd: noop, broadcastChunk: noop,
+      broadcastThinkingStart: noop, broadcastThinkingChunk: noop, broadcastThinkingEnd: noop,
+      broadcastToolInputStart: noop, broadcastToolInputChunk: noop, broadcastToolInputEnd: noop,
+      pendingConfirmations: [] as string[],
+    };
+    await new DefaultHarness().run({
+      agent: { id: "agent-test", model: "gpt-test", tools: [], mcp_servers: [{ name: "linear", type: "url", url: "https://mcp.linear.app/mcp" }] },
+      model, systemPrompt: "Test", env: {}, session_id: "sess-1",
+      userMessage: { type: "user.message", content: [{ type: "text", text: "file it" }] },
+      tools, runtime,
+    } as never);
+
+    // t0 ran and its error is in the log.
+    expect(events.filter((e) => e.type === "agent.tool_result" && e.tool_use_id === "toolu_E")).toHaveLength(1);
+    expect(events.find((e) => e.type === "agent.tool_result" && e.tool_use_id === "toolu_E")).toMatchObject({ is_error: true });
+    // Only the approval-gated call is pending.
+    expect(runtime.pendingConfirmations).toEqual(["toolu_M"]);
+    // Even handed a stale pending list that includes it, the sub-agent closer skips t0.
+    const stuck = subAgentParkedCalls(events as never, ["toolu_M", "toolu_E"])!;
+    expect(stuck.parked.map((p) => p.id)).toEqual(["toolu_M"]);
+    expect(stuck.notice).not.toContain("t0");
   });
 });
 

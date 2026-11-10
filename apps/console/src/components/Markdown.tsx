@@ -13,6 +13,7 @@ import javascript from "highlight.js/lib/languages/javascript";
 import plaintext from "highlight.js/lib/languages/plaintext";
 import { SessionLink } from "./SessionFiles";
 import { resolveOutputLink } from "../lib/session-outputs";
+import { isOwnOAuthUrl } from "../lib/markdown-urls";
 
 /**
  * Hand-rolled syntax highlighting registry. Replaces rehype-highlight,
@@ -47,10 +48,16 @@ const jsxRuntime = { Fragment, jsx, jsxs } as Parameters<typeof toJsxRuntime>[1]
 
 const REMARK_PLUGINS = [remarkGfm];
 
+/** Never a live link or image to our own OAuth routes: Markdown here is
+ *  untrusted (agent output), and a click would start a sign-in flow. */
+function dropOAuthUrls(url: string): string | null {
+  return isOwnOAuthUrl(url, window.location.origin) ? null : defaultUrlTransform(url);
+}
+
 /** react-markdown blanks hrefs with unknown protocols; keep the ones that
  *  name a sandbox path so SessionLink can turn them into downloads. */
-function keepSandboxUrls(url: string): string {
-  return /^(sandbox|file):/i.test(url) ? url : defaultUrlTransform(url);
+function keepSandboxUrls(url: string): string | null {
+  return /^(sandbox|file):/i.test(url) ? url : dropOAuthUrls(url);
 }
 
 /**
@@ -150,7 +157,7 @@ export function Markdown({
   return (
     <ReactMarkdown
       remarkPlugins={REMARK_PLUGINS}
-      {...(sessionId ? { urlTransform: keepSandboxUrls } : {})}
+      urlTransform={sessionId ? keepSandboxUrls : dropOAuthUrls}
       components={components}
     >
       {children}

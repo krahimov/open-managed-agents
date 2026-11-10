@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router";
 import type { Event } from "../lib/events";
+import { openOAuthPopup } from "../lib/oauth-popup";
 
 /**
  * Setup attached a saved login instead of asking (system.saved_login_attached):
@@ -87,11 +88,7 @@ export function SavedLoginLine({
     });
     if (sessionId) params.set("session_id", sessionId);
     if (ev.request_id) params.set("request_id", ev.request_id);
-    const popup = window.open(
-      `/v1/oauth/authorize?${params.toString()}`,
-      `oauth-${service}`,
-      "width=600,height=700,popup=yes",
-    );
+    const popup = openOAuthPopup(params, `oauth-${service}`);
     if (!popup) {
       setError("Your browser blocked the sign-in window. Allow popups for this site and try again.");
       return;

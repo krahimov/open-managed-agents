@@ -1163,6 +1163,13 @@ export class DefaultHarness implements HarnessInterface {
       // final empty step failed the whole work item). Only classify as
       // silent_stop when the ENTIRE turn shipped nothing.
       const steps = await r.steps;
+      // toolResults holds only tool-result parts; a call whose execute threw
+      // is a tool-error part — it ran and already has its is_error result,
+      // so it must not be reported as awaiting confirmation.
+      const toolErrorIds: string[] = [];
+      for (const part of (steps[steps.length - 1]?.content ?? []) as Array<{ type?: string; toolCallId?: string }>) {
+        if (part?.type === "tool-error" && typeof part.toolCallId === "string") toolErrorIds.push(part.toolCallId);
+      }
       const turnShippedNothing = steps.every(
         (s) =>
           (!s.text || s.text.trim().length === 0)
@@ -1206,7 +1213,7 @@ export class DefaultHarness implements HarnessInterface {
           `model_stream_error: ${lastStreamErrorMessage ?? "provider stream ended in error with no output"}`,
         );
       }
-      return { finishReason, text: finalText, toolCalls, toolResults, usage };
+      return { finishReason, text: finalText, toolCalls, toolResults, toolErrorIds, usage };
       } catch (err) {
         // Boundary: streamText + the read awaits above (finishReason /
         // text / toolCalls / usage) are the LLM-provider edge. Native
@@ -1232,7 +1239,11 @@ export class DefaultHarness implements HarnessInterface {
     // 8. Detect pending tool confirmations and custom tool results
     if (result.toolCalls?.length) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const resultedIds = new Set((result.toolResults as any[])?.map((r: any) => r.toolCallId) ?? []);
+      const resultedIds = new Set([
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        ...((result.toolResults as any[])?.map((r: any) => r.toolCallId) ?? []),
+        ...(result.toolErrorIds ?? []),
+      ]);
       const pending = result.toolCalls
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         .filter((c: any) => !resultedIds.has(c.toolCallId))

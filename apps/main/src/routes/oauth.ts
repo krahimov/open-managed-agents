@@ -7,6 +7,8 @@ import {
   bindOAuthInitiator,
   gateOAuthStart,
   inlineScriptJson,
+  isLoopbackRedirect,
+  mintOAuthStartToken,
   verifyOAuthInitiator,
   OAUTH_STATE_TTL_SECONDS,
   type OAuthInitiator,
@@ -278,6 +280,21 @@ interface OAuthState {
 }
 
 // ─── Routes ───
+
+/**
+ * POST /v1/oauth/start-token — one-time start token for the console's
+ * popup; /authorize without one shows a confirm page (gateOAuthStart).
+ */
+app.post("/start-token", async (c) => {
+  const r = await mintOAuthStartToken(c, {
+    authType: c.get("auth_type"),
+    tenantId: c.get("tenant_id"),
+    userId: c.get("user_id"),
+    kv: c.var.services.kv,
+  });
+  if (!r.ok) return c.json({ error: r.message }, r.status);
+  return c.json({ token: r.token, expires_in: r.expires_in }, 200, { "Cache-Control": "no-store" });
+});
 
 /**
  * GET /v1/oauth/authorize
@@ -732,7 +749,8 @@ app.get("/callback", async (c) => {
           bc.close();
           notified = true;
         } catch (e) {}
-        if (notified) {
+        // oma connect: only a hit on its localhost /callback ends the CLI's wait.
+        if (notified && !${inlineScriptJson(isLoopbackRedirect(oauthState.redirect_uri))}) {
           window.close();
         } else {
           window.location.href = ${inlineScriptJson(redirectUrl.toString())};
