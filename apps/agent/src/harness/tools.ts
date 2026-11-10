@@ -4,7 +4,7 @@ import { z } from "zod";
 import { anthropic } from "@ai-sdk/anthropic";
 import type { LanguageModel } from "ai";
 import type { AgentConfig, ToolsetConfig, CustomToolConfig, SessionEvent } from "@open-managed-agents/shared";
-import { evaluatePolicy } from "@open-managed-agents/shared";
+import { evaluatePolicy, resolveToolPermission } from "@open-managed-agents/shared";
 import type { ToMarkdownProvider } from "@open-managed-agents/markdown";
 import type { SandboxExecutor, ProcessHandle } from "./interface";
 import { nanoid } from "nanoid";
@@ -439,20 +439,13 @@ function jsonSchemaPropertyToZod(prop: Record<string, unknown>): z.ZodTypeAny {
 }
 
 /**
- * Resolve the permission policy for a given tool name from the agent config.
- * Checks per-tool config first, then falls back to default_config, then "always_allow".
+ * Resolve the permission policy for a given tool name from the agent config:
+ * the policy of the toolset the tool belongs to (mcp__<server>__* → that
+ * server's mcp_toolset), per-tool config first. See
+ * packages/shared/src/tool-permission.ts.
  */
 export function getToolPermission(agentConfig: AgentConfig, toolName: string): string {
-  for (const t of agentConfig.tools) {
-    if (t.type === "custom") continue;
-    const ts = t as ToolsetConfig;
-    // Per-tool config takes priority
-    const cfg = ts.configs?.find(c => c.name === toolName);
-    if (cfg?.permission_policy?.type) return cfg.permission_policy.type;
-    // Fall back to default config
-    if (ts.default_config?.permission_policy?.type) return ts.default_config.permission_policy.type;
-  }
-  return "always_allow";
+  return resolveToolPermission(agentConfig.tools, toolName);
 }
 
 // Exported so the evidence capability statement reports the SAME surface
@@ -466,6 +459,9 @@ export function getEnabledTools(tools: AgentConfig["tools"]): Set<string> {
 
   for (const t of tools) {
     if (t.type === "custom") continue;
+    // mcp_toolset configs name that server's tools, not built-ins — letting
+    // the first one win here could switch the whole built-in set off.
+    if (t.type.startsWith("mcp_toolset")) continue;
 
     const ts = t as ToolsetConfig;
     if (ts.configs) {

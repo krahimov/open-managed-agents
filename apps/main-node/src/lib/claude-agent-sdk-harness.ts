@@ -38,10 +38,14 @@ import {
 } from "@open-managed-agents/api-types";
 import type { AgentConfig } from "@open-managed-agents/shared";
 import {
+  OMA_BUILTINS_WITH_CC_EQUIVALENT,
+  anyToolsetAsks,
+  ccNameForOmaBuiltin,
   ccToolNameToOma,
   compileSdkDisallowedTools,
   evaluatePolicy,
   generateId,
+  resolveOwningToolsetPermission,
 } from "@open-managed-agents/shared";
 import {
   buildSetupPrompt,
@@ -225,6 +229,66 @@ export interface ClaudeAgentSdkHarnessDeps {
     sessionId: string,
     args: { skill_name: string; reason: string },
   ) => Promise<{ request_id: string; status: string; note?: string }>;
+}
+
+/**
+ * Toolset permission policies (always_ask on a toolset or one tool) for the
+ * claude-agent-sdk harness. It has no confirmation round-trip, so an
+ * always_ask tool is refused rather than run unasked — the operator asked
+ * to approve it. Resolved by the OWNING toolset (resolveOwningToolsetPermission,
+ * not the DefaultHarness's restrict-only ratchet: this path never asked, so
+ * a console agent's auto-written always_allow MCP servers keep working),
+ * and only for tools a toolset can govern: the agent's declared MCP servers
+ * and the OMA built-ins mapped onto Claude Code names (NotebookEdit counts
+ * as edit). Claude Code internals (ToolSearch, TodoWrite, …) and the
+ * platform's in-process servers (oma_setup / oma_platform) are never gated.
+ *
+ * Claude Code names MCP tools mcp__<server>__<tool> with the server name
+ * normalized to [A-Za-z0-9_-]; declared servers are matched the same way.
+ *
+ * `disallowedTools` removes always_ask built-ins statically, because
+ * permissionMode "default" auto-approves read-only built-ins (Read, Glob,
+ * Grep) without consulting canUseTool; `asks` is the per-call check for
+ * everything else (MCP tools are discovered at runtime).
+ */
+export function sdkToolsetGate(agent: Pick<AgentConfig, "tools" | "mcp_servers">): {
+  active: boolean;
+  disallowedTools: string[];
+  asks: (ccToolName: string) => boolean;
+} {
+  const normalize = (name: string) => name.replace(/[^A-Za-z0-9_-]/g, "_");
+  // CC server segment → declared OMA server name.
+  const declared = new Map<string, string>();
+  for (const s of agent.mcp_servers ?? []) {
+    declared.set(s.name, s.name);
+    if (!declared.has(normalize(s.name))) declared.set(normalize(s.name), s.name);
+  }
+  const ccAliases: Record<string, string> = { NotebookEdit: "edit", MultiEdit: "edit" };
+  const omaNameOf = (ccName: string): string | null => {
+    if (ccName.startsWith("mcp__")) {
+      // Longest declared server whose CC form prefixes the name.
+      const rest = ccName.slice("mcp__".length);
+      const match = [...declared.keys()]
+        .filter((k) => rest.startsWith(`${k}__`))
+        .sort((a, b) => b.length - a.length)[0];
+      return match ? `mcp__${declared.get(match)}__${rest.slice(match.length + 2)}` : null;
+    }
+    const oma = ccAliases[ccName] ?? ccToolNameToOma(ccName);
+    return oma !== ccName ? oma : null;
+  };
+  const asks = (ccName: string): boolean => {
+    const oma = omaNameOf(ccName);
+    return !!oma && resolveOwningToolsetPermission(agent.tools, oma) === "always_ask";
+  };
+  const disallowedTools = [
+    ...OMA_BUILTINS_WITH_CC_EQUIVALENT.filter(
+      (oma) => resolveOwningToolsetPermission(agent.tools, oma) === "always_ask",
+    ).map((oma) => ccNameForOmaBuiltin(oma)!),
+    ...Object.entries(ccAliases)
+      .filter(([, oma]) => resolveOwningToolsetPermission(agent.tools, oma) === "always_ask")
+      .map(([cc]) => cc),
+  ];
+  return { active: anyToolsetAsks(agent.tools), disallowedTools, asks };
 }
 
 /** reasoning_level → claude-agent-sdk `thinking` / `effort` options via
@@ -701,7 +765,24 @@ export class ClaudeAgentSdkHarness {
     // through until the SDK confirmation round-trip lands (plan Phase 4).
     const policy = ctx.agent.effective_policy;
     const hasPolicy = !!policy?.rules?.length;
-    const disallowedTools = compileSdkDisallowedTools(policy);
+
+    // Toolset always_ask (see sdkToolsetGate): refused per call, since this
+    // path has no confirmation round-trip.
+    const toolsetGate = sdkToolsetGate(ctx.agent);
+    const gated = hasPolicy || toolsetGate.active;
+    const disallowedTools = [
+      ...new Set([...compileSdkDisallowedTools(policy), ...toolsetGate.disallowedTools]),
+    ];
+    if (toolsetGate.disallowedTools.length > 0) {
+      // canUseTool never runs for removed tools, so say it once per turn.
+      runtime.broadcast({
+        type: "session.warning",
+        source: "tool_permission",
+        message:
+          `Not offering ${toolsetGate.disallowedTools.join(", ")}: set to always_ask, which the claude-agent-sdk ` +
+          `harness can't ask for yet. Use the default harness to approve calls, or set them to always_allow.`,
+      } as SessionEvent);
+    }
 
     try {
       const stream = query({
@@ -735,18 +816,36 @@ export class ClaudeAgentSdkHarness {
               },
           // Headless: OMA has no tool-confirmation round-trip on this path
           // yet, and the child is already scoped to a per-session workdir.
-          // With a pinned policy, bypassPermissions would skip canUseTool
-          // entirely — so policy sessions run permissionMode "default" and
-          // the callback below answers every check (deny per policy, allow
-          // otherwise), keeping the turn headless while enforcing the gate.
-          permissionMode: hasPolicy ? "default" : "bypassPermissions",
+          // With a pinned policy or an always_ask toolset, bypassPermissions
+          // would skip canUseTool entirely — so those sessions run
+          // permissionMode "default" and the callback below answers every
+          // check (deny per policy / always_ask, allow otherwise), keeping
+          // the turn headless while enforcing the gate.
+          permissionMode: gated ? "default" : "bypassPermissions",
           ...(disallowedTools.length > 0 ? { disallowedTools } : {}),
-          ...(hasPolicy
+          ...(gated
             ? {
                 canUseTool: async (
                   toolName: string,
                   input: Record<string, unknown>,
                 ) => {
+                  if (toolsetGate.asks(toolName)) {
+                    runtime.broadcast({
+                      type: "session.warning",
+                      source: "tool_permission",
+                      message:
+                        `Refused ${ccToolNameToOma(toolName)}: its toolset is always_ask and the claude-agent-sdk ` +
+                        `harness can't ask for approval yet. Use the default harness to approve calls, or set the ` +
+                        `toolset to always_allow.`,
+                    } as SessionEvent);
+                    return {
+                      behavior: "deny" as const,
+                      message:
+                        `This tool requires user approval (always_ask), which this session can't request. ` +
+                        `It was not run; tell the user it needs approval.`,
+                    };
+                  }
+                  if (!hasPolicy) return { behavior: "allow" as const, updatedInput: input };
                   const decision = evaluatePolicy(
                     policy,
                     ccToolNameToOma(toolName),

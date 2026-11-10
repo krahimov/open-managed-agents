@@ -32,7 +32,7 @@
 // hintTurnInFlight callback).
 
 import { nanoid } from "nanoid";
-import { generateEventId } from "@open-managed-agents/shared";
+import { generateEventId, resolveConfirmedToolCall } from "@open-managed-agents/shared";
 import type {
   AgentConfig,
   SessionEvent,
@@ -736,7 +736,9 @@ export class SessionStateMachine {
     // tool carries its execute function (buildTools strips it for
     // always_ask / policy-ask tools), then run exactly this call. The
     // tool_use intent is already durable (previous turn), and the result
-    // is persisted as soon as it settles.
+    // is persisted as soon as it settles. An approved call_mcp_tool runs
+    // the deferred MCP tool it names (call_mcp_tool itself only exists
+    // after per-turn tool budgeting, not in the rebuilt dict).
     let content: string;
     let isError = false;
     try {
@@ -744,9 +746,10 @@ export class SessionStateMachine {
         string,
         { execute?: (input: unknown, opts: unknown) => Promise<unknown> } | undefined
       >;
-      const execute = built?.[use.name]?.execute;
-      if (!execute) throw new Error(`tool ${use.name} is not available`);
-      const result = await execute(use.input, {
+      const target = resolveConfirmedToolCall(built, use.name, use.input);
+      const execute = target.tool?.execute;
+      if (!execute) throw new Error(`tool ${target.name} is not available`);
+      const result = await execute(target.input, {
         toolCallId: use.id,
         messages: [],
         abortSignal,

@@ -7,6 +7,7 @@ import {
   openAiReasoningEffort,
   type ReasoningLevel,
 } from "@open-managed-agents/api-types";
+import { OPENAI_MAX_TOOL_NAME, openAiSafeToolName } from "@open-managed-agents/shared";
 
 /**
  * API compatibility types:
@@ -259,7 +260,9 @@ export function resolveModel(
 // it is stable across turns: a mangled name logged into the event log
 // re-mangles to itself on history replay (already ≤64 → identity).
 
-export const OPENAI_MAX_TOOL_NAME = 64;
+// openAiSafeToolName lives in @open-managed-agents/shared so the approval
+// path (session-runtime) can map a shortened name back to its tool.
+export { OPENAI_MAX_TOOL_NAME, openAiSafeToolName };
 
 function fnv1a(s: string): number {
   let h = 0x811c9dc5;
@@ -270,14 +273,6 @@ function fnv1a(s: string): number {
   return h >>> 0;
 }
 
-/** Deterministically shorten a tool name to ≤64 chars (identity when it
- *  already fits). Collisions between distinct long names are avoided by
- *  the 7-char base36 fnv1a suffix. */
-export function openAiSafeToolName(name: string): string {
-  if (name.length <= OPENAI_MAX_TOOL_NAME) return name;
-  const suffix = fnv1a(name).toString(36).padStart(7, "0").slice(0, 7);
-  return `${name.slice(0, OPENAI_MAX_TOOL_NAME - 8)}_${suffix}`;
-}
 
 // ─── Unified reasoning-level → provider knobs ────────────────────────────
 //

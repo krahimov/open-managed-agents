@@ -37,7 +37,7 @@ import type {
   StreamRepo,
 } from "@open-managed-agents/event-log";
 import { recoverInterruptedState as runRecovery } from "./recovery";
-import { findOrphanToolUses } from "@open-managed-agents/session-runtime";
+import { findOrphanToolUses, toolResultEventFor, withAskGatesLifted } from "@open-managed-agents/session-runtime";
 import {
   RuntimeAdapterImpl,
   type RuntimeAdapter,
@@ -69,7 +69,7 @@ import type { ApiCompat } from "../harness/provider";
 import type { LanguageModel } from "ai";
 import { generateText } from "ai";
 import { extractTextFromContent, type JudgeFn } from "@open-managed-agents/shared";
-import { resolveEgressPolicy, type EgressPolicy } from "@open-managed-agents/shared";
+import { resolveEgressPolicy, resolveConfirmedToolCall, type EgressPolicy } from "@open-managed-agents/shared";
 import {
   runOutcomeSupervisor,
   type ActiveOutcomeState,
@@ -144,6 +144,9 @@ interface PendingToolCall {
   toolCallId: string;
   toolName: string;
   args: Record<string, unknown>;
+  /** Event family of the parked call — decides confirmation vs custom
+   *  result and the result event shape. Absent on state written before. */
+  eventType?: "agent.tool_use" | "agent.mcp_tool_use" | "agent.custom_tool_use";
 }
 
 /**
@@ -3627,9 +3630,10 @@ export class SessionDO extends DurableObject<Env> {
           }
         }
 
-        // Build tools with execute functions intact (not stripped for always_ask)
+        // Build tools with execute functions intact: ask gates lifted (buildTools
+        // strips execute from always_ask / policy-ask tools); deny rules stay.
         const auxResolved = await this.resolveAuxModel(agent);
-        const allTools = await buildTools(this.applyMcpUrlFixups(agent), sandbox, {
+        const allTools = await buildTools(withAskGatesLifted(this.applyMcpUrlFixups(agent)), sandbox, {
           ANTHROPIC_API_KEY: this.env.ANTHROPIC_API_KEY,
           ANTHROPIC_BASE_URL: this.env.ANTHROPIC_BASE_URL,
           TAVILY_API_KEY: this.env.TAVILY_API_KEY,
@@ -3647,52 +3651,39 @@ export class SessionDO extends DurableObject<Env> {
           listWakeups: () => this.listWakeups(),
         });
 
-        // Find the original tool definition (before always_ask stripping)
-        // We need to re-build without permission stripping to get the execute function
-        const originalTool = allTools[pending.toolName];
-        if (originalTool?.execute) {
+        // An approved call_mcp_tool runs the deferred MCP tool it names.
+        const confirmed = resolveConfirmedToolCall(allTools, pending.toolName, pending.args ?? {});
+        const use = { id: pending.toolCallId, type: pending.eventType ?? ("agent.tool_use" as const) };
+        let resultEvent: SessionEvent;
+        const originalTool = confirmed.tool;
+        if (!originalTool?.execute) {
+          // Never leave the call without a result — the next model turn
+          // would replay an orphaned tool call.
+          resultEvent = toolResultEventFor(use, `Error: tool ${confirmed.name} is not available`, true);
+        } else {
           try {
-            const result = await originalTool.execute(pending.args, {
+            const result = await originalTool.execute(confirmed.input, {
               toolCallId: pending.toolCallId,
               messages: [],
               abortSignal: undefined,
             });
-            const resultStr = typeof result === "string" ? result : JSON.stringify(result);
-            const toolResultEvent: SessionEvent = {
-              type: "agent.tool_result",
-              tool_use_id: pending.toolCallId,
-              content: resultStr,
-              // v1-additive (docs/trajectory-v1-spec.md "Causality"):
-              // matching agent.tool_use's EventBase.id IS pending.toolCallId.
-              parent_event_id: pending.toolCallId,
-            };
-            history.append(toolResultEvent);
-            this.broadcastEvent(toolResultEvent);
+            resultEvent = toolResultEventFor(use, typeof result === "string" ? result : JSON.stringify(result));
           } catch (e) {
-            const toolResultEvent: SessionEvent = {
-              type: "agent.tool_result",
-              tool_use_id: pending.toolCallId,
-              content: `Error: ${e instanceof Error ? e.message : String(e)}`,
-              is_error: true,
-              parent_event_id: pending.toolCallId,
-            };
-            history.append(toolResultEvent);
-            this.broadcastEvent(toolResultEvent);
+            resultEvent = toolResultEventFor(use, `Error: ${e instanceof Error ? e.message : String(e)}`, true);
           }
         }
+        history.append(resultEvent);
+        this.broadcastEvent(resultEvent);
       }
     } else {
-      // Denied or not found — inject denial result
+      // Denied or not found — inject denial result (mcp_tool_result for a
+      // parked MCP call, so history pairs it with its agent.mcp_tool_use).
       const denyMsg = confirmation.deny_message || "Tool execution was denied by the user.";
-      const toolResultEvent: SessionEvent = {
-        type: "agent.tool_result",
-        tool_use_id: confirmation.tool_use_id,
-        content: `Denied: ${denyMsg}`,
-        is_error: true,
-        // v1-additive: matching agent.tool_use's EventBase.id IS the
-        // tool_use_id the confirmation references.
-        parent_event_id: confirmation.tool_use_id,
-      };
+      const toolResultEvent = toolResultEventFor(
+        { id: confirmation.tool_use_id, type: pending?.eventType ?? "agent.tool_use" },
+        `Denied: ${denyMsg}`,
+        true,
+      );
       history.append(toolResultEvent);
       this.broadcastEvent(toolResultEvent);
     }
@@ -4691,24 +4682,19 @@ export class SessionDO extends DurableObject<Env> {
         const recentEvents = history.getEvents();
         const pendingCalls: PendingToolCall[] = [];
         for (const eventId of ctx.runtime.pendingConfirmations) {
-          // Find the matching agent.tool_use or agent.custom_tool_use event
-          const toolUseEvent = recentEvents.find((e: SessionEvent) => {
-            if (e.type === "agent.tool_use") {
-              return (e as AgentToolUseEvent).id === eventId;
-            }
-            if (e.type === "agent.custom_tool_use") {
-              return (e as import("@open-managed-agents/shared").AgentCustomToolUseEvent).id === eventId;
-            }
-            return false;
-          });
+          // Find the matching tool-use event: built-in, MCP (an always_ask
+          // server's tools park as agent.mcp_tool_use) or custom.
+          const toolUseEvent = recentEvents.find((e: SessionEvent) =>
+            (e.type === "agent.tool_use" || e.type === "agent.mcp_tool_use" || e.type === "agent.custom_tool_use") &&
+            (e as { id?: string }).id === eventId,
+          ) as (SessionEvent & { id: string; name: string; input: Record<string, unknown> }) | undefined;
           if (toolUseEvent) {
-            if (toolUseEvent.type === "agent.tool_use") {
-              const tue = toolUseEvent as AgentToolUseEvent;
-              pendingCalls.push({ toolCallId: tue.id, toolName: tue.name, args: tue.input });
-            } else if (toolUseEvent.type === "agent.custom_tool_use") {
-              const cte = toolUseEvent as import("@open-managed-agents/shared").AgentCustomToolUseEvent;
-              pendingCalls.push({ toolCallId: cte.id, toolName: cte.name, args: cte.input });
-            }
+            pendingCalls.push({
+              toolCallId: toolUseEvent.id,
+              toolName: toolUseEvent.name,
+              args: toolUseEvent.input,
+              eventType: toolUseEvent.type as PendingToolCall["eventType"],
+            });
           }
         }
         if (pendingCalls.length) {
@@ -4848,7 +4834,10 @@ export class SessionDO extends DurableObject<Env> {
 
       // Check if any pending are custom tool uses (no execute function, not always_ask built-in)
       const storedPendingCalls = this.state.pending_tool_calls;
+      // By event family when recorded (call_mcp_tool / search_mcp_tools are
+      // agent.tool_use, not custom); name heuristic only for older state.
       const hasCustomToolPending = storedPendingCalls.some(p =>
+        p.eventType ? p.eventType === "agent.custom_tool_use" :
         !["bash", "read", "write", "edit", "glob", "grep", "web_fetch", "web_search"].includes(p.toolName) &&
         !p.toolName.startsWith("mcp_") &&
         !p.toolName.startsWith("call_agent_") &&

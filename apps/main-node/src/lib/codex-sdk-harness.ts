@@ -30,8 +30,9 @@
  * bearer token and the handlers run in this process.
  *
  * Remaining gap vs the claude-agent-sdk harness (fail-closed, not silent):
- * no per-tool permission callback, so pinned access policies can't be
- * enforced → sessions with a policy are rejected rather than run open.
+ * no per-tool permission callback, so pinned access policies and always_ask
+ * MCP toolsets can't be enforced → such sessions are rejected rather than
+ * run open.
  * System prompt rides in <cwd>/AGENTS.md (the Codex project-doc channel);
  * attached skills are materialized under <cwd>/skills/ and referenced there.
  */
@@ -57,7 +58,7 @@ import {
   type SessionEvent,
 } from "@open-managed-agents/api-types";
 import type { AgentConfig } from "@open-managed-agents/shared";
-import { generateId } from "@open-managed-agents/shared";
+import { generateId, mcpServerMayAsk } from "@open-managed-agents/shared";
 import type { HarnessPatch, McpTarget } from "./claude-agent-sdk-harness.js";
 import { startMcpHttpBridge, type BridgeTool, type McpHttpBridge } from "./mcp-http-bridge.js";
 import { codexComputerTools, computerCodexEnv, COMPUTER_CODEX_FEATURES } from "./codex-computer-tools.js";
@@ -603,6 +604,23 @@ export class CodexSdkHarness {
       fail(
         "This agent has a pinned access policy, which the codex-sdk harness cannot enforce yet. " +
           "Use the default or claude-agent-sdk harness, or remove the policy.",
+      );
+    }
+    // Same for toolset permission policies — but only where one applies to
+    // a tool this harness exposes: the agent's MCP servers, judged by each
+    // server's own mcp_toolset (or the built-in default it inherits when
+    // it declares none). Codex's own shell/patch tools aren't OMA
+    // built-ins, so an always_ask on the built-in toolset alone never
+    // governed them and doesn't fail the session. Setup sessions only
+    // expose the platform's oma_setup tools, which no toolset governs.
+    const askingServers = isSetup
+      ? []
+      : (ctx.agent.mcp_servers ?? []).map((s) => s.name).filter((name) => mcpServerMayAsk(ctx.agent.tools, name));
+    if (askingServers.length > 0) {
+      fail(
+        `MCP server${askingServers.length > 1 ? "s" : ""} ${askingServers.join(", ")} ` +
+          `${askingServers.length > 1 ? "have" : "has"} tools set to always_ask, which the codex-sdk harness cannot ask for. ` +
+          "Use the default harness (it asks before running those tools), or set them to always_allow.",
       );
     }
 

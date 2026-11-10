@@ -227,6 +227,73 @@ describe("SessionStateMachine human-in-the-loop", () => {
     expect(lastIdle(f.log).stop_reason).toEqual({ type: "end_turn" });
   });
 
+  it("an approved call_mcp_tool runs the deferred MCP tool it names, with its arguments", async () => {
+    let calls = 0;
+    const run = async (ctx: HarnessInput) => {
+      calls++;
+      if (calls > 1) {
+        ctx.eventLog.append({ type: "agent.message", content: [{ type: "text", text: "done" }] } as SessionEvent);
+        return;
+      }
+      ctx.eventLog.append({
+        type: "agent.tool_use",
+        id: "toolu_meta",
+        name: "call_mcp_tool",
+        input: { name: "mcp__linear__create_issue", arguments: { title: "Bug" } },
+        evaluated_permission: "ask",
+      } as unknown as SessionEvent);
+      ctx.runtime?.pendingConfirmations?.push("toolu_meta");
+    };
+    const target = vi.fn(async () => "ISS-1");
+    const f = createMachine(run, {
+      runtime: () => ({ pendingConfirmations: [] }),
+      // The rebuilt dict has no call_mcp_tool (it only exists after
+      // per-turn budgeting) — just the deferred tool itself.
+      tools: () => ({ mcp__linear__create_issue: { execute: target } }),
+    });
+    await f.machine.runTurn("agent_test", userMessage);
+    expect(lastIdle(f.log).stop_reason).toMatchObject({ action_type: "tool_confirmation", event_ids: ["toolu_meta"] });
+
+    await f.machine.runTurn("agent_test", {
+      type: "user.tool_confirmation",
+      tool_use_id: "toolu_meta",
+      result: "allow",
+    } as never);
+
+    expect(target).toHaveBeenCalledWith({ title: "Bug" }, expect.objectContaining({ toolCallId: "toolu_meta" }));
+    const toolResult = (f.log.getEvents() as Array<Record<string, unknown>>).find((e) => e.type === "agent.tool_result");
+    expect(toolResult).toMatchObject({ tool_use_id: "toolu_meta", content: "ISS-1" });
+  });
+
+  it("an approved call_mcp_tool never resolves to a non-MCP tool", async () => {
+    let calls = 0;
+    const run = async (ctx: HarnessInput) => {
+      if (++calls > 1) return;
+      ctx.eventLog.append({
+        type: "agent.tool_use",
+        id: "toolu_meta",
+        name: "call_mcp_tool",
+        input: { name: "bash", arguments: { command: "rm -rf /" } },
+        evaluated_permission: "ask",
+      } as unknown as SessionEvent);
+      ctx.runtime?.pendingConfirmations?.push("toolu_meta");
+    };
+    const bash = vi.fn(async () => "ran");
+    const meta = vi.fn(async () => "ran");
+    const f = createMachine(run, {
+      runtime: () => ({ pendingConfirmations: [] }),
+      // Even if the rebuilt dict carried call_mcp_tool itself, an approval
+      // must neither run it nor let it reach a built-in.
+      tools: () => ({ bash: { execute: bash }, call_mcp_tool: { execute: meta } }),
+    });
+    await f.machine.runTurn("agent_test", userMessage);
+    await f.machine.runTurn("agent_test", { type: "user.tool_confirmation", tool_use_id: "toolu_meta", result: "allow" } as never);
+    expect(bash).not.toHaveBeenCalled();
+    expect(meta).not.toHaveBeenCalled();
+    const toolResult = (f.log.getEvents() as Array<Record<string, unknown>>).find((e) => e.type === "agent.tool_result");
+    expect(toolResult).toMatchObject({ tool_use_id: "toolu_meta", is_error: true });
+  });
+
   it("records a denial and resumes the harness", async () => {
     const h = gatedToolHarness(["toolu_1"]);
     const f = createMachine(h.run, { runtime: () => ({ pendingConfirmations: [] }) });

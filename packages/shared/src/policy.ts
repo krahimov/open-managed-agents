@@ -120,6 +120,14 @@ const OMA_TO_CC_TOOL: Record<string, string> = {
   web_search: "WebSearch",
 };
 
+/** Claude Code names of the OMA built-ins (Bash, Read, …) — the CC tools
+ *  an OMA toolset permission can govern. */
+export function ccNameForOmaBuiltin(omaName: string): string | undefined {
+  return OMA_TO_CC_TOOL[omaName];
+}
+
+export const OMA_BUILTINS_WITH_CC_EQUIVALENT: readonly string[] = Object.keys(OMA_TO_CC_TOOL);
+
 /** CC tool name → OMA name (for canUseTool evaluating CC callbacks). */
 const CC_TO_OMA_TOOL: Record<string, string> = Object.fromEntries(
   Object.entries(OMA_TO_CC_TOOL).map(([oma, cc]) => [cc, oma]),
