@@ -1,9 +1,10 @@
 import { DesktopViewer } from "./DesktopViewer";
 import { useEffect, useState } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { Monitor, RefreshCw } from "lucide-react";
-import { ApiError, getActiveTenantId, readApiError } from "../lib/api";
+import { ApiError, getActiveTenantId, readApiError, type useApi } from "../lib/api";
 import { getClerkBearerToken } from "../lib/clerk-auth";
+import { AGENT_COMPUTER_LABEL, isAgentComputerEnvironment, type EnvironmentChoice } from "../lib/default-environment";
 import { useApiMutation, useApiQuery } from "../lib/useApiQuery";
 import { Button } from "./ui/button";
 
@@ -18,9 +19,42 @@ interface AgentMachine {
   errorReason: string | null;
 }
 
-interface MachineResponse {
+export interface MachineResponse {
   machine: AgentMachine | null;
   supported: boolean;
+}
+
+/** Cache key of GET /v1/agents/:id/machine — the one `useApiQuery` gives the
+ *  panel, so other callers (the delete confirm) share its entry. */
+export function agentMachineQueryKey(agentId: string) {
+  return [`/v1/agents/${agentId}/machine`, {}] as const;
+}
+
+/** Whether the agent has a computer, asked of the server right now: a
+ *  session may have created one since the panel's cached answer. Shares the
+ *  panel's key, so a fetch already in flight is reused. */
+export async function loadAgentMachine(
+  queryClient: QueryClient,
+  api: ReturnType<typeof useApi>["api"],
+  agentId: string,
+): Promise<MachineResponse> {
+  const queryKey = agentMachineQueryKey(agentId);
+  return queryClient.fetchQuery({
+    queryKey,
+    queryFn: ({ signal }) => api<MachineResponse>(queryKey[0], { signal, silentErrors: true }),
+    staleTime: 0,
+  });
+}
+
+/** Delete confirmation that says for certain whether a computer goes with
+ *  the agent. `status` is null when that could not be checked. */
+export function deleteAgentConfirmText(name: string, status: MachineResponse | null): string {
+  const what = !status
+    ? "If it has a computer, the computer and all files on its disk are deleted too."
+    : status.machine
+      ? "Its computer and all files on its disk will be deleted too."
+      : "It has no computer, so there is no computer or disk to delete.";
+  return `Delete agent "${name}"? ${what} This cannot be undone.`;
 }
 
 const stateLabels: Record<string, string> = {
@@ -124,8 +158,20 @@ function BrowserPreview({ agentId, machine }: { agentId: string; machine: AgentM
   );
 }
 
-export function AgentComputerPanel({ agentId }: { agentId: string }) {
-  const machinePath = `/v1/agents/${agentId}/machine`;
+export function AgentComputerPanel({
+  agentId,
+  localRuntime = false,
+  defaultEnvironment,
+}: {
+  agentId: string;
+  /** The agent runs on the user's own machine, so a cloud computer
+   *  doesn't apply to it. */
+  localRuntime?: boolean;
+  /** The agent's default environment: undefined while it loads, null when
+   *  the agent has none (or it could not be loaded). */
+  defaultEnvironment?: EnvironmentChoice | null;
+}) {
+  const machinePath = agentMachineQueryKey(agentId)[0];
   const queryClient = useQueryClient();
   const status = useApiQuery<MachineResponse>(machinePath, undefined, {
     staleTime: 0,
@@ -137,7 +183,7 @@ export function AgentComputerPanel({ agentId }: { agentId: string }) {
   });
   const control = useApiMutation<{ machine: AgentMachine }>({
     onSuccess: (result) => {
-      queryClient.setQueryData<MachineResponse>([machinePath, {}], {
+      queryClient.setQueryData<MachineResponse>(agentMachineQueryKey(agentId), {
         supported: true,
         machine: result.machine,
       });
@@ -150,6 +196,18 @@ export function AgentComputerPanel({ agentId }: { agentId: string }) {
   const canStart = !machine || ["stopped", "archived", "error"].includes(machine.state);
   const starting = control.isPending && control.variables?.path.endsWith("/start");
   const stopping = control.isPending && control.variables?.path.endsWith("/stop");
+  // Instance-wide support is off and there's no computer yet. Computers
+  // are still given per environment: an agent whose default environment
+  // has one gets it from its next session; any other agent runs each
+  // session in a fresh sandbox, and Start would be refused.
+  const noComputer = !!status.data && !supported;
+  const environmentLoading = noComputer && defaultEnvironment === undefined;
+  const computerFromNextSession =
+    noComputer && !!defaultEnvironment && isAgentComputerEnvironment(defaultEnvironment);
+  const sessionSandboxOnly = noComputer && !environmentLoading && !computerFromNextSession;
+
+  // Local-runtime agents run on the user's own machine.
+  if (localRuntime && (status.isLoading || noComputer)) return null;
 
   return (
     <section aria-labelledby="agent-computer-heading" className="max-w-4xl rounded-lg border border-border bg-bg-surface p-4">
@@ -159,10 +217,16 @@ export function AgentComputerPanel({ agentId }: { agentId: string }) {
             <Monitor className="size-4" aria-hidden="true" />
             Computer
           </h2>
-          <p className="mt-1 text-sm text-fg-muted max-w-2xl">
-            This agent's Linux computer runs in the cloud. Its sessions share files and Chromium,
-            and active work continues when you close this page or your laptop.
-          </p>
+          {sessionSandboxOnly ? (
+            <p className="mt-1 text-sm text-fg-muted max-w-2xl">
+              This agent runs each session in a fresh sandbox that is cleared when the session ends.
+            </p>
+          ) : !environmentLoading && (
+            <p className="mt-1 text-sm text-fg-muted max-w-2xl">
+              This agent's Linux computer runs in the cloud. Its sessions share files and Chromium,
+              and active work continues when you close this page or your laptop.
+            </p>
+          )}
         </div>
         {supported && (
           <div className="flex gap-2">
@@ -192,7 +256,9 @@ export function AgentComputerPanel({ agentId }: { agentId: string }) {
         )}
       </div>
 
-      {status.isLoading && <p className="mt-4 text-sm text-fg-subtle">Loading computer...</p>}
+      {(status.isLoading || environmentLoading) && (
+        <p className="mt-4 text-sm text-fg-subtle">Loading computer...</p>
+      )}
       {status.error && (
         <div role="alert" className="mt-4 flex flex-wrap items-center gap-3">
           <p className="text-sm text-danger">Could not load computer. {status.error.message}</p>
@@ -201,10 +267,16 @@ export function AgentComputerPanel({ agentId }: { agentId: string }) {
           </Button>
         </div>
       )}
-      {status.data && !supported && (
+      {computerFromNextSession && (
         <p className="mt-4 text-sm text-fg-muted">
-          Cloud computers are not enabled on this instance. An administrator needs to configure
-          an agent machine provider to use this feature.
+          Its computer is created when its next session starts.
+        </p>
+      )}
+      {sessionSandboxOnly && (
+        <p className="mt-4 text-sm text-fg-muted">
+          To give it a persistent computer that keeps its files and browser between sessions,
+          click Edit, open the Sandbox tab, and choose a default environment marked
+          “{AGENT_COMPUTER_LABEL}”.
         </p>
       )}
       {supported && (

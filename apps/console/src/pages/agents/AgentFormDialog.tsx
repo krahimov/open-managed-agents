@@ -37,7 +37,11 @@ import {
 import type { AgentRecord as Agent } from "../../types/agent";
 import { SETUP_KICKOFF_NEW, setupPath, startSetupSession } from "./setup-session";
 import { BRAND_NAME } from "../../lib/brand";
-import { isAgentComputerEnvironment, pickDefaultEnvironmentId } from "../../lib/default-environment";
+import {
+  AGENT_COMPUTER_LABEL,
+  isAgentComputerEnvironment,
+  pickDefaultEnvironmentId,
+} from "../../lib/default-environment";
 import {
   AMBIENT_WAKE_MODES,
   buildAmbientTrigger,
@@ -364,6 +368,13 @@ export function AgentFormDialog({
 
   const createDialogRef = useRef<HTMLDivElement>(null);
   const createPreviousFocus = useRef<HTMLElement | null>(null);
+  // What the form looked like when the user reached it (template pick or
+  // edit prefill). Automatic prefills (default model card, default
+  // environment) are applied to it too, so only the user's own changes make
+  // the draft "dirty" and worth confirming before an accidental dismiss.
+  const pristineFormRef = useRef<FormState | null>(null);
+  // Set once the user types in the YAML/JSON editor.
+  const codeEditedRef = useRef(false);
   const composioConnectionsRef = useRef<ComposioConnectionState>({});
   const composioAuthWaitersRef = useRef<
     Map<string, Set<(completion: ComposioAuthCompletion) => void>>
@@ -455,6 +466,10 @@ export function AgentFormDialog({
     if (modelCards.length === 0) return;
     const def = modelCards.find((mc) => mc.is_default) ?? modelCards[0];
     setForm((f) => ({ ...f, modelCardId: def.id, model: def.model_id }));
+    const pristine = pristineFormRef.current;
+    if (pristine && !pristine.modelCardId && !pristine.model) {
+      pristineFormRef.current = { ...pristine, modelCardId: def.id, model: def.model_id };
+    }
     // Intentionally not depending on form.* — guards above prevent the
     // re-trigger loop and we only want to hydrate on step entry / cards arrival.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -475,13 +490,17 @@ export function AgentFormDialog({
       setVaults(activeVaults);
       setEnvironments(envRes.data ?? []);
       setSandboxConfig(sandboxRes);
+      // Never preselect an agent-computer environment: a persistent
+      // computer is an explicit choice on the Sandbox tab.
+      const defaultEnvironmentId = pickDefaultEnvironmentId(envRes.data ?? []);
       setForm((f) => {
         if (editAgent || f.environmentId) return f;
-        // Never preselect an agent-computer environment: a persistent
-        // computer is an explicit choice on the Sandbox tab.
-        const defaultEnvironmentId = pickDefaultEnvironmentId(envRes.data ?? []);
         return defaultEnvironmentId ? { ...f, environmentId: defaultEnvironmentId } : f;
       });
+      const pristine = pristineFormRef.current;
+      if (!editAgent && defaultEnvironmentId && pristine && !pristine.environmentId) {
+        pristineFormRef.current = { ...pristine, environmentId: defaultEnvironmentId };
+      }
     });
     return () => {
       cancelled = true;
@@ -495,6 +514,8 @@ export function AgentFormDialog({
     if (!open || !editAgent) return;
     const next = configToForm(editAgent as unknown as Record<string, unknown>);
     setForm(next);
+    pristineFormRef.current = next;
+    codeEditedRef.current = false;
     setCreateStep("form");
     setCreateMode("form");
     setTab("basic");
@@ -524,6 +545,8 @@ export function AgentFormDialog({
     setCreateError("");
     setCreateMode("form");
     setCodeValue("");
+    pristineFormRef.current = null;
+    codeEditedRef.current = false;
     setIntegrationSearch("");
     setComposioConnectionsSynced({});
     composioAuthWaitersRef.current.clear();
@@ -532,6 +555,36 @@ export function AgentFormDialog({
     onClose();
   };
 
+  const formChanged = () => {
+    const pristine = pristineFormRef.current;
+    return !!pristine && JSON.stringify(form) !== JSON.stringify(pristine);
+  };
+
+  // Accidental dismissals (Escape, backdrop click) ask before throwing away
+  // the user's changes. Only the form step counts: the template picker has
+  // nothing worth keeping. Cancel / Setup chat are explicit and stay
+  // unguarded, like every other console dialog.
+  const dismiss = () => {
+    const dirty = createStep === "form" && (codeEditedRef.current || formChanged());
+    if (
+      dirty &&
+      !confirm(
+        isEdit
+          ? "Discard your changes to this agent? They will be lost."
+          : "Discard this agent? Your changes will be lost.",
+      )
+    ) {
+      return;
+    }
+    closeCreate();
+  };
+  // The keydown listener below binds once per open; it reaches the latest
+  // render's dismiss (and so the latest form state) through this ref.
+  const dismissRef = useRef(dismiss);
+  useEffect(() => {
+    dismissRef.current = dismiss;
+  });
+
   // Dialog a11y — focus trap + Escape, scroll lock, focus restore on close.
   // Mirrors components/Modal.tsx behavior so this hand-rolled multi-step
   // dialog is keyboard-equivalent.
@@ -539,7 +592,13 @@ export function AgentFormDialog({
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        closeCreate();
+        // Escape belongs to the innermost layer first. Radix layers inside
+        // the dialog (Select listboxes, Combobox popovers, the MCP picker
+        // modal) close themselves in a capture-phase listener and mark the
+        // event handled, and an IME uses Escape to cancel its composition —
+        // neither should also close the dialog.
+        if (e.defaultPrevented || e.isComposing) return;
+        dismissRef.current();
         return;
       }
       if (e.key !== "Tab") return;
@@ -561,9 +620,8 @@ export function AgentFormDialog({
     };
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
-    // closeCreate is stable enough — deps kept tight to avoid re-binding
-    // on every keystroke.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // Deps kept tight to avoid re-binding on every keystroke; Escape goes
+    // through dismissRef so it always sees the current form.
   }, [open]);
 
   useEffect(() => {
@@ -1282,21 +1340,25 @@ export function AgentFormDialog({
       ...INITIAL_FORM,
       environmentId: form.environmentId || pickDefaultEnvironmentId(environments),
     };
-    if (tmpl.id === "blank") {
-      setForm(baseForm);
-    } else {
-      setForm({
-        ...baseForm,
-        name: tmpl.name,
-        model: tmpl.model,
-        system: tmpl.system,
-        description: tmpl.description,
-        mcpServers: tmpl.mcpServers.map((m) => ({ ...m })),
-        skills: tmpl.skills.map((s) => ({ ...s } as SkillEntry)),
-      });
-    }
+    const next: FormState =
+      tmpl.id === "blank"
+        ? baseForm
+        : {
+            ...baseForm,
+            name: tmpl.name,
+            model: tmpl.model,
+            system: tmpl.system,
+            description: tmpl.description,
+            mcpServers: tmpl.mcpServers.map((m) => ({ ...m })),
+            skills: tmpl.skills.map((s) => ({ ...s } as SkillEntry)),
+          };
+    setForm(next);
+    // The template's prefill is the starting point, not a change.
+    pristineFormRef.current = next;
+    codeEditedRef.current = false;
     setCreateStep("form");
-    setTab(tmpl.id === "blank" ? "integrations" : "basic");
+    // Name and model — the only required fields — are on Basic.
+    setTab("basic");
   };
 
   // Convert current form state to a config object
@@ -1344,7 +1406,11 @@ export function AgentFormDialog({
           createMode === "yaml"
             ? (yaml.load(codeValue) as Record<string, unknown>)
             : JSON.parse(codeValue);
-        setForm(configToForm(parsed));
+        const next = configToForm(parsed);
+        // A round trip through an untouched code view isn't an edit, even
+        // though the parse back is lossy.
+        if (!codeEditedRef.current && !formChanged()) pristineFormRef.current = next;
+        setForm(next);
       } catch {
         /* keep current form if parse fails */
       }
@@ -1437,7 +1503,7 @@ export function AgentFormDialog({
     <>
       <div
         className="fixed inset-0 bg-bg-overlay flex items-center justify-center z-50"
-        onClick={closeCreate}
+        onClick={dismiss}
       >
         <div
           ref={createDialogRef}
@@ -1680,7 +1746,10 @@ export function AgentFormDialog({
                     )}
                     <textarea
                       value={codeValue}
-                      onChange={(e) => setCodeValue(e.target.value)}
+                      onChange={(e) => {
+                        codeEditedRef.current = true;
+                        setCodeValue(e.target.value);
+                      }}
                       className={`${inputCls} flex-1 resize-none font-mono text-xs leading-relaxed min-h-[300px]`}
                       spellCheck={false}
                     />
@@ -2903,7 +2972,7 @@ function SandboxTab({
           >
             {environments.map((env) => (
               <SelectOption key={env.id} value={env.id}>
-                {env.name} ({env.id}){isAgentComputerEnvironment(env) ? " · persistent agent computer" : ""}
+                {env.name} ({env.id}){isAgentComputerEnvironment(env) ? ` · ${AGENT_COMPUTER_LABEL}` : ""}
               </SelectOption>
             ))}
           </Select>

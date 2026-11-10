@@ -4,6 +4,7 @@ import yaml from "js-yaml";
 import { OMA_SETUP_HARNESS } from "@open-managed-agents/api-types";
 import { useApi } from "../lib/api";
 import { toast } from "sonner";
+import { BracesIcon } from "lucide-react";
 import { Markdown } from "../components/Markdown";
 import { formatDuration, formatRelative, shortenId } from "../lib/format";
 import { Badge, StatusPill } from "../components/Badge";
@@ -802,14 +803,29 @@ export function SessionDetail() {
               see what makes up this session at a glance. Name falls back
               to a short ID slice if the snapshot didn't carry one — better
               "agent_…XYZ" than nothing. */}
+          {/* Agent name goes straight to the agent's page (a real link, so
+              cmd/middle-click open a tab); its raw config stays one click
+              away in the side panel. */}
           {(sessionMeta.agentSnapshot?.id || agentId) && (
-            <Badge
-              icon={<AgentIcon />}
-              label={sessionMeta.agentSnapshot?.name || shortenId(sessionMeta.agentSnapshot?.id || agentId)}
-              onClick={() =>
-                setResourcePanel({ kind: "agent", id: sessionMeta.agentSnapshot?.id || agentId })
-              }
-            />
+            <span className="inline-flex items-center gap-0.5">
+              <Badge
+                icon={<AgentIcon />}
+                label={sessionMeta.agentSnapshot?.name || shortenId(sessionMeta.agentSnapshot?.id || agentId)}
+                to={`/agents/${encodeURIComponent(sessionMeta.agentSnapshot?.id || agentId)}`}
+              />
+              <Button
+                variant="ghost"
+                size="icon-xs"
+                className="text-fg-subtle min-w-11 min-h-11 sm:min-w-0 sm:min-h-0"
+                aria-label="View agent config"
+                title="View agent config"
+                onClick={() =>
+                  setResourcePanel({ kind: "agent", id: sessionMeta.agentSnapshot?.id || agentId })
+                }
+              >
+                <BracesIcon />
+              </Button>
+            </span>
           )}
           {sessionMeta.environmentId && (
             <Badge

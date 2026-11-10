@@ -22,3 +22,8 @@ export function isAgentComputerEnvironment(env: EnvironmentChoice): boolean {
 export function pickDefaultEnvironmentId(environments: readonly EnvironmentChoice[]): string {
   return environments.find((env) => !isAgentComputerEnvironment(env))?.id ?? "";
 }
+
+/** Tag every environment picker (new agent, new session) shows next to an
+ *  agent-computer environment, so the billable choice is visible wherever
+ *  it is made. */
+export const AGENT_COMPUTER_LABEL = "persistent agent computer";

@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router";
 import { useApi } from "../lib/api";
+import { Skeleton } from "./Skeleton";
 
 /** GET/PUT /v1/agents/:id/memory (main-node). */
 export interface AgentMemoryResponse {
@@ -20,8 +21,8 @@ export interface AgentMemoryResponse {
  * next, which store holds it, and a switch. Off means every session (and
  * every scheduled run) starts blank.
  *
- * Renders nothing on runtimes without the endpoint (404), so the agent page
- * is unchanged there.
+ * Shows a placeholder under its heading while loading. Renders nothing on
+ * runtimes without the endpoint (404), so the agent page is unchanged there.
  */
 export function AgentMemoryPanel({ agentId }: { agentId: string }) {
   const { api } = useApi();
@@ -44,6 +45,22 @@ export function AgentMemoryPanel({ agentId }: { agentId: string }) {
   });
 
   const memory = status.data;
+  if (status.isPending) {
+    return (
+      <section aria-labelledby="agent-memory-heading" aria-busy="true" className="mt-6 max-w-2xl">
+        <div className="flex items-center justify-between gap-3 mb-2">
+          <h2 id="agent-memory-heading" className="font-display text-base font-semibold">
+            Memory
+          </h2>
+          <Skeleton className="h-5 w-9" rounded="full" />
+        </div>
+        <div role="status" aria-label="Loading memory" className="border border-border rounded-lg px-4 py-3 space-y-2">
+          <Skeleton className="h-4 w-2/3" />
+          <Skeleton className="h-4 w-1/2" />
+        </div>
+      </section>
+    );
+  }
   if (!memory) return null;
 
   const on = memory.enabled;

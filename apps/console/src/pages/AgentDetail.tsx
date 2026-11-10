@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useQuery, useQueryClient, type InfiniteData, type QueryClient } from "@tanstack/react-query";
 import { useParams, Link, useNavigate, useSearchParams } from "react-router";
 import { toast } from "sonner";
 import { getActiveTenantId, useApi } from "../lib/api";
@@ -10,11 +10,17 @@ import { Page } from "../components/Page";
 import { Modal } from "../components/Modal";
 import { Field } from "../components/Field";
 import { PageHeader } from "../components/PageHeader";
+import { Skeleton } from "../components/Skeleton";
 import { CreateDeploymentDialog } from "../components/CreateDeploymentDialog";
 import { Button } from "@/components/ui/button";
 import type { AgentRecord as Agent } from "../types/agent";
+import type { EnvironmentChoice } from "../lib/default-environment";
 import { AmbientTriggerControls } from "../components/AmbientTriggerControls";
-import { AgentComputerPanel } from "../components/AgentComputerPanel";
+import {
+  AgentComputerPanel,
+  deleteAgentConfirmText,
+  loadAgentMachine,
+} from "../components/AgentComputerPanel";
 import { AgentMemoryPanel } from "../components/AgentMemoryPanel";
 import { AgentModelSwitcher } from "../components/AgentModelSwitcher";
 import { REASONING_LEVEL_LABELS, uiReasoningLevel } from "@open-managed-agents/api-types";
@@ -46,6 +52,37 @@ interface Pub {
   mode: string;
   persona: { name: string; avatarUrl: string | null };
   workspace_name: string | null;
+}
+
+/** True for every cached query about one agent: its own record and the
+ *  paths under it (/v1/agents/:id/…, /v1/integrations/…/agents/:id/…). */
+const isAgentQuery = (agentId: string) => ({ queryKey }: { queryKey: readonly unknown[] }) => {
+  const path = queryKey[0];
+  return typeof path === "string" && (path === `/v1/agents/${agentId}` || path.includes(`/agents/${agentId}/`));
+};
+
+/** After a delete: take the agent out of the cached agent lists (so the list
+ *  page doesn't show it while it refetches), mark every agent list stale,
+ *  and stop any in-flight fetch about the agent. Its own cached queries are
+ *  dropped by `dropAgentQueries` once nothing on screen observes them. */
+export function forgetDeletedAgent(qc: QueryClient, agentId: string) {
+  qc.setQueriesData<InfiniteData<{ data: Agent[] }>>(
+    { queryKey: ["/v1/agents", "infinite"] },
+    (old) =>
+      old && {
+        ...old,
+        pages: old.pages.map((page) => ({ ...page, data: page.data.filter((a) => a.id !== agentId) })),
+      },
+  );
+  void qc.invalidateQueries({ queryKey: ["/v1/agents"] });
+  void qc.cancelQueries({ predicate: isAgentQuery(agentId) });
+}
+
+/** Drop a deleted agent's cached queries. Only call this once the
+ *  components observing them have unmounted — a still-mounted observer
+ *  would recreate the query and refetch a 404. */
+export function dropAgentQueries(qc: QueryClient, agentId: string) {
+  qc.removeQueries({ predicate: isAgentQuery(agentId) });
 }
 
 interface AmbientRule {
@@ -83,6 +120,10 @@ export function AgentDetail() {
   };
   const [openingSetup, setOpeningSetup] = useState(false);
   const [showDeploy, setShowDeploy] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  // Set once this agent is deleted; the unmount that follows the
+  // navigation away then drops its cached queries.
+  const deletedAgentId = useRef<string | null>(null);
   const qc = useQueryClient();
   const formAux = useAgentFormAux(editing);
 
@@ -127,6 +168,24 @@ export function AgentDetail() {
     undefined,
     { enabled },
   );
+
+  // The default environment decides what the Computer panel says when
+  // there's no computer yet. Not fetched for local-runtime agents. Quiet and
+  // single-try: an agent can still point at a deleted environment (404), and
+  // the panel then just falls back to the session-sandbox copy. Same cache
+  // key as useApiQuery so the environment pages share the entry.
+  const defaultEnvironmentId = agent?._oma?.runtime_binding ? undefined : agent?._oma?.default_environment_id;
+  const defaultEnvironmentPath = defaultEnvironmentId ? `/v1/environments/${defaultEnvironmentId}` : null;
+  const { data: defaultEnvironment, isError: defaultEnvironmentFailed } = useQuery<EnvironmentChoice>({
+    queryKey: [defaultEnvironmentPath, {}],
+    queryFn: ({ signal }) => api<EnvironmentChoice>(defaultEnvironmentPath!, { signal, silentErrors: true }),
+    enabled: !!defaultEnvironmentPath,
+    retry: false,
+  });
+
+  useEffect(() => () => {
+    if (deletedAgentId.current) dropAgentQueries(qc, deletedAgentId.current);
+  }, [qc]);
 
   const versions = versionsRes?.data ?? [];
   // Filter to live publications only — same predicate the old useEffect ran.
@@ -181,17 +240,34 @@ export function AgentDetail() {
   const archive = async () => {
     if (!confirm("Archive this agent?")) return;
     await api(`/v1/agents/${id}/archive`, { method: "POST", body: "{}" });
+    // Cached lists would otherwise still show it as active.
+    void qc.invalidateQueries({ queryKey: ["/v1/agents"] });
+    void qc.invalidateQueries({ queryKey: [`/v1/agents/${id}`] });
     nav("/agents");
   };
 
   const del = async () => {
-    if (!confirm("Delete this agent? If it has a cloud computer, the computer and its files are deleted too. This cannot be undone.")) return;
-    await api(`/v1/agents/${id}`, { method: "DELETE" });
+    if (!agent) return;
+    // Say for certain whether a computer goes with it; ask the server
+    // when the Computer panel hasn't loaded yet.
+    const machine = await loadAgentMachine(qc, api, agent.id).catch(() => null);
+    if (!confirm(deleteAgentConfirmText(agent.name, machine))) return;
+    setDeleting(true);
+    try {
+      // Can take a few seconds: the agent's computer is deleted with it.
+      await api(`/v1/agents/${agent.id}`, { method: "DELETE" });
+    } catch {
+      setDeleting(false); // api() surfaces the error
+      return;
+    }
+    deletedAgentId.current = agent.id;
+    forgetDeletedAgent(qc, agent.id);
+    toast.success(`Deleted agent "${agent.name}"`);
     nav("/agents");
   };
 
   if (error) return <div className="p-10 text-danger">Error: {error}</div>;
-  if (!agent) return <div className="p-10 text-fg-subtle">Loading...</div>;
+  if (!agent) return <AgentDetailSkeleton />;
 
   return (
     <Page
@@ -219,7 +295,14 @@ export function AgentDetail() {
               <Button variant="outline" size="sm" onClick={archive}>
                 Archive
               </Button>
-              <Button variant="destructive" size="sm" onClick={del}>
+              <Button
+                variant="destructive"
+                size="sm"
+                onClick={() => void del()}
+                loading={deleting}
+                loadingLabel="Deleting…"
+                disabled={deleting}
+              >
                 Delete
               </Button>
             </>
@@ -287,7 +370,14 @@ export function AgentDetail() {
           {agent.archived_at && <><span className="text-fg-muted">Archived</span><span className="text-warning">{new Date(agent.archived_at).toLocaleString()}</span></>}
         </div>
 
-      <AgentComputerPanel key={agent.id} agentId={agent.id} />
+      <AgentComputerPanel
+        key={agent.id}
+        agentId={agent.id}
+        localRuntime={!!agent._oma?.runtime_binding}
+        defaultEnvironment={
+          !defaultEnvironmentId || defaultEnvironmentFailed ? null : defaultEnvironment
+        }
+      />
 
       {/* Integrations — one fold per provider so adding a 4th / 5th doesn't
           push the rest of the page below the viewport. Default-open when
@@ -403,6 +493,23 @@ export function AgentDetail() {
         onClose={() => setShowDeploy(false)}
         initialAgentId={agent.id}
       />
+    </Page>
+  );
+}
+
+/** Placeholder while the agent loads: the header row and the properties
+ *  grid, so the page doesn't read as empty on a cold cache. */
+function AgentDetailSkeleton() {
+  return (
+    <Page header={<PageHeader title={<Skeleton className="h-6 w-48" />} />}>
+      <div role="status" aria-label="Loading agent" className="grid grid-cols-[140px_1fr] gap-x-4 gap-y-3 max-w-2xl pt-1">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <div key={i} className="contents">
+            <Skeleton className="h-4 w-20" />
+            <Skeleton className="h-4 w-56" />
+          </div>
+        ))}
+      </div>
     </Page>
   );
 }

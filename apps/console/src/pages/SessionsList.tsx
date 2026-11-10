@@ -16,11 +16,23 @@ import { FilterChip, CreatedFilterChip } from "../components/FilterChip";
 import { RowActionsMenu } from "../components/RowActionsMenu";
 
 import type { SessionRecord as Session } from "../types/session";
-import { pickDefaultEnvironmentId, type EnvironmentChoice } from "../lib/default-environment";
+import {
+  AGENT_COMPUTER_LABEL,
+  isAgentComputerEnvironment,
+  pickDefaultEnvironmentId,
+  type EnvironmentChoice,
+} from "../lib/default-environment";
 
 interface Vault { id: string; name: string; }
 interface FilePick { id: string; filename: string; size_bytes: number; }
 interface MemoryStorePick { id: string; name: string; }
+type EnvironmentPick = EnvironmentChoice & { name: string };
+
+/** "name (id)", plus the agent-computer tag — same wording as the New
+ *  agent form, so the billable choice reads the same in both pickers. */
+function environmentTextLabel(env: EnvironmentPick): string {
+  return `${env.name} (${env.id})${isAgentComputerEnvironment(env) ? ` · ${AGENT_COMPUTER_LABEL}` : ""}`;
+}
 
 type AgentLite = {
   id: string;
@@ -30,6 +42,9 @@ type AgentLite = {
   // whether to show the Environment picker — local-runtime sessions
   // don't run a sandbox container so there's nothing to pick.
   runtime_binding?: { runtime_id: string; acp_agent_id: string };
+  // List rows carry the agent's own defaults too, which lets the modal
+  // preselect its environment without waiting for the detail fetch.
+  _oma?: { default_environment_id?: string };
 };
 
 // Session status options for the toolbar status chip. "any" maps to no
@@ -229,7 +244,17 @@ export function SessionsList() {
   // toggles vaults. Lookups are by hostname (matches outbound proxy logic
   // in apps/main/src/routes/mcp-proxy.ts:resolveOutboundCredentialByHost).
   const [vaultCredHosts, setVaultCredHosts] = useState<Record<string, Set<string>>>({});
-  const [envs, setEnvs] = useState<Array<EnvironmentChoice & { name: string }>>([]);
+  const [envs, setEnvs] = useState<EnvironmentPick[]>([]);
+  // The picked agent's own default environment ("" = it has none), keyed
+  // by agent id so a late answer for a previously picked agent is ignored.
+  // Unset while that agent's details are still loading.
+  const [agentDefaultEnv, setAgentDefaultEnv] = useState<
+    { agentId: string; environmentId: string } | null
+  >(null);
+  // Set when the user picks an environment themselves, remembering which
+  // agent was picked at the time. Automatic defaults never overwrite that
+  // pick for the same agent (see the effect that applies them).
+  const envUserPickRef = useRef<{ agentId: string } | null>(null);
   const [vaults, setVaults] = useState<Vault[]>([]);
   const [files, setFiles] = useState<FilePick[]>([]);
   const [memoryStores, setMemoryStores] = useState<MemoryStorePick[]>([]);
@@ -362,12 +387,10 @@ export function SessionsList() {
           .map((s) => s.url)
           .filter((u): u is string => typeof u === "string" && u.length > 0);
         setAgentMcpUrls(urls);
-        if (row._oma?.default_environment_id) {
-          setValue("environment_id", row._oma.default_environment_id, {
-            shouldValidate: true,
-            shouldDirty: true,
-          });
-        }
+        setAgentDefaultEnv({
+          agentId: watchedAgentId,
+          environmentId: row._oma?.default_environment_id ?? "",
+        });
         if (row._oma?.default_vault_ids?.length) {
           const current = getValues("vault_ids");
           setValue("vault_ids", Array.from(new Set([...current, ...row._oma.default_vault_ids])), {
@@ -377,10 +400,42 @@ export function SessionsList() {
         }
       })
       .catch(() => {
-        if (!cancelled) setAgentMcpUrls([]);
+        if (cancelled) return;
+        setAgentMcpUrls([]);
+        // Unknown default: fall back like an agent without one.
+        setAgentDefaultEnv({ agentId: watchedAgentId, environmentId: "" });
       });
     return () => { cancelled = true; };
   }, [watchedAgentId, api, getValues, setValue]);
+
+  // Keep the Environment field on the right default while the modal is
+  // open. Driven by state rather than by when each fetch lands, so the
+  // order of the agent detail, the environment list and openModal() can't
+  // change the outcome:
+  //   - the picked agent's own default wins, replacing whatever an earlier
+  //     agent's default or the fallback put there — but not a pick the
+  //     user made while this agent was selected;
+  //   - an agent without one gets the first ordinary environment (never a
+  //     persistent agent computer), unless the user already picked one;
+  //     a previous agent's default does not stick around.
+  useEffect(() => {
+    if (!showCreate) return;
+    const own =
+      agentDefaultEnv?.agentId === watchedAgentId ? agentDefaultEnv.environmentId : undefined;
+    // Picked agent's details still loading — wait for its own default.
+    if (watchedAgentId && own === undefined) return;
+    const userPick = envUserPickRef.current;
+    if (own) {
+      if (userPick?.agentId === watchedAgentId) return;
+      envUserPickRef.current = null;
+    } else if (userPick) {
+      return;
+    }
+    const next = own || pickDefaultEnvironmentId(envs);
+    if (getValues("environment_id") !== next) {
+      setValue("environment_id", next, { shouldValidate: true, shouldDirty: true });
+    }
+  }, [showCreate, watchedAgentId, agentDefaultEnv, envs, getValues, setValue]);
 
   // Lazy-load credential hostnames for any newly-selected vault. Cache
   // forever within this modal lifetime — credential rotation mid-form is
@@ -467,7 +522,7 @@ export function SessionsList() {
     try {
       const [a, e, v, f, m] = await Promise.all([
         api<{ data: AgentLite[] }>("/v1/agents?limit=200&status=any"),
-        api<{ data: Array<EnvironmentChoice & { name: string }> }>("/v1/environments?limit=200"),
+        api<{ data: EnvironmentPick[] }>("/v1/environments?limit=200"),
         api<{ data: Vault[] }>("/v1/vaults?limit=200").catch(() => ({ data: [] })),
         api<{ data: FilePick[] }>("/v1/files?limit=200").catch(() => ({ data: [] })),
         api<{ data: MemoryStorePick[] }>("/v1/memory_stores").catch(() => ({ data: [] })),
@@ -490,6 +545,8 @@ export function SessionsList() {
     setShowCreate(false);
     reset(INITIAL_FORM_VALUES);
     setSelectedAgentDetail(null);
+    setAgentDefaultEnv(null);
+    envUserPickRef.current = null;
     setAgentMcpUrls([]);
     setVaultCredHosts({});
     setRevealedSecrets(new Set());
@@ -501,14 +558,20 @@ export function SessionsList() {
   const openModal = useCallback((agentId?: string) => {
     const selectedAgentId = agentId || agents[0]?.id || "";
     const selected = agents.find((a) => a.id === selectedAgentId) ?? null;
+    const ownDefault = selected?._oma ? selected._oma.default_environment_id ?? "" : undefined;
     reset({
       ...INITIAL_FORM_VALUES,
       agent: selectedAgentId,
-      // An agent's own default environment is applied when its detail
-      // loads; without one, never preselect a persistent agent computer.
-      environment_id: pickDefaultEnvironmentId(envs),
+      // The agent's own default when its list row already says; otherwise
+      // the effect above fills it in once the agent's details load. Without
+      // one, never preselect a persistent agent computer.
+      environment_id: ownDefault || pickDefaultEnvironmentId(envs),
     });
     setSelectedAgentDetail(selected);
+    if (ownDefault !== undefined) {
+      setAgentDefaultEnv({ agentId: selectedAgentId, environmentId: ownDefault });
+    }
+    envUserPickRef.current = null;
     setAgentMcpUrls([]);
     setVaultCredHosts({});
     setRevealedSecrets(new Set());
@@ -905,6 +968,12 @@ export function SessionsList() {
                     onValueChange={(v, item) => {
                       field.onChange(v);
                       if (item) setSelectedAgentDetail(item);
+                      if (item?._oma) {
+                        setAgentDefaultEnv({
+                          agentId: v,
+                          environmentId: item._oma.default_environment_id ?? "",
+                        });
+                      }
                     }}
                     endpoint="/v1/agents"
                     getValue={(a) => a.id}
@@ -939,17 +1008,23 @@ export function SessionsList() {
                 name="environment_id"
                 render={({ field, fieldState }) => (
                   <>
-                    <Combobox<{ id: string; name: string }>
+                    <Combobox<EnvironmentPick>
                       value={field.value}
-                      onValueChange={(v) => field.onChange(v)}
+                      onValueChange={(v) => {
+                        envUserPickRef.current = { agentId: getValues("agent") };
+                        field.onChange(v);
+                      }}
                       endpoint="/v1/environments"
                       getValue={(e) => e.id}
                       getLabel={(e) => (
                         <span>
                           {e.name} <span className="text-fg-subtle text-[12px]">({e.id})</span>
+                          {isAgentComputerEnvironment(e) && (
+                            <span className="text-fg-subtle text-[12px]"> · {AGENT_COMPUTER_LABEL}</span>
+                          )}
                         </span>
                       )}
-                      getTextLabel={(e) => `${e.name} (${e.id})`}
+                      getTextLabel={environmentTextLabel}
                       placeholder="Select environment..."
                     />
                     {showError(fieldState.isTouched, fieldState.error?.message) && (
