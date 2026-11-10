@@ -30,6 +30,7 @@ import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import type { AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { ContentBlock } from "@open-managed-agents/shared";
 import { openAiSafeToolName } from "../provider";
+import { toolCallNeedsApproval } from "../tool-budget";
 
 export const PENDING_TOOL_TEXT =
   "Awaiting user action (tool confirmation or client-side result); this call has not run yet.";
@@ -149,7 +150,9 @@ export async function adaptOmaTools(
       // Plain JSON Schema: pi-ai validates it via its non-TypeBox path.
       parameters: parameters as never,
       execute: async (toolCallId, params, signal): Promise<AgentToolResult<OmaToolDetails>> => {
-        if (typeof t.execute !== "function") {
+        // No execute (always_ask / custom), or a call that needs approval
+        // first (call_mcp_tool → an always_ask deferred tool).
+        if (typeof t.execute !== "function" || toolCallNeedsApproval(t, params)) {
           return {
             content: [{ type: "text", text: PENDING_TOOL_TEXT }],
             details: { oma_pending: true },

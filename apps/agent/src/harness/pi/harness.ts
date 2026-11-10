@@ -50,7 +50,7 @@ import {
   type ToolSettlement,
 } from "../durable-tools";
 import { resolveCompactionStrategy } from "../compaction";
-import { OPENAI_MAX_TOOLS, applyToolBudget } from "../tool-budget";
+import { OPENAI_MAX_TOOLS, applyToolBudget, toolCallNeedsApproval } from "../tool-budget";
 import { credentialsFromLanguageModel, resolvePiModel, type PiModelCredentials, type ResolvedPiModel } from "./model";
 import { ensureContinuableTail, modelMessagesToPi, providerOptionsFromThinking } from "./messages";
 import { adaptOmaTools, piContentToWire, type AdaptedTools, type OmaToolDetails } from "./tools";
@@ -349,7 +349,9 @@ export class PiEventBridge {
   private async writeAheadToolUse(call: ToolCall, stepId: string | undefined): Promise<void> {
     const toolName = this.opts.tools.toOma(call.name);
     const t = this.opts.omaTools[toolName];
-    const hasExecute = typeof t?.execute === "function";
+    // call_mcp_tool parks (like a tool without execute) when its target is
+    // an always_ask deferred tool — same rule as default-loop.
+    const hasExecute = typeof t?.execute === "function" && !toolCallNeedsApproval(t, call.arguments);
     try {
       const events = toolCallEvents(
         { toolCallId: call.id, toolName, input: call.arguments ?? {} },

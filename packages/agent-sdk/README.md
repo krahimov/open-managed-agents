@@ -14,22 +14,16 @@ browser bundle, the same way Stripe publishable keys are.
 
 ## 1. Deploy your agent
 
-In the Console: **Agents → your agent → Deploy**, or via API:
+In the Console: **Agents → your agent → Deploy**. The publishable key
+(`oma_pk_...`) is shown exactly once; rotate it any time from the same
+deployment in the Console.
 
-```bash
-curl -X POST https://your-openma-host/v1/deployments \
-  -H "x-api-key: $OMA_API_KEY" \
-  -H "content-type: application/json" \
-  -d '{
-    "agent_id": "agent_abc123",
-    "environment_id": "env_abc123",
-    "name": "Support bot (prod)",
-    "allowed_origins": ["https://app.example.com"]
-  }'
-```
-
-The response contains `key` (`oma_pk_...`) — shown exactly once. Rotate it any
-time with `POST /v1/deployments/:id/rotate_key`.
+Creating a deployment and rotating its key mint a new key, so they need a
+signed-in Console session: `POST /v1/deployments` and
+`POST /v1/deployments/:id/rotate_key` refuse tenant API keys (`x-api-key`)
+with `403 permission_error`, the same way API keys can't mint API keys.
+Listing, reading, updating and deleting deployments still work with an API
+key.
 
 ## 2. Connect from your app
 

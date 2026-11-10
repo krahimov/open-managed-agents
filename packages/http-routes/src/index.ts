@@ -40,8 +40,28 @@ export type { TenantRoutesDeps, MeRoutesDeps } from "./tenants";
 export {
   buildApiKeyRoutes,
   mintApiKeyOnStorage,
+  apiKeyMintForbidden,
   sha256Hex,
 } from "./api-keys";
+
+export {
+  bindOAuthInitiator,
+  gateOAuthStart,
+  inlineScriptJson,
+  isLoopbackRedirect,
+  mintOAuthStartToken,
+  verifyOAuthInitiator,
+  OAUTH_START_CONFIRM_PARAM,
+  OAUTH_STATE_TTL_SECONDS,
+} from "./oauth-initiator";
+export type {
+  OAuthInitiator,
+  OAuthInitiatorAuth,
+  OAuthInitiatorCheck,
+  OAuthStartGate,
+  OAuthStartKv,
+  OAuthStartTokenResult,
+} from "./oauth-initiator";
 export type {
   ApiKeyRoutesDeps,
   ApiKeyStorage,

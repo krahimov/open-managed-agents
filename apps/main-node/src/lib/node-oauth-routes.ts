@@ -1,6 +1,16 @@
 import { Hono } from "hono";
 import type { CredentialAuth } from "@open-managed-agents/shared";
-import type { RouteServices } from "@open-managed-agents/http-routes";
+import {
+  bindOAuthInitiator,
+  gateOAuthStart,
+  inlineScriptJson,
+  isLoopbackRedirect,
+  mintOAuthStartToken,
+  verifyOAuthInitiator,
+  OAUTH_STATE_TTL_SECONDS,
+  type OAuthInitiator,
+  type RouteServices,
+} from "@open-managed-agents/http-routes";
 
 interface OAuthState {
   completion_key?: string;
@@ -32,6 +42,9 @@ interface OAuthState {
   /** Service slug from the access request (card-side name, e.g. "github"),
    *  used for the grant text instead of the host-derived server name. */
   service?: string;
+  /** Who started the flow — the callback refuses anyone else (see
+   *  packages/http-routes/src/oauth-initiator.ts). */
+  initiator?: OAuthInitiator;
 }
 
 interface ProtectedResourceMeta {
@@ -96,11 +109,23 @@ export interface NodeOAuthRoutesDeps {
 }
 
 type NodeOAuthVars = {
-  Variables: { tenant_id: string; user_id?: string };
+  Variables: { tenant_id: string; user_id?: string; auth_type?: string };
 };
 
 export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthVars> {
   const app = new Hono<NodeOAuthVars>();
+
+  // One-time start token for the console's popup (see gateOAuthStart).
+  app.post("/start-token", async (c) => {
+    const r = await mintOAuthStartToken(c, {
+      authType: c.get("auth_type"),
+      tenantId: c.get("tenant_id"),
+      userId: c.get("user_id"),
+      kv: deps.services.kv,
+    });
+    if (!r.ok) return c.json({ error: r.message }, r.status);
+    return c.json({ token: r.token, expires_in: r.expires_in }, 200, { "Cache-Control": "no-store" });
+  });
 
   app.get("/authorize", async (c) => {
     const mcpServerUrl = c.req.query("mcp_server_url");
@@ -115,6 +140,19 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     if (!mcpServerUrl || (!vaultId && !newVaultName)) {
       return c.json({ error: "mcp_server_url and vault_id are required" }, 400);
     }
+    let startTarget = mcpServerUrl;
+    try {
+      startTarget = new URL(mcpServerUrl).host;
+    } catch {}
+    const gate = await gateOAuthStart(c, {
+      authType: c.get("auth_type"),
+      tenantId: c.get("tenant_id"),
+      userId: c.get("user_id"),
+      kv: deps.services.kv,
+      target: startTarget,
+    });
+    if (gate.kind === "refuse") return c.html(closeHtml("Connection not started", htmlEscape(gate.reason)), 403);
+    if (gate.kind === "confirm") return c.html(gate.html, 200, gate.headers);
 
     let parsedMcpUrl: URL;
     try {
@@ -255,10 +293,17 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       session_id: sessionIdParam,
       request_id: requestIdParam,
       service: serviceParam,
+      initiator: await bindOAuthInitiator(c, {
+        state,
+        tenantId,
+        userId: c.get("user_id"),
+        authType: c.get("auth_type"),
+        baseUrl,
+      }),
     };
 
     await deps.services.kv.put(`oauth_state:${state}`, JSON.stringify(oauthState), {
-      expirationTtl: 600,
+      expirationTtl: OAUTH_STATE_TTL_SECONDS,
     });
 
     const authUrl = new URL(meta.authServer.authorization_endpoint);
@@ -298,7 +343,17 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     const stateKey = `oauth_state:${state}`;
     const stateData = await deps.services.kv.get(stateKey);
     if (!stateData) return c.json({ error: "Invalid or expired OAuth state" }, 400);
+    // Single use: claim the state before any check or token exchange, so a
+    // replayed (or raced) callback finds nothing.
+    await deps.services.kv.delete(stateKey);
     const oauthState = JSON.parse(stateData) as OAuthState;
+    const bound = await verifyOAuthInitiator(c, {
+      state,
+      initiator: oauthState.initiator,
+      callerTenantId: c.get("tenant_id"),
+      callerUserId: c.get("user_id"),
+    });
+    if (!bound.ok) return c.html(closeHtml("Sign-in could not be completed", htmlEscape(bound.reason)), 403);
 
     const baseUrl = getBaseUrl(c.req.url);
     const tokenBody = new URLSearchParams({
@@ -322,7 +377,6 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
 
     if (!tokenRes.ok) {
       const errBody = await tokenRes.text().catch(() => "");
-      await deps.services.kv.delete(stateKey);
       // A dead cached registration surfaces as invalid_client — drop it so
       // the next attempt re-registers instead of failing forever.
       if (oauthState.dcr_cache_key && /invalid_client/i.test(errBody)) {
@@ -333,7 +387,6 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
 
     const tokens = await readTokenResponse(tokenRes);
     if (!tokens.access_token) {
-      await deps.services.kv.delete(stateKey);
       return c.html(closeHtml("Token exchange failed", "Provider did not return an access token."), 502);
     }
 
@@ -401,7 +454,6 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
         });
       }
     } catch (err) {
-      await deps.services.kv.delete(stateKey);
       return c.html(
         closeHtml(
           "Could not store the credential",
@@ -411,7 +463,6 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       );
     }
 
-    await deps.services.kv.delete(stateKey);
     if (oauthState.completion_key) await deps.services.kv.put(oauthState.completion_key, "complete", { expirationTtl: 900 });
     const probeResult = await probeMcpServer(oauthState.mcp_server_url, tokens.access_token);
 
@@ -450,7 +501,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       <p>Connected to ${htmlEscape(serverName)}. Closing...</p>
       <script>
         (function(){
-          var msg = ${JSON.stringify({
+          var msg = ${inlineScriptJson({
             type: "oauth_complete",
             service: grantService,
             server_name: serverName,
@@ -463,21 +514,25 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
             probe_ok: probeResult.ok,
             probe_message: probeResult.message ?? null,
           })};
-          var notified = false;
+          var openerNotified = false;
+          var broadcast = false;
           try {
             if (window.opener && !window.opener.closed) {
               window.opener.postMessage(msg, "*");
-              notified = true;
+              openerNotified = true;
             }
           } catch (e) {}
           try {
             var bc = new BroadcastChannel("openma-oauth");
             bc.postMessage(msg);
             bc.close();
-            notified = true;
+            broadcast = true;
           } catch (e) {}
-          if (notified) window.close();
-          else window.location.href = ${JSON.stringify(redirectUrl.toString())};
+          // A console popup (it has an opener) closes, even when the console
+          // itself runs on localhost. oma connect's OS-opened tab has none, and
+          // only a hit on its localhost /callback ends the CLI's wait.
+          if (openerNotified || (broadcast && !${inlineScriptJson(isLoopbackRedirect(oauthState.redirect_uri))})) window.close();
+          else window.location.href = ${inlineScriptJson(redirectUrl.toString())};
         })();
       </script>
       </body></html>
@@ -957,7 +1012,7 @@ async function probeMcpServer(
 function closeHtml(title: string, body: string, extra: Record<string, unknown> = {}): string {
   // body may carry markup for the page; the postMessage variant is plain text.
   const plain = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-  const msg = JSON.stringify({
+  const msg = inlineScriptJson({
     type: "oauth_error",
     message: `${title}: ${plain}`.slice(0, 500),
     ...extra,

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
 import { SavedLoginLine } from "./SavedLoginLine";
 
@@ -23,6 +23,7 @@ const show = (props: Partial<Parameters<typeof SavedLoginLine>[0]> = {}) =>
 
 beforeEach(() => {
   vi.stubGlobal("BroadcastChannel", class { addEventListener() {} removeEventListener() {} close() {} });
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ token: "tok-1" })));
 });
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
@@ -32,12 +33,16 @@ it("names the vault the agent got and links to it", () => {
   expect(screen.getByRole("link", { name: "linear connection" })).toHaveAttribute("href", "/vaults/vlt-1");
 });
 
-it("switches into a new vault, never the shared one, against this session", () => {
-  const open = vi.spyOn(window, "open").mockReturnValue({ closed: false } as any);
+it("switches into a new vault, never the shared one, against this session", async () => {
+  const popup = { closed: false, location: { href: "" } };
+  vi.spyOn(window, "open").mockReturnValue(popup as any);
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ token: "tok-1" })));
   show();
   fireEvent.click(screen.getByRole("button", { name: "Switch account" }));
-  const url = new URL(String(open.mock.calls[0][0]), "https://console.example");
+  await waitFor(() => expect(popup.location.href).not.toBe(""));
+  const url = new URL(popup.location.href, "https://console.example");
   expect(url.pathname).toBe("/v1/oauth/authorize");
+  expect(url.searchParams.get("oauth_confirm")).toBe("tok-1");
   expect(url.searchParams.get("new_vault_name")).toBe("linear · Incident commander");
   expect(url.searchParams.has("vault_id")).toBe(false);
   expect(url.searchParams.get("session_id")).toBe("sess-1");
@@ -46,7 +51,7 @@ it("switches into a new vault, never the shared one, against this session", () =
 });
 
 it("shows the error from the popup and lets the user retry", () => {
-  vi.spyOn(window, "open").mockReturnValue({ closed: false } as any);
+  vi.spyOn(window, "open").mockReturnValue({ closed: false, location: { href: "" } } as any);
   show();
   fireEvent.click(screen.getByRole("button", { name: "Switch account" }));
   act(() => {
@@ -62,7 +67,7 @@ it("shows the error from the popup and lets the user retry", () => {
 it("does not get stuck waiting when the popup is closed", () => {
   vi.useFakeTimers();
   try {
-    const popup = { closed: false };
+    const popup = { closed: false, location: { href: "" } };
     vi.spyOn(window, "open").mockReturnValue(popup as any);
     show();
     fireEvent.click(screen.getByRole("button", { name: "Switch account" }));

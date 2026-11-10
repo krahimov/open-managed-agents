@@ -3,6 +3,7 @@ import { useNavigate, useParams, useSearchParams } from "react-router";
 import { toast } from "sonner";
 
 import { useApi } from "../lib/api";
+import { openOAuthPopup } from "../lib/oauth-popup";
 import { useApiQuery, useQueryClient } from "../lib/useApiQuery";
 
 import { Modal } from "../components/Modal";
@@ -635,11 +636,7 @@ function AddCredentialModal({
     });
     if (opts?.clientId) params.set("client_id", opts.clientId);
     if (opts?.clientSecret) params.set("client_secret", opts.clientSecret);
-    window.open(
-      `/v1/oauth/authorize?${params.toString()}`,
-      "oauth",
-      "width=600,height=700,popup=yes",
-    );
+    openOAuthPopup(params, "oauth");
   };
 
   const createBearerCred = async () => {

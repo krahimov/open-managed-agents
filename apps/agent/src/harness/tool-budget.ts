@@ -13,16 +13,44 @@
 //      deferred ToolSearch / Anthropic's tool-search: the model can still
 //      do everything, it just discovers the long tail on demand.
 //
+// Permissions: buildTools has already stripped `execute` from always_ask /
+// policy-ask tools. A deferred tool like that must still ASK, not become
+// unreachable — so call_mcp_tool carries `needsApproval` for exactly those
+// targets: the AI SDK leaves the call pending, the harness records it as an
+// ask-gated tool_use, and an approval re-runs the TARGET tool directly
+// (session-runtime unwraps call_mcp_tool via resolveConfirmedToolCall in
+// packages/shared/src/tool-permission.ts).
+//
 // Pure function of the tool dict + budget, so history replay is stable:
 // the same harness produces the same direct/deferred split every turn.
 
-import { tool, type Tool, type ToolSet } from "ai";
+import { jsonSchema, tool, type Tool, type ToolSet } from "ai";
 import { z } from "zod";
+import { CALL_MCP_BAD_ARGUMENTS, CALL_MCP_TOOL_NAME, parseCallMcpArguments } from "@open-managed-agents/shared";
 
 export const OPENAI_MAX_TOOLS = 128;
 export const SEARCH_TOOL_NAME = "search_mcp_tools";
-export const CALL_TOOL_NAME = "call_mcp_tool";
+export const CALL_TOOL_NAME = CALL_MCP_TOOL_NAME;
 const META_TOOL_COUNT = 2;
+
+const callMcpToolInput = z.object({
+  name: z.string().min(1).max(200),
+  // Some models send the arguments JSON-encoded; accept both.
+  arguments: z.union([z.record(z.string(), z.unknown()), z.string()]).optional(),
+});
+type CallMcpToolInput = z.infer<typeof callMcpToolInput>;
+const CALL_MCP_TOOL_WIRE_SCHEMA = {
+  type: "object" as const,
+  properties: {
+    name: { type: "string" as const, minLength: 1, maxLength: 200, description: "Full deferred tool name, e.g. mcp__linear__create_issue" },
+    arguments: {
+      description: "Tool arguments (JSON object)",
+      anyOf: [{ type: "object" as const, additionalProperties: true }, { type: "string" as const }],
+    },
+  },
+  required: ["name"],
+  additionalProperties: false,
+};
 
 const MCP_PREFIX = "mcp__";
 
@@ -44,6 +72,26 @@ export interface ToolBudgetResult {
 function toolDescription(t: Tool): string {
   const d = (t as { description?: unknown }).description;
   return typeof d === "string" ? d : "";
+}
+
+function hasExecute(t: Tool | undefined): boolean {
+  return typeof (t as { execute?: unknown } | undefined)?.execute === "function";
+}
+
+/**
+ * True when this concrete call must wait for user approval: the tool has a
+ * synchronous `needsApproval` (call_mcp_tool) that says so for `input`.
+ * The harness uses it to stamp the write-ahead tool_use as ask-gated.
+ */
+export function toolCallNeedsApproval(t: unknown, input: unknown): boolean {
+  const na = (t as { needsApproval?: unknown } | undefined)?.needsApproval;
+  if (na === true) return true;
+  if (typeof na !== "function") return false;
+  try {
+    return (na as (i: unknown) => unknown)(input) === true;
+  } catch {
+    return false;
+  }
 }
 
 function jsonSchemaOf(t: Tool): unknown {
@@ -150,6 +198,7 @@ export function applyToolBudget(
             server: mcpServerOf(name),
             description: toolDescription(t).slice(0, 400),
             input_schema: jsonSchemaOf(t) ?? "(see description)",
+            ...(hasExecute(t) ? {} : { requires_approval: true }),
           };
         }),
         null,
@@ -162,22 +211,41 @@ export function applyToolBudget(
     description:
       `Invoke a deferred MCP tool by its full name (as returned by ${SEARCH_TOOL_NAME}, e.g. "mcp__linear__create_issue") ` +
       `with a JSON object of arguments matching its input schema. Deferred servers: ${serverSummary}.`,
-    inputSchema: z.object({
-      name: z.string().min(1).max(200).describe("Full deferred tool name, e.g. mcp__linear__create_issue"),
-      arguments: z.record(z.string(), z.unknown()).optional().describe("Tool arguments (JSON object)"),
+    // Wire schema spelled out, validated with zod: the AI SDK's zod
+    // conversion closes every object (additionalProperties:false), which
+    // declared `arguments` as an object that allows NO keys — the model
+    // was told that, and the pi harness (validating against the JSON
+    // schema) refused every call with object arguments.
+    inputSchema: jsonSchema<CallMcpToolInput>(CALL_MCP_TOOL_WIRE_SCHEMA, {
+      validate: (value) => {
+        const r = callMcpToolInput.safeParse(value);
+        return r.success ? { success: true, value: r.data } : { success: false, error: r.error };
+      },
     }),
+    // Deferred always_ask / policy-ask tools (no execute) ask the user
+    // first; everything else runs immediately.
+    // Malformed arguments never park: execute hands the error back so the
+    // model retries, instead of the user approving a call that can't run.
+    needsApproval: ({ name, arguments: args }: { name: string; arguments?: unknown }) => {
+      const t = deferred.get(name);
+      return !!t && !hasExecute(t) && parseCallMcpArguments(args) !== null;
+    },
     execute: async (
-      { name, arguments: args }: { name: string; arguments?: Record<string, unknown> },
+      { name, arguments: args }: { name: string; arguments?: Record<string, unknown> | string },
       callOpts: unknown,
     ) => {
       const t = deferred.get(name);
       if (!t) {
         return `Unknown deferred tool "${name}". Use ${SEARCH_TOOL_NAME} to find the exact name. Deferred servers: ${serverSummary}.`;
       }
+      const parsed = parseCallMcpArguments(args);
+      if (!parsed) return `Invalid arguments for "${name}": ${CALL_MCP_BAD_ARGUMENTS}`;
       const exec = (t as { execute?: (a: unknown, o: unknown) => unknown }).execute;
-      if (typeof exec !== "function") return `Tool "${name}" cannot be executed here.`;
+      // needsApproval normally parks these before execute; a harness that
+      // ignores it (or a replay) must still not run a gated tool unasked.
+      if (typeof exec !== "function") return `Tool "${name}" requires user approval and was not run.`;
       try {
-        const out = await exec(args ?? {}, callOpts);
+        const out = await exec(parsed, callOpts);
         return typeof out === "string" ? out : JSON.stringify(out);
       } catch (err) {
         return `Tool "${name}" failed: ${err instanceof Error ? err.message : String(err)}`;
@@ -187,3 +255,4 @@ export function applyToolBudget(
 
   return { tools: direct, deferred, deferredByServer };
 }
+

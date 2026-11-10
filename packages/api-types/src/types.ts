@@ -576,6 +576,9 @@ export interface AgentMcpToolUseEvent extends EventBase {
   mcp_server_name: string;
   name: string;
   input: Record<string, unknown>;
+  /** "ask" when the call is parked for a user.tool_confirmation (the
+   *  server's mcp_toolset is always_ask). */
+  evaluated_permission?: "allow" | "ask";
   /** Durable-execution metadata (see docs/durable-execution.md). Stamped
    *  by the default harness on write-ahead tool calls. `idempotency_key` =
    *  `${session_id}:${tool_use_id}` — stable across retries/recovery so

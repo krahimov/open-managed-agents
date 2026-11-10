@@ -106,7 +106,7 @@ oma agents create <name>                    # create agent
 oma sessions create --agent <id> --env <id> # start session
 oma sessions message <id> <text>            # send message
 oma models create --name <n> --model-id <id> --api-key <key>
-oma keys create                             # generate API key
+oma auth login                              # browser sign-in → CLI token (API keys can't mint keys)
 oma --help                                  # full command list
 ```
 

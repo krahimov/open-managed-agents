@@ -267,6 +267,37 @@ export class ClerkTokenVerifier {
   }
 }
 
+/**
+ * Routes the console reaches by navigating a popup rather than by fetch:
+ * the MCP OAuth start, and the provider's redirect back. A navigation
+ * can't carry `Authorization`, so on these alone the Clerk session JWT is
+ * also read from clerk-js's first-party `__session` cookie (main-node
+ * serves the console on the same origin). Both stay as guarded as a
+ * cookie session: /authorize needs a one-time start token
+ * (gateOAuthStart) and /callback is bound to the starting browser and
+ * user (verifyOAuthInitiator). Everywhere else the cookie is ignored, so
+ * it never becomes an ambient credential for the API.
+ */
+const CLERK_COOKIE_NAVIGATIONS = new Set(["/v1/oauth/authorize", "/v1/oauth/callback"]);
+
+/** The Clerk session JWT a request carries: `Authorization: Bearer`, or on
+ *  the OAuth navigations above the `__session` cookie. Null when neither. */
+export function clerkSessionTokenFrom(
+  headers: Headers,
+  request?: { method: string; path: string },
+): string | null {
+  const authz = headers.get("authorization") ?? "";
+  if (authz.startsWith("Bearer ")) return authz.slice("Bearer ".length).trim() || null;
+  if (!request || request.method !== "GET" || !CLERK_COOKIE_NAVIGATIONS.has(request.path)) return null;
+  for (const part of (headers.get("cookie") ?? "").split(";")) {
+    const eq = part.indexOf("=");
+    if (eq === -1 || part.slice(0, eq).trim() !== "__session") continue;
+    const value = part.slice(eq + 1).trim();
+    return value || null;
+  }
+  return null;
+}
+
 // ─── svix webhook signature ──────────────────────────────────────────────
 
 /**

@@ -30,9 +30,10 @@
 import { Hono, type Context } from "hono";
 import type { KvStore } from "@open-managed-agents/kv-store";
 import { resolveServices, type RouteServicesArg } from "../types";
+import { apiKeyMintForbidden } from "../api-keys";
 
 interface Vars {
-  Variables: { tenant_id: string; user_id?: string };
+  Variables: { tenant_id: string; user_id?: string; auth_type?: string };
 }
 
 interface GatewayVars {
@@ -200,7 +201,12 @@ export function buildDeploymentRoutes(deps: DeploymentRoutesDeps) {
   const app = new Hono<Vars>();
 
   // POST /v1/deployments — publish an agent. Returns the key ONCE.
+  // Minting a publishable key needs a console session, like API keys: the
+  // key lives in KV with no tie to the caller's credential, so one minted
+  // over a leaked API key would outlive that key's revocation.
   app.post("/", async (c) => {
+    const forbidden = apiKeyMintForbidden(c.var.auth_type, "publishable keys");
+    if (forbidden) return forbidden;
     const services = resolveServices(deps.services, c);
     const storage = kvDeploymentStorage(resolveKv(deps, c));
     const t = c.var.tenant_id;
@@ -298,6 +304,8 @@ export function buildDeploymentRoutes(deps: DeploymentRoutesDeps) {
 
   // POST /v1/deployments/:id/rotate_key — mint a fresh key, kill the old.
   app.post("/:id/rotate_key", async (c) => {
+    const forbidden = apiKeyMintForbidden(c.var.auth_type, "publishable keys");
+    if (forbidden) return forbidden;
     const storage = kvDeploymentStorage(resolveKv(deps, c));
     const rec = await storage.get(c.var.tenant_id, c.req.param("id"));
     if (!rec) return c.json({ error: "Deployment not found" }, 404);

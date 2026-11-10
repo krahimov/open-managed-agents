@@ -3,13 +3,32 @@ import type { Env } from "@open-managed-agents/shared";
 import { logWarn } from "@open-managed-agents/shared";
 import type { CredentialAuth } from "@open-managed-agents/shared";
 import type { Services } from "@open-managed-agents/services";
+import {
+  bindOAuthInitiator,
+  gateOAuthStart,
+  inlineScriptJson,
+  isLoopbackRedirect,
+  mintOAuthStartToken,
+  verifyOAuthInitiator,
+  OAUTH_STATE_TTL_SECONDS,
+  type OAuthInitiator,
+} from "@open-managed-agents/http-routes";
 
 const app = new Hono<{
   Bindings: Env;
-  Variables: { tenant_id: string; services: Services };
+  Variables: { tenant_id: string; user_id?: string; auth_type?: string; services: Services };
 }>();
 
 // ─── Helpers ───
+
+/** Escape text interpolated into the callback's HTML. error_description
+ *  and token-endpoint bodies are attacker-influenced (reflected XSS on the
+ *  console origin would defeat the initiator binding below). */
+function htmlEscape(s: string): string {
+  return s.replace(/[&<>"']/g, (ch) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]!
+  ));
+}
 
 /** Generate a cryptographically random string for PKCE and state. */
 function randomString(length: number): string {
@@ -255,9 +274,27 @@ interface OAuthState {
   authorization_server: string;
   redirect_uri: string;
   resource_uri: string;
+  /** Who started the flow — the callback refuses anyone else (see
+   *  packages/http-routes/src/oauth-initiator.ts). */
+  initiator?: OAuthInitiator;
 }
 
 // ─── Routes ───
+
+/**
+ * POST /v1/oauth/start-token — one-time start token for the console's
+ * popup; /authorize without one shows a confirm page (gateOAuthStart).
+ */
+app.post("/start-token", async (c) => {
+  const r = await mintOAuthStartToken(c, {
+    authType: c.get("auth_type"),
+    tenantId: c.get("tenant_id"),
+    userId: c.get("user_id"),
+    kv: c.var.services.kv,
+  });
+  if (!r.ok) return c.json({ error: r.message }, r.status);
+  return c.json({ token: r.token, expires_in: r.expires_in }, 200, { "Cache-Control": "no-store" });
+});
 
 /**
  * GET /v1/oauth/authorize
@@ -280,6 +317,19 @@ app.get("/authorize", async (c) => {
   if (!mcpServerUrl || !vaultId) {
     return c.json({ error: "mcp_server_url and vault_id are required" }, 400);
   }
+  let startTarget = mcpServerUrl;
+  try {
+    startTarget = new URL(mcpServerUrl).host;
+  } catch {}
+  const gate = await gateOAuthStart(c, {
+    authType: c.get("auth_type"),
+    tenantId: c.get("tenant_id"),
+    userId: c.get("user_id"),
+    kv: c.var.services.kv,
+    target: startTarget,
+  });
+  if (gate.kind === "refuse") return c.json({ error: gate.reason }, 403);
+  if (gate.kind === "confirm") return c.html(gate.html, 200, gate.headers);
 
   // Verify vault exists. Vaults live in D1 (vaults-store) since the
   // KV → D1 migration; this route was missed in that sweep — every
@@ -486,12 +536,19 @@ app.get("/authorize", async (c) => {
     authorization_server: meta.authServer.issuer,
     redirect_uri: clientRedirectUri || `${baseUrl}/`,
     resource_uri: meta.resource.resource,
+    initiator: await bindOAuthInitiator(c, {
+      state,
+      tenantId: t,
+      userId: c.get("user_id"),
+      authType: c.get("auth_type"),
+      baseUrl,
+    }),
   };
 
   await c.var.services.kv.put(
     `oauth_state:${state}`,
     JSON.stringify(oauthState),
-    { expirationTtl: 600 },
+    { expirationTtl: OAUTH_STATE_TTL_SECONDS },
   );
 
   // Build authorization URL
@@ -523,7 +580,7 @@ app.get("/callback", async (c) => {
 
   if (error) {
     const desc = c.req.query("error_description") || error;
-    return c.html(`<html><body><h2>Authorization failed</h2><p>${desc}</p><script>window.close()</script></body></html>`, 400);
+    return c.html(`<html><body><h2>Authorization failed</h2><p>${htmlEscape(desc)}</p><script>window.close()</script></body></html>`, 400);
   }
 
   if (!code || !state) {
@@ -537,7 +594,21 @@ app.get("/callback", async (c) => {
     return c.json({ error: "Invalid or expired OAuth state" }, 400);
   }
 
+  // Single use: claim the state before any check or token exchange.
+  await c.var.services.kv.delete(stateKey);
   const oauthState: OAuthState = JSON.parse(stateData);
+  const bound = await verifyOAuthInitiator(c, {
+    state,
+    initiator: oauthState.initiator,
+    callerTenantId: c.get("tenant_id"),
+    callerUserId: c.get("user_id"),
+  });
+  if (!bound.ok) {
+    return c.html(
+      `<html><body><h2>Sign-in could not be completed</h2><p>${htmlEscape(bound.reason)}</p><script>window.close()</script></body></html>`,
+      403,
+    );
+  }
 
   // Exchange code for tokens
   const baseUrl = getBaseUrl(c);
@@ -568,8 +639,7 @@ app.get("/callback", async (c) => {
 
   if (!tokenRes.ok) {
     const errBody = await tokenRes.text();
-    await c.var.services.kv.delete(stateKey);
-    return c.html(`<html><body><h2>Token exchange failed</h2><p>${errBody}</p><script>window.close()</script></body></html>`, 502);
+    return c.html(`<html><body><h2>Token exchange failed</h2><p>${htmlEscape(errBody)}</p><script>window.close()</script></body></html>`, 502);
   }
 
   const tokens = (await tokenRes.json()) as {
@@ -625,9 +695,6 @@ app.get("/callback", async (c) => {
     });
   }
 
-  // Clean up state
-  await c.var.services.kv.delete(stateKey);
-
   // Probe the MCP server with the just-obtained token. Same shape as the
   // Slack publish probe — POST tools/list, classify the response, surface
   // the result on the success page so the user sees ✓ or a precise warning
@@ -659,33 +726,37 @@ app.get("/callback", async (c) => {
   // etc.) — by 2026 this should be unreachable.
   return c.html(`
     <html><body>
-    <p>Connected to ${serverName}. Closing…</p>
+    <p>Connected to ${htmlEscape(serverName)}. Closing…</p>
     <script>
       (function(){
-        var msg = {
+        var msg = ${inlineScriptJson({
           type: "oauth_complete",
-          service: "${serverName}",
-          vault_id: "${oauthState.vault_id}",
-          probe_ok: ${probeResult.ok ? "true" : "false"},
-          probe_message: ${JSON.stringify(probeResult.message ?? null)},
-        };
-        var notified = false;
+          service: serverName,
+          vault_id: oauthState.vault_id,
+          probe_ok: probeResult.ok,
+          probe_message: probeResult.message ?? null,
+        })};
+        var openerNotified = false;
+        var broadcast = false;
         try {
           if (window.opener && !window.opener.closed) {
             window.opener.postMessage(msg, "*");
-            notified = true;
+            openerNotified = true;
           }
         } catch (e) {}
         try {
           var bc = new BroadcastChannel("openma-oauth");
           bc.postMessage(msg);
           bc.close();
-          notified = true;
+          broadcast = true;
         } catch (e) {}
-        if (notified) {
+        // A console popup (it has an opener) closes, even when the console
+        // itself runs on localhost. oma connect's OS-opened tab has none, and
+        // only a hit on its localhost /callback ends the CLI's wait.
+        if (openerNotified || (broadcast && !${inlineScriptJson(isLoopbackRedirect(oauthState.redirect_uri))})) {
           window.close();
         } else {
-          window.location.href = ${JSON.stringify(redirectUrl.toString())};
+          window.location.href = ${inlineScriptJson(redirectUrl.toString())};
         }
       })();
     </script>

@@ -12,7 +12,31 @@
 import { Hono } from "hono";
 
 interface Vars {
-  Variables: { tenant_id: string; user_id?: string };
+  Variables: { tenant_id: string; user_id?: string; auth_type?: "api_key" | "session" | "disabled" };
+}
+
+/**
+ * Keys carry no scopes — every key is a full tenant credential — so a
+ * key-authenticated caller can't be limited to minting a "subset" key.
+ * Minting over key auth is refused outright instead: otherwise one leaked
+ * key mints replacements that survive its revocation (privilege
+ * persistence). Console sessions (and AUTH_DISABLED dev) keep full ability.
+ */
+export function apiKeyMintForbidden(
+  authType: string | undefined,
+  what = "API keys",
+): Response | null {
+  if (authType !== "api_key") return null;
+  return Response.json(
+    {
+      type: "error",
+      error: {
+        type: "permission_error",
+        message: `API keys cannot create ${what}. Sign in to the console (cookie session) to create one.`,
+      },
+    },
+    { status: 403 },
+  );
 }
 
 export interface ApiKeyMeta {
@@ -74,6 +98,8 @@ export function buildApiKeyRoutes(deps: ApiKeyRoutesDeps) {
   const app = new Hono<Vars>();
 
   app.post("/", async (c) => {
+    const forbidden = apiKeyMintForbidden(c.var.auth_type);
+    if (forbidden) return forbidden;
     const tenantId = c.var.tenant_id;
     const userId = c.var.user_id;
     const body = await c.req

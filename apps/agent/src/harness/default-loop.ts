@@ -8,9 +8,10 @@ import { SummarizeCompactionStrategy, resolveCompactionStrategy } from "./compac
 import type { CompactionStrategy } from "./compaction";
 import { ALL_TOOLS } from "./tools";
 import { llmLoggingMiddleware, llmLogKey } from "./llm-logging-middleware";
-import { isOpenAiCompatModel, sanitizeOpenAiToolNames, reasoningProviderOptions } from "./provider";
+import { isOpenAiCompatModel, isOpenAiResponsesModel, sanitizeOpenAiToolNames, reasoningProviderOptions } from "./provider";
+import { applyOpenAiStrictSchemas } from "./openai-tool-schema";
 import type { ToolSet } from "ai";
-import { OPENAI_MAX_TOOLS, SEARCH_TOOL_NAME, CALL_TOOL_NAME, applyToolBudget } from "./tool-budget";
+import { OPENAI_MAX_TOOLS, SEARCH_TOOL_NAME, CALL_TOOL_NAME, applyToolBudget, toolCallNeedsApproval } from "./tool-budget";
 import { classifyTool, idempotencyKeyFor } from "@open-managed-agents/session-runtime";
 import type { ToolExecutionClass } from "@open-managed-agents/shared";
 import {
@@ -32,8 +33,12 @@ const isMcpTool = (name: string) => name.startsWith("mcp_");
 // makes `runtime.broadcast` emit `agent.tool_use`; false routes to
 // `agent.custom_tool_use`. Down-stream consumers (Console UI, SDK event
 // filters, billing dashboards) split on those event types.
+// The tool-budget meta tools run server-side like built-ins — without this
+// they surfaced as agent.custom_tool_use (client-owned), so an ask-gated
+// call_mcp_tool couldn't be confirmed and a crash mid-call waited forever.
 export const isBuiltinTool = (name: string): boolean =>
-  BUILTIN_TOOLS.has(name) || isMcpTool(name) || name.startsWith("call_agent_");
+  BUILTIN_TOOLS.has(name) || isMcpTool(name) || name.startsWith("call_agent_") ||
+  name === SEARCH_TOOL_NAME || name === CALL_TOOL_NAME;
 
 
 /**
@@ -115,6 +120,9 @@ export function toolCallEvents(
       name: toolName,
       input: callInput,
       ...durable,
+      // Same marker as built-ins: an always_ask MCP tool is client-owned
+      // until confirmed (recovery, interrupt fixup and the console key on it).
+      ...(extras.pending ? { evaluated_permission: "ask" as const } : {}),
     });
   } else if (isBuiltinTool(toolName)) {
     const event: AgentToolUseEvent = {
@@ -441,6 +449,15 @@ export class DefaultHarness implements HarnessInterface {
             `reachable via ${SEARCH_TOOL_NAME} / ${CALL_TOOL_NAME}.`,
         } as SessionEvent);
       }
+      // The Responses API applies strict mode on its own when `strict` is
+      // omitted, forcing every optional argument to be filled ("" / 0 /
+      // null → MCP servers reject the call). Send strict explicitly, with
+      // optionals encoded as nullable and placeholder nulls stripped before
+      // the tool runs (see openai-tool-schema.ts). chat/completions defaults
+      // to non-strict and fronts third-party gateways — left as is.
+      if (cached.tools && isOpenAiResponsesModel(model)) {
+        cached.tools = applyOpenAiStrictSchemas(cached.tools as ToolSet) as typeof cached.tools;
+      }
       const safe = sanitizeOpenAiToolNames({ tools: cached.tools, messages: cached.messages });
       if (safe.tools) cached.tools = safe.tools as typeof cached.tools;
       if (safe.messages) cached.messages = safe.messages as typeof cached.messages;
@@ -536,9 +553,11 @@ export class DefaultHarness implements HarnessInterface {
       const finalTools = (cached.tools ?? {}) as Record<string, any>;
       const lookupTool = (name: string) => finalTools[name] ?? tools[name];
 
-      const toolUseExtras = (toolName: string, toolCallId: string): ToolUseExtras => {
+      const toolUseExtras = (toolName: string, toolCallId: string, input?: unknown): ToolUseExtras => {
         const t = lookupTool(toolName);
-        const hasExecute = typeof t?.execute === "function";
+        // call_mcp_tool has an execute but parks (needsApproval) when its
+        // target is an always_ask / policy-ask deferred tool.
+        const hasExecute = typeof t?.execute === "function" && !toolCallNeedsApproval(t, input);
         return {
           idempotency_key: idempotencyKeyFor(sessionId, toolCallId),
           execution_class: classifyTool(toolName, { hasExecute, annotations: t?.annotations }),
@@ -612,7 +631,7 @@ export class DefaultHarness implements HarnessInterface {
             await runtime.broadcastToolInputEnd(part.toolCallId, "completed");
             liveToolInput.delete(part.toolCallId);
           }
-          for (const e of toolCallEvents(part, toolUseExtras(part.toolName, part.toolCallId))) {
+          for (const e of toolCallEvents(part, toolUseExtras(part.toolName, part.toolCallId, part.input))) {
             await persist(e);
           }
           writeAheadToolUses.add(part.toolCallId);
@@ -913,7 +932,7 @@ export class DefaultHarness implements HarnessInterface {
                 await runtime.broadcastToolInputEnd(partTC.toolCallId, "completed");
                 liveToolInput.delete(partTC.toolCallId);
               }
-              for (const e of toolCallEvents(partTC, toolUseExtras(partTC.toolName, partTC.toolCallId))) {
+              for (const e of toolCallEvents(partTC, toolUseExtras(partTC.toolName, partTC.toolCallId, partTC.input))) {
                 runtime.broadcast(e);
               }
               writeAheadToolUses.add(partTC.toolCallId);
@@ -927,9 +946,13 @@ export class DefaultHarness implements HarnessInterface {
               for (const e of toolResultEvents(partTR)) runtime.broadcast(e);
               break;
             }
-            // source / file / tool-approval-request: not produced by current
-            // tool surface; intentionally skipped. Add cases here if those
-            // become reachable — the bijection requires every part write a
+            // tool-approval-request: produced by call_mcp_tool when its
+            // target is an always_ask deferred tool (needsApproval). No
+            // extra wire event — the preceding tool-call part already wrote
+            // the ask-gated tool_use (evaluated_permission: "ask").
+            // source / file: not produced by current tool surface;
+            // intentionally skipped. Add cases here if those become
+            // reachable — the bijection requires every part write a
             // matching wire event.
           }
         }
@@ -1140,6 +1163,13 @@ export class DefaultHarness implements HarnessInterface {
       // final empty step failed the whole work item). Only classify as
       // silent_stop when the ENTIRE turn shipped nothing.
       const steps = await r.steps;
+      // toolResults holds only tool-result parts; a call whose execute threw
+      // is a tool-error part — it ran and already has its is_error result,
+      // so it must not be reported as awaiting confirmation.
+      const toolErrorIds: string[] = [];
+      for (const part of (steps[steps.length - 1]?.content ?? []) as Array<{ type?: string; toolCallId?: string }>) {
+        if (part?.type === "tool-error" && typeof part.toolCallId === "string") toolErrorIds.push(part.toolCallId);
+      }
       const turnShippedNothing = steps.every(
         (s) =>
           (!s.text || s.text.trim().length === 0)
@@ -1183,7 +1213,7 @@ export class DefaultHarness implements HarnessInterface {
           `model_stream_error: ${lastStreamErrorMessage ?? "provider stream ended in error with no output"}`,
         );
       }
-      return { finishReason, text: finalText, toolCalls, toolResults, usage };
+      return { finishReason, text: finalText, toolCalls, toolResults, toolErrorIds, usage };
       } catch (err) {
         // Boundary: streamText + the read awaits above (finishReason /
         // text / toolCalls / usage) are the LLM-provider edge. Native
@@ -1209,7 +1239,11 @@ export class DefaultHarness implements HarnessInterface {
     // 8. Detect pending tool confirmations and custom tool results
     if (result.toolCalls?.length) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const resultedIds = new Set((result.toolResults as any[])?.map((r: any) => r.toolCallId) ?? []);
+      const resultedIds = new Set([
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        ...((result.toolResults as any[])?.map((r: any) => r.toolCallId) ?? []),
+        ...(result.toolErrorIds ?? []),
+      ]);
       const pending = result.toolCalls
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         .filter((c: any) => !resultedIds.has(c.toolCallId))

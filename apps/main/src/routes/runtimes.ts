@@ -30,11 +30,12 @@ import { skillFileR2Key } from "@open-managed-agents/shared";
 import { resolveKnownAgent } from "@open-managed-agents/acp-runtime/known-agents";
 import type { Services } from "@open-managed-agents/services";
 import type { KvStore } from "@open-managed-agents/kv-store";
+import { apiKeyMintForbidden } from "@open-managed-agents/http-routes";
 
 /** Browser-facing routes — mounted under /v1/runtimes. */
 export const runtimesRoutes = new Hono<{
   Bindings: Env;
-  Variables: { tenant_id: string; user_id?: string };
+  Variables: { tenant_id: string; user_id?: string; auth_type?: string };
 }>();
 
 /** Daemon-facing routes — mounted under /agents/runtime. NO authMiddleware. */
@@ -81,6 +82,11 @@ async function sha256(input: string): Promise<string> {
 
 // POST /v1/runtimes/connect-runtime — browser asks for a one-time exchange code.
 runtimesRoutes.post("/connect-runtime", async (c) => {
+  // The exchange this code unlocks mints a runtime token plus an oma_* key
+  // per tenant — browser (cookie session) only, never over an API key, or a
+  // leaked key could mint replacements that outlive its revocation.
+  const forbidden = apiKeyMintForbidden(c.get("auth_type"));
+  if (forbidden) return forbidden;
   const userId = c.get("user_id");
   const tenantId = c.get("tenant_id");
   if (!userId || !tenantId) return c.json({ error: "unauthorized" }, 401);

@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { useApi } from "../lib/api";
 import { Button } from "@/components/ui/button";
 import type { Event } from "../lib/events";
+import { openOAuthPopup } from "../lib/oauth-popup";
 import { OAuthAppSetupPanel, type OAuthAppRequirement } from "./OAuthAppSetupPanel";
 
 /**
@@ -296,11 +297,7 @@ export function AccessRequestCard({
         // then only cosmetic.
         if (sessionId) params.set("session_id", sessionId);
         if (ev.request_id) params.set("request_id", ev.request_id);
-        window.open(
-          `/v1/oauth/authorize?${params.toString()}`,
-          `oauth-${service}`,
-          "width=600,height=700,popup=yes",
-        );
+        openOAuthPopup(params, `oauth-${service}`);
         return;
       }
       // Composio path. Open the popup synchronously (popup blockers) and

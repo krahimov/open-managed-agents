@@ -12,6 +12,7 @@ import {
   type CodexLike,
 } from "../src/lib/codex-sdk-harness.js";
 import type { ThreadEvent } from "@openai/codex-sdk";
+import { jsonSchema } from "ai";
 
 function fakeCodex(events: ThreadEvent[], calls: { started: unknown[]; resumed: Array<{ id: string; options: unknown }> }): CodexLike {
   const thread = {
@@ -209,6 +210,82 @@ describe("CodexSdkHarness.run", () => {
     await expect(harness.run(ctx)).rejects.toThrow(/access policy/);
     expect(broadcasts.some((b) => b.type === "session.error")).toBe(true);
     expect(calls.started).toHaveLength(0); // never reached the codex child
+  });
+
+  it("rejects sessions whose MCP servers ask for approval (fail-closed: no per-call hook)", async () => {
+    const calls = { started: [] as unknown[], resumed: [] };
+    const harness = new CodexSdkHarness({ createCodex: () => fakeCodex([], calls) });
+    const { ctx, broadcasts } = makeCtx({
+      agent: {
+        id: "agent-1",
+        model: "gpt-5.2",
+        mcp_servers: [{ name: "linear", type: "url", url: "https://mcp.linear.app/mcp" }],
+        tools: [{ type: "mcp_toolset", mcp_server_name: "linear", default_config: { enabled: true, permission_policy: { type: "always_ask" } } }],
+      },
+    });
+
+    await expect(harness.run(ctx)).rejects.toThrow(/linear.*always_ask/);
+    expect(broadcasts.some((b) => b.type === "session.error")).toBe(true);
+    expect(calls.started).toHaveLength(0);
+  });
+
+  it("computer sessions don't fail on an always_ask MCP tool: it's dropped from the bridge, the rest still run", async () => {
+    vi.stubEnv("OMA_CODEX_ALLOWED_AGENTS", "default/agent-1");
+    const events: ThreadEvent[] = [
+      { type: "thread.started", thread_id: "thr-pc" },
+      { type: "item.completed", item: { id: "item_0", type: "agent_message", text: "ok" } },
+    ];
+    const calls = { started: [] as unknown[], resumed: [] as Array<{ id: string; options: unknown }> };
+    let options: any;
+    const harness = new CodexSdkHarness({ createCodex: (o) => { options = o; return fakeCodex(events, calls); } });
+    const { ctx, broadcasts } = makeCtx({
+      agent: {
+        id: "agent-1",
+        model: "gpt-5.2",
+        mcp_servers: [{ name: "linear", type: "url", url: "https://mcp.linear.app/mcp" }],
+        tools: [
+          { type: "agent_toolset_20260401", default_config: { enabled: true, permission_policy: { type: "always_allow" } } },
+          { type: "mcp_toolset", mcp_server_name: "linear", configs: [{ name: "delete_issue", enabled: true, permission_policy: { type: "always_ask" } }] },
+        ],
+      },
+      // What buildTools hands over: the ask-gated tool has no execute.
+      tools: {
+        mcp__linear__list_issues: { description: "list", inputSchema: jsonSchema({ type: "object", properties: {} }), execute: async () => "[]" },
+        mcp__linear__delete_issue: { description: "delete", inputSchema: jsonSchema({ type: "object", properties: {} }) },
+      },
+      runtime: { sandbox: { sandboxCapabilities: () => ({ scope: "agent" }) } },
+    });
+
+    await harness.run(ctx);
+    expect(broadcasts.some((b) => b.type === "session.error")).toBe(false);
+    expect(calls.started).toHaveLength(1);
+    // The agent's servers aren't mounted in codex directly on this path.
+    expect(Object.keys(options.config.mcp_servers ?? {})).not.toContain("linear");
+  });
+
+  it("keeps running agents whose always_ask doesn't touch a tool it exposes", async () => {
+    const events: ThreadEvent[] = [
+      { type: "thread.started", thread_id: "thr-ok" },
+      { type: "item.completed", item: { id: "item_0", type: "agent_message", text: "ok" } },
+    ];
+    const calls = { started: [] as unknown[], resumed: [] as Array<{ id: string; options: unknown }> };
+    const harness = new CodexSdkHarness({ createCodex: () => fakeCodex(events, calls) });
+    const { ctx, broadcasts } = makeCtx({
+      agent: {
+        id: "agent-1",
+        model: "gpt-5.2",
+        // Built-in-only ask (codex's own tools aren't OMA built-ins), and an
+        // ask on a server this agent doesn't declare.
+        tools: [
+          { type: "agent_toolset_20260401", default_config: { enabled: true, permission_policy: { type: "always_allow" } }, configs: [{ name: "bash", enabled: true, permission_policy: { type: "always_ask" } }] },
+          { type: "mcp_toolset", mcp_server_name: "linear", default_config: { enabled: true, permission_policy: { type: "always_ask" } } },
+        ],
+      },
+    });
+
+    await harness.run(ctx);
+    expect(broadcasts.some((b) => b.type === "session.error")).toBe(false);
+    expect(calls.started).toHaveLength(1);
   });
 
   it("maps reasoning_level onto codex modelReasoningEffort", async () => {

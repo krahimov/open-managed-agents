@@ -21,13 +21,18 @@ can hold directly.
 
 ## Management API (tenant-authed)
 
+Create and `rotate_key` mint a publishable key, so they require a Console
+session (cookie or Clerk); a tenant API key (`x-api-key`) gets
+`403 permission_error` — same rule as API keys minting API keys
+(`apiKeyMintForbidden`). The other routes accept either.
+
 ```
 POST   /v1/deployments                 {agent_id, agent_version?, environment_id?, name?, allowed_origins?}
-                                       → record + key (key shown ONCE)
+                                       → record + key (key shown ONCE)  [Console session only]
 GET    /v1/deployments                 → {data: [...]}
 GET    /v1/deployments/:id
 POST   /v1/deployments/:id             {name?, allowed_origins?, disabled?, environment_id?, agent_version?}
-POST   /v1/deployments/:id/rotate_key  → record + new key (old key dies)
+POST   /v1/deployments/:id/rotate_key  → record + new key (old key dies)  [Console session only]
 DELETE /v1/deployments/:id
 ```
 

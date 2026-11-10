@@ -85,8 +85,7 @@ function makeStubSessionsApp(recorded: RecordedRequest[]) {
   return app;
 }
 
-function makeHarness() {
-  const kv = new InMemoryKvStore();
+function makeHarness(authType?: string, kv = new InMemoryKvStore()) {
   const recorded: RecordedRequest[] = [];
   const agents = {
     get: async ({ agentId }: { tenantId: string; agentId: string }) =>
@@ -97,6 +96,7 @@ function makeHarness() {
   const mgmt = new Hono<{ Variables: { tenant_id: string } }>();
   mgmt.use("*", async (c, next) => {
     c.set("tenant_id", TENANT);
+    if (authType) c.set("auth_type" as never, authType as never);
     await next();
   });
   mgmt.route("/", buildDeploymentRoutes({ services }));
@@ -199,6 +199,41 @@ describe("deployments — management routes", () => {
       body: "{}",
     });
     expect(newKeyRes.status).toBe(201);
+  });
+
+  it("refuses to mint or rotate a publishable key over API-key auth", async () => {
+    // Publishable keys live in KV, untied to the caller's credential: one
+    // minted over a leaked API key would outlive that key's revocation.
+    const dep = await createDeployment(h.mgmt);
+    const viaKey = makeHarness("api_key", h.kv);
+    const before = await h.kv.list({ prefix: "deploy:" });
+    const create = await viaKey.mgmt.request("/", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agent_id: "agent_1" }),
+    });
+    expect(create.status).toBe(403);
+    const body = (await create.json()) as { error: { type: string } };
+    expect(body.error.type).toBe("permission_error");
+    expect(JSON.stringify(body)).not.toContain("oma_pk_");
+    expect(await h.kv.list({ prefix: "deploy:" })).toEqual(before);
+
+    // Rotation is refused too, and the existing key keeps working.
+    const rotate = await viaKey.mgmt.request(`/${dep.id}/rotate_key`, { method: "POST" });
+    expect(rotate.status).toBe(403);
+    const stillWorks = await viaKey.gateway.request("/sessions", {
+      method: "POST",
+      headers: { authorization: `Bearer ${dep.key}` },
+      body: "{}",
+    });
+    expect(stillWorks.status).toBe(201);
+
+    // A console session still publishes.
+    expect((await makeHarness("session").mgmt.request("/", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ agent_id: "agent_1" }),
+    })).status).toBe(201);
   });
 
   it("delete removes the deployment and kills its key", async () => {
