@@ -49,6 +49,8 @@ export interface TelegramDeps {
   publicBaseUrl?: string;
   requestAccess?: (tenantId: string, sessionId: string, service: string, requestId: string) => Promise<unknown>;
   hasVault?: (tenantId: string, vaultId: string) => Promise<boolean>;
+  /** Attach the agent's own memory store to a new working conversation. Must not throw. */
+  attachAgentMemory?: (input: import("./agent-memory-mode.js").AttachAgentMemoryInput) => Promise<void>;
   fetch?: typeof fetch;
 }
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -333,6 +335,9 @@ export class TelegramOnboarding {
       vaultIds: Array.isArray(agent.metadata?.default_vault_ids) ? agent.metadata.default_vault_ids as string[] : [],
       metadata: { telegram_user: a.user_id, ...(mode === "setup" ? { oma_setup: true } : {}) },
     });
+    if (mode === "work") {
+      await this.d.attachAgentMemory?.({ tenantId: a.tenant_id, sessionId: session.id, agentId, agentSnapshot: agent, principalId: a.user_id });
+    }
     await this.d.sql
       .prepare(
         "INSERT INTO telegram_conversations (session_id,tenant_id,user_id,agent_id,mode,transition_id) VALUES (?,?,?,?,?,?) ON CONFLICT (tenant_id,user_id,agent_id) DO UPDATE SET session_id=excluded.session_id,mode=excluded.mode,transition_id=excluded.transition_id,last_seq=-1",

@@ -15,6 +15,7 @@ import { Button } from "@/components/ui/button";
 import type { AgentRecord as Agent } from "../types/agent";
 import { AmbientTriggerControls } from "../components/AmbientTriggerControls";
 import { AgentComputerPanel } from "../components/AgentComputerPanel";
+import { AgentMemoryPanel } from "../components/AgentMemoryPanel";
 import { AgentModelSwitcher } from "../components/AgentModelSwitcher";
 import { REASONING_LEVEL_LABELS, uiReasoningLevel } from "@open-managed-agents/api-types";
 import { AgentFormDialog } from "./agents/AgentFormDialog";
@@ -343,6 +344,8 @@ export function AgentDetail() {
           />
         </div>
       </div>
+
+      <AgentMemoryPanel key={agent.id} agentId={agent.id} />
 
       <AmbientRulesPanel
         agentId={agent.id}
@@ -849,6 +852,8 @@ function AmbientRulesPanel({
       setBudgetPreset("standard");
       setNextWakeAt("");
       await invalidate();
+      // A first rule switches the agent's memory on server-side.
+      void qc.invalidateQueries({ queryKey: [`/v1/agents/${agentId}/memory`] });
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Failed to create ambient rule");
     } finally {

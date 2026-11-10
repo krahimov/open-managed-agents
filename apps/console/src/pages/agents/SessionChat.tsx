@@ -17,6 +17,7 @@ import { AccessRequestCard } from "../../components/AccessRequestCard";
 import { SavedLoginLine } from "../../components/SavedLoginLine";
 import { HarnessDiffCard } from "../../components/HarnessDiffCard";
 import { AmbientRuleCard } from "../../components/AmbientRuleCard";
+import { MemoryEnabledCard } from "../../components/MemoryEnabledCard";
 import { SkillRequestCard } from "../../components/SkillRequestCard";
 import { buildTimeline } from "../../components/tool-calls/model";
 import { WorkTimeline, WorkingRow } from "../../components/tool-calls/ToolCalls";
@@ -113,6 +114,7 @@ function isRenderable(ev: Event): boolean {
   // read the durable grant (grantedRequestIdsOf).
   if (ev.type === "system.access_granted") return true;
   if (ev.type === "system.ambient_rule_created") return true;
+  if (ev.type === "system.memory_enabled") return true;
   if (ev.type === "system.skill_request") return true;
   return false;
 }
@@ -323,6 +325,9 @@ export function SessionChat({
               }
               if (ev.type === "system.ambient_rule_created") {
                 return <AmbientRuleCard key={key} event={ev} />;
+              }
+              if (ev.type === "system.memory_enabled") {
+                return <MemoryEnabledCard key={key} event={ev} />;
               }
               if (ev.type === "system.skill_request") {
                 return <SkillRequestCard key={key} event={ev} sessionId={sessionId} />;

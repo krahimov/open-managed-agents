@@ -17,9 +17,10 @@ import { buildAmbientWebhookRoutes, type AmbientWebhookDeps } from "./webhook";
 import { Hono } from "hono";
 import type {
   AgentConfig,
+  AgentMemoryConfig,
   ReasoningLevel,
 } from "@open-managed-agents/shared";
-import { REASONING_LEVELS } from "@open-managed-agents/shared";
+import { AGENT_MEMORY_MODES, REASONING_LEVELS } from "@open-managed-agents/shared";
 import {
   AgentNotFoundError,
   AgentVersionMismatchError,
@@ -49,6 +50,7 @@ function formatAgent(agent: AgentConfig) {
   }
   if (agent.harness) oma.harness = agent.harness;
   if (agent.reasoning_level) oma.reasoning_level = agent.reasoning_level;
+  if (agent.memory) oma.memory = agent.memory;
   if (agent.runtime_binding) oma.runtime_binding = agent.runtime_binding;
   if (agent.appendable_prompts && agent.appendable_prompts.length > 0) {
     oma.appendable_prompts = agent.appendable_prompts;
@@ -81,6 +83,7 @@ function formatAgent(agent: AgentConfig) {
     aux_model: _aux,
     harness: _harness,
     reasoning_level: _rl,
+    memory: _mem,
     runtime_binding: _rb,
     appendable_prompts: _ap,
     callable_agents: _ca,
@@ -169,6 +172,27 @@ function multiagentToCallableAgents(
   return { list: out };
 }
 
+/** Validate an _oma.memory block. `undefined`/`null` are fine (unset /
+ *  clear); otherwise `mode` must be one of the enum values and `store_id`,
+ *  when present, a non-empty string (per_user stores are per principal). */
+function invalidMemoryConfig(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object") return "memory must be an object";
+  const m = value as { mode?: unknown; store_id?: unknown };
+  if (typeof m.mode !== "string" || !(AGENT_MEMORY_MODES as readonly string[]).includes(m.mode)) {
+    return `memory.mode must be one of ${AGENT_MEMORY_MODES.join("|")}`;
+  }
+  if (m.store_id !== undefined && (typeof m.store_id !== "string" || !m.store_id.trim())) {
+    return "memory.store_id must be a non-empty string";
+  }
+  // "off" may keep a store_id: disabling memory retains the agent's store
+  // so re-enabling finds the same notes.
+  if (m.store_id !== undefined && m.mode === "per_user") {
+    return "memory.store_id is not valid with mode 'per_user'";
+  }
+  return null;
+}
+
 /** Validate an _oma.reasoning_level value. `undefined`/`null` are fine
  *  (unset / clear); anything else must be one of the enum values. */
 function invalidReasoningLevel(value: unknown): string | null {
@@ -216,6 +240,14 @@ export interface AgentRoutesDeps extends AmbientWebhookDeps {
    *  spoofed by a tenant-scoped legacy API key. Auth-disabled dev keeps
    *  the fallback (no identity exists to verify). */
   requireVerifiedApprover?: boolean;
+  /** Called after an ambient rule is created over REST. Node uses it to
+   *  switch agent memory on (each firing is a fresh session, so memory is
+   *  the only continuity) — same helper the create_ambient_rule tool runs. */
+  onAmbientRuleCreated?: (input: {
+    tenantId: string;
+    agentId: string;
+    ruleId: string;
+  }) => Promise<void>;
 }
 
 export function buildAgentRoutes(deps: AgentRoutesDeps) {
@@ -239,6 +271,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
         aux_model?: string | { id: string; speed?: "standard" | "fast" };
         harness?: string;
         reasoning_level?: ReasoningLevel;
+        memory?: AgentMemoryConfig;
         runtime_binding?: AgentConfig["runtime_binding"];
         appendable_prompts?: string[];
       };
@@ -249,6 +282,8 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
 
     const rlError = invalidReasoningLevel(raw._oma?.reasoning_level);
     if (rlError) return c.json({ error: rlError }, 400);
+    const memError = invalidMemoryConfig(raw._oma?.memory);
+    if (memError) return c.json({ error: memError }, 400);
 
     const body = {
       ...raw,
@@ -256,6 +291,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
       aux_model: raw._oma?.aux_model,
       harness: raw._oma?.harness,
       reasoning_level: raw._oma?.reasoning_level,
+      memory: raw._oma?.memory,
       runtime_binding: raw._oma?.runtime_binding,
       appendable_prompts: raw._oma?.appendable_prompts,
     };
@@ -333,6 +369,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
         metadata: body.metadata,
         aux_model: body.aux_model,
         reasoning_level: body.reasoning_level,
+        memory: body.memory,
         appendable_prompts: body.appendable_prompts,
         runtime_binding: body.runtime_binding,
         enable_general_subagent: (body as { enable_general_subagent?: boolean })
@@ -464,6 +501,11 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
               ? c.var.user_id
               : (raw as { created_by?: string }).created_by,
         } as Parameters<typeof services.ambientRules.create>[0]["input"],
+      });
+      // Runtime side effects of a new rule (Node: memory auto-enable). The
+      // rule exists either way — a failed hook must not fail the create.
+      await deps.onAmbientRuleCreated?.({ tenantId, agentId, ruleId: row.id }).catch((err) => {
+        console.warn("[agents] onAmbientRuleCreated failed", err);
       });
       return c.json(toApiAmbientRule(row), 201);
     } catch (err) {
@@ -649,6 +691,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
         aux_model?: string | { id: string; speed?: "standard" | "fast" } | null;
         harness?: string;
         reasoning_level?: ReasoningLevel | null;
+        memory?: AgentMemoryConfig | null;
         runtime_binding?: AgentConfig["runtime_binding"] | null;
         appendable_prompts?: string[] | null;
       };
@@ -665,6 +708,8 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
 
     const rlError = invalidReasoningLevel(raw._oma?.reasoning_level);
     if (rlError) return c.json({ error: rlError }, 400);
+    const memError = invalidMemoryConfig(raw._oma?.memory);
+    if (memError) return c.json({ error: memError }, 400);
 
     const body = {
       ...raw,
@@ -672,6 +717,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
       aux_model: raw._oma?.aux_model,
       harness: raw._oma?.harness,
       reasoning_level: raw._oma?.reasoning_level,
+      memory: raw._oma?.memory,
       runtime_binding: raw._oma?.runtime_binding,
       appendable_prompts: raw._oma?.appendable_prompts,
     };
@@ -719,6 +765,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
           metadata: body.metadata,
           aux_model: body.aux_model,
           reasoning_level: body.reasoning_level,
+          memory: body.memory,
           appendable_prompts: body.appendable_prompts,
           runtime_binding: body.runtime_binding,
           enable_general_subagent: (body as { enable_general_subagent?: boolean })

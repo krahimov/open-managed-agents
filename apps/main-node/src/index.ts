@@ -53,6 +53,7 @@ import {
 } from "@open-managed-agents/agents-store";
 import {
   createSqliteMemoryStoreService,
+  r2Key,
   SqlMemoryRepo,
 } from "@open-managed-agents/memory-store";
 import { LocalFsBlobStore as MemoryLocalFsBlobStore } from "@open-managed-agents/memory-store/adapters/local-fs-blob";
@@ -85,7 +86,18 @@ import { generateEventId, extractTextFromContent, extractTraceFacts } from "@ope
 import type { TraceFacts } from "@open-managed-agents/shared";
 import { DefaultHarness } from "@open-managed-agents/agent/harness/default-loop";
 import { CodexSdkHarness } from "./lib/codex-sdk-harness.js";
-import type { SdkMemoryPort } from "./lib/sdk-harness-memory.js";
+import { createSdkMemoryPort } from "./lib/sdk-harness-memory.js";
+import {
+  autoEnableMemoryForAmbientRule,
+  buildAgentMemoryRoutes,
+  buildAttachAgentMemory,
+  describeAmbientMemory,
+  enableAgentMemory,
+  type AgentMemoryDeps,
+  type AgentMemoryState,
+  type EnableMemoryResult,
+} from "./lib/agent-memory-mode.js";
+import { MemoryPromptBuilder, createSessionMemoryContext } from "./lib/memory-prompt.js";
 import { ClaudeAgentSdkHarness } from "./lib/claude-agent-sdk-harness.js";
 import type { PiHarness } from "@open-managed-agents/agent/harness/pi";
 import {
@@ -178,7 +190,6 @@ import { buildNodeScheduler } from "./lib/node-scheduler-jobs.js";
 import { startNodeMemoryQueue } from "./lib/node-memory-queue.js";
 import {
   buildSandboxEnvForEnvironment,
-  environmentMemoryStoreRefs,
   sandboxProviderFromEnvironment,
 } from "./lib/environment-runtime-config.js";
 import {
@@ -586,6 +597,61 @@ const memoryService = createSqliteMemoryStoreService({
   blobs: memoryBlobs,
 });
 const memoryRepo = new SqlMemoryRepo(drizzleDb);
+
+// Agent-level memory (`_oma.memory.mode`) — which store an agent owns and
+// attaching it to that agent's sessions. See lib/agent-memory-mode.ts.
+const agentMemoryDeps: AgentMemoryDeps = {
+  memoryService,
+  agents: agentsService,
+  // A session resource of type memory_store — the same binding a caller
+  // gets by passing `resources: [{type: "memory_store"}]` at create.
+  attach: async ({ tenantId, sessionId, storeId, access }) => {
+    const existing = await sessionsService.listResourcesBySession({ sessionId }).catch(() => []);
+    const already = existing.some(
+      (r) =>
+        r.type === "memory_store" &&
+        (r.resource as { memory_store_id?: string }).memory_store_id === storeId,
+    );
+    if (already) return;
+    await sessionsService.addResource({
+      tenantId,
+      sessionId,
+      resource: { type: "memory_store", memory_store_id: storeId, access } as never,
+    });
+  },
+  log: (msg, ctx) => logger.info({ op: "memory.mode", ...ctx }, msg),
+};
+const attachAgentMemory = buildAttachAgentMemory(agentMemoryDeps);
+/** Best-effort variant for the non-REST session creators: a memory failure
+ *  must never stop a scheduled run or an inbound message from starting. */
+const attachAgentMemoryQuietly: typeof attachAgentMemory = (input) =>
+  attachAgentMemory(input).catch((err) => {
+    logger.warn(
+      { err, op: "memory.mode.attach_failed", session_id: input.sessionId, agent_id: input.agentId },
+      "agent memory attach failed; session continues without it",
+    );
+  });
+// What working sessions are told about their stores (listing + newest notes).
+const memoryPrompt = new MemoryPromptBuilder({
+  list: async (storeId) => {
+    const rows = await memoryRepo.list(storeId, {});
+    return rows.map((r) => ({ path: r.path, sizeBytes: r.size_bytes, updatedAt: r.updated_at }));
+  },
+  read: async (storeId, memPath) => (await memoryBlobs.getText(r2Key(storeId, memPath)))?.text ?? null,
+});
+// Which stores a session has, and the reminders describing them.
+const sessionMemory = createSessionMemoryContext({
+  sessions: sessionsService,
+  memoryService,
+  legacyBindings: async (sessionId) =>
+    (
+      await sql
+        .prepare(`SELECT store_id, access FROM session_memory_stores WHERE session_id = ?`)
+        .bind(sessionId)
+        .all<{ store_id: string; access: string }>()
+    ).results ?? [],
+  prompt: memoryPrompt,
+});
 // Memory blob watcher — wires chokidar fs events through
 // packages/queue's processMemoryEvent so CF + Node share one upsert
 // code path. PG mode uses the multi-replica-safe PG queue table; SQLite
@@ -948,6 +1014,8 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
         reportSavedLogin: (login) => postSavedLoginLine(context.tenantId, context.sessionId, agent.id, login),
         createAmbientRule: (a) =>
           createAmbientRuleFromSession(context.tenantId, agent.id, context.sessionId, a),
+        enableMemory: () =>
+          enableAgentMemoryFromSession(context.tenantId, agent.id, context.sessionId),
         env: { TAVILY_API_KEY: process.env.TAVILY_API_KEY },
       });
     }
@@ -1037,66 +1105,15 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
   },
   buildHarness: () => {
     const def = new DefaultHarness();
-    const sdkMemoryPort: SdkMemoryPort = {
-      resolve: async (tenantId, sessionId) => {
-        const rows = await sql
-          .prepare(
-            `SELECT store_id, access FROM session_memory_stores WHERE session_id = ?`,
-          )
-          .bind(sessionId)
-          .all<{ store_id: string; access: string }>();
-        const out: Array<{
-          storeId: string;
-          name: string;
-          access: "read_write" | "read_only";
-          memories: Array<{ path: string; content: string }>;
-        }> = [];
-        for (const r of rows.results ?? []) {
-          const store = await memoryService
-            .getStore({ tenantId, storeId: r.store_id })
-            .catch(() => null);
-          if (!store) continue;
-          const metas = await memoryService
-            .listMemories({ tenantId, storeId: r.store_id })
-            .catch(() => []);
-          const memories: Array<{ path: string; content: string }> = [];
-          for (const m of metas) {
-            const full = await memoryService
-              .readByPath({ tenantId, storeId: r.store_id, path: m.path })
-              .catch(() => null);
-            memories.push({ path: m.path, content: full?.content ?? "" });
-          }
-          out.push({
-            storeId: r.store_id,
-            name: store.name,
-            access: r.access === "read_only" ? "read_only" : "read_write",
-            memories,
-          });
-        }
-        return out;
-      },
-      write: async ({ tenantId, sessionId, storeId, path: memPath, content, baseSha256 }) => {
-        try {
-          await memoryService.writeByPath({
-            tenantId,
-            storeId,
-            path: memPath,
-            content,
-            precondition: baseSha256
-              ? { type: "content_sha256", content_sha256: baseSha256 }
-              : { type: "not_exists" },
-            actor: { type: "agent_session", id: sessionId },
-          });
-          return { ok: true };
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          const conflict =
-            (err as { name?: string })?.name === "MemoryPreconditionFailedError" ||
-            /precondition|sha256|exists/i.test(msg);
-          return { ok: false, conflict, error: msg };
-        }
-      },
-    };
+    // Every binding the DefaultHarness would mount: environment defaults,
+    // session resources (incl. the agent's own store from its memory mode)
+    // and the legacy session_memory_stores rows.
+    const sdkMemoryPort = createSdkMemoryPort({
+      attachments: async (tenantId, sessionId) => [
+        ...(await sessionMemory.attachments(tenantId, sessionId)).values(),
+      ],
+      memoryService,
+    });
     const sdk = new ClaudeAgentSdkHarness({
       resolveMcpTarget: resolveNodeMcpProxyTarget,
       resolveSkills: (tenantId, refs) => skillStore.resolveRefs(tenantId, refs),
@@ -1121,6 +1138,9 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
       setupAccessStatus: ensureSetupAccessReconciled,
       createAmbientRule: (tenantId, sessionId, agentId, a) =>
         createAmbientRuleFromSession(tenantId, agentId, sessionId, a),
+      enableMemory: (tenantId, sessionId, agentId) =>
+        enableAgentMemoryFromSession(tenantId, agentId, sessionId),
+      memory: sdkMemoryPort,
       findSkills: (tenantId, query) => findSkillsForTenant(tenantId, query),
       requestSkill: (tenantId, agentId, sessionId, a) =>
         postSkillRequest(tenantId, agentId, sessionId, a),
@@ -1138,6 +1158,8 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
         postAccessRequest(tenantId, sessionId, a),
       createAmbientRule: (tenantId, sessionId, agentId, a) =>
         createAmbientRuleFromSession(tenantId, agentId, sessionId, a),
+      enableMemory: (tenantId, sessionId, agentId) =>
+        enableAgentMemoryFromSession(tenantId, agentId, sessionId),
       findSkills: (tenantId, query) => findSkillsForTenant(tenantId, query),
       requestSkill: (tenantId, agentId, sessionId, a) =>
         postSkillRequest(tenantId, agentId, sessionId, a),
@@ -1234,7 +1256,20 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
     const rawSystemPrompt = isSetup
       ? buildSetupPrompt(input.agent, { accessStatus })
       : input.agent.system ?? "";
-    const memoryContext = await buildNodeMemoryPromptContext(input.tenantId, input.sessionId);
+    // Host-workdir SDK harnesses see stores at ./memory/<name>/ (materialized
+    // by sdk-harness-memory.ts, which also adds the usage guidance); every
+    // sandboxed path — an agent computer included — mounts /mnt/memory.
+    const hostWorkdirMemory =
+      harness === "claude-agent-sdk" ||
+      (harness === "codex-sdk" && input.sandbox.sandboxCapabilities?.().scope !== "agent");
+    // Setup sessions get no memory reminders (and no store attached), so
+    // skip the listing work for them entirely.
+    const memoryContext = isSetup
+      ? { storeIds: [], reminders: [] }
+      : await sessionMemory.promptContext(input.tenantId, input.sessionId, {
+          mountRoot: hostWorkdirMemory ? "./memory" : "/mnt/memory",
+          includeGuidance: !hostWorkdirMemory,
+        });
     return {
       agent: input.agent,
       userMessage: input.userMessage,
@@ -2064,7 +2099,14 @@ v1.route("/agents", buildAgentRoutes({
   ...(maxAgentsPerTenant
     ? { preCreateGate: buildAgentPreCreateGate({ sql, maxAgents: maxAgentsPerTenant }) }
     : {}),
+  // Rules created from the console's Ambient panel get the same memory
+  // default as ones the agent creates with create_ambient_rule.
+  onAmbientRuleCreated: async ({ tenantId, agentId }) => {
+    await autoEnableMemoryForAmbientRule(agentMemoryDeps, { tenantId, agentId });
+  },
 }));
+// GET/PUT /v1/agents/:id/memory — the console's memory toggle.
+v1.route("/agents", buildAgentMemoryRoutes({ memory: agentMemoryDeps }));
 const sessionRouter = new NodeSessionRouter({
   sql,
   hub,
@@ -2078,6 +2120,7 @@ const sessionRouter = new NodeSessionRouter({
 if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_USERNAME && process.env.TELEGRAM_WEBHOOK_SECRET) {
   telegram = new TelegramOnboarding({
     sql, agents: agentsService, sessions: sessionsService, router: sessionRouter,
+    attachAgentMemory: attachAgentMemoryQuietly,
     token: process.env.TELEGRAM_BOT_TOKEN,
     username: process.env.TELEGRAM_BOT_USERNAME.replace(/^@/, ""),
     webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET,
@@ -2136,7 +2179,7 @@ async function createAmbientRuleFromSession(
     prompt: string;
     wake_mode?: "observe" | "decide" | "act" | "escalate";
   },
-): Promise<{ id: string; next_wake_at?: string }> {
+): Promise<{ id: string; next_wake_at?: string; memory_note?: string }> {
   const timezone = a.timezone?.trim() || "UTC";
   const next = new Cron(a.cron, { timezone }).nextRun();
   if (!next) throw new Error(`cron "${a.cron}" has no future occurrence`);
@@ -2171,7 +2214,54 @@ async function createAmbientRuleFromSession(
     .catch(() => {
       // Card is presentation only — the rule itself is already created.
     });
-  return { id: row.id, next_wake_at: row.next_wake_at };
+  // Every firing of this rule is a fresh session, so memory is the only
+  // continuity it has: switch it on here, in the handler, unless the user
+  // explicitly turned it off. The note rides back in the tool result so the
+  // agent reports the real state.
+  let memoryNote: string;
+  try {
+    const auto = await autoEnableMemoryForAmbientRule(agentMemoryDeps, { tenantId, agentId });
+    memoryNote = describeAmbientMemory(auto);
+    if (auto.action === "enabled") await postMemoryEnabledCard(sessionId, auto.state, "ambient_rule");
+  } catch (err) {
+    logger.warn({ err, op: "memory.mode.auto_enable_failed", agent_id: agentId }, "memory auto-enable failed");
+    memoryNote =
+      "Memory could NOT be switched on automatically, so each scheduled run starts with no memory of earlier runs. Tell the user; it can be turned on from the agent page.";
+  }
+  return { id: row.id, next_wake_at: row.next_wake_at, memory_note: memoryNote };
+}
+
+/** The setup agent's enable_memory tool on every harness: provision the
+ *  agent's store, set its memory mode, and post the setup-panel card.
+ *  Hoisted so the buildTools/buildHarness closures above can reference it. */
+async function enableAgentMemoryFromSession(
+  tenantId: string,
+  agentId: string,
+  sessionId: string,
+): Promise<EnableMemoryResult> {
+  const result = await enableAgentMemory(agentMemoryDeps, { tenantId, agentId });
+  // A repeat call changes nothing, so it gets no second card.
+  if (result.newly_enabled) await postMemoryEnabledCard(sessionId, result, "setup");
+  return result;
+}
+
+/** Append the system.memory_enabled card. Presentation only — memory is
+ *  already on by the time this runs, so a lost card changes nothing. */
+async function postMemoryEnabledCard(
+  sessionId: string,
+  state: AgentMemoryState,
+  source: "setup" | "ambient_rule",
+): Promise<void> {
+  await sessionRouter
+    .appendEvent(sessionId, {
+      type: "system.memory_enabled",
+      id: generateEventId(),
+      mode: state.mode,
+      ...(state.store ? { store_id: state.store.id, store_name: state.store.name } : {}),
+      source,
+      newly_enabled: true,
+    } as SessionEvent)
+    .catch(() => {});
 }
 
 /**
@@ -2503,6 +2593,9 @@ const sessionRoutesApp = buildSessionRoutes({
   }),
   lifecycle: {
     ...nodeSessionLifecycle({ files: filesService, filesBlob }),
+    // Agent memory mode: attach the agent's own store before the runtime
+    // inits, so it is mounted and described on turn 1.
+    attachAgentMemory,
     // Clerk Billing entitlement gate: free-plan tenants get a concurrent-
     // session cap (402), paid plans pass, non-Clerk tenants fail open.
     ...(clerkConfig && clerkStore && clerkConfig.billingEnforce
@@ -3360,6 +3453,7 @@ if (platformRootSecret) {
     credentials: credentialService,
     sessions: sessionsService,
     agents: agentsService,
+    attachAgentMemory: attachAgentMemoryQuietly,
     resolveTenantId: async (userId) => {
       const row = await sql
         .prepare(
@@ -3720,6 +3814,7 @@ const ambientDispatcher = new NodeAmbientDispatcher({
   ambientRules: ambientRulesService,
   agents: agentsService,
   sessions: sessionsService,
+  attachAgentMemory: attachAgentMemoryQuietly,
   // Same lever the integrations bridge uses: append a user.message via
   // NodeSessionRouter so the harness runs a real turn.
   appendUserEvent: async (sessionId, _tenantId, _agentId, event) => {
@@ -4329,124 +4424,6 @@ function parseBooleanEnv(value: string | undefined, fallback: boolean): boolean 
   if (["1", "true", "yes", "on"].includes(normalized)) return true;
   if (["0", "false", "no", "off"].includes(normalized)) return false;
   return fallback;
-}
-
-async function buildNodeMemoryPromptContext(
-  tenantId: string,
-  sessionId: string,
-): Promise<{
-  storeIds: string[];
-  reminders: Array<{ source: string; text: string }>;
-}> {
-  const attachments = new Map<string, {
-    storeId: string;
-    access: "read_only" | "read_write";
-    instructions?: string;
-  }>();
-
-  const session = await sessionsService.get({ tenantId, sessionId }).catch(() => null);
-  await addEnvironmentMemoryPromptBindings(attachments, tenantId, session?.environment_snapshot);
-
-  {
-    // Both dialects use the shared service (JSON `config` blob) since
-    // migration 0002 reconciled PG session_resources with the cf-auth shape.
-    const resources = await sessionsService
-      .listResourcesBySession({ sessionId })
-      .catch(() => []);
-    for (const row of resources) {
-      if (row.type !== "memory_store") continue;
-      const resource = row.resource as {
-        memory_store_id?: string;
-        store_id?: string;
-        access?: string;
-        instructions?: string;
-      };
-      const storeId = resource.memory_store_id ?? resource.store_id;
-      if (!storeId) continue;
-      attachments.set(storeId, {
-        storeId,
-        access: resource.access === "read_only" ? "read_only" : "read_write",
-        instructions:
-          typeof resource.instructions === "string"
-            ? resource.instructions.slice(0, 4096)
-            : undefined,
-      });
-    }
-  }
-
-  const legacyRows = await sql
-    .prepare(`SELECT store_id, access FROM session_memory_stores WHERE session_id = ?`)
-    .bind(sessionId)
-    .all<{ store_id: string; access: string }>()
-    .catch(() => ({ results: [] }));
-  for (const row of legacyRows.results ?? []) {
-    if (attachments.has(row.store_id)) continue;
-    attachments.set(row.store_id, {
-      storeId: row.store_id,
-      access: row.access === "read_only" ? "read_only" : "read_write",
-    });
-  }
-
-  const reminders: Array<{ source: string; text: string }> = [];
-  for (const attachment of attachments.values()) {
-    const store = await memoryService.getStore({
-      tenantId,
-      storeId: attachment.storeId,
-    });
-    if (!store) continue;
-    const accessLabel = attachment.access === "read_only" ? "read-only" : "read-write";
-    const lines = [
-      `## Memory store: ${store.name}`,
-      `Mounted at /mnt/memory/${store.name}/ (${accessLabel})`,
-    ];
-    if (store.description) lines.push(store.description);
-    if (attachment.instructions) lines.push(attachment.instructions);
-    if (attachment.access === "read_only") {
-      lines.push("(read-only mount - write attempts to this directory will fail)");
-    }
-    reminders.push({
-      source: `memory:${attachment.storeId}`,
-      text: lines.join("\n"),
-    });
-  }
-
-  return {
-    storeIds: [...attachments.keys()],
-    reminders,
-  };
-}
-
-async function addEnvironmentMemoryPromptBindings(
-  attachments: Map<string, {
-    storeId: string;
-    access: "read_only" | "read_write";
-    instructions?: string;
-  }>,
-  tenantId: string,
-  environment?: EnvironmentConfig | null,
-): Promise<void> {
-  const refs = environmentMemoryStoreRefs(environment);
-  if (refs.length === 0) return;
-
-  let storesByName: Map<string, string> | null = null;
-  for (const ref of refs) {
-    let storeId = ref.storeId;
-    if (!storeId && ref.name) {
-      storesByName ??= await loadNodeMemoryStoresByName(tenantId);
-      storeId = storesByName.get(ref.name);
-    }
-    if (!storeId) continue;
-    attachments.set(storeId, {
-      storeId,
-      access: ref.access,
-      ...(ref.instructions ? { instructions: ref.instructions } : {}),
-    });
-  }
-}
-
-async function loadNodeMemoryStoresByName(tenantId: string): Promise<Map<string, string>> {
-  const stores = await memoryService.listStores({ tenantId, status: "active" });
-  return new Map(stores.map((store) => [store.name, store.id]));
 }
 
 function mountNodeSandboxConfigRoutes(v1App: NodeV1App): void {
