@@ -96,6 +96,22 @@ describe("AgentMemoryPanel", () => {
     expect(screen.getByRole("switch", { name: "Agent memory" })).toHaveAttribute("aria-checked", "false");
   });
 
+  it("keeps its slot with a loading placeholder until memory loads", async () => {
+    let respond!: (response: Response) => void;
+    fetchMock.mockImplementation(() => new Promise<Response>((resolve) => { respond = resolve; }));
+    renderPanel();
+
+    expect(screen.getByRole("heading", { name: "Memory" })).toBeInTheDocument();
+    expect(screen.getByRole("status", { name: "Loading memory" })).toBeInTheDocument();
+    expect(screen.queryByRole("switch")).not.toBeInTheDocument();
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    respond(Response.json({ enabled: false, mode: "off", explicit_off: false, store: null }));
+
+    expect(await screen.findByRole("switch", { name: "Agent memory" })).toBeInTheDocument();
+    expect(screen.queryByRole("status", { name: "Loading memory" })).not.toBeInTheDocument();
+  });
+
   it("renders nothing on runtimes without the endpoint", async () => {
     fetchMock.mockResolvedValue(Response.json({ error: "Not found" }, { status: 404 }));
     const view = renderPanel();

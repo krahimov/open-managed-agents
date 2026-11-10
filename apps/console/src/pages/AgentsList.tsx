@@ -1,6 +1,8 @@
 import { useMemo, useState } from "react";
 import { useNavigate } from "react-router";
+import { useQueryClient } from "@tanstack/react-query";
 import { ArchiveIcon, TrashIcon } from "lucide-react";
+import { toast } from "sonner";
 
 import { useApi } from "../lib/api";
 import { useInfiniteApiQuery } from "../lib/useApiQuery";
@@ -8,11 +10,13 @@ import { DataTable, type ColumnDef } from "../components/DataTable";
 import { FacetedFilter } from "../components/FacetedFilter";
 import { FilterChip, CreatedFilterChip } from "../components/FilterChip";
 import { RowActionsMenu } from "../components/RowActionsMenu";
+import { deleteAgentConfirmText, loadAgentMachine } from "../components/AgentComputerPanel";
 import { Button } from "@/components/ui/button";
 import { PopoverContent } from "@/components/ui/popover";
 import type { AgentRecord as Agent } from "../types/agent";
 import { AgentFormDialog } from "./agents/AgentFormDialog";
 import { useAgentFormAux } from "./agents/useAgentFormAux";
+import { dropAgentQueries, forgetDeletedAgent } from "./AgentDetail";
 
 
 type StatusValue = "any" | "active" | "archived";
@@ -26,6 +30,7 @@ const STATUS_OPTIONS: { value: StatusValue; label: string }[] = [
 export function AgentsList() {
   const { api } = useApi();
   const nav = useNavigate();
+  const qc = useQueryClient();
   const { allAgents, customSkills, modelCards, runtimes } = useAgentFormAux();
   const [showCreate, setShowCreate] = useState(false);
 
@@ -149,11 +154,17 @@ export function AgentsList() {
                   icon: <TrashIcon className="size-4" />,
                   destructive: true,
                   onSelect: async () => {
-                    if (!confirm(`Delete ${a.name}? If it has a cloud computer, the computer and its files are deleted too. This can't be undone.`)) return;
+                    const machine = await loadAgentMachine(qc, api, a.id).catch(() => null);
+                    if (!confirm(deleteAgentConfirmText(a.name, machine))) return;
                     try {
                       await api(`/v1/agents/${a.id}`, { method: "DELETE" });
-                      refreshAgents();
-                    } catch {}
+                    } catch {
+                      return;
+                    }
+                    forgetDeletedAgent(qc, a.id);
+                    // Nothing on this page observes the agent's own queries.
+                    dropAgentQueries(qc, a.id);
+                    toast.success(`Deleted agent "${a.name}"`);
                   },
                 },
               ]}
@@ -164,7 +175,7 @@ export function AgentsList() {
         size: 56,
       },
     ],
-    [api, refreshAgents],
+    [api, qc, refreshAgents],
   );
 
   // Active-filter chip displays — kept null when matching the default so

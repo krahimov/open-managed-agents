@@ -1,7 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { AgentComputerPanel } from "./AgentComputerPanel";
+import { type ComponentProps } from "react";
+import {
+  AgentComputerPanel,
+  agentMachineQueryKey,
+  deleteAgentConfirmText,
+  loadAgentMachine,
+} from "./AgentComputerPanel";
 import { ACTIVE_TENANT_KEY } from "../lib/api";
 
 vi.mock("../lib/clerk-auth", () => ({
@@ -25,17 +31,20 @@ const runningMachine = {
   errorReason: null,
 };
 
+const sessionSandboxEnv = { id: "env_session", config: { sandbox: { provider: "subprocess" } } };
+const agentComputerEnv = { id: "env_computer", config: { sandbox: { provider: "daytona", scope: "agent" } } };
+
 const fetchMock = vi.fn<typeof fetch>();
 const createObjectURL = vi.fn(() => "blob:computer-preview");
 const revokeObjectURL = vi.fn();
 
-function renderPanel() {
+function renderPanel(props: Partial<ComponentProps<typeof AgentComputerPanel>> = {}) {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
   return render(
     <QueryClientProvider client={client}>
-      <AgentComputerPanel agentId="agent_test" />
+      <AgentComputerPanel agentId="agent_test" defaultEnvironment={sessionSandboxEnv} {...props} />
     </QueryClientProvider>,
   );
 }
@@ -66,14 +75,74 @@ afterEach(() => {
 });
 
 describe("AgentComputerPanel", () => {
-  it("explains unsupported instances without offering controls or fetching a screenshot", async () => {
+  it("tells an agent on a session sandbox how to get a computer, without offering controls", async () => {
     fetchMock.mockResolvedValue(Response.json({ machine: null, supported: false }));
 
     renderPanel();
 
-    expect(await screen.findByText(/Cloud computers are not enabled/)).toBeInTheDocument();
+    expect(await screen.findByText(/runs each session in a fresh sandbox/)).toBeInTheDocument();
+    expect(screen.getByText(/click Edit, open the Sandbox tab/)).toHaveTextContent(
+      "choose a default environment marked “persistent agent computer”",
+    );
+    expect(screen.queryByText(/not enabled/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Linux computer runs in the cloud/)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Start computer" })).not.toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives the same advice to an agent without a default environment", async () => {
+    fetchMock.mockResolvedValue(Response.json({ machine: null, supported: false }));
+
+    renderPanel({ defaultEnvironment: null });
+
+    expect(await screen.findByText(/runs each session in a fresh sandbox/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start computer" })).not.toBeInTheDocument();
+  });
+
+  it("says an agent-computer environment creates the computer on the next session", async () => {
+    fetchMock.mockResolvedValue(Response.json({ machine: null, supported: false }));
+
+    renderPanel({ defaultEnvironment: agentComputerEnv });
+
+    expect(await screen.findByText("Its computer is created when its next session starts.")).toBeInTheDocument();
+    expect(screen.getByText(/Linux computer runs in the cloud/)).toBeInTheDocument();
+    expect(screen.queryByText(/fresh sandbox/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start computer" })).not.toBeInTheDocument();
+  });
+
+  it("waits for the default environment before choosing what to say", async () => {
+    fetchMock.mockResolvedValue(Response.json({ machine: null, supported: false }));
+
+    renderPanel({ defaultEnvironment: undefined });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("Loading computer...")).toBeInTheDocument();
+    expect(screen.queryByText(/fresh sandbox/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/next session starts/)).not.toBeInTheDocument();
+  });
+
+  it("renders nothing for an agent on a local runtime without a computer", async () => {
+    fetchMock.mockResolvedValue(Response.json({ machine: null, supported: false }));
+
+    const view = renderPanel({ localRuntime: true });
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(view.container).toBeEmptyDOMElement());
+  });
+
+  it("keeps the computer view for an agent that has a computer, whatever its environment", async () => {
+    // The endpoint reports supported whenever a computer exists.
+    fetchMock.mockResolvedValue(Response.json({
+      machine: { ...runningMachine, browserEnabled: false },
+      supported: true,
+    }));
+
+    renderPanel({ defaultEnvironment: sessionSandboxEnv, localRuntime: true });
+
+    expect(await screen.findByText("Running")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop computer" })).toBeInTheDocument();
+    expect(screen.getByText(/Linux computer runs in the cloud/)).toBeInTheDocument();
+    expect(screen.queryByText(/fresh sandbox/)).not.toBeInTheDocument();
   });
 
   it("starts a computer and fetches its preview with session and workspace authentication", async () => {
@@ -169,4 +238,37 @@ it('opens the native desktop with an authenticated ticket and disconnects the vi
   expect(desktop.disconnect).toHaveBeenCalledOnce();
   expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/stop'))).toBe(false);
   view.unmount();
+});
+
+describe("agent delete confirmation", () => {
+  it("says for certain whether the computer and its files go too", () => {
+    expect(deleteAgentConfirmText("Ops", { machine: runningMachine, supported: true })).toBe(
+      'Delete agent "Ops"? Its computer and all files on its disk will be deleted too. This cannot be undone.',
+    );
+    expect(deleteAgentConfirmText("Ops", { machine: null, supported: true })).toBe(
+      'Delete agent "Ops"? It has no computer, so there is no computer or disk to delete. This cannot be undone.',
+    );
+    expect(deleteAgentConfirmText("Ops", null)).toMatch(/^Delete agent "Ops"\? If it has a computer/);
+  });
+
+  it("asks the server even when the panel has an older answer cached", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 30_000 } } });
+    // The panel saw no computer; a session has since created one.
+    client.setQueryData(agentMachineQueryKey("agent_test"), { machine: null, supported: false });
+    const api = vi.fn(async () => ({ machine: runningMachine, supported: false }));
+
+    expect(await loadAgentMachine(client, api as never, "agent_test")).toEqual({ machine: runningMachine, supported: false });
+    expect(api).toHaveBeenCalledWith(machinePath, expect.objectContaining({ silentErrors: true }));
+    expect(client.getQueryData(agentMachineQueryKey("agent_test"))).toEqual({ machine: runningMachine, supported: false });
+  });
+
+  it("reuses a status fetch already in flight under the panel's key", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const api = vi.fn(async () => ({ machine: null, supported: false }));
+    const panelFetch = client.fetchQuery({ queryKey: agentMachineQueryKey("agent_test"), queryFn: () => api() });
+
+    expect(await loadAgentMachine(client, api as never, "agent_test")).toEqual({ machine: null, supported: false });
+    await panelFetch;
+    expect(api).toHaveBeenCalledTimes(1);
+  });
 });
