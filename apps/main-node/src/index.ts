@@ -24,7 +24,7 @@ import { resolveDeploymentIdentity } from "./lib/deployment-identity.js";
 import { SandboxSweeper, sandboxSweepConfigFromEnv, sandboxSweepCronFromEnv, sandboxSweepSqlLookups } from "./lib/sandbox-sweeper.js";
 
 import { serve } from "@hono/node-server";
-import { serveStatic } from "@hono/node-server/serve-static";
+import { mountConsoleUi } from "./lib/console-static";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import {
@@ -208,7 +208,7 @@ import {
 import { NodeSessionWorkQueue } from "./lib/node-session-work-queue.js";
 import { createNodeOutcomeRunner } from "./lib/node-outcome.js";
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { dirname, relative, resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { nanoid } from "nanoid";
 import {
@@ -3790,12 +3790,8 @@ v1.get("/sessions/:id/memory_stores", async (c) => {
 // ── Console UI (optional) ──
 const consoleDir = process.env.CONSOLE_DIR;
 if (consoleDir) {
-  const cwd = process.cwd();
-  const rootRel = consoleDir.startsWith("/")
-    ? relative(cwd, consoleDir)
-    : consoleDir;
-  app.use("/*", serveStatic({ root: rootRel }));
-  app.get("/*", serveStatic({ root: rootRel, path: "index.html" }));
+  // index.html no-cache, hashed /assets immutable, unknown /assets → 404.
+  const rootRel = mountConsoleUi(app, consoleDir);
   logger.info({ op: "main-node.console_ui", dir: consoleDir, cwd_rel: rootRel }, "console UI served");
 }
 
