@@ -37,6 +37,7 @@ import {
 import type { AgentRecord as Agent } from "../../types/agent";
 import { SETUP_KICKOFF_NEW, setupPath, startSetupSession } from "./setup-session";
 import { BRAND_NAME } from "../../lib/brand";
+import { isAgentComputerEnvironment, pickDefaultEnvironmentId } from "../../lib/default-environment";
 import {
   AMBIENT_WAKE_MODES,
   buildAmbientTrigger,
@@ -79,6 +80,7 @@ interface EnvironmentLite {
       allow_package_managers?: boolean;
     };
     packages?: { npm?: string[]; pip?: string[] };
+    sandbox?: { scope?: string | null } | null;
   };
 }
 interface SandboxConfig {
@@ -474,8 +476,11 @@ export function AgentFormDialog({
       setEnvironments(envRes.data ?? []);
       setSandboxConfig(sandboxRes);
       setForm((f) => {
-        if (editAgent || f.environmentId || (envRes.data ?? []).length === 0) return f;
-        return { ...f, environmentId: envRes.data[0].id };
+        if (editAgent || f.environmentId) return f;
+        // Never preselect an agent-computer environment: a persistent
+        // computer is an explicit choice on the Sandbox tab.
+        const defaultEnvironmentId = pickDefaultEnvironmentId(envRes.data ?? []);
+        return defaultEnvironmentId ? { ...f, environmentId: defaultEnvironmentId } : f;
       });
     });
     return () => {
@@ -1275,7 +1280,7 @@ export function AgentFormDialog({
   const selectTemplate = (tmpl: AgentTemplate) => {
     const baseForm = {
       ...INITIAL_FORM,
-      environmentId: form.environmentId || environments[0]?.id || "",
+      environmentId: form.environmentId || pickDefaultEnvironmentId(environments),
     };
     if (tmpl.id === "blank") {
       setForm(baseForm);
@@ -2898,7 +2903,7 @@ function SandboxTab({
           >
             {environments.map((env) => (
               <SelectOption key={env.id} value={env.id}>
-                {env.name} ({env.id})
+                {env.name} ({env.id}){isAgentComputerEnvironment(env) ? " · persistent agent computer" : ""}
               </SelectOption>
             ))}
           </Select>

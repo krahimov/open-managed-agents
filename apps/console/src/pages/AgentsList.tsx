@@ -149,7 +149,7 @@ export function AgentsList() {
                   icon: <TrashIcon className="size-4" />,
                   destructive: true,
                   onSelect: async () => {
-                    if (!confirm(`Delete ${a.name}? This can't be undone.`)) return;
+                    if (!confirm(`Delete ${a.name}? If it has a cloud computer, the computer and its files are deleted too. This can't be undone.`)) return;
                     try {
                       await api(`/v1/agents/${a.id}`, { method: "DELETE" });
                       refreshAgents();

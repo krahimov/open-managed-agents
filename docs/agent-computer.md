@@ -62,6 +62,10 @@ Enable browser tools on the agent:
 }
 ```
 
+The console never preselects an agent-computer environment for a new agent or
+session, even when it is first in the list: a persistent computer is chosen
+explicitly on the agent's Sandbox tab or in the session dialog.
+
 Start a session using that agent and environment. When the server default is
 agent scope, the agent's Computer section can provision a computer before the
 first session. Set `metadata.default_environment_id` on the agent to make the
@@ -78,9 +82,18 @@ Computer controls and scheduled ambient sessions use its chosen environment.
   Chromium. Detaching or deleting a session does not delete its computer.
 - Active turns and tracked background processes keep the computer awake. Stop
   returns `409` while work is active. Closing a preview does not stop work.
-- Idle machines stop according to `MACHINE_IDLE_STOP_MINUTES`. There is no
-  automatic disk deletion. Stopped machine storage may still incur provider
-  charges.
+- Idle machines stop according to `MACHINE_IDLE_STOP_MINUTES`. A stopped
+  machine keeps its disk, which still counts against the provider's storage
+  quota and may incur charges.
+- **Deleting an agent deletes its computer**: the provider machine and its
+  disk are removed with the agent and cannot be recovered. If the provider is
+  unreachable at that moment the agent is still deleted, and the cleanup is
+  retried by the orphan sweep below.
+- **Archiving an agent stops its computer and keeps it.** The disk is
+  preserved for as long as the agent exists; delete the agent to free it. A
+  computer with active work is not interrupted and stops when idle.
+- A session that outlives its deleted agent can no longer use, or re-create,
+  that agent's computer.
 - The machine configuration is frozen on first creation. A session requesting a
   different image, browser setting, or tool configuration is rejected instead
   of silently replacing the computer.
@@ -90,6 +103,53 @@ Computer controls and scheduled ambient sessions use its chosen environment.
 - API process crash recovery uses the existing session recovery behavior. A
   client disconnect continues normally; an API process crash is a different
   failure and may require retrying the interrupted model turn.
+
+## Sandbox cleanup
+
+Sandboxes that nothing owns any more would otherwise fill the provider
+account's disk quota, at which point every new session fails. The Node server
+therefore reconciles the Daytona account with its database on a schedule
+(hourly by default) and deletes:
+
+- agent computers whose agent no longer exists, together with their
+  `agent_machines` row;
+- per-session sandboxes whose session no longer exists, or has been idle or
+  terminated for more than 7 days. Session workspaces are scratch space; the
+  session itself, its outputs and its memory stores are not touched, and a
+  resumed session gets a fresh sandbox.
+
+The sweep is deliberately conservative. It only deletes a box when all of the
+following hold:
+
+1. The box carries OMA's own labels (`oma-session-id` or `oma-machine-id`).
+   Anything else in the account is never touched.
+2. The box belongs to this deployment: its `oma-deployment-id` label matches,
+   or — for boxes created before that label existed — this database holds the
+   session or machine row the box is labelled with. A box labelled for another
+   deployment is never touched, so a laptop and a production server can share
+   one Daytona account.
+3. Its labels agree with the database row they point at (same tenant, same
+   agent).
+4. The box is more than an hour old.
+5. The owner is still missing, or the session still stale, when re-checked
+   immediately before the delete.
+
+A running session is never treated as stale, an archived agent still counts
+as existing, and a sweep that cannot read the provider or the database deletes
+nothing. Every deletion is logged with the box, tenant, agent or session ids
+(`op: sandbox_sweep.deleted`), and each sweep logs a summary
+(`op: sandbox_sweep.finished`).
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `SANDBOX_SWEEP_CRON` | `17 * * * *` | Schedule. `off` disables the sweep. |
+| `SANDBOX_SWEEP_DRY_RUN` | `false` | Log what would be deleted (`op: sandbox_sweep.would_delete`) and delete nothing. |
+| `SANDBOX_SWEEP_SESSION_MAX_AGE_DAYS` | `7` | How long a session may be idle or terminated before its sandbox is removed. |
+| `SANDBOX_SWEEP_MAX_DELETIONS` | `50` | Upper bound per sweep; the remainder waits for the next one. |
+| `SANDBOX_SWEEP_ADOPT_UNLABELLED` | `false` | Also treat OMA-labelled boxes that have no deployment label and no database record as this deployment's. Only enable when no other OMA install uses the same Daytona account; run with `SANDBOX_SWEEP_DRY_RUN=true` first. |
+| `OMA_DEPLOYMENT_ID` | generated, stored in the database | Pins the deployment identity. Without it a new database gets a new identity and will not clean up boxes created against the previous one. |
+
+The sweep runs only when `DAYTONA_API_KEY` is set.
 
 ## Full Linux desktop
 
@@ -149,6 +209,8 @@ All endpoints require the owning tenant's authentication and an existing agent.
 | `POST /v1/agents/:id/machine/stop` | Preserve disk and stop when idle |
 | `GET /v1/agents/:id/machine/screenshot` | PNG of the desktop, or current browser tab in headless mode |
 | `POST /v1/agents/:id/machine/desktop-ticket` | Short-lived ticket for the live desktop WebSocket |
+| `POST /v1/agents/:id/archive` | Archives the agent; stops and keeps its computer |
+| `DELETE /v1/agents/:id` | Deletes the agent and its computer |
 
 The existing session outputs API lists and downloads generated files. Browser
 preview requests do not start a stopped computer. Listing or downloading session

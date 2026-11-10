@@ -90,6 +90,8 @@ export interface DaytonaSandboxInstance {
   state?: string;
   recoverable?: boolean;
   labels?: Record<string, string>;
+  /** ISO timestamp from the SDK (the in-memory fake reports epoch ms). */
+  createdAt?: string | number;
   autoStopInterval?: number;
   autoDeleteInterval?: number;
   computerUse?: {
@@ -187,4 +189,78 @@ export function isDaytonaNotFound(err: unknown, mod?: DaytonaModule | null): boo
     return DAYTONA_SANDBOX_REFERENCE_RE.test(msg);
   }
   return false;
+}
+
+// ─── Box ownership labels ───────────────────────────────────────────
+
+/** Labels OMA stamps on every Daytona box it creates. Cleanup code (agent
+ *  delete, the orphan sweeper) identifies boxes by these and never touches a
+ *  box that lacks them. `deployment` separates several OMA installs that
+ *  share one Daytona account; boxes created before it existed carry none. */
+export const OMA_BOX_LABELS = {
+  session: "oma-session-id",
+  machine: "oma-machine-id",
+  tenant: "oma-tenant-id",
+  agent: "oma-agent-id",
+  deployment: "oma-deployment-id",
+} as const;
+
+// ─── Capacity errors ────────────────────────────────────────────────
+
+export type SandboxCapacityResource = "storage" | "compute" | "capacity";
+
+/** The provider account refused to create/start a box because an account
+ *  quota is exhausted. `message` is written for the session's end user —
+ *  the raw provider text (which names the provider's own dashboard) stays in
+ *  `cause` and in server logs. */
+export class SandboxCapacityError extends Error {
+  readonly code = "sandbox_capacity" as const;
+  constructor(readonly resource: SandboxCapacityResource, cause: unknown) {
+    super(SANDBOX_CAPACITY_MESSAGES[resource], { cause });
+    this.name = "SandboxCapacityError";
+  }
+}
+
+const SANDBOX_CAPACITY_MESSAGES: Record<SandboxCapacityResource, string> = {
+  storage:
+    "Sandbox unavailable: this workspace's sandbox storage is full, so a sandbox could not be started and nothing was run. " +
+    "A workspace owner can free space by deleting agents and sessions that are no longer needed (their sandboxes and computers are deleted with them), " +
+    "or ask the operator of this deployment to raise the sandbox storage limit. Then try again.",
+  compute:
+    "Sandbox unavailable: this workspace's sandbox CPU/memory allowance is fully in use, so a sandbox could not be started and nothing was run. " +
+    "Wait for running sessions to finish or stop agent computers that are not needed, " +
+    "or ask the operator of this deployment to raise the sandbox limit. Then try again.",
+  capacity:
+    "Sandbox unavailable: this workspace has reached its sandbox limit, so a sandbox could not be started and nothing was run. " +
+    "A workspace owner can free capacity by deleting agents and sessions that are no longer needed, " +
+    "or ask the operator of this deployment to raise the sandbox limit. Then try again.",
+};
+
+/** Daytona's organization quota refusals, e.g. "Total disk limit exceeded.
+ *  Maximum allowed: 30GiB" (live prod 2026-11-10), and the cpu / memory /
+ *  "quota exceeded" variants of the same check. Rate limits ("rate limit
+ *  exceeded") are transient and deliberately do not match. */
+const DAYTONA_QUOTA_RE =
+  /\btotal (?:cpu|memory|disk|storage|sandbox)[a-z ]* (?:quota|limit) exceeded\b|\bquota (?:has been )?(?:exceeded|reached)\b/i;
+
+/** Translate a provider quota refusal into a `SandboxCapacityError`; every
+ *  other error is returned unchanged. */
+export function mapDaytonaProvisionError(err: unknown): unknown {
+  if (err instanceof SandboxCapacityError) return err;
+  const msg = err instanceof Error ? err.message : String(err);
+  if (!DAYTONA_QUOTA_RE.test(msg)) return err;
+  const resource: SandboxCapacityResource = /\b(?:disk|storage)\b/i.test(msg)
+    ? "storage"
+    : /\b(?:cpu|memory|ram)\b/i.test(msg)
+      ? "compute"
+      : "capacity";
+  return new SandboxCapacityError(resource, err);
+}
+
+/** A delete/get told us the box is already gone. Unlike `isDaytonaNotFound`
+ *  this also accepts a bare HTTP 404, so only use it for calls addressed to
+ *  the SANDBOX itself — never for file or process operations. */
+export function isDaytonaBoxGone(err: unknown, mod?: DaytonaModule | null): boolean {
+  if (isDaytonaNotFound(err, mod)) return true;
+  return (err as { statusCode?: unknown } | null)?.statusCode === 404;
 }

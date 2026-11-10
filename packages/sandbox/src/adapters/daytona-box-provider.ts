@@ -21,7 +21,7 @@ import type {
   DaytonaModule,
   DaytonaSandboxInstance,
 } from "./daytona-types";
-import { loadDaytonaModule } from "./daytona-types";
+import { OMA_BOX_LABELS, loadDaytonaModule, mapDaytonaProvisionError } from "./daytona-types";
 import type { SandboxBrowserEndpoint } from "../ports";
 
 export const DEFAULT_SANDBOX_IMAGE = "node:22-bookworm";
@@ -65,6 +65,10 @@ export interface SandboxBoxProvider {
 
 export interface SessionBoxProviderDeps {
   sessionId: string;
+  /** Owning tenant and OMA deployment, stamped as labels so the orphan
+   *  sweeper can prove a box is this install's before deleting it. */
+  tenantId?: string;
+  deploymentId?: string;
   /** Daytona API key. Falls back to DAYTONA_API_KEY env var. */
   apiKey?: string;
   /** Daytona API URL (self-host). Falls back to DAYTONA_API_URL. */
@@ -80,7 +84,13 @@ export interface SessionBoxProviderDeps {
 
 /** Create params for a per-session box. Unchanged from the original adapter:
  *  `ephemeral: true` (delete-on-stop) by default, otherwise never auto-delete. */
-export function buildDaytonaCreateParams(opts: { image?: string; sessionId: string; ephemeral?: boolean }): {
+export function buildDaytonaCreateParams(opts: {
+  image?: string;
+  sessionId: string;
+  ephemeral?: boolean;
+  tenantId?: string;
+  deploymentId?: string;
+}): {
   image: string;
   labels: Record<string, string>;
   ephemeral?: boolean;
@@ -88,7 +98,11 @@ export function buildDaytonaCreateParams(opts: { image?: string; sessionId: stri
 } {
   return {
     image: opts.image ?? DEFAULT_SANDBOX_IMAGE,
-    labels: { "oma-session-id": opts.sessionId },
+    labels: {
+      [OMA_BOX_LABELS.session]: opts.sessionId,
+      ...(opts.tenantId ? { [OMA_BOX_LABELS.tenant]: opts.tenantId } : {}),
+      ...(opts.deploymentId ? { [OMA_BOX_LABELS.deployment]: opts.deploymentId } : {}),
+    },
     ...(opts.ephemeral ?? true
       ? { ephemeral: true }
       : { autoDeleteInterval: -1 }),
@@ -177,8 +191,23 @@ export class SessionBoxProvider implements SandboxBoxProvider {
       image: this.deps.image,
       sessionId: this.deps.sessionId,
       ephemeral: this.deps.ephemeral,
+      tenantId: this.deps.tenantId,
+      deploymentId: this.deps.deploymentId,
     });
-    const sb = await client.create(params);
+    let sb: DaytonaSandboxInstance;
+    try {
+      sb = await client.create(params);
+    } catch (err) {
+      const mapped = mapDaytonaProvisionError(err);
+      if (mapped !== err) {
+        // The session sees the readable message; the provider's own text
+        // (quota numbers, dashboard link) stays here.
+        this.deps.logger.warn(
+          `sandbox create for session ${this.deps.sessionId} refused by provider quota: ${(err as Error).message}`,
+        );
+      }
+      throw mapped;
+    }
     this.deps.logger.log(`sandbox ${sb.id} ready`);
     try {
       await this.deps.bootstrap(sb);

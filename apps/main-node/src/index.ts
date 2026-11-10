@@ -19,6 +19,9 @@ import { agentComputerOutputsAdapter } from "./lib/agent-computer-outputs.js";
 import { computerBackupExecutor } from "./lib/agent-computer-backup.js";
 import { agentComputerSpec, agentComputerEnabled } from "./lib/agent-computer-config.js";
 import { buildAgentComputerRoutes } from "./lib/agent-computer-routes.js";
+import { createAgentComputerCleanup } from "./lib/agent-computer-cleanup.js";
+import { resolveDeploymentIdentity } from "./lib/deployment-identity.js";
+import { SandboxSweeper, sandboxSweepConfigFromEnv, sandboxSweepCronFromEnv, sandboxSweepSqlLookups } from "./lib/sandbox-sweeper.js";
 
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
@@ -679,9 +682,15 @@ const workspaceBackups = new NodeWorkspaceBackupService({
 
 const machineStore = new NodeAgentMachineStore({ sql, dialect });
 await machineStore.ensureSchema();
+// Stamped on every sandbox this install creates; cleanup only ever deletes
+// boxes it can attribute to this deployment (lib/deployment-identity.ts).
+const deploymentIdentity = await resolveDeploymentIdentity({ sql, dialect });
+const sandboxSweepLookups = sandboxSweepSqlLookups(sql);
 const agentMachines = new AgentMachineManager({
   store: machineStore,
   tickIntervalMs: 0,
+  deploymentId: deploymentIdentity.id,
+  agentExists: sandboxSweepLookups.agentExists,
   apiKey: process.env.DAYTONA_API_KEY,
   apiUrl: process.env.DAYTONA_API_URL,
   bootstrap: bootstrapAgentComputer,
@@ -810,7 +819,10 @@ async function buildSandbox(
   environment?: EnvironmentConfig | null,
   owner?: { tenantId: string; agentId: string | null },
 ): Promise<import("@open-managed-agents/sandbox").SandboxExecutor> {
-  const sandboxEnv = buildSandboxEnvForEnvironment(process.env, environment);
+  const sandboxEnv: Record<string, string | undefined> = {
+    ...buildSandboxEnvForEnvironment(process.env, environment),
+    OMA_DEPLOYMENT_ID: deploymentIdentity.id,
+  };
   const provider = sandboxProviderFromEnvironment(process.env, environment);
   if (sandboxEnv.SANDBOX_SCOPE === "agent" && provider !== "daytona") {
     throw new Error("Agent computer scope requires the Daytona provider.");
@@ -2038,8 +2050,12 @@ v1.get("/agents/:id/evidence/activity", async (c) => {
 // Flat per-tenant agent cap (MAX_AGENTS_PER_TENANT) — interim production
 // guard for every tenant until billing entitlements own limits.
 const maxAgentsPerTenant = resolveMaxAgentsPerTenant();
+const agentComputerCleanup = createAgentComputerCleanup({ machines: agentMachines });
 v1.route("/agents", buildAgentRoutes({
   services,
+  // Deleting an agent deletes its cloud computer; archiving stops and keeps it.
+  onAgentDeleted: agentComputerCleanup.onAgentDeleted,
+  onAgentArchived: agentComputerCleanup.onAgentArchived,
   sessionsApp: () => sessionRoutesApp,
   validateModel: validateNodeModel,
   // Auth-enabled deployments must not accept client-supplied approved_by on
@@ -3714,6 +3730,30 @@ const ambientDispatcher = new NodeAmbientDispatcher({
   },
 });
 
+// Orphan-sandbox sweep: only when this install can reach a Daytona account,
+// and never when the operator switched it off (SANDBOX_SWEEP_CRON=off).
+let sandboxSweeper: SandboxSweeper | null = null;
+if (process.env.DAYTONA_API_KEY && sandboxSweepCronFromEnv(process.env)) {
+  const { DaytonaBoxInventory } = await import("@open-managed-agents/sandbox/adapters/daytona-inventory");
+  const sweepConfig = sandboxSweepConfigFromEnv(process.env);
+  sandboxSweeper = new SandboxSweeper({
+    inventory: new DaytonaBoxInventory({ apiKey: process.env.DAYTONA_API_KEY, apiUrl: process.env.DAYTONA_API_URL }),
+    listMachines: () => machineStore.list(),
+    destroyMachine: (tenantId, agentId) => agentMachines.destroy(tenantId, agentId, { reason: "agent_missing" }),
+    ...sandboxSweepLookups,
+    deploymentId: deploymentIdentity.id,
+    config: sweepConfig,
+  });
+  logger.info(
+    {
+      op: "main-node.sandbox_sweep.enabled", deployment_id: deploymentIdentity.id, deployment_id_source: deploymentIdentity.source,
+      cron: sandboxSweepCronFromEnv(process.env), dry_run: sweepConfig.dryRun,
+      session_max_age_days: sweepConfig.sessionMaxAgeMs / 86_400_000, adopt_unlabelled: sweepConfig.adoptUnlabelled,
+    },
+    "orphan sandbox sweep enabled",
+  );
+}
+
 const { buildNodeJudgeResolver } = await import("./lib/eval-judge.js");
 const scheduler = buildNodeScheduler({
   evalServices: {
@@ -3732,6 +3772,7 @@ const scheduler = buildNodeScheduler({
   ambientDispatcher,
   integrationsSql: platformRootSecret ? sql : null,
   wakeups: { pump: () => sessionWakeups.pump() },
+  sandboxSweeper,
 });
 await scheduler.start();
 logger.info({ op: "main-node.scheduler.started" }, "scheduler started");
