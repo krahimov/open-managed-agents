@@ -112,6 +112,11 @@ POST /v1/agents/:id/ambient-rules
   `next_wake_at` from the cron, so you never need to set it manually.
 - Spawned sessions inherit the agent's `default_vault_ids` (MCP credentials
   work in background runs).
+- Creating a rule turns the agent's **memory** on (unless it was explicitly
+  turned off): each firing is a fresh session, so memory is how a run knows
+  what earlier runs did. `GET/PUT /v1/agents/:id/memory {"enabled": bool}`
+  shows / switches it; `_oma.memory.mode` (`off` | `shared` | `per_user`) is
+  the config field. See `docs/agent-memory.md`.
 - Full CRUD: `GET/POST /v1/agents/:id/ambient-rules`,
   `GET/PATCH/DELETE /v1/agents/:id/ambient-rules/:ruleId`.
 

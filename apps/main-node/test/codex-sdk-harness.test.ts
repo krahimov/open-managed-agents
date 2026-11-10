@@ -257,4 +257,84 @@ describe("CodexSdkHarness.run", () => {
     expect(bridgeEntry?.url).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
     expect(bridgeEntry?.http_headers.Authorization).toMatch(/^Bearer /);
   });
+
+  // The setup agent must be able to switch memory on from every harness
+  // (prod 2026-11-10: nothing in the setup toolset could). The fake codex
+  // child calls the bridge the way the real one does — JSON-RPC over HTTP.
+  it("setup sessions expose enable_memory over the bridge; working sessions do not", async () => {
+    vi.stubEnv("OMA_CODEX_HOME", path.join(process.env.SANDBOX_WORKDIR!, "setup-auth"));
+    vi.stubEnv("OMA_CODEX_AUTH_JSON", "");
+    const enabledFor: Array<{ tenantId: string; sessionId: string; agentId: string }> = [];
+    const seen: { tools: string[]; result: string } = { tools: [], result: "" };
+    let bridge: { url: string; http_headers: Record<string, string> } | undefined;
+    const rpc = async (method: string, params: Record<string, unknown>) => {
+      const res = await fetch(bridge!.url, {
+        method: "POST",
+        headers: {
+          ...bridge!.http_headers,
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      });
+      const text = await res.text();
+      const raw = text.startsWith("event:") || text.startsWith("data:")
+        ? text.split("\n").find((l) => l.startsWith("data:"))?.slice(5).trim() ?? ""
+        : text;
+      return (JSON.parse(raw) as { result: Record<string, unknown> }).result;
+    };
+    const makeHarness = (isSetup: boolean) =>
+      new CodexSdkHarness({
+        createCodex: (options) => {
+          bridge = (options as { config?: { mcp_servers?: Record<string, typeof bridge> } }).config
+            ?.mcp_servers?.oma_platform;
+          return {
+            startThread: () => ({
+              async runStreamed() {
+                const listed = await rpc("tools/list", {});
+                seen.tools = (listed.tools as Array<{ name: string }>).map((t) => t.name);
+                if (seen.tools.includes("enable_memory")) {
+                  const called = await rpc("tools/call", { name: "enable_memory", arguments: {} });
+                  seen.result = (called.content as Array<{ text: string }>)[0].text;
+                }
+                async function* gen(): AsyncGenerator<ThreadEvent> {
+                  yield { type: "thread.started", thread_id: "thr-mem" };
+                }
+                return { events: gen() };
+              },
+            }),
+            resumeThread: () => {
+              throw new Error("unexpected resume");
+            },
+          };
+        },
+        readSessionMetadata: async () => (isSetup ? { oma_setup: true } : {}),
+        updateAgent: async () => ({ id: "agent-1", name: "updated" }) as never,
+        requestServiceAccess: async () => ({ request_id: "r", status: "pending" }),
+        enableMemory: async (tenantId, sessionId, agentId) => {
+          enabledFor.push({ tenantId, sessionId, agentId });
+          return {
+            enabled: true,
+            mode: "shared",
+            explicit_off: false,
+            newly_enabled: true,
+            store: { id: "memstore-1", name: "agent-1-memory" },
+          };
+        },
+      });
+
+    const setup = makeCtx({ session_id: "sess-setup-memory" });
+    await makeHarness(true).run(setup.ctx);
+    expect(seen.tools).toContain("update_harness");
+    expect(seen.tools).toContain("enable_memory");
+    expect(enabledFor).toEqual([{ tenantId: "default", sessionId: "sess-setup-memory", agentId: "agent-1" }]);
+    expect(seen.result).toContain("Memory is now ON for this agent.");
+    expect(seen.result).toContain('Store "agent-1-memory" is attached read-write');
+
+    seen.tools = [];
+    await makeHarness(false).run(makeCtx({ session_id: "sess-working" }).ctx);
+    expect(seen.tools).toContain("request_access");
+    expect(seen.tools).not.toContain("enable_memory");
+    expect(enabledFor).toHaveLength(1);
+  });
 });

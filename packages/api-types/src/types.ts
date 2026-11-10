@@ -44,6 +44,18 @@ export interface CustomToolConfig {
 
 export type ToolConfig = ToolsetConfig | CustomToolConfig;
 
+/** Agent-level cross-session memory mode (rides the `_oma` wire envelope). */
+export type AgentMemoryMode = "off" | "shared" | "per_user";
+export const AGENT_MEMORY_MODES: readonly AgentMemoryMode[] = ["off", "shared", "per_user"];
+
+export interface AgentMemoryConfig {
+  mode: AgentMemoryMode;
+  /** The agent's own store for `shared`. Auto-provisioned (and pinned back
+   *  here) when memory is enabled without one; kept while `off` so
+   *  re-enabling finds the same notes. */
+  store_id?: string;
+}
+
 export interface AgentConfig {
   id: string;
   name: string;
@@ -89,6 +101,22 @@ export interface AgentConfig {
    * SDK's effort option.
    */
   reasoning_level?: ReasoningLevel;
+  /**
+   * Cross-session memory. OMA-only, rides the `_oma` wire envelope like
+   * harness / reasoning_level, and is snapshotted onto sessions like every
+   * other config field.
+   *   off      — no agent store attached; each session starts blank. An
+   *              explicit "off" is a user decision: the platform never
+   *              auto-enables over it.
+   *   shared   — one store per agent (`store_id`), attached read-write to
+   *              every new working session at /mnt/memory/<store name>/.
+   *   per_user — one store per (agent, calling principal), provisioned
+   *              lazily at session start.
+   * Unset = off, but still eligible for the automatic enable that happens
+   * when the agent gets its first ambient rule (each firing is a fresh
+   * session, so memory is the only continuity).
+   */
+  memory?: AgentMemoryConfig;
   /**
    * SESSION-SNAPSHOT-ONLY enrichment — never present on live agent rows.
    * The access policy resolved from the agent's permission grants at
@@ -1065,6 +1093,22 @@ export interface SystemAmbientRuleCreatedEvent extends EventBase {
   next_wake_at?: string;
 }
 
+// Agent memory switched on from inside a session — by the setup agent's
+// enable_memory tool, or automatically when an ambient rule is created on
+// an agent that never had memory configured. Presentation frame like
+// system.ambient_rule_created: the console renders a small card so the user
+// sees memory is on and which store holds it; old consumers ignore it.
+export interface SystemMemoryEnabledEvent extends EventBase {
+  type: "system.memory_enabled";
+  mode: AgentMemoryMode;
+  store_id?: string;
+  store_name?: string;
+  /** What turned it on. */
+  source: "setup" | "ambient_rule";
+  /** False when memory was already on (idempotent re-enable). */
+  newly_enabled: boolean;
+}
+
 // Agent-initiated skill acquisition. Emitted when the agent calls its
 // request_skill tool ("this task needs the xlsx skill"). The console
 // renders an attach card showing provenance + scan status; approval runs
@@ -1159,6 +1203,7 @@ export type SessionEvent =
   | SystemAccessGrantedEvent
   | SystemSavedLoginAttachedEvent
   | SystemAmbientRuleCreatedEvent
+  | SystemMemoryEnabledEvent
   | SystemSkillRequestEvent
   | SystemTurnResumeEvent;
 

@@ -12,6 +12,7 @@ import { AccessRequestCard } from "../components/AccessRequestCard";
 import { SavedLoginLine } from "../components/SavedLoginLine";
 import { grantedRequestIdsOf } from "./agents/SessionChat";
 import { AmbientRuleCard } from "../components/AmbientRuleCard";
+import { MemoryEnabledCard } from "../components/MemoryEnabledCard";
 import { SkillRequestCard } from "../components/SkillRequestCard";
 import { Button } from "@/components/ui/button";
 import { AgentIcon, ClockIcon, DurationIcon, EnvIcon, VaultIcon } from "../components/icons";
@@ -1666,6 +1667,8 @@ function EventRender({
 
     case "system.ambient_rule_created":
       return <AmbientRuleCard event={event} />;
+    case "system.memory_enabled":
+      return <MemoryEnabledCard event={event} />;
 
     case "system.skill_request":
       return <SkillRequestCard event={event} />;

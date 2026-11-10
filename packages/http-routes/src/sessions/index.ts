@@ -79,6 +79,25 @@ export interface OutputsAdapter {
 }
 
 export interface SessionLifecycleHooks {
+  /**
+   * Agent-level memory (`_oma.memory.mode`): attach the agent's own memory
+   * store to the new session — `shared` per agent, `per_user` per (agent,
+   * principal). Runs after the row exists and BEFORE runtime init so the
+   * store is mounted on turn 1. Composes with explicit env / session
+   * attachments (those add stores; this governs the agent's own). Absent
+   * on runtimes without the hook. Failures are logged and never block
+   * session creation.
+   */
+  attachAgentMemory?: (input: {
+    tenantId: string;
+    sessionId: string;
+    agentId: string;
+    agentSnapshot: AgentConfig;
+    /** Session metadata as created (setup sessions are skipped). */
+    metadata?: Record<string, unknown>;
+    /** Calling principal for per_user partitioning (user id or API key id). */
+    principalId?: string;
+  }) => Promise<void>;
   /** Pre-create gate (USAGE_METER.canStartSandbox). Returns null to
    *  proceed; { status, body } to short-circuit. */
   preCreateGate?: (input: {
@@ -703,6 +722,26 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
       return mapSessionError(c, err);
     }
     const sessionId = session.id;
+
+    if (deps.lifecycle?.attachAgentMemory) {
+      try {
+        await deps.lifecycle.attachAgentMemory({
+          tenantId: t,
+          sessionId,
+          agentId,
+          agentSnapshot: sessionAgentSnapshot as AgentConfig,
+          metadata: body.metadata,
+          principalId: c.var.user_id,
+        });
+        // Report what the hook attached alongside the caller's resources.
+        const bound = await services.sessions.listResourcesBySession({ sessionId });
+        for (const row of bound) {
+          if (!createdResources.some((r) => r.id === row.id)) createdResources.push(row as never);
+        }
+      } catch (err) {
+        console.warn("[sessions] attachAgentMemory failed; session continues without agent memory", err);
+      }
+    }
 
     await persistGithubRepositoryResourceSecrets({
       services,
