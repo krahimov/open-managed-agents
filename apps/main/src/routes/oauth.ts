@@ -736,21 +736,24 @@ app.get("/callback", async (c) => {
           probe_ok: probeResult.ok,
           probe_message: probeResult.message ?? null,
         })};
-        var notified = false;
+        var openerNotified = false;
+        var broadcast = false;
         try {
           if (window.opener && !window.opener.closed) {
             window.opener.postMessage(msg, "*");
-            notified = true;
+            openerNotified = true;
           }
         } catch (e) {}
         try {
           var bc = new BroadcastChannel("openma-oauth");
           bc.postMessage(msg);
           bc.close();
-          notified = true;
+          broadcast = true;
         } catch (e) {}
-        // oma connect: only a hit on its localhost /callback ends the CLI's wait.
-        if (notified && !${inlineScriptJson(isLoopbackRedirect(oauthState.redirect_uri))}) {
+        // A console popup (it has an opener) closes, even when the console
+        // itself runs on localhost. oma connect's OS-opened tab has none, and
+        // only a hit on its localhost /callback ends the CLI's wait.
+        if (openerNotified || (broadcast && !${inlineScriptJson(isLoopbackRedirect(oauthState.redirect_uri))})) {
           window.close();
         } else {
           window.location.href = ${inlineScriptJson(redirectUrl.toString())};

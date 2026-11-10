@@ -34,6 +34,9 @@ export function openOAuthPopup(
   return popup;
 }
 
+/** With Clerk the mint authenticates by bearer; the popup's navigations
+ *  can't carry one, so main-node reads clerk-js's `__session` cookie on
+ *  /v1/oauth/authorize and /v1/oauth/callback (clerkSessionTokenFrom). */
 async function mintStartToken(query: string): Promise<string | null> {
   const clerkToken = await getClerkBearerToken();
   const res = await fetch("/v1/oauth/start-token", {

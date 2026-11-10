@@ -223,6 +223,7 @@ import {
   ClerkTokenVerifier,
   ClerkStore,
   buildClerkPreCreateGate,
+  clerkSessionTokenFrom,
   handleClerkWebhook,
 } from "./lib/clerk";
 import { resolveMaxAgentsPerTenant, buildAgentPreCreateGate } from "./lib/agent-limits";
@@ -1721,7 +1722,7 @@ if (clerkConfig && clerkStore) {
 const authMw = buildAuthMw({
   disabled: authDisabled,
   bypassPath: (path) => path === "/health" || path.startsWith("/auth/"),
-  resolveSession: async (headers) => {
+  resolveSession: async (headers, request) => {
     if (auth) {
       const session = (await auth.api.getSession({ headers })) as
         | { user?: { id: string; email?: string | null; name?: string | null } }
@@ -1735,10 +1736,10 @@ const authMw = buildAuthMw({
       }
     }
     // Clerk session JWT — `Authorization: Bearer <token>` (API keys use
-    // the x-api-key header, so there's no collision on Bearer).
+    // the x-api-key header, so there's no collision on Bearer), or Clerk's
+    // __session cookie on the MCP OAuth popup's navigations only.
     if (clerkVerifier && clerkStore) {
-      const authz = headers.get("authorization") ?? "";
-      const token = authz.startsWith("Bearer ") ? authz.slice("Bearer ".length).trim() : "";
+      const token = clerkSessionTokenFrom(headers, request);
       if (token) {
         try {
           const verified = await clerkVerifier.verify(token);

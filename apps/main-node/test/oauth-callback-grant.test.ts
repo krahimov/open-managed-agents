@@ -192,6 +192,30 @@ describe("oauth callback grant recording", () => {
     expect(win.location.href).toBe("");
   });
 
+  it("console popup on a localhost console (local dev, self-host) still closes instead of loading the console in the popup", async () => {
+    stubUpstreams();
+    const f = fakeServices({ ...baseState, redirect_uri: "http://localhost:8787/vaults/vlt-1" });
+    const res = await mount(buildNodeOAuthRoutes({ services: f.services as never })).request(
+      "https://api.example/v1/oauth/callback?code=abc&state=st1",
+    );
+    const opener = { closed: false, postMessage: vi.fn() };
+    const { win } = runCallbackScript(await res.text(), opener);
+    expect(opener.postMessage).toHaveBeenCalledTimes(1);
+    expect(win.close).toHaveBeenCalledTimes(1);
+    expect(win.location.href).toBe("");
+  });
+
+  it("an https console tab with no opener closes once it has broadcast", async () => {
+    stubUpstreams();
+    const f = fakeServices(baseState);
+    const res = await mount(buildNodeOAuthRoutes({ services: f.services as never })).request(
+      "https://api.example/v1/oauth/callback?code=abc&state=st1",
+    );
+    const { win, posted } = runCallbackScript(await res.text(), null);
+    expect(posted).toHaveLength(1);
+    expect(win.close).toHaveBeenCalledTimes(1);
+  });
+
   it("saves a switched account in a new vault and never touches the shared one", async () => {
     stubUpstreams();
     const grants: GrantNotification[] = [];
@@ -614,6 +638,46 @@ describe("oauth callback is bound to the initiator", () => {
       const forged = new URL(url);
       forged.searchParams.set("oauth_confirm", "made-up");
       expect((await mount(routes, alice).request(forged.toString())).status).toBe(403);
+    });
+
+    it("a repeated key (percent-encoded or literal) never gets a confirm page or a token", async () => {
+      stubAll();
+      const f = fakeServices(baseState);
+      f.kv.delete("oauth_state:st1");
+      const routes = buildNodeOAuthRoutes({ services: f.services as never });
+      // Hono reads the first literal key (Linear) for the page; re-serialized,
+      // the encoded copy (evil) would come first and the handler would use it.
+      const smuggled = [
+        "https://api.example/v1/oauth/authorize?mcp%5Fserver%5Furl=https://evil.example/mcp&mcp_server_url=https://mcp.linear.app/mcp&vault_id=vlt-1",
+        "https://api.example/v1/oauth/authorize?mcp_server_url=https://mcp.linear.app/mcp&mcp_server_url=https://evil.example/mcp&vault_id=vlt-1",
+        "https://api.example/v1/oauth/authorize?mcp_server_url=https://mcp.linear.app/mcp&vault_id=vlt-1&vault%5Fid=vlt-2",
+      ];
+      for (const u of smuggled) {
+        for (const headers of [{ "sec-fetch-site": "none" }, { "sec-fetch-site": "same-origin" }, {}]) {
+          const res = await mount(routes, alice).request(u, { headers });
+          expect(res.status).toBe(403);
+          expect(await res.text()).not.toContain("Continue");
+        }
+      }
+      expect([...f.kv.keys()].some((k) => k.startsWith("oauth_start:") || k.startsWith("oauth_state:"))).toBe(false);
+      // API-key callers aren't gated; this is about what a victim's browser is shown.
+    });
+
+    it("Continue repeats the original query as sent, plus the token", async () => {
+      stubAll();
+      const routes = buildNodeOAuthRoutes({ services: fakeServices(baseState).services as never });
+      const raw = "mcp%5Fserver%5Furl=https://mcp.sentry.dev/mcp&vault_id=vlt-1&oauth_confirm=";
+      const res = await mount(routes, alice).request(`https://api.example/v1/oauth/authorize?${raw}`, {
+        headers: { "sec-fetch-site": "none" },
+      });
+      expect(res.status).toBe(200);
+      const html = await res.text();
+      expect(html).toContain("Connect mcp.sentry.dev?");
+      const href = /<a href="([^"]+)">Continue<\/a>/.exec(html)![1]!.replace(/&amp;/g, "&");
+      expect(href).toMatch(/^\/v1\/oauth\/authorize\?mcp%5Fserver%5Furl=https:\/\/mcp\.sentry\.dev\/mcp&vault_id=vlt-1&oauth_confirm=[A-Za-z0-9_-]+$/);
+      const go = await mount(routes, alice).request(new URL(href, "https://api.example").toString());
+      expect(go.status).toBe(302);
+      expect(new URL(go.headers.get("location")!).origin).toBe("https://mcp.sentry.dev");
     });
   });
 

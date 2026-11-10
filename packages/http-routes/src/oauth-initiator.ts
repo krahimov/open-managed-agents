@@ -219,6 +219,8 @@ export async function mintOAuthStartToken(
  *   - Sec-Fetch-Site cross-site / same-site → refused.
  *   - Sec-Fetch-Dest other than document (an <img>, a fetch, an iframe) →
  *     refused: a start is always a top-level or popup navigation.
+ *   - a query that names any parameter twice (literally or percent-encoded)
+ *     → refused, so the page, the token and the handler read one value.
  *   - a valid one-time `oauth_confirm` token (console fetch-minted, or from
  *     the confirm page) bound to this user and this exact request → starts.
  *   - anything else — same-origin included, since any link on our origin
@@ -240,7 +242,17 @@ export async function gateOAuthStart(
   if (dest && dest !== "document") {
     return { kind: "refuse", reason: "A connection can only be started by opening it in a window. Start it again from the console." };
   }
-  const requestKey = await startRequestKey(new URL(c.req.url).searchParams);
+  const reqUrl = new URL(c.req.url);
+  // The gate, the confirm page and the handler must read one query. The
+  // handlers use Hono's c.req.query(), which returns the first *literal*
+  // `key=` and skips a percent-encoded copy (`mcp%5Fserver%5Furl=`) that
+  // URLSearchParams, the token binding, decodes to the same key. With a
+  // repeated key the page could name one MCP host while Continue starts
+  // another, so a start never carries a key twice. The console never does.
+  if (hasRepeatedKey(reqUrl.searchParams)) {
+    return { kind: "refuse", reason: "This connection link repeats a parameter. Start it again from the console." };
+  }
+  const requestKey = await startRequestKey(reqUrl.searchParams);
   const token = c.req.query(OAUTH_START_CONFIRM_PARAM);
   if (token) {
     const key = `oauth_start:${await sha256Base64url(token)}`;
@@ -270,9 +282,7 @@ export async function gateOAuthStart(
     userId: input.userId,
     request: requestKey,
   });
-  const u = new URL(c.req.url);
-  u.searchParams.set(OAUTH_START_CONFIRM_PARAM, fresh);
-  const continueHref = `${u.pathname}${u.search}`;
+  const continueHref = `${reqUrl.pathname}?${withConfirmToken(reqUrl.search, fresh)}`;
   const target = escapeHtml(input.target);
   return {
     kind: "confirm",
@@ -290,6 +300,30 @@ Continue only if you started this connection yourself.</p>
 <p><a href="${escapeHtml(continueHref)}">Continue</a> &nbsp; <span style="color:#888">or close this window to cancel.</span></p>
 </body></html>`,
   };
+}
+
+function hasRepeatedKey(params: URLSearchParams): boolean {
+  const seen = new Set<string>();
+  for (const key of params.keys()) {
+    if (seen.has(key)) return true;
+    seen.add(key);
+  }
+  return false;
+}
+
+/** The raw query with `oauth_confirm=<token>` appended. The other pairs
+ *  are kept byte for byte rather than re-serialized, so Continue is read
+ *  exactly like the request that rendered the confirm page. An empty
+ *  `oauth_confirm` pair (there was no token, or we wouldn't be here) is
+ *  dropped. */
+function withConfirmToken(rawSearch: string, token: string): string {
+  const pairs = rawSearch.replace(/^\?/, "").split("&").filter((pair) => {
+    if (!pair) return false;
+    const [key] = new URLSearchParams(pair).keys();
+    return key !== OAUTH_START_CONFIRM_PARAM;
+  });
+  pairs.push(`${OAUTH_START_CONFIRM_PARAM}=${encodeURIComponent(token)}`);
+  return pairs.join("&");
 }
 
 function escapeHtml(value: string): string {

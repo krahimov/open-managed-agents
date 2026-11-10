@@ -35,8 +35,13 @@ export interface ApiKeyResolution {
 export interface AuthMiddlewareDeps {
   /** True bypasses auth entirely; tenant_id="default". */
   disabled: boolean;
-  /** Resolve a session cookie → user info. Return null on miss. */
-  resolveSession(headers: Headers): Promise<AuthSession | null>;
+  /** Resolve a session cookie → user info. Return null on miss. `request`
+   *  lets a resolver accept a credential only on some routes (Clerk's
+   *  __session cookie on the OAuth popup's navigations). */
+  resolveSession(
+    headers: Headers,
+    request?: { method: string; path: string },
+  ): Promise<AuthSession | null>;
   /** Resolve an x-api-key value → tenant + optional user. Null on miss. */
   resolveApiKey(apiKey: string): Promise<ApiKeyResolution | null>;
   /** Look up the user's default tenant (first membership by created_at). */
@@ -91,7 +96,7 @@ export function createAuthMiddleware(deps: AuthMiddlewareDeps) {
     // 2. Cookie session
     let session: AuthSession | null = null;
     try {
-      session = await deps.resolveSession(c.req.raw.headers);
+      session = await deps.resolveSession(c.req.raw.headers, { method: c.req.method, path: c.req.path });
     } catch {
       return c.json({ error: "Unauthorized" }, 401);
     }

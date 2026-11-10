@@ -2,9 +2,12 @@
 // are minted with a local RSA keypair, svix signatures are computed
 // in-test with a known secret, and the store runs on in-memory sqlite.
 
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createHmac, generateKeyPairSync, sign as cryptoSign } from "node:crypto";
 import Database from "better-sqlite3";
+import { Hono } from "hono";
+import { createAuthMiddleware } from "@open-managed-agents/auth";
+import { buildNodeOAuthRoutes } from "../src/lib/node-oauth-routes";
 import { BetterSqlite3SqlClient } from "@open-managed-agents/sql-client/adapters/better-sqlite3";
 import {
   resolveClerkConfig,
@@ -13,6 +16,7 @@ import {
   ClerkStore,
   verifySvixSignature,
   buildClerkPreCreateGate,
+  clerkSessionTokenFrom,
   handleClerkWebhook,
   isPaidPlan,
   primaryEmailOf,
@@ -207,6 +211,138 @@ describe("ClerkTokenVerifier", () => {
     await expect(strict.verify(mintToken(goodClaims({ azp: "https://evil.dev" })))).rejects.toThrow(
       /azp not allowed/,
     );
+  });
+});
+
+// ─── Clerk on the MCP OAuth popup's navigations ─────────────────────────
+
+describe("clerkSessionTokenFrom", () => {
+  const get = (path: string) => ({ method: "GET", path });
+
+  it("prefers the Authorization bearer everywhere", () => {
+    const h = new Headers({ authorization: "Bearer jwt-a", cookie: "__session=jwt-b" });
+    expect(clerkSessionTokenFrom(h, get("/v1/agents"))).toBe("jwt-a");
+    expect(clerkSessionTokenFrom(h, get("/v1/oauth/authorize"))).toBe("jwt-a");
+  });
+
+  it("reads the __session cookie only on GET /v1/oauth/authorize and /v1/oauth/callback", () => {
+    const h = new Headers({ cookie: "other=1; __session=jwt-b; __session_x=jwt-c" });
+    expect(clerkSessionTokenFrom(h, get("/v1/oauth/authorize"))).toBe("jwt-b");
+    expect(clerkSessionTokenFrom(h, get("/v1/oauth/callback"))).toBe("jwt-b");
+    // Not an ambient credential for the rest of the API.
+    expect(clerkSessionTokenFrom(h, get("/v1/agents"))).toBeNull();
+    expect(clerkSessionTokenFrom(h, get("/v1/oauth/apps/requirement"))).toBeNull();
+    expect(clerkSessionTokenFrom(h, { method: "POST", path: "/v1/oauth/start-token" })).toBeNull();
+    expect(clerkSessionTokenFrom(h, { method: "POST", path: "/v1/oauth/authorize" })).toBeNull();
+    expect(clerkSessionTokenFrom(h)).toBeNull();
+    expect(clerkSessionTokenFrom(new Headers({ cookie: "__session_x=jwt-c" }), get("/v1/oauth/callback"))).toBeNull();
+  });
+});
+
+describe("Clerk-mode console: MCP OAuth popup", () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  /** The real auth middleware with main-node's Clerk resolution, in front of the real OAuth routes. */
+  function clerkApp() {
+    const v = verifier();
+    const kv = new Map<string, string>();
+    const services = {
+      kv: {
+        get: async (k: string) => kv.get(k) ?? null,
+        put: async (k: string, val: string) => void kv.set(k, val),
+        delete: async (k: string) => void kv.delete(k),
+      },
+      credentials: { listByVaults: async () => [], create: async () => ({ id: "cred-1" }), update: async () => ({}) },
+      vaults: { get: async () => ({ id: "vlt-1" }) },
+    };
+    const app = new Hono();
+    app.use(
+      "/v1/*",
+      createAuthMiddleware({
+        disabled: false,
+        resolveSession: async (headers, request) => {
+          const token = clerkSessionTokenFrom(headers, request);
+          if (!token) return null;
+          try {
+            return { userId: (await v.verify(token)).userId };
+          } catch {
+            return null;
+          }
+        },
+        resolveApiKey: async () => null,
+        defaultTenantForUser: async () => "t1",
+        hasMembership: async () => true,
+        ensureTenantForUser: async () => "t1",
+      }),
+    );
+    app.route("/v1/oauth", buildNodeOAuthRoutes({ services: services as never }));
+    return app;
+  }
+
+  it("mints with the bearer, then the popup's /authorize and the provider's /callback authenticate by __session", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.includes("oauth-protected-resource")) {
+          return Response.json({ resource: "https://mcp.notion.com/mcp", authorization_servers: ["https://mcp.notion.com"] });
+        }
+        if (url.includes("oauth-authorization-server")) {
+          return Response.json({
+            issuer: "https://mcp.notion.com",
+            authorization_endpoint: "https://mcp.notion.com/authorize",
+            token_endpoint: "https://mcp.notion.com/token",
+            registration_endpoint: "https://mcp.notion.com/register",
+          });
+        }
+        if (url.endsWith("/register")) return Response.json({ client_id: "dcr" });
+        if (url.endsWith("/token")) return Response.json({ access_token: "at", expires_in: 3600 });
+        return new Response("{}", { status: 200 });
+      }),
+    );
+    const app = clerkApp();
+    const jwt = mintToken(goodClaims());
+    const query = "mcp_server_url=https%3A%2F%2Fmcp.notion.com%2Fmcp&vault_id=vlt-1&redirect_uri=https%3A%2F%2Fapp.example%2Fvaults%2Fvlt-1";
+
+    const minted = await app.request("https://app.example/v1/oauth/start-token", {
+      method: "POST",
+      headers: { authorization: `Bearer ${jwt}`, "content-type": "application/json", "sec-fetch-site": "same-origin" },
+      body: JSON.stringify({ query }),
+    });
+    expect(minted.status).toBe(200);
+    const { token } = (await minted.json()) as { token: string };
+
+    // The popup navigation carries cookies, never Authorization: without
+    // clerk-js's __session cookie it is anonymous.
+    const authorize = `https://app.example/v1/oauth/authorize?${query}&oauth_confirm=${encodeURIComponent(token)}`;
+    const nav = { "sec-fetch-site": "same-origin", "sec-fetch-dest": "document" };
+    expect((await app.request(authorize, { headers: nav })).status).toBe(401);
+    const started = await app.request(authorize, { headers: { ...nav, cookie: `__session=${jwt}` } });
+    expect(started.status).toBe(302);
+    const state = new URL(started.headers.get("location")!).searchParams.get("state")!;
+    const nonce = started.headers.get("set-cookie")!.split(";")[0]!;
+
+    const done = await app.request(`https://app.example/v1/oauth/callback?code=c&state=${state}`, {
+      headers: { cookie: `__session=${jwt}; ${nonce}` },
+    });
+    expect(done.status).toBe(200);
+    expect(await done.text()).toContain("oauth_complete");
+  });
+
+  it("the __session cookie alone can't start a flow: it is still gated like a cookie session", async () => {
+    const app = clerkApp();
+    const jwt = mintToken(goodClaims());
+    const res = await app.request(
+      "https://app.example/v1/oauth/authorize?mcp_server_url=https%3A%2F%2Fevil.example%2Fmcp&vault_id=vlt-1",
+      { headers: { cookie: `__session=${jwt}`, "sec-fetch-site": "same-origin", "sec-fetch-dest": "document" } },
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("Connect evil.example?");
+    // And it authenticates nothing outside the OAuth navigations.
+    const other = await app.request("https://app.example/v1/oauth/apps/requirement?mcp_server_url=x", {
+      headers: { cookie: `__session=${jwt}` },
+    });
+    expect(other.status).toBe(401);
   });
 });
 
