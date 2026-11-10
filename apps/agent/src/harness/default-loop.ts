@@ -8,7 +8,8 @@ import { SummarizeCompactionStrategy, resolveCompactionStrategy } from "./compac
 import type { CompactionStrategy } from "./compaction";
 import { ALL_TOOLS } from "./tools";
 import { llmLoggingMiddleware, llmLogKey } from "./llm-logging-middleware";
-import { isOpenAiCompatModel, sanitizeOpenAiToolNames, reasoningProviderOptions } from "./provider";
+import { isOpenAiCompatModel, isOpenAiResponsesModel, sanitizeOpenAiToolNames, reasoningProviderOptions } from "./provider";
+import { applyOpenAiStrictSchemas } from "./openai-tool-schema";
 import type { ToolSet } from "ai";
 import { OPENAI_MAX_TOOLS, SEARCH_TOOL_NAME, CALL_TOOL_NAME, applyToolBudget, toolCallNeedsApproval } from "./tool-budget";
 import { classifyTool, idempotencyKeyFor } from "@open-managed-agents/session-runtime";
@@ -447,6 +448,15 @@ export class DefaultHarness implements HarnessInterface {
             `${Object.entries(budget.deferredByServer).map(([srv, n]) => `${srv} (${n})`).join(", ")} — ` +
             `reachable via ${SEARCH_TOOL_NAME} / ${CALL_TOOL_NAME}.`,
         } as SessionEvent);
+      }
+      // The Responses API applies strict mode on its own when `strict` is
+      // omitted, forcing every optional argument to be filled ("" / 0 /
+      // null → MCP servers reject the call). Send strict explicitly, with
+      // optionals encoded as nullable and placeholder nulls stripped before
+      // the tool runs (see openai-tool-schema.ts). chat/completions defaults
+      // to non-strict and fronts third-party gateways — left as is.
+      if (cached.tools && isOpenAiResponsesModel(model)) {
+        cached.tools = applyOpenAiStrictSchemas(cached.tools as ToolSet) as typeof cached.tools;
       }
       const safe = sanitizeOpenAiToolNames({ tools: cached.tools, messages: cached.messages });
       if (safe.tools) cached.tools = safe.tools as typeof cached.tools;
