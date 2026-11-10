@@ -95,6 +95,21 @@ describe("DaytonaSandbox (session scope) — box lifecycle", () => {
     expect(bootstrapRuns[0].timeout).toBe(300);
     expect(sb.unhandledCommands.map((c) => c.name)).toEqual(["apt-get", "apt-get"]);
     expect(sb.unhandledCommands[1].args).toContain("ripgrep");
+    // Data agents reach for bare `python` and `pip install` first.
+    expect(sb.unhandledCommands[1].args).toEqual(
+      expect.arrayContaining(["python3", "python3-pip", "python3-venv", "python-is-python3"]),
+    );
+  });
+
+  it("lets pip install into the PEP 668 system Python, unless the environment overrides it", async () => {
+    const fake = new FakeDaytona();
+    const a = makeSandbox(fake);
+    expect(await a.exec("echo $PIP_BREAK_SYSTEM_PACKAGES")).toBe("1");
+    expect(onlyBox(fake).execLog.at(-1)?.env).toMatchObject({ PIP_BREAK_SYSTEM_PACKAGES: "1" });
+
+    const b = makeSandbox(new FakeDaytona());
+    await b.setEnvVars({ PIP_BREAK_SYSTEM_PACKAGES: "0" });
+    expect(await b.exec("echo $PIP_BREAK_SYSTEM_PACKAGES")).toBe("0");
   });
 
   it("honours image / ephemeral=false / apiKey from env", async () => {

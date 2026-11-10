@@ -79,6 +79,9 @@ const DEFAULT_BOOTSTRAP_APT_PACKAGES = [
   "jq",
   "less",
   "procps",
+  // Bare `python` (agents reach for it first); python3 alone leaves
+  // `python: not found`.
+  "python-is-python3",
   "python3",
   "python3-pip",
   "python3-venv",
@@ -936,6 +939,10 @@ export class DaytonaSandbox implements SandboxExecutor {
 
   private buildEnv(command: string): Record<string, string> {
     const out: Record<string, string> = {
+      // Debian 12 marks the system Python externally managed (PEP 668), so
+      // a bare `pip install pandas` refuses. Agent sandboxes are disposable;
+      // let on-demand installs through. Environment env vars still win.
+      PIP_BREAK_SYSTEM_PACKAGES: "1",
       ...this.envVars,
       OMA_SANDBOX_MAX_FILE_BYTES: String(this.maxFileBytes),
     };

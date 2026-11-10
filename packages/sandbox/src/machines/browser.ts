@@ -85,6 +85,43 @@ export function buildAgentBrowserStartScript(desktop = false): string {
   ].join("\n");
 }
 
+// Python for data work (pandas, bs4, ...). Kept OUT of spec.aptPackages:
+// that list is part of the frozen machine config, and changing it would
+// fail every existing computer with MachineConfigMismatchError. Runs on the
+// snapshot path too, where python availability depends on the snapshot.
+// Debian's python3 has no bare `python`, so link it when missing.
+const PYTHON_READY_MARKER = "/var/lib/oma/python-ready";
+const PYTHON_APT_PACKAGES = ["python3", "python3-pip", "python3-venv", "python-is-python3"];
+
+/** Exported for tests. Exits non-zero on failure; the caller only warns. */
+export function buildAgentComputerPythonScript(): string {
+  return [
+    'as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }',
+    `if [ -f ${quote(PYTHON_READY_MARKER)} ]; then exit 0; fi`,
+    "if ! command -v python3 >/dev/null 2>&1 || ! python3 -m pip --version >/dev/null 2>&1; then",
+    '  command -v apt-get >/dev/null 2>&1 || { echo "python3 is missing and apt-get is unavailable" >&2; exit 127; }',
+    "  as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq || exit 1",
+    `  as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ${PYTHON_APT_PACKAGES.join(" ")} || exit 1`,
+    "fi",
+    'command -v python >/dev/null 2>&1 || as_root ln -sf "$(command -v python3)" /usr/local/bin/python || exit 1',
+    `touch ${quote(PYTHON_READY_MARKER)}`,
+  ].join("\n");
+}
+
+/** Best-effort: a computer without Python is still a working computer. */
+async function ensurePython(sb: DaytonaSandboxInstance): Promise<void> {
+  try {
+    const result = await sb.process.executeCommand(buildAgentComputerPythonScript(), undefined, undefined, 300);
+    if (result.exitCode !== 0) {
+      console.warn("[agent-computer] python setup failed; continuing without it", {
+        sandboxId: sb.id, exitCode: result.exitCode, output: (result.result ?? "").slice(-1000),
+      });
+    }
+  } catch (err) {
+    console.warn("[agent-computer] python setup failed; continuing without it", { sandboxId: sb.id, error: String(err) });
+  }
+}
+
 async function execute(sb: DaytonaSandboxInstance, command: string, timeoutSec: number): Promise<string> {
   const result = await sb.process.executeCommand(command, undefined, undefined, timeoutSec);
   if (result.exitCode !== 0) {
@@ -134,6 +171,7 @@ export async function bootstrapAgentComputer(sb: DaytonaSandboxInstance, spec: A
   } else {
     await execute(sb, commands.join("\n"), 600);
   }
+  await ensurePython(sb);
   if (spec.desktop) {
     if (!sb.computerUse) throw new Error("Daytona SDK does not support desktop control");
     console.info("[agent-computer] starting Daytona desktop", { sandboxId: sb.id });

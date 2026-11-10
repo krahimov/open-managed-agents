@@ -13,6 +13,7 @@ import {
   composeSystemPrompt,
   platformGuidance,
   platformGuidanceFor,
+  pythonToolingGuidance,
   sessionOutputsGuidance,
   sessionOutputsGuidanceFor,
 } from "@open-managed-agents/agent/harness/platform-guidance";
@@ -54,6 +55,12 @@ describe("platformGuidanceFor", () => {
     expect(platformGuidanceFor({})).toBe(platformGuidance);
     expect(platformGuidanceFor({ outputsPath: undefined })).toBe(platformGuidance);
     expect(platformGuidance).toContain(DEFAULT_PATH);
+  });
+
+  it("tells agents python3/python and pip are available for on-demand installs", () => {
+    expect(platformGuidance).toContain(pythonToolingGuidance);
+    expect(pythonToolingGuidance).toContain("`python3` (also `python`) and `pip` are available");
+    expect(platformGuidance).toContain("`pip install` it on demand");
   });
 
   it("swaps the outputs path and keeps every other guidance block", () => {

@@ -1,0 +1,46 @@
+{
+  "default": {
+    "image": "node:22-bookworm",
+    "snapshot": null,
+    "workdir": "/workspace",
+    "aptPackages": [
+      "build-essential",
+      "ca-certificates",
+      "coreutils",
+      "curl",
+      "file",
+      "findutils",
+      "gawk",
+      "git",
+      "grep",
+      "jq",
+      "less",
+      "procps",
+      "python3",
+      "python3-pip",
+      "python3-venv",
+      "ripgrep",
+      "sed",
+      "unzip",
+      "zip"
+    ],
+    "bootstrapTools": true,
+    "browser": true,
+    "desktop": false,
+    "idleStopMinutes": 30,
+    "maxFileBytes": 536870912,
+    "sdkMode": "off"
+  },
+  "snapshot": {
+    "image": null,
+    "snapshot": "daytona-small",
+    "workdir": "/workspace",
+    "aptPackages": [],
+    "bootstrapTools": false,
+    "browser": true,
+    "desktop": false,
+    "idleStopMinutes": 30,
+    "maxFileBytes": 536870912,
+    "sdkMode": "off"
+  }
+}

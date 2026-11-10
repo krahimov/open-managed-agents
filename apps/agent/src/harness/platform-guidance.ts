@@ -31,10 +31,16 @@ export const DEFAULT_SESSION_OUTPUTS_PATH = "/mnt/session/outputs/";
 export function sessionOutputsGuidanceFor(
   outputsPath: string = DEFAULT_SESSION_OUTPUTS_PATH,
 ): string {
-  return `Files you write under \`${outputsPath}\` persist after the session ends and are downloadable by the user from the session's Files panel. Use this path for final artifacts the user should keep (reports, exports, generated docs, packaged code). Files written anywhere else (e.g. \`/workspace/\`) are scratch — they may be lost on container recycle and are not user-accessible. Treat the sandbox as ephemeral compute, not bulk storage: do not create large datasets, disk images, archives, package caches, or direct writes under \`/mnt/_oma_storage\`. For external service files, prefer the matching MCP tool or provider upload flow.`;
+  return `Files you write under \`${outputsPath}\` persist after the session ends and are downloadable by the user from the session's Files panel. Use this path for final artifacts the user should keep (reports, exports, generated docs, packaged code). Files written anywhere else (e.g. \`/workspace/\`) are scratch — they may be lost on container recycle and are not user-accessible. Treat the sandbox as ephemeral compute, not bulk storage: do not create large datasets, disk images, archives, bulk package caches, or direct writes under \`/mnt/_oma_storage\`. For external service files, prefer the matching MCP tool or provider upload flow.`;
 }
 
 export const sessionOutputsGuidance = sessionOutputsGuidanceFor();
+
+// Prod QA: data-analysis agents hit `python: not found` and assumed pip was
+// unusable, then burned calls rewriting the work in awk/node. Both sandbox
+// images (CF venv, Daytona bootstrap) ship python3 + pip.
+export const pythonToolingGuidance =
+  "`python3` (also `python`) and `pip` are available in the sandbox. If a Python library you need (e.g. pandas, beautifulsoup4) is missing, `pip install` it on demand instead of rewriting the work in another language.";
 
 export const externalServiceGuidance =
   "When a user asks about an OAuth-connected external service such as Google Drive, Gmail, Notion, Slack, GitHub, or Linear, use the available MCP tools for that service first. Do not expect provider CLIs, OAuth tokens, API keys, or credential files to exist in bash; those credentials are held by the platform and injected only through MCP/proxy calls. Before saying credentials are missing, check whether a matching MCP tool is available and use that tool.";
@@ -57,7 +63,7 @@ export function platformGuidanceFor(opts?: PlatformGuidanceOptions): string {
   const outputs = opts?.outputsPath
     ? sessionOutputsGuidanceFor(opts.outputsPath)
     : sessionOutputsGuidance;
-  return `${authenticatedCommandGuidance}\n\n${loopStopGuidance}\n\n${outputs}\n\n${externalServiceGuidance}\n\n${environmentProposalGuidance}`;
+  return `${authenticatedCommandGuidance}\n\n${loopStopGuidance}\n\n${outputs}\n\n${pythonToolingGuidance}\n\n${externalServiceGuidance}\n\n${environmentProposalGuidance}`;
 }
 
 export const platformGuidance = platformGuidanceFor();
