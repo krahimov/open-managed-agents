@@ -29,6 +29,7 @@ export {
   MachineQuotaError,
   MachineLockedError,
   MachineConfigMismatchError,
+  AgentDeletedError,
   isAgentMachineError,
   newAgentMachineRow,
   normalizeExpectedStates,

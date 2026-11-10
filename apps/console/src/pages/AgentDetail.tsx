@@ -185,7 +185,7 @@ export function AgentDetail() {
   };
 
   const del = async () => {
-    if (!confirm("Delete this agent? This cannot be undone.")) return;
+    if (!confirm("Delete this agent? If it has a cloud computer, the computer and its files are deleted too. This cannot be undone.")) return;
     await api(`/v1/agents/${id}`, { method: "DELETE" });
     nav("/agents");
   };

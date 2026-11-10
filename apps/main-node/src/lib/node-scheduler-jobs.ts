@@ -30,6 +30,7 @@ import {
   type SandboxFetcher,
 } from "@open-managed-agents/evals-runner";
 import type { NodeAmbientDispatcher } from "./node-ambient-dispatch.js";
+import { sandboxSweepCronFromEnv } from "./sandbox-sweeper.js";
 
 export interface NodeSchedulerDeps {
   evalServices: EvalRunnerServices;
@@ -54,6 +55,9 @@ export interface NodeSchedulerDeps {
   /** Session wakeup pump (NodeSessionWakeups). Fires due schedule-tool
    *  wakeups by enqueuing synthetic user.message events. Skip when null. */
   wakeups?: { pump: () => Promise<number> } | null;
+  /** Orphan-sandbox sweeper (lib/sandbox-sweeper.ts). Skip when null — the
+   *  host has no Daytona account or the operator disabled the sweep. */
+  sandboxSweeper?: { run: () => Promise<unknown> } | null;
   /** Override defaults via env so an operator can quiet noisy crons
    *  during a maintenance window without a code change. */
   env?: NodeJS.ProcessEnv;
@@ -157,6 +161,22 @@ export function buildNodeScheduler(deps: NodeSchedulerDeps) {
         } catch (err) {
           log.warn({ err, op: "scheduler.ambient.failed" }, "ambient dispatch failed");
         }
+      },
+    });
+  }
+
+  // Orphan sandboxes — hourly by default. Cleaning up cloud boxes is not
+  // urgent, and a slow cadence keeps provider API load negligible.
+  const sandboxSweepCron = sandboxSweepCronFromEnv(env);
+  if (deps.sandboxSweeper && sandboxSweepCron) {
+    const sweeper = deps.sandboxSweeper;
+    scheduler.register({
+      name: "sandbox-sweep",
+      cron: sandboxSweepCron,
+      // The sweeper logs its own outcome and failures; a failed sweep must
+      // never take the scheduler down.
+      handler: async () => {
+        await sweeper.run().catch(() => undefined);
       },
     });
   }

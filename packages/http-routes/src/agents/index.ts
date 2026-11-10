@@ -228,6 +228,14 @@ export interface AgentRoutesDeps extends AmbientWebhookDeps {
     tenantId: string,
     agentId: string,
   ) => Promise<boolean>;
+  /** Runs after an agent row was hard-deleted, to release resources that
+   *  belonged to it (Node: the agent's persistent cloud computer). The
+   *  delete has already happened — a failure here is the host's to log and
+   *  retry, and never changes the response. */
+  onAgentDeleted?: (tenantId: string, agentId: string) => Promise<void>;
+  /** Runs after an agent was archived (Node: stop, but keep, its computer).
+   *  Same contract as `onAgentDeleted`. */
+  onAgentArchived?: (tenantId: string, agentId: string) => Promise<void>;
   /** Pre-create gate, mirroring sessions' lifecycle.preCreateGate: return
    *  null to proceed, { status, body } to short-circuit. Node wires the
    *  MAX_AGENTS_PER_TENANT cap (and later billing entitlements) here. */
@@ -851,6 +859,11 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
         tenantId: c.var.tenant_id,
         agentId: c.req.param("id"),
       });
+      try {
+        await deps.onAgentArchived?.(c.var.tenant_id, c.req.param("id"));
+      } catch {
+        // The agent is archived; resource cleanup is the host's to retry.
+      }
       return c.json(toApiAgent(row));
     } catch (err) {
       if (err instanceof AgentNotFoundError) {
@@ -895,6 +908,11 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
     }
 
     await services.agents.delete({ tenantId, agentId: id });
+    try {
+      await deps.onAgentDeleted?.(tenantId, id);
+    } catch {
+      // The agent is deleted; resource cleanup is the host's to retry.
+    }
     return c.json({ type: "agent_deleted", id });
   });
 

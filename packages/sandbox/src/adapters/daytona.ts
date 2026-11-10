@@ -130,6 +130,10 @@ export interface DaytonaSandboxOptions {
    *  because durable state lives in the session log, R2 outputs, and memory
    *  stores, not in the sandbox's scratch filesystem. */
   ephemeral?: boolean;
+  /** Owning tenant / OMA deployment id, stamped as labels on a per-session
+   *  box (see `OMA_BOX_LABELS`). Ignored when `box` is supplied. */
+  tenantId?: string;
+  deploymentId?: string;
   /** Where the box comes from. Default: a `SessionBoxProvider` (create on
    *  first use, delete on destroy — today's per-session behaviour). Agent
    *  scope passes the per-agent machine provider instead. */
@@ -194,6 +198,8 @@ export class DaytonaSandbox implements SandboxExecutor {
     this.daytonaModule = opts.daytonaModule ?? null;
     this.box = opts.box ?? new SessionBoxProvider({
       sessionId: opts.sessionId,
+      tenantId: opts.tenantId,
+      deploymentId: opts.deploymentId,
       apiKey: opts.apiKey,
       apiUrl: opts.apiUrl,
       image: opts.image,
@@ -1154,6 +1160,8 @@ export const sandboxFactory: SandboxFactory = async (ctx, env) => {
   return new DaytonaSandbox({
     box,
     sessionId: ctx.sessionId,
+    tenantId: ctx.tenantId,
+    deploymentId: env.OMA_DEPLOYMENT_ID || undefined,
     apiKey: env.DAYTONA_API_KEY,
     apiUrl: env.DAYTONA_API_URL,
     image: env.SANDBOX_IMAGE,

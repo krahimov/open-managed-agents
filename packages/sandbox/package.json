@@ -11,6 +11,7 @@
     "./adapters/daytona-types": "./src/adapters/daytona-types.ts",
     "./adapters/daytona-box-provider": "./src/adapters/daytona-box-provider.ts",
     "./adapters/daytona-process": "./src/adapters/daytona-process.ts",
+    "./adapters/daytona-inventory": "./src/adapters/daytona-inventory.ts",
     "./adapters/litebox": "./src/adapters/litebox.ts",
     "./adapters/boxrun": "./src/adapters/boxrun.ts",
     "./orchestrator": "./src/orchestrator.ts",
