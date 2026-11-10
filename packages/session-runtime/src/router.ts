@@ -123,6 +123,17 @@ export interface SessionRouter {
    *  implementations may no-op when the sandbox is not realized. */
   refreshResources?(sessionId: string): Promise<void>;
 
+  /** Write one just-added file resource into the session sandbox before
+   *  returning, and report the path it landed at (null when the runtime
+   *  has no sandbox for this session, e.g. setup sessions). Rejects when
+   *  the bytes could not be written. Node implements this so a file
+   *  attached mid-session is on disk before the next turn; runtimes
+   *  without it fall back to `refreshResources`. */
+  mountFileResource?(
+    sessionId: string,
+    resource: { fileId: string; mountPath?: string },
+  ): Promise<string | null>;
+
   /** Submit a user.* event. Returns the underlying status + body so
    *  routes can pass non-202 (terminated 409) verbatim. */
   appendEvent(

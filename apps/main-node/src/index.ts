@@ -23,6 +23,7 @@ import { buildAgentComputerRoutes } from "./lib/agent-computer-routes.js";
 import { serve } from "@hono/node-server";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import {
   createNodeLogger,
 } from "@open-managed-agents/observability/logger/node";
@@ -126,6 +127,9 @@ import {
   type InstallProxyForwarder,
   mintApiKeyOnStorage,
   sha256Hex,
+  handleFileUpload,
+  resolveUploadMaxBytes,
+  contentDispositionAttachment,
 } from "@open-managed-agents/http-routes";
 import {
   buildNodeRepos,
@@ -1247,6 +1251,15 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
           }),
       rawSystemPrompt,
       platformReminders: isSetup ? [] : memoryContext.reminders,
+      // Resolve `source: {type:"file", file_id}` image/document blocks to
+      // bytes (CF SessionDO parity). Without it the console's attached
+      // images reached the model as "[image file_…]" placeholder text.
+      fileFetcher: async (fileId) => {
+        const file = await filesService.get({ tenantId: input.tenantId, fileId });
+        const object = file ? await filesBlob.get(file.r2_key) : null;
+        if (!file || !object) return null;
+        return { bytes: await object.bytes(), mediaType: file.media_type, filename: file.filename };
+      },
       env: {
         ANTHROPIC_API_KEY: creds.apiKey,
         ANTHROPIC_BASE_URL: creds.apiCompat.startsWith("ant") ? creds.baseURL : undefined,
@@ -1426,6 +1439,9 @@ const services: RouteServices = {
   credentials: credentialService,
   memory: memoryService,
   sessions: sessionsService,
+  // Lets POST /v1/sessions/:id/resources 404 an unknown (or another
+  // tenant's) file_id before it persists an attachment row.
+  files: filesService,
   kv,
   newEventLog,
   hub: {
@@ -3405,12 +3421,39 @@ if (platformRootSecret) {
 
 // ── Files API (subset of apps/main/src/routes/files.ts) ──
 //
-// CF mounts a richer files surface with synthesized session-output ids
-// and multipart upload; Node ships the read-side equivalent so the SDK
-// + console can list, download, and delete files. Uploads still go via
-// POST /v1/sessions/:id/files (lifecycle.promoteSandboxFile) and the
-// CF-only POST /v1/files (multipart upload from the browser) — that
-// route can be ported when console upload UX needs it.
+// CF mounts a richer files surface with synthesized session-output ids;
+// Node ships upload + list + download + delete. POST /v1/files shares its
+// handler with CF (http-routes/files/upload.ts) so the contract can't
+// drift; sandbox → file promotion stays on POST /v1/sessions/:id/files
+// (lifecycle.promoteSandboxFile).
+const uploadMaxBytes = resolveUploadMaxBytes(process.env.UPLOAD_MAX_BYTES);
+v1.post(
+  "/files",
+  // Stream-level cap so an oversized (or chunked, length-less) body is cut
+  // off while reading instead of after buffering. The slack covers the
+  // multipart envelope / base64 inflation of a JSON upload; the exact
+  // per-file ceiling is enforced by handleFileUpload.
+  bodyLimit({
+    maxSize: Math.ceil(uploadMaxBytes * 1.4) + 1024 * 1024,
+    onError: (c) =>
+      c.json({ error: `Upload too large: limit is ${uploadMaxBytes} bytes` }, 413),
+  }),
+  async (c) => {
+    const t = c.var.tenant_id;
+    return handleFileUpload(c.req.raw, {
+      tenantId: t,
+      files: filesService,
+      filesBlob,
+      toRecord: toFileRecord,
+      maxBytes: uploadMaxBytes,
+      // Unlike CF (free-form scope tag), Node only accepts a scope_id that
+      // is one of this tenant's sessions — rows keyed to a foreign session
+      // id would be swept by that session's cascade delete.
+      sessionExists: async (sessionId) =>
+        (await sessionsService.get({ tenantId: t, sessionId })) !== null,
+    });
+  },
+);
 v1.get("/files", async (c) => {
   const t = c.var.tenant_id;
   const scopeId = c.req.query("scope_id") ?? undefined;
@@ -3434,7 +3477,13 @@ v1.get("/files/:id/content", async (c) => {
   const obj = await filesBlob.get(row.r2_key);
   if (!obj) return c.json({ error: "File content not found" }, 404);
   return new Response(obj.body, {
-    headers: { "Content-Type": row.media_type },
+    headers: {
+      "Content-Type": row.media_type,
+      // Uploads are user-controlled bytes served from the console's own
+      // origin — never let a browser render them inline (text/html, svg).
+      "Content-Disposition": contentDispositionAttachment(row.filename),
+      "X-Content-Type-Options": "nosniff",
+    },
   });
 });
 v1.get("/files/:id", async (c) => {

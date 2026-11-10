@@ -178,8 +178,13 @@ const captureScreenshot = async (): Promise<File | null> => {
 // Provider Context & Types
 // ============================================================================
 
+/** A pending attachment. `file` keeps the picked File so submit handlers
+ *  can upload the original bytes (and read its size) — the `url` is a
+ *  blob: URL here and a data: URL by the time onSubmit runs. */
+export type PromptInputAttachmentItem = FileUIPart & { id: string; file?: File };
+
 export interface AttachmentsContext {
-  files: (FileUIPart & { id: string })[];
+  files: PromptInputAttachmentItem[];
   add: (files: File[] | FileList) => void;
   remove: (id: string) => void;
   clear: () => void;
@@ -255,7 +260,7 @@ export const PromptInputProvider = ({
 
   // ----- attachments state (global when wrapped)
   const [attachmentFiles, setAttachmentFiles] = useState<
-    (FileUIPart & { id: string })[]
+    PromptInputAttachmentItem[]
   >([]);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   // oxlint-disable-next-line eslint(no-empty-function)
@@ -270,6 +275,7 @@ export const PromptInputProvider = ({
     setAttachmentFiles((prev) => [
       ...prev,
       ...incoming.map((file) => ({
+        file,
         filename: file.name,
         id: nanoid(),
         mediaType: file.type,
@@ -533,7 +539,7 @@ export const PromptInput = ({
   const formRef = useRef<HTMLFormElement | null>(null);
 
   // ----- Local attachments (only used when no provider)
-  const [items, setItems] = useState<(FileUIPart & { id: string })[]>([]);
+  const [items, setItems] = useState<PromptInputAttachmentItem[]>([]);
   const files = usingProvider ? controller.attachments.files : items;
 
   // ----- Local referenced sources (always local to PromptInput)
@@ -610,9 +616,10 @@ export const PromptInput = ({
             message: "Too many files. Some were not added.",
           });
         }
-        const next: (FileUIPart & { id: string })[] = [];
+        const next: PromptInputAttachmentItem[] = [];
         for (const file of capped) {
           next.push({
+            file,
             filename: file.name,
             id: nanoid(),
             mediaType: file.type,

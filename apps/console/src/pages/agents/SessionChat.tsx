@@ -296,7 +296,7 @@ export function SessionChat({
                 return (
                   <Message from="assistant" key={key}>
                     <MessageContent>
-                      <Markdown>{eventText(ev)}</Markdown>
+                      <Markdown sessionId={sessionId}>{eventText(ev)}</Markdown>
                     </MessageContent>
                   </Message>
                 );

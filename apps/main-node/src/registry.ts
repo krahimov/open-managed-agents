@@ -21,7 +21,7 @@
 // — same interface CF wires for the OmaSandbox path. Per-runtime
 // mounters were removed in P5.
 
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import {
   RuntimeAdapterImpl,
   SessionStateMachine,
@@ -29,7 +29,7 @@ import {
 } from "@open-managed-agents/session-runtime";
 import type { SqlClient } from "@open-managed-agents/sql-client";
 import { SqlStreamRepo, type SqlEventLog } from "@open-managed-agents/event-log/sql";
-import type { SandboxExecutor } from "@open-managed-agents/sandbox";
+import { DEFAULT_SESSION_OUTPUTS_DIR, type SandboxExecutor } from "@open-managed-agents/sandbox";
 import type {
   OrchestratorMemoryMount,
   SandboxOrchestrator,
@@ -164,8 +164,35 @@ interface SharedSessionResourceRow {
   config: string;
 }
 
+/**
+ * Directory user-attached files land in for THIS sandbox: the sibling of
+ * its session outputs dir. Session-scoped sandboxes → `/mnt/session/uploads`;
+ * agent-scoped ones (one box shared by every session of an agent) →
+ * `/mnt/sessions/<sid>/uploads`, so two sessions never see each other's
+ * attachments.
+ */
+export function sessionUploadsDir(sandbox: Pick<SandboxExecutor, "sessionOutputsPath">): string {
+  const outputs = (sandbox.sessionOutputsPath?.() ?? DEFAULT_SESSION_OUTPUTS_DIR).replace(/\/+$/, "");
+  return posix.join(posix.dirname(outputs), "uploads");
+}
+
+/** Last path segment of a stored filename — uploads are validated at
+ *  POST /v1/files, but rows written by older builds / other writers must
+ *  not be able to steer the mount path either. */
+function safeMountFilename(filename: string | null | undefined, fallback: string): string {
+  const base = (filename ?? "").split(/[\\/]/).pop()?.trim() ?? "";
+  // eslint-disable-next-line no-control-regex
+  if (!base || base === "." || base === ".." || /[\u0000-\u001f\u007f]/.test(base)) return fallback;
+  return base;
+}
+
 export class SessionRegistry {
   private map = new Map<string, Promise<SessionEntry>>();
+  /** sessionId → fileId → sandbox path the file was written to. Lets a
+   *  live session take ONE new attachment without rewriting (and clobbering
+   *  the agent's edits to) every file mounted before it. Process-local: a
+   *  rebuilt sandbox remounts everything from the resource rows. */
+  private mountedFiles = new Map<string, Map<string, string>>();
 
   constructor(private deps: SessionRegistryDeps) {}
 
@@ -251,6 +278,7 @@ export class SessionRegistry {
    */
   async destroy(sessionId: string): Promise<void> {
     const p = this.map.get(sessionId);
+    this.mountedFiles.delete(sessionId);
     if (!p) return;
     this.map.delete(sessionId);
     try {
@@ -267,7 +295,9 @@ export class SessionRegistry {
   /**
    * Remount the current resource set into an already-realized sandbox.
    * If the session has not warmed yet, initial provisioning will mount
-   * resources when getOrCreate() eventually builds it.
+   * resources when getOrCreate() eventually builds it. File resources this
+   * process already wrote are skipped — rewriting them would discard the
+   * agent's edits to its copy.
    */
   async refreshResources(sessionId: string, tenantId: string): Promise<boolean> {
     const p = this.map.get(sessionId);
@@ -282,8 +312,34 @@ export class SessionRegistry {
       environment: sessionRuntime.environmentSnapshot,
       environmentId: sessionRuntime.environmentId,
       restoreWorkspace: false,
+      onlyNewFiles: true,
     });
     return true;
+  }
+
+  /**
+   * Write one file resource into the session's sandbox NOW and return the
+   * path it landed at. Called by POST /v1/sessions/:id/resources so an
+   * attachment is on disk before the caller's next user.message can start a
+   * turn — and so the caller learns the real path to tell the agent.
+   *
+   * Realizes the sandbox if the session hasn't warmed yet (the turn that
+   * follows needs it anyway). Unlike the best-effort mount at sandbox start,
+   * a failure here throws: the caller is waiting on exactly this file.
+   * Returns null for setup sessions, which never get a computer.
+   */
+  async mountFileResource(
+    sessionId: string,
+    tenantId: string,
+    resource: { fileId: string; mountPath?: string },
+  ): Promise<string | null> {
+    const sessionRuntime = await this.loadSessionRuntimeContext(sessionId, tenantId);
+    if (sessionRuntime.isSetup) return null;
+    const entry = await this.getOrCreate(sessionId, tenantId);
+    // A cold start just mounted every resource row, this one included.
+    const already = this.mountedFiles.get(sessionId)?.get(resource.fileId);
+    if (already && (!resource.mountPath || resource.mountPath === already)) return already;
+    return this.writeFileResource(sessionId, tenantId, entry.sandbox, resource);
   }
 
   /**
@@ -315,6 +371,8 @@ export class SessionRegistry {
     environment?: EnvironmentConfig | null;
     environmentId?: string | null;
     restoreWorkspace: boolean;
+    /** Live refresh: skip file resources this process already wrote. */
+    onlyNewFiles?: boolean;
   }): Promise<void> {
     const memoryMounts = await this.buildMemoryMounts(
       input.sessionId,
@@ -331,7 +389,12 @@ export class SessionRegistry {
         ? { restoreOnWarm: true } : undefined,
     });
     await this.mountSharedSessionResources(input.sessionId, input.tenantId, input.sandbox);
-    await this.mountFileResources(input.sessionId, input.tenantId, input.sandbox);
+    await this.mountFileResources(
+      input.sessionId,
+      input.tenantId,
+      input.sandbox,
+      input.onlyNewFiles === true,
+    );
   }
 
   private async mountSharedSessionResources(
@@ -448,48 +511,15 @@ export class SessionRegistry {
     sessionId: string,
     tenantId: string,
     sandbox: SandboxExecutor,
+    onlyNew = false,
   ): Promise<void> {
     if (!this.deps.filesService || !this.deps.filesBlob) return;
     const resources = await this.loadFileResourceMounts(sessionId);
+    const mounted = this.mountedFiles.get(sessionId);
     for (const resource of resources) {
+      if (onlyNew && mounted?.has(resource.fileId)) continue;
       try {
-        const file = await this.deps.filesService.get({
-          tenantId,
-          fileId: resource.fileId,
-        });
-        if (!file) {
-          log.warn(
-            {
-              op: "session_registry.file_resource_missing",
-              session_id: sessionId,
-              file_id: resource.fileId,
-            },
-            "session file resource metadata not found",
-          );
-          continue;
-        }
-        const object = await this.deps.filesBlob.get(file.r2_key);
-        if (!object) {
-          log.warn(
-            {
-              op: "session_registry.file_resource_blob_missing",
-              session_id: sessionId,
-              file_id: resource.fileId,
-              blob_key: file.r2_key,
-            },
-            "session file resource blob not found",
-          );
-          continue;
-        }
-        const bytes = await object.bytes();
-        const mountPath =
-          resource.mountPath ??
-          `/mnt/session/uploads/${file.filename || resource.fileId}`;
-        if (sandbox.writeFileBytes) {
-          await sandbox.writeFileBytes(mountPath, bytes);
-        } else {
-          await sandbox.writeFile(mountPath, new TextDecoder().decode(bytes));
-        }
+        await this.writeFileResource(sessionId, tenantId, sandbox, resource);
       } catch (err) {
         log.warn(
           {
@@ -502,6 +532,36 @@ export class SessionRegistry {
         );
       }
     }
+  }
+
+  /** Copy one file resource's bytes into the sandbox. Throws when the
+   *  file row / blob is gone or the sandbox write fails. */
+  private async writeFileResource(
+    sessionId: string,
+    tenantId: string,
+    sandbox: SandboxExecutor,
+    resource: FileResourceMount,
+  ): Promise<string> {
+    if (!this.deps.filesService || !this.deps.filesBlob) {
+      throw new Error("file storage is not configured");
+    }
+    const file = await this.deps.filesService.get({ tenantId, fileId: resource.fileId });
+    if (!file) throw new Error(`file ${resource.fileId} not found`);
+    const object = await this.deps.filesBlob.get(file.r2_key);
+    if (!object) throw new Error(`file ${resource.fileId} has no stored content`);
+    const bytes = await object.bytes();
+    const mountPath =
+      resource.mountPath ??
+      posix.join(sessionUploadsDir(sandbox), safeMountFilename(file.filename, resource.fileId));
+    if (sandbox.writeFileBytes) {
+      await sandbox.writeFileBytes(mountPath, bytes);
+    } else {
+      await sandbox.writeFile(mountPath, new TextDecoder().decode(bytes));
+    }
+    let mounted = this.mountedFiles.get(sessionId);
+    if (!mounted) this.mountedFiles.set(sessionId, (mounted = new Map()));
+    mounted.set(resource.fileId, mountPath);
+    return mountPath;
   }
 
   private async loadFileResourceMounts(sessionId: string): Promise<FileResourceMount[]> {
@@ -552,6 +612,9 @@ export class SessionRegistry {
     tenantId: string,
   ): Promise<SessionEntry> {
     const sandboxWorkdir = join(this.deps.sandboxWorkdirRoot, sessionId);
+    // A new sandbox object starts with nothing mounted (also covers a
+    // retried build after a failed one).
+    this.mountedFiles.delete(sessionId);
     const sessionRuntime = await this.loadSessionRuntimeContext(sessionId, tenantId);
     const environment = sessionRuntime.environmentSnapshot;
     // Config interviews use platform setup tools only. Never reserve a machine,

@@ -2,6 +2,13 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router";
 
 import { useApi } from "../../lib/api";
+import { formatBytes } from "../../lib/attachments";
+import {
+  downloadSessionOutput,
+  downloadUploadedFile,
+  refreshSessionOutputs,
+  useSessionOutputs,
+} from "../../lib/session-outputs";
 
 /**
  * Right-rail panels mounted from `SessionDetail`. Kept here so the main
@@ -104,19 +111,17 @@ export function ResourcePanel({
   );
 }
 
-interface SessionOutputFile {
+interface UploadedFileRow {
+  id: string;
   filename: string;
-  size_bytes: number;
-  uploaded_at: string;
   media_type: string;
+  size_bytes: number;
+  created_at: string;
+  downloadable?: boolean;
 }
 
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
-}
+const fileRowButton =
+  "font-mono text-fg hover:text-info truncate block max-w-full text-left";
 
 export function FilesPanel({
   sessionId,
@@ -126,17 +131,22 @@ export function FilesPanel({
   onClose: () => void;
 }) {
   const { api } = useApi();
-  const [files, setFiles] = useState<SessionOutputFile[] | null>(null);
-  const [err, setErr] = useState<string | null>(null);
+  // Shared listing (same store the chat's links + per-turn strip use);
+  // re-list on open so the panel is never staler than the transcript.
+  const { outputs: files, error: err } = useSessionOutputs(sessionId);
+  const [uploads, setUploads] = useState<UploadedFileRow[]>([]);
 
   useEffect(() => {
-    setFiles(null);
-    setErr(null);
-    api<{ data: SessionOutputFile[]; has_more: boolean }>(
-      `/v1/sessions/${sessionId}/outputs`,
-    )
-      .then((d) => setFiles(d.data ?? []))
-      .catch((e) => setErr(e instanceof Error ? e.message : String(e)));
+    void refreshSessionOutputs(sessionId);
+    setUploads([]);
+    // Files the user attached in chat (uploaded with scope_id = session).
+    api<{ data: UploadedFileRow[] }>(`/v1/files?scope_id=${encodeURIComponent(sessionId)}`, {
+      silentErrors: true,
+    })
+      // Cloudflare folds session outputs into this listing as synthesized
+      // `out:` ids — those are already shown above.
+      .then((d) => setUploads((d.data ?? []).filter((f) => !f.id.startsWith("out:"))))
+      .catch(() => setUploads([]));
     // api closure changes every render; sessionId is the only stable input
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId]);
@@ -163,7 +173,7 @@ export function FilesPanel({
         </button>
       </div>
       <div className="flex-1 overflow-y-auto p-4 text-xs">
-        {err && <div className="text-danger">Failed to load: {err}</div>}
+        {err && !files && <div className="text-danger">Failed to load: {err}</div>}
         {!files && !err && <div className="text-fg-subtle">Loading…</div>}
         {files && files.length === 0 && (
           <div className="text-fg-subtle">
@@ -178,14 +188,16 @@ export function FilesPanel({
                 className="flex items-center gap-3 py-2"
               >
                 <div className="min-w-0 flex-1">
-                  <a
-                    href={`/v1/sessions/${sessionId}/outputs/${encodeURIComponent(f.filename)}`}
-                    download={f.filename}
-                    className="font-mono text-fg hover:text-info truncate block"
-                    title={f.filename}
+                  {/* Button + authenticated fetch, not <a href>: a plain
+                      link can't send the Clerk bearer / workspace header. */}
+                  <button
+                    type="button"
+                    onClick={() => void downloadSessionOutput(sessionId, f.filename)}
+                    className={fileRowButton}
+                    title={`Download ${f.filename}`}
                   >
                     {f.filename}
-                  </a>
+                  </button>
                   <div className="text-[10px] text-fg-subtle mt-0.5">
                     {formatBytes(f.size_bytes)} · {f.media_type} · {new Date(f.uploaded_at).toLocaleString()}
                   </div>
@@ -193,6 +205,38 @@ export function FilesPanel({
               </li>
             ))}
           </ul>
+        )}
+        {uploads.length > 0 && (
+          <div className="mt-5">
+            <div className="text-[10px] uppercase text-fg-subtle font-mono mb-1">
+              Attached by you
+            </div>
+            <ul className="space-y-1.5">
+              {uploads.map((f) => (
+                <li key={f.id} className="flex items-center gap-3 py-2">
+                  <div className="min-w-0 flex-1">
+                    {f.downloadable ? (
+                      <button
+                        type="button"
+                        onClick={() => void downloadUploadedFile(f.id, f.filename)}
+                        className={fileRowButton}
+                        title={`Download ${f.filename}`}
+                      >
+                        {f.filename}
+                      </button>
+                    ) : (
+                      <span className="font-mono text-fg truncate block" title={f.filename}>
+                        {f.filename}
+                      </span>
+                    )}
+                    <div className="text-[10px] text-fg-subtle mt-0.5">
+                      {formatBytes(f.size_bytes)} · {f.media_type} · {new Date(f.created_at).toLocaleString()}
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          </div>
         )}
       </div>
     </aside>
