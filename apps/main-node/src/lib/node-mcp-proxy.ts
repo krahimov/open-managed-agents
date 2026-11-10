@@ -1,3 +1,5 @@
+import { isComposioMcpUrl, normalizeMcpServerUrl } from "@open-managed-agents/shared";
+
 export const SENSITIVE_UPSTREAM_AUTH_HEADERS = ["authorization", "x-api-key"] as const;
 
 export type NodeMcpProxyTarget = {
@@ -266,4 +268,30 @@ export async function forwardNodeMcpRequest(
 
 function normalizePath(pathname: string): string {
   return pathname.replace(/\/+$/, "") || "/";
+}
+
+// ─── Credential ↔ declared server URL match ───────────────────────────────
+//
+// Which vault credential authenticates a declared MCP server
+// (resolveNodeMcpProxyTarget). Vault credentials only AUTHENTICATE the
+// agent's declared servers — they no longer add servers of their own (see
+// packages/shared/src/vault-mcp-servers.ts) — so a declared URL that differs
+// from the stored credential URL only cosmetically (trailing slash, query,
+// host case) must still match, for every credential type. Same rule as the
+// CF proxy (apps/main/src/routes/mcp-proxy.ts credentialMatchesServerUrl).
+// Before, Node matched non-Composio credentials by exact string, so `…/mcp`
+// vs `…/mcp/` silently went unauthenticated.
+
+export function credentialMatchesMcpServerUrl(
+  auth: { type?: string; mcp_server_url?: string },
+  serverUrl: string,
+): boolean {
+  if (!auth.mcp_server_url) return false;
+  if (auth.mcp_server_url === serverUrl) return true;
+  const credentialUrl = normalizeMcpServerUrl(auth.mcp_server_url);
+  if (credentialUrl && credentialUrl === normalizeMcpServerUrl(serverUrl)) return true;
+  // Composio: any tool-router URL matches any other — the proxy prefers a
+  // concrete per-session router over the generic sentinel among candidates.
+  if (auth.type !== "composio_mcp") return false;
+  return isComposioMcpUrl(auth.mcp_server_url) && isComposioMcpUrl(serverUrl);
 }

@@ -251,6 +251,14 @@ export function AccessRequestCard({
         }),
       });
       setApiKey("");
+      // Attach the vault to this session's agent and declare the server on
+      // it — vault credentials only authenticate declared servers. Best
+      // effort: the key is saved either way.
+      await api(`/v1/sessions/${sessionId}/access/attach`, {
+        method: "POST",
+        body: JSON.stringify({ service, vault_id: vault.id, mcp_server_url: ev.mcp_server_url }),
+        silentErrors: true,
+      }).catch(() => {});
       notifiedRef.current = true;
       setStatus("connected");
       await api(`/v1/sessions/${sessionId}/events`, {
