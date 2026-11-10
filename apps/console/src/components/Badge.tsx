@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { Link } from "react-router";
 
 /**
  * Status pill — small colored chip that represents a state (idle / running /
@@ -47,10 +48,16 @@ export function StatusPill({ status, label }: { status: StatusTone | string; lab
   );
 }
 
+const INTERACTIVE_BADGE =
+  "text-[11px] px-2 py-0.5 min-h-11 sm:min-h-0 rounded border border-border hover:border-border-strong hover:bg-bg-surface text-fg-muted flex items-center gap-1.5 font-mono max-w-xs";
+
 /**
  * Generic interactive badge — icon + label with hover affordance and
  * optional click. Used by session-header resource badges (agent / env /
  * vault) and similar contexts where a chip should feel clickable.
+ *
+ * Pass `to` to make it a real link (cmd/middle-click open a new tab);
+ * it looks the same as the clickable version.
  *
  * For non-interactive labels (duration, age, count), pass no onClick;
  * the badge renders as a plain span without hover styling.
@@ -60,11 +67,14 @@ export function Badge({
   label,
   title,
   onClick,
+  to,
 }: {
   icon?: ReactNode;
   label: ReactNode;
   title?: string;
   onClick?: () => void;
+  /** In-app path; renders the badge as a router link. */
+  to?: string;
 }) {
   const inner = (
     <>
@@ -72,12 +82,20 @@ export function Badge({
       <span className="truncate">{label}</span>
     </>
   );
+  const interactiveTitle = title ?? (typeof label === "string" ? label : undefined);
+  if (to) {
+    return (
+      <Link to={to} onClick={onClick} className={INTERACTIVE_BADGE} title={interactiveTitle}>
+        {inner}
+      </Link>
+    );
+  }
   if (onClick) {
     return (
       <button
         onClick={onClick}
-        className="text-[11px] px-2 py-0.5 min-h-11 sm:min-h-0 rounded border border-border hover:border-border-strong hover:bg-bg-surface text-fg-muted flex items-center gap-1.5 font-mono max-w-xs"
-        title={title ?? (typeof label === "string" ? label : undefined)}
+        className={INTERACTIVE_BADGE}
+        title={interactiveTitle}
       >
         {inner}
       </button>
