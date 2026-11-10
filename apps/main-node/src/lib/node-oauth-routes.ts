@@ -1,6 +1,13 @@
 import { Hono } from "hono";
 import type { CredentialAuth } from "@open-managed-agents/shared";
-import type { RouteServices } from "@open-managed-agents/http-routes";
+import {
+  bindOAuthInitiator,
+  crossSiteOAuthStart,
+  verifyOAuthInitiator,
+  OAUTH_STATE_TTL_SECONDS,
+  type OAuthInitiator,
+  type RouteServices,
+} from "@open-managed-agents/http-routes";
 
 interface OAuthState {
   completion_key?: string;
@@ -32,6 +39,9 @@ interface OAuthState {
   /** Service slug from the access request (card-side name, e.g. "github"),
    *  used for the grant text instead of the host-derived server name. */
   service?: string;
+  /** Who started the flow — the callback refuses anyone else (see
+   *  packages/http-routes/src/oauth-initiator.ts). */
+  initiator?: OAuthInitiator;
 }
 
 interface ProtectedResourceMeta {
@@ -96,7 +106,7 @@ export interface NodeOAuthRoutesDeps {
 }
 
 type NodeOAuthVars = {
-  Variables: { tenant_id: string; user_id?: string };
+  Variables: { tenant_id: string; user_id?: string; auth_type?: string };
 };
 
 export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthVars> {
@@ -115,6 +125,8 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     if (!mcpServerUrl || (!vaultId && !newVaultName)) {
       return c.json({ error: "mcp_server_url and vault_id are required" }, 400);
     }
+    const crossSite = crossSiteOAuthStart(c, c.get("auth_type"));
+    if (crossSite) return c.html(closeHtml("Connection not started", htmlEscape(crossSite)), 403);
 
     let parsedMcpUrl: URL;
     try {
@@ -255,10 +267,17 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       session_id: sessionIdParam,
       request_id: requestIdParam,
       service: serviceParam,
+      initiator: await bindOAuthInitiator(c, {
+        state,
+        tenantId,
+        userId: c.get("user_id"),
+        authType: c.get("auth_type"),
+        baseUrl,
+      }),
     };
 
     await deps.services.kv.put(`oauth_state:${state}`, JSON.stringify(oauthState), {
-      expirationTtl: 600,
+      expirationTtl: OAUTH_STATE_TTL_SECONDS,
     });
 
     const authUrl = new URL(meta.authServer.authorization_endpoint);
@@ -298,7 +317,17 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     const stateKey = `oauth_state:${state}`;
     const stateData = await deps.services.kv.get(stateKey);
     if (!stateData) return c.json({ error: "Invalid or expired OAuth state" }, 400);
+    // Single use: claim the state before any check or token exchange, so a
+    // replayed (or raced) callback finds nothing.
+    await deps.services.kv.delete(stateKey);
     const oauthState = JSON.parse(stateData) as OAuthState;
+    const bound = await verifyOAuthInitiator(c, {
+      state,
+      initiator: oauthState.initiator,
+      callerTenantId: c.get("tenant_id"),
+      callerUserId: c.get("user_id"),
+    });
+    if (!bound.ok) return c.html(closeHtml("Sign-in could not be completed", htmlEscape(bound.reason)), 403);
 
     const baseUrl = getBaseUrl(c.req.url);
     const tokenBody = new URLSearchParams({
@@ -322,7 +351,6 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
 
     if (!tokenRes.ok) {
       const errBody = await tokenRes.text().catch(() => "");
-      await deps.services.kv.delete(stateKey);
       // A dead cached registration surfaces as invalid_client — drop it so
       // the next attempt re-registers instead of failing forever.
       if (oauthState.dcr_cache_key && /invalid_client/i.test(errBody)) {
@@ -333,7 +361,6 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
 
     const tokens = await readTokenResponse(tokenRes);
     if (!tokens.access_token) {
-      await deps.services.kv.delete(stateKey);
       return c.html(closeHtml("Token exchange failed", "Provider did not return an access token."), 502);
     }
 
@@ -401,7 +428,6 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
         });
       }
     } catch (err) {
-      await deps.services.kv.delete(stateKey);
       return c.html(
         closeHtml(
           "Could not store the credential",
@@ -411,7 +437,6 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       );
     }
 
-    await deps.services.kv.delete(stateKey);
     if (oauthState.completion_key) await deps.services.kv.put(oauthState.completion_key, "complete", { expirationTtl: 900 });
     const probeResult = await probeMcpServer(oauthState.mcp_server_url, tokens.access_token);
 

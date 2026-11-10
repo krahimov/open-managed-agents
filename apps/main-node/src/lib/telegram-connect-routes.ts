@@ -26,9 +26,9 @@ interface Flow {
 }
 
 /** Private dispatch to existing provider handlers. Neither the path nor tenant is client supplied. */
-async function dispatch(routes: Hono<Vars>, tenantId: string, url: URL, body?: unknown) {
+async function dispatch(routes: Hono<Vars>, tenantId: string, url: URL, body?: unknown, userId?: string) {
   const app = new Hono<Vars>();
-  app.use("*", async (c, next) => { c.set("tenant_id", tenantId); await next(); });
+  app.use("*", async (c, next) => { c.set("tenant_id", tenantId); if (userId) c.set("user_id", userId); await next(); });
   app.route("/", routes);
   return app.request(url.toString(), body === undefined ? undefined : {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
@@ -84,7 +84,10 @@ export function buildTelegramConnectRoutes(d: Deps) {
         authorize.searchParams.set("mcp_server_url", event.mcp_server_url);
         authorize.searchParams.set("vault_id", vaultId);
         authorize.searchParams.set("redirect_uri", `${new URL(d.baseUrl).origin}/composio/callback?toolkit=${encodeURIComponent(service)}`);
-        const response = await dispatch(buildNodeOAuthRoutes({ services: d.services, env: process.env, completionKey: `telegram_oauth:${flowId}` }), tenantId, authorize);
+        // userId binds the OAuth state to this Telegram-verified user: the
+        // callback then requires that user's console session, not just any
+        // member of the tenant (see oauth-initiator.ts).
+        const response = await dispatch(buildNodeOAuthRoutes({ services: d.services, env: process.env, completionKey: `telegram_oauth:${flowId}` }), tenantId, authorize, undefined, userId);
         const location = response.headers.get("location");
         if (!location) return c.json({ error: "The provider could not start OAuth. Check that its MCP OAuth app is configured on this deployment." }, 502);
         url = location;

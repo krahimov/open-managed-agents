@@ -3,13 +3,29 @@ import type { Env } from "@open-managed-agents/shared";
 import { logWarn } from "@open-managed-agents/shared";
 import type { CredentialAuth } from "@open-managed-agents/shared";
 import type { Services } from "@open-managed-agents/services";
+import {
+  bindOAuthInitiator,
+  crossSiteOAuthStart,
+  verifyOAuthInitiator,
+  OAUTH_STATE_TTL_SECONDS,
+  type OAuthInitiator,
+} from "@open-managed-agents/http-routes";
 
 const app = new Hono<{
   Bindings: Env;
-  Variables: { tenant_id: string; services: Services };
+  Variables: { tenant_id: string; user_id?: string; auth_type?: string; services: Services };
 }>();
 
 // ─── Helpers ───
+
+/** Escape text interpolated into the callback's HTML. error_description
+ *  and token-endpoint bodies are attacker-influenced (reflected XSS on the
+ *  console origin would defeat the initiator binding below). */
+function htmlEscape(s: string): string {
+  return s.replace(/[&<>"']/g, (ch) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]!
+  ));
+}
 
 /** Generate a cryptographically random string for PKCE and state. */
 function randomString(length: number): string {
@@ -255,6 +271,9 @@ interface OAuthState {
   authorization_server: string;
   redirect_uri: string;
   resource_uri: string;
+  /** Who started the flow — the callback refuses anyone else (see
+   *  packages/http-routes/src/oauth-initiator.ts). */
+  initiator?: OAuthInitiator;
 }
 
 // ─── Routes ───
@@ -280,6 +299,8 @@ app.get("/authorize", async (c) => {
   if (!mcpServerUrl || !vaultId) {
     return c.json({ error: "mcp_server_url and vault_id are required" }, 400);
   }
+  const crossSite = crossSiteOAuthStart(c, c.get("auth_type"));
+  if (crossSite) return c.json({ error: crossSite }, 403);
 
   // Verify vault exists. Vaults live in D1 (vaults-store) since the
   // KV → D1 migration; this route was missed in that sweep — every
@@ -486,12 +507,19 @@ app.get("/authorize", async (c) => {
     authorization_server: meta.authServer.issuer,
     redirect_uri: clientRedirectUri || `${baseUrl}/`,
     resource_uri: meta.resource.resource,
+    initiator: await bindOAuthInitiator(c, {
+      state,
+      tenantId: t,
+      userId: c.get("user_id"),
+      authType: c.get("auth_type"),
+      baseUrl,
+    }),
   };
 
   await c.var.services.kv.put(
     `oauth_state:${state}`,
     JSON.stringify(oauthState),
-    { expirationTtl: 600 },
+    { expirationTtl: OAUTH_STATE_TTL_SECONDS },
   );
 
   // Build authorization URL
@@ -523,7 +551,7 @@ app.get("/callback", async (c) => {
 
   if (error) {
     const desc = c.req.query("error_description") || error;
-    return c.html(`<html><body><h2>Authorization failed</h2><p>${desc}</p><script>window.close()</script></body></html>`, 400);
+    return c.html(`<html><body><h2>Authorization failed</h2><p>${htmlEscape(desc)}</p><script>window.close()</script></body></html>`, 400);
   }
 
   if (!code || !state) {
@@ -537,7 +565,21 @@ app.get("/callback", async (c) => {
     return c.json({ error: "Invalid or expired OAuth state" }, 400);
   }
 
+  // Single use: claim the state before any check or token exchange.
+  await c.var.services.kv.delete(stateKey);
   const oauthState: OAuthState = JSON.parse(stateData);
+  const bound = await verifyOAuthInitiator(c, {
+    state,
+    initiator: oauthState.initiator,
+    callerTenantId: c.get("tenant_id"),
+    callerUserId: c.get("user_id"),
+  });
+  if (!bound.ok) {
+    return c.html(
+      `<html><body><h2>Sign-in could not be completed</h2><p>${htmlEscape(bound.reason)}</p><script>window.close()</script></body></html>`,
+      403,
+    );
+  }
 
   // Exchange code for tokens
   const baseUrl = getBaseUrl(c);
@@ -568,8 +610,7 @@ app.get("/callback", async (c) => {
 
   if (!tokenRes.ok) {
     const errBody = await tokenRes.text();
-    await c.var.services.kv.delete(stateKey);
-    return c.html(`<html><body><h2>Token exchange failed</h2><p>${errBody}</p><script>window.close()</script></body></html>`, 502);
+    return c.html(`<html><body><h2>Token exchange failed</h2><p>${htmlEscape(errBody)}</p><script>window.close()</script></body></html>`, 502);
   }
 
   const tokens = (await tokenRes.json()) as {
@@ -625,9 +666,6 @@ app.get("/callback", async (c) => {
     });
   }
 
-  // Clean up state
-  await c.var.services.kv.delete(stateKey);
-
   // Probe the MCP server with the just-obtained token. Same shape as the
   // Slack publish probe — POST tools/list, classify the response, surface
   // the result on the success page so the user sees ✓ or a precise warning
@@ -659,13 +697,13 @@ app.get("/callback", async (c) => {
   // etc.) — by 2026 this should be unreachable.
   return c.html(`
     <html><body>
-    <p>Connected to ${serverName}. Closing…</p>
+    <p>Connected to ${htmlEscape(serverName)}. Closing…</p>
     <script>
       (function(){
         var msg = {
           type: "oauth_complete",
-          service: "${serverName}",
-          vault_id: "${oauthState.vault_id}",
+          service: ${JSON.stringify(serverName).replace(/</g, "\\u003c")},
+          vault_id: ${JSON.stringify(oauthState.vault_id).replace(/</g, "\\u003c")},
           probe_ok: ${probeResult.ok ? "true" : "false"},
           probe_message: ${JSON.stringify(probeResult.message ?? null)},
         };

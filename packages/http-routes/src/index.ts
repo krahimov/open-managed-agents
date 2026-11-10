@@ -43,6 +43,14 @@ export {
   apiKeyMintForbidden,
   sha256Hex,
 } from "./api-keys";
+
+export {
+  bindOAuthInitiator,
+  crossSiteOAuthStart,
+  verifyOAuthInitiator,
+  OAUTH_STATE_TTL_SECONDS,
+} from "./oauth-initiator";
+export type { OAuthInitiator, OAuthInitiatorAuth, OAuthInitiatorCheck } from "./oauth-initiator";
 export type {
   ApiKeyRoutesDeps,
   ApiKeyStorage,
