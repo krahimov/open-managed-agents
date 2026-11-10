@@ -27,7 +27,8 @@
 // user meant to start. A cross-site page could navigate a signed-in victim
 // to /authorize with an attacker MCP server, then bounce the victim's own
 // browser to the callback. So a cookie-session start must also come from
-// our own origin (the console's same-origin popup) per Sec-Fetch-Site.
+// our own origin (the console's same-origin popup) per Sec-Fetch-Site, or
+// be confirmed on a page only our origin can read (gateOAuthStart).
 
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import type { Context } from "hono";
@@ -114,18 +115,130 @@ export async function bindOAuthInitiator(
   return initiator;
 }
 
+/** Minimal KV surface shared by Node's services.kv and CF's services.kv. */
+export interface OAuthStartKv {
+  get(key: string): Promise<string | null>;
+  put(key: string, value: string, opts?: { expirationTtl?: number }): Promise<unknown>;
+  delete(key: string): Promise<unknown>;
+}
+
+/** Query param carrying the one-time token minted by the confirm page. */
+export const OAUTH_START_CONFIRM_PARAM = "oauth_confirm";
+const START_CONFIRM_TTL_SECONDS = 300;
+
+export type OAuthStartGate =
+  | { kind: "ok" }
+  | { kind: "refuse"; reason: string }
+  /** Render `html` (with `headers`) instead of starting the flow. */
+  | { kind: "confirm"; html: string; headers: Record<string, string> };
+
+/** The /authorize request minus the confirm token, order-independent. */
+function startRequestKey(c: Context): string {
+  const u = new URL(c.req.url);
+  u.searchParams.delete(OAUTH_START_CONFIRM_PARAM);
+  u.searchParams.sort();
+  return `${u.pathname}?${u.searchParams.toString()}`;
+}
+
 /**
- * Refuse a cookie-session /authorize that a cross-site page triggered.
- * Returns the reason to show, or null when the start is acceptable.
- * Browsers send Sec-Fetch-Site on every navigation; "same-origin" is the
- * console popup and "none" a typed/bookmarked URL. Non-browser callers
- * (API keys, internal dispatch) don't send it and aren't session-bound.
+ * Decide whether a cookie-session /authorize may start a flow. Non-browser
+ * callers (API keys, internal dispatch) aren't session-bound and pass.
+ *
+ *   - Sec-Fetch-Site cross-site / same-site → refused.
+ *   - same-origin (the console's popup) → starts.
+ *   - "none" or no header → a confirm page first. "none" is every
+ *     navigation without a web initiator — typed URLs, but also links
+ *     opened from Slack, email or chat desktop apps — and older browsers
+ *     send nothing, so neither proves the user meant to start. The page's
+ *     Continue link carries a one-time token bound to this user and this
+ *     exact request, which only a reader of the page (our origin) has.
  */
-export function crossSiteOAuthStart(c: Context, authType: string | undefined): string | null {
-  if (normalizeAuth(authType) !== "session") return null;
+export async function gateOAuthStart(
+  c: Context,
+  input: { authType?: string; tenantId: string; userId?: string; kv: OAuthStartKv; target: string },
+): Promise<OAuthStartGate> {
+  if (normalizeAuth(input.authType) !== "session") return { kind: "ok" };
   const site = c.req.header("sec-fetch-site");
-  if (!site || site === "same-origin" || site === "none") return null;
-  return "This connection was started from another site. Start it again from the console.";
+  if (site && site !== "same-origin" && site !== "none") {
+    return { kind: "refuse", reason: "This connection was started from another site. Start it again from the console." };
+  }
+  const requestKey = startRequestKey(c);
+  const token = c.req.query(OAUTH_START_CONFIRM_PARAM);
+  if (token) {
+    const key = `oauth_start:${await sha256Base64url(token)}`;
+    const raw = await input.kv.get(key);
+    if (raw) await input.kv.delete(key);
+    let rec: { tenant_id?: string; user_id?: string; request?: string; expires_at?: number } | null = null;
+    try {
+      rec = raw ? JSON.parse(raw) : null;
+    } catch {
+      rec = null;
+    }
+    if (
+      !rec ||
+      rec.tenant_id !== input.tenantId ||
+      rec.user_id !== input.userId ||
+      rec.request !== requestKey ||
+      typeof rec.expires_at !== "number" ||
+      Date.now() > rec.expires_at
+    ) {
+      return { kind: "refuse", reason: "This confirmation is no longer valid. Start the connection again from the console." };
+    }
+    return { kind: "ok" };
+  }
+  if (site === "same-origin") return { kind: "ok" };
+
+  const fresh = randomNonce();
+  await input.kv.put(
+    `oauth_start:${await sha256Base64url(fresh)}`,
+    JSON.stringify({
+      tenant_id: input.tenantId,
+      user_id: input.userId,
+      request: requestKey,
+      expires_at: Date.now() + START_CONFIRM_TTL_SECONDS * 1000,
+    }),
+    { expirationTtl: START_CONFIRM_TTL_SECONDS },
+  );
+  const u = new URL(c.req.url);
+  u.searchParams.set(OAUTH_START_CONFIRM_PARAM, fresh);
+  const continueHref = `${u.pathname}${u.search}`;
+  const target = escapeHtml(input.target);
+  return {
+    kind: "confirm",
+    headers: {
+      "Cache-Control": "no-store",
+      "X-Frame-Options": "DENY",
+      "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; form-action 'none'",
+      "Referrer-Policy": "no-referrer",
+    },
+    html: `<!doctype html><html><head><meta charset="utf-8"><title>Connect ${target}?</title></head>
+<body style="font-family:system-ui;max-width:36rem;margin:3rem auto;line-height:1.5">
+<h2>Connect ${target}?</h2>
+<p>This link signs in to <strong>${target}</strong> and saves that login in your workspace.
+Continue only if you started this connection yourself.</p>
+<p><a href="${escapeHtml(continueHref)}">Continue</a> &nbsp; <span style="color:#888">or close this window to cancel.</span></p>
+</body></html>`,
+  };
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (ch) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]!
+  ));
+}
+
+/**
+ * JSON for an inline <script>: JSON.stringify leaves `<` alone, so a value
+ * holding `</script>` (a provider's error text, an MCP server's probe
+ * body) would end the script element and run as markup on our origin.
+ */
+export function inlineScriptJson(value: unknown): string {
+  return (JSON.stringify(value) ?? "null")
+    .replace(/</g, "\\u003c")
+    .replace(/>/g, "\\u003e")
+    .replace(/&/g, "\\u0026")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
 }
 
 export type OAuthInitiatorCheck = { ok: true } | { ok: false; reason: string };

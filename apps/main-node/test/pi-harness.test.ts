@@ -25,6 +25,7 @@ import {
 import { eventsToMessages } from "../../agent/src/runtime/history";
 import { resolveModel } from "../../agent/src/harness/provider";
 import { resetInflightToolCallsForTest } from "../../agent/src/harness/durable-tools";
+import { applyToolBudget, CALL_TOOL_NAME } from "../../agent/src/harness/tool-budget";
 import type { HarnessContext } from "../../agent/src/harness/interface";
 import type { SessionEvent } from "@open-managed-agents/shared";
 
@@ -342,6 +343,40 @@ describe("pi harness: run() against a faux pi-ai model", () => {
       .toMatchObject({ evaluated_permission: "ask", idempotency_key: "sess-1:b" });
     const results = writes.filter((w) => w.event.type === "agent.tool_result").map((w) => (w.event as { tool_use_id: string }).tool_use_id);
     expect(results).toEqual(["a"]);
+  });
+
+  it("parks a call_mcp_tool whose deferred target is ask-gated (write-ahead ask, pending, never run)", async () => {
+    resetInflightToolCallsForTest();
+    const ran = vi.fn(async () => "ran");
+    const { tools } = applyToolBudget(
+      {
+        a: tool({ inputSchema: z.object({}), execute: ran }),
+        b: tool({ inputSchema: z.object({}), execute: ran }),
+        c: tool({ inputSchema: z.object({}), execute: ran }),
+        d: tool({ inputSchema: z.object({}), execute: ran }),
+        // always_ask → buildTools stripped execute
+        mcp__linear__create_issue: tool({ description: "Create a Linear issue", inputSchema: z.object({ title: z.string() }) }),
+        mcp__linear__list_issues: tool({ description: "List Linear issues", inputSchema: z.object({}), execute: ran }),
+      },
+      { maxTools: 4 },
+    );
+    const { ctx, writes, pendingConfirmations } = makeCtx({ tools });
+    const { harness, faux } = fauxResolver([
+      fauxAssistantMessage(
+        [fauxToolCall(CALL_TOOL_NAME, { name: "mcp__linear__create_issue", arguments: { title: "Bug" } }, { id: "g1" })],
+        { stopReason: "toolUse" },
+      ),
+      fauxAssistantMessage("should not be requested"),
+    ]);
+    await harness.run(ctx);
+    expect(faux.state.callCount).toBe(1);
+    expect(pendingConfirmations).toEqual(["g1"]);
+    expect(writes.find((w) => (w.event as { id?: string }).id === "g1")).toMatchObject({
+      via: "persist",
+      event: { type: "agent.tool_use", name: CALL_TOOL_NAME, evaluated_permission: "ask" },
+    });
+    expect(writes.some((w) => (w.event as { tool_use_id?: string }).tool_use_id === "g1")).toBe(false);
+    expect(ran).not.toHaveBeenCalled();
   });
 
   it("classifies MCP and custom tools like the default harness", async () => {

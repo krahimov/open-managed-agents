@@ -747,6 +747,7 @@ export class SessionStateMachine {
         { execute?: (input: unknown, opts: unknown) => Promise<unknown> } | undefined
       >;
       const target = resolveConfirmedToolCall(built, use.name, use.input);
+      if (target.error) throw new Error(target.error);
       const execute = target.tool?.execute;
       if (!execute) throw new Error(`tool ${target.name} is not available`);
       const result = await execute(target.input, {

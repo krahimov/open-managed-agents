@@ -173,6 +173,17 @@ function makeNullable(node: JsonSchema): JsonSchema {
   return { ...node, type: [...types, "null"] };
 }
 
+function objectish(s: unknown): boolean {
+  return isObj(s) && (typesOf(s).includes("object") || "properties" in s);
+}
+
+/** Does `s` hold an object schema anywhere (itself, its items, its branches)? */
+function containsObject(s: unknown): boolean {
+  if (!isObj(s)) return false;
+  if (objectish(s) || containsObject(s.items)) return true;
+  return (["anyOf", "oneOf"] as const).some((k) => Array.isArray(s[k]) && (s[k] as unknown[]).some(containsObject));
+}
+
 interface Budget {
   props: number;
   enumValues: number;
@@ -198,15 +209,22 @@ function convert(node: unknown, depth: number, counter: Budget, root = false): J
     const chars = values.reduce<number>((n, v) => n + String(v).length, 0);
     counter.chars += chars;
     if (counter.enumValues > MAX_ENUM_VALUES) throw new NotStrict("too many enum values");
+    if (counter.chars > MAX_TOTAL_CHARS) throw new NotStrict("schema too large");
     if (values.length > LARGE_ENUM && chars > MAX_LARGE_ENUM_CHARS) throw new NotStrict("large enum");
   }
   if ("type" in out && (types.length === 0 || types.some((t) => !STRICT_TYPES.has(t)))) throw new NotStrict("type");
   if (typeof out.format === "string" && !STRICT_FORMATS.has(out.format)) throw new NotStrict("format");
   if (Array.isArray(out.anyOf)) {
-    // Unions of objects: which branch a value took is ambiguous, so its
-    // placeholder nulls couldn't be stripped reliably.
-    if (out.anyOf.some((b) => isObj(b) && (typesOf(b).includes("object") || "properties" in b))) {
-      throw new NotStrict("union of objects");
+    // Unions with objects in more than one place (object branches, or an
+    // array of objects beside another array): which branch a value took is
+    // ambiguous, so its placeholder nulls couldn't be stripped reliably.
+    // stripNullOptionals only follows a lone array branch (itemsShape).
+    const holders = out.anyOf.filter(containsObject);
+    if (holders.length) {
+      const arrays = out.anyOf.filter((b) => isObj(b) && b.items !== undefined);
+      if (holders.length > 1 || objectish(holders[0]) || arrays.length !== 1 || arrays[0] !== holders[0]) {
+        throw new NotStrict("union of objects");
+      }
     }
     out.anyOf = out.anyOf.map((b) => convert(b, depth + 1, counter));
   }

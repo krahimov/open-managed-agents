@@ -173,19 +173,56 @@ export function anyToolsetAsks(tools: ToolConfig[] | undefined): boolean {
  * call_mcp_tool resolves to the deferred MCP tool it names — the dict
  * rebuilt for the approval holds that tool directly (call_mcp_tool itself
  * only exists after per-turn budgeting) — with its `arguments`. Anything
- * else runs as recorded.
+ * else runs as recorded. `error` set → don't run it; report that instead.
  */
 export function resolveConfirmedToolCall<T>(
   built: Record<string, T | undefined> | null | undefined,
   name: string,
   input: Record<string, unknown>,
-): { tool: T | undefined; name: string; input: Record<string, unknown> } {
+): { tool: T | undefined; name: string; input: Record<string, unknown>; error?: string } {
   if (name === CALL_MCP_TOOL_NAME) {
     const target = typeof input?.name === "string" ? input.name : "";
     if (!parseMcpToolName(target)) return { tool: undefined, name, input };
-    return { tool: lookupBuilt(built, target), name: target, input: parseCallMcpArguments(input.arguments) };
+    const args = parseCallMcpArguments(input.arguments);
+    if (!args) return { tool: undefined, name: target, input: {}, error: CALL_MCP_BAD_ARGUMENTS };
+    return { tool: lookupBuilt(built, target), name: target, input: args };
   }
   return { tool: lookupBuilt(built, name), name, input };
+}
+
+type ParkableEvent = { type: string; id?: string; name?: string; input?: unknown };
+const PARKABLE_TYPES = new Set(["agent.tool_use", "agent.mcp_tool_use", "agent.custom_tool_use"]);
+
+/**
+ * A delegated (sub-agent) run that stopped on calls only a user could
+ * resolve — approval, or a client-side tool result. Sub-agent threads have
+ * no requires_action path, so those calls would sit unresolved forever and
+ * the delegation would come back empty. Returns the parked tool_use events
+ * (to close out) and the notice the delegating agent gets instead, or null
+ * when nothing parked.
+ */
+export function subAgentParkedCalls(
+  events: readonly ParkableEvent[],
+  pendingIds: readonly string[],
+): { parked: Array<{ id: string; type: string; name: string }>; notice: string } | null {
+  if (!pendingIds.length) return null;
+  const ids = new Set(pendingIds);
+  const parked = events
+    .filter((e): e is ParkableEvent & { id: string } => PARKABLE_TYPES.has(e.type) && typeof e.id === "string" && ids.has(e.id))
+    .map((e) => {
+      const target = e.name === CALL_MCP_TOOL_NAME ? (e.input as { name?: unknown } | undefined)?.name : undefined;
+      return { id: e.id, type: e.type, name: typeof target === "string" ? target : e.name ?? "tool" };
+    });
+  if (!parked.length) return null;
+  const names = [...new Set(parked.map((p) => p.name))];
+  const many = names.length > 1;
+  return {
+    parked,
+    notice:
+      `[sub-agent stopped] ${names.join(", ")} ${many ? "need" : "needs"} the user's approval (or a client-side result), which a delegated agent can't ask for, ` +
+      `so ${many ? "they were" : "it was"} not run. Do this step in the main conversation (where the user can approve it), ` +
+      `or set ${many ? "those tools" : "that tool"} to always_allow on the delegated agent.`,
+  };
 }
 
 /** Look a tool up by its recorded name. On OpenAI, names over 64 chars are
@@ -200,18 +237,25 @@ function lookupBuilt<T>(built: Record<string, T | undefined> | null | undefined,
 }
 
 /** call_mcp_tool's `arguments`: an object, or a JSON-encoded object (some
- *  models stringify it). Anything else → {}. */
-export function parseCallMcpArguments(args: unknown): Record<string, unknown> {
+ *  models stringify it); absent → {}. Anything else (a string that isn't
+ *  JSON, an array, a number) → null: running the tool with {} instead
+ *  would drop the model's filters — or run something other than what the
+ *  user approved. */
+export function parseCallMcpArguments(args: unknown): Record<string, unknown> | null {
+  if (args === undefined || args === null) return {};
   let v = args;
   if (typeof v === "string") {
     try {
       v = JSON.parse(v);
     } catch {
-      return {};
+      return null;
     }
   }
-  return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+  return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
 }
+
+export const CALL_MCP_BAD_ARGUMENTS =
+  "`arguments` must be a JSON object of the tool's arguments (or a string holding one); the tool was not run.";
 
 // ─── OpenAI tool-name shortening ──────────────────────────────────────────
 //

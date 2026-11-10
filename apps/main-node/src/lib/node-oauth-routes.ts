@@ -2,7 +2,8 @@ import { Hono } from "hono";
 import type { CredentialAuth } from "@open-managed-agents/shared";
 import {
   bindOAuthInitiator,
-  crossSiteOAuthStart,
+  gateOAuthStart,
+  inlineScriptJson,
   verifyOAuthInitiator,
   OAUTH_STATE_TTL_SECONDS,
   type OAuthInitiator,
@@ -125,8 +126,19 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
     if (!mcpServerUrl || (!vaultId && !newVaultName)) {
       return c.json({ error: "mcp_server_url and vault_id are required" }, 400);
     }
-    const crossSite = crossSiteOAuthStart(c, c.get("auth_type"));
-    if (crossSite) return c.html(closeHtml("Connection not started", htmlEscape(crossSite)), 403);
+    let startTarget = mcpServerUrl;
+    try {
+      startTarget = new URL(mcpServerUrl).host;
+    } catch {}
+    const gate = await gateOAuthStart(c, {
+      authType: c.get("auth_type"),
+      tenantId: c.get("tenant_id"),
+      userId: c.get("user_id"),
+      kv: deps.services.kv,
+      target: startTarget,
+    });
+    if (gate.kind === "refuse") return c.html(closeHtml("Connection not started", htmlEscape(gate.reason)), 403);
+    if (gate.kind === "confirm") return c.html(gate.html, 200, gate.headers);
 
     let parsedMcpUrl: URL;
     try {
@@ -475,7 +487,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
       <p>Connected to ${htmlEscape(serverName)}. Closing...</p>
       <script>
         (function(){
-          var msg = ${JSON.stringify({
+          var msg = ${inlineScriptJson({
             type: "oauth_complete",
             service: grantService,
             server_name: serverName,
@@ -502,7 +514,7 @@ export function buildNodeOAuthRoutes(deps: NodeOAuthRoutesDeps): Hono<NodeOAuthV
             notified = true;
           } catch (e) {}
           if (notified) window.close();
-          else window.location.href = ${JSON.stringify(redirectUrl.toString())};
+          else window.location.href = ${inlineScriptJson(redirectUrl.toString())};
         })();
       </script>
       </body></html>
@@ -982,7 +994,7 @@ async function probeMcpServer(
 function closeHtml(title: string, body: string, extra: Record<string, unknown> = {}): string {
   // body may carry markup for the page; the postMessage variant is plain text.
   const plain = body.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-  const msg = JSON.stringify({
+  const msg = inlineScriptJson({
     type: "oauth_error",
     message: `${title}: ${plain}`.slice(0, 500),
     ...extra,

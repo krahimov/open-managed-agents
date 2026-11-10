@@ -613,7 +613,11 @@ export class CodexSdkHarness {
     // built-ins, so an always_ask on the built-in toolset alone never
     // governed them and doesn't fail the session. Setup sessions only
     // expose the platform's oma_setup tools, which no toolset governs.
-    const askingServers = isSetup
+    // Computer sessions never mount the agent's servers in codex: they get
+    // ctx.tools over the bridge, where buildTools already stripped execute
+    // from ask-gated tools and codexComputerTools drops them (refused per
+    // tool, the way claude-agent-sdk does).
+    const askingServers = (isSetup || computer)
       ? []
       : (ctx.agent.mcp_servers ?? []).map((s) => s.name).filter((name) => mcpServerMayAsk(ctx.agent.tools, name));
     if (askingServers.length > 0) {

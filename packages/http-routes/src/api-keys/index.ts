@@ -22,15 +22,17 @@ interface Vars {
  * key mints replacements that survive its revocation (privilege
  * persistence). Console sessions (and AUTH_DISABLED dev) keep full ability.
  */
-export function apiKeyMintForbidden(authType: string | undefined): Response | null {
+export function apiKeyMintForbidden(
+  authType: string | undefined,
+  what = "API keys",
+): Response | null {
   if (authType !== "api_key") return null;
   return Response.json(
     {
       type: "error",
       error: {
         type: "permission_error",
-        message:
-          "API keys cannot create API keys. Sign in to the console (cookie session) to create one.",
+        message: `API keys cannot create ${what}. Sign in to the console (cookie session) to create one.`,
       },
     },
     { status: 403 },

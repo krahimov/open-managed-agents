@@ -157,12 +157,25 @@ describe("Agent + Session snapshot", () => {
     });
     const agent = (await a.json()) as any;
 
+    // Publishing needs a console session (an API key can't mint a
+    // publishable key that would outlive its revocation)...
     const depRes = await post("/v1/deployments", {
       agent_id: agent.id,
       environment_id: envObj.id,
     });
-    expect(depRes.status).toBe(201);
-    const deployment = (await depRes.json()) as any;
+    expect(depRes.status).toBe(403);
+    // ...which this suite has no fixture for, so seed the record the way
+    // the mint path stores it.
+    const deployment = { id: "dep_seededvltmcp01", key: "oma_pk_" + "d".repeat(32) };
+    const keyDigest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(deployment.key));
+    const keyHash = [...new Uint8Array(keyDigest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const now = new Date().toISOString();
+    await env.CONFIG_KV.put(`deploy:rec:${deployment.id}`, JSON.stringify({
+      id: deployment.id, tenant_id: "default", name: "seeded", agent_id: agent.id, agent_version: null,
+      environment_id: envObj.id, key_prefix: deployment.key.slice(0, 11), key_hash: keyHash,
+      allowed_origins: null, disabled: false, created_at: now, updated_at: now,
+    }));
+    await env.CONFIG_KV.put(`deploy:key:${keyHash}`, deployment.id);
 
     const publicSessionRes = await api("/public/v1/sessions", {
       method: "POST",

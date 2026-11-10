@@ -5,7 +5,8 @@ import type { CredentialAuth } from "@open-managed-agents/shared";
 import type { Services } from "@open-managed-agents/services";
 import {
   bindOAuthInitiator,
-  crossSiteOAuthStart,
+  gateOAuthStart,
+  inlineScriptJson,
   verifyOAuthInitiator,
   OAUTH_STATE_TTL_SECONDS,
   type OAuthInitiator,
@@ -299,8 +300,19 @@ app.get("/authorize", async (c) => {
   if (!mcpServerUrl || !vaultId) {
     return c.json({ error: "mcp_server_url and vault_id are required" }, 400);
   }
-  const crossSite = crossSiteOAuthStart(c, c.get("auth_type"));
-  if (crossSite) return c.json({ error: crossSite }, 403);
+  let startTarget = mcpServerUrl;
+  try {
+    startTarget = new URL(mcpServerUrl).host;
+  } catch {}
+  const gate = await gateOAuthStart(c, {
+    authType: c.get("auth_type"),
+    tenantId: c.get("tenant_id"),
+    userId: c.get("user_id"),
+    kv: c.var.services.kv,
+    target: startTarget,
+  });
+  if (gate.kind === "refuse") return c.json({ error: gate.reason }, 403);
+  if (gate.kind === "confirm") return c.html(gate.html, 200, gate.headers);
 
   // Verify vault exists. Vaults live in D1 (vaults-store) since the
   // KV → D1 migration; this route was missed in that sweep — every
@@ -700,13 +712,13 @@ app.get("/callback", async (c) => {
     <p>Connected to ${htmlEscape(serverName)}. Closing…</p>
     <script>
       (function(){
-        var msg = {
+        var msg = ${inlineScriptJson({
           type: "oauth_complete",
-          service: ${JSON.stringify(serverName).replace(/</g, "\\u003c")},
-          vault_id: ${JSON.stringify(oauthState.vault_id).replace(/</g, "\\u003c")},
-          probe_ok: ${probeResult.ok ? "true" : "false"},
-          probe_message: ${JSON.stringify(probeResult.message ?? null)},
-        };
+          service: serverName,
+          vault_id: oauthState.vault_id,
+          probe_ok: probeResult.ok,
+          probe_message: probeResult.message ?? null,
+        })};
         var notified = false;
         try {
           if (window.opener && !window.opener.closed) {
@@ -723,7 +735,7 @@ app.get("/callback", async (c) => {
         if (notified) {
           window.close();
         } else {
-          window.location.href = ${JSON.stringify(redirectUrl.toString())};
+          window.location.href = ${inlineScriptJson(redirectUrl.toString())};
         }
       })();
     </script>

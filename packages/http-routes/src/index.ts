@@ -46,11 +46,19 @@ export {
 
 export {
   bindOAuthInitiator,
-  crossSiteOAuthStart,
+  gateOAuthStart,
+  inlineScriptJson,
   verifyOAuthInitiator,
+  OAUTH_START_CONFIRM_PARAM,
   OAUTH_STATE_TTL_SECONDS,
 } from "./oauth-initiator";
-export type { OAuthInitiator, OAuthInitiatorAuth, OAuthInitiatorCheck } from "./oauth-initiator";
+export type {
+  OAuthInitiator,
+  OAuthInitiatorAuth,
+  OAuthInitiatorCheck,
+  OAuthStartGate,
+  OAuthStartKv,
+} from "./oauth-initiator";
 export type {
   ApiKeyRoutesDeps,
   ApiKeyStorage,

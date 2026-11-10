@@ -225,6 +225,34 @@ describe("oauth callback grant recording", () => {
   });
 });
 
+describe("oauth callback success page", () => {
+  it("keeps MCP-server and caller-supplied strings inside the inline script (no </script> breakout)", async () => {
+    const payload = "</script><script>window.pwned=1</script>";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.endsWith("/oauth/token")) return Response.json({ access_token: "at", expires_in: 3600 });
+        // The MCP server writes the probe failure text.
+        return new Response(payload, { status: 401 });
+      }),
+    );
+    const f = fakeServices({ ...baseState, service: `x${payload}` });
+    const res = await mount(buildNodeOAuthRoutes({ services: f.services as never })).request(
+      "https://api.example/v1/oauth/callback?code=abc&state=st1",
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // Only the page's own script element; the payload survives as data.
+    expect(html.match(/<script>/g)).toHaveLength(1);
+    expect(html.match(/<\/script>/g)).toHaveLength(1);
+    expect(html).not.toContain(payload);
+    const msg = JSON.parse(/var msg = (\{.*?\});\n/s.exec(html)![1]!);
+    expect(msg.service).toBe(`x${payload}`);
+    expect(msg.probe_message).toContain(payload);
+  });
+});
+
 describe("Telegram MCP OAuth completion receipts", () => {
   it("writes a receipt only after credentials are stored, and does not accept a query-supplied key", async () => {
     stubUpstreams();
@@ -280,6 +308,7 @@ describe("oauth callback is bound to the initiator", () => {
     const routes = buildNodeOAuthRoutes({ services: f.services as never });
     const res = await mount(routes, vars).request(
       "https://api.example/v1/oauth/authorize?mcp_server_url=https://mcp.sentry.dev/mcp&vault_id=vlt-1",
+      { headers: { "sec-fetch-site": "same-origin" } },
     );
     expect(res.status).toBe(302);
     const state = new URL(res.headers.get("location")!).searchParams.get("state")!;
@@ -392,12 +421,73 @@ describe("oauth callback is bound to the initiator", () => {
     expect(crossSite.status).toBe(403);
     expect(crossSite.headers.get("set-cookie")).toBeNull();
     expect((await mount(routes, alice).request(url, { headers: { "sec-fetch-site": "same-site" } })).status).toBe(403);
-    // The console popup (same-origin) and a typed URL (none) still start.
+    // The console popup (same-origin) still starts.
     expect((await mount(routes, alice).request(url, { headers: { "sec-fetch-site": "same-origin" } })).status).toBe(302);
-    expect((await mount(routes, alice).request(url, { headers: { "sec-fetch-site": "none" } })).status).toBe(302);
     // API-key starts aren't browser navigations; the header doesn't apply.
     const viaKey = { tenant_id: "t1", user_id: "alice", auth_type: "api_key" };
     expect((await mount(routes, viaKey).request(url, { headers: { "sec-fetch-site": "cross-site" } })).status).toBe(302);
+  });
+
+  describe("a start with no web initiator (Sec-Fetch-Site none / missing) must be confirmed", () => {
+    const url = "https://api.example/v1/oauth/authorize?mcp_server_url=https://mcp.sentry.dev/mcp&vault_id=vlt-1";
+    /** Render the confirm page and pull out its Continue link. */
+    async function confirmPage(routes: ReturnType<typeof buildNodeOAuthRoutes>, headers: Record<string, string>) {
+      const res = await mount(routes, alice).request(url, { headers });
+      expect(res.status).toBe(200);
+      expect(res.headers.get("set-cookie")).toBeNull();
+      expect(res.headers.get("x-frame-options")).toBe("DENY");
+      expect(res.headers.get("content-security-policy")).toContain("frame-ancestors 'none'");
+      const html = await res.text();
+      expect(html).toContain("mcp.sentry.dev");
+      const href = /<a href="([^"]+)">Continue<\/a>/.exec(html)![1]!.replace(/&amp;/g, "&");
+      return new URL(href, "https://api.example").toString();
+    }
+
+    it("a link opened from a desktop app (none) or a browser without the header shows a confirm page, not a 302", async () => {
+      stubAll();
+      const f = fakeServices(baseState);
+      f.kv.delete("oauth_state:st1");
+      const routes = buildNodeOAuthRoutes({ services: f.services as never });
+      await confirmPage(routes, { "sec-fetch-site": "none" });
+      await confirmPage(routes, {});
+      // No flow state was minted for either.
+      expect([...f.kv.keys()].some((k) => k.startsWith("oauth_state:"))).toBe(false);
+    });
+
+    it("Continue starts the flow once; the token can't be replayed", async () => {
+      stubAll();
+      const f = fakeServices(baseState);
+      const routes = buildNodeOAuthRoutes({ services: f.services as never });
+      const next = await confirmPage(routes, { "sec-fetch-site": "none" });
+      const go = await mount(routes, alice).request(next, { headers: { "sec-fetch-site": "same-origin" } });
+      expect(go.status).toBe(302);
+      expect(go.headers.get("set-cookie")).toMatch(/^oma_oauth_/);
+      // Same token again (even from a header-less browser) is refused.
+      expect((await mount(routes, alice).request(next)).status).toBe(403);
+    });
+
+    it("a header-less browser can finish the confirm with the token", async () => {
+      stubAll();
+      const routes = buildNodeOAuthRoutes({ services: fakeServices(baseState).services as never });
+      const next = await confirmPage(routes, {});
+      expect((await mount(routes, alice).request(next)).status).toBe(302);
+    });
+
+    it("the token is bound to the user and to the exact request", async () => {
+      stubAll();
+      const routes = buildNodeOAuthRoutes({ services: fakeServices(baseState).services as never });
+      const mallory = { tenant_id: "t1", user_id: "mallory", auth_type: "session" };
+      const forOther = await confirmPage(routes, {});
+      expect((await mount(routes, mallory).request(forOther)).status).toBe(403);
+
+      const altered = new URL(await confirmPage(routes, {}));
+      altered.searchParams.set("mcp_server_url", "https://evil.example/mcp");
+      expect((await mount(routes, alice).request(altered.toString())).status).toBe(403);
+
+      const forged = new URL(url);
+      forged.searchParams.set("oauth_confirm", "made-up");
+      expect((await mount(routes, alice).request(forged.toString())).status).toBe(403);
+    });
   });
 
   it("rejects an expired state even if the KV entry outlived its TTL", async () => {

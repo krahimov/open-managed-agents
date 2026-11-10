@@ -69,7 +69,7 @@ import type { ApiCompat } from "../harness/provider";
 import type { LanguageModel } from "ai";
 import { generateText } from "ai";
 import { extractTextFromContent, type JudgeFn } from "@open-managed-agents/shared";
-import { resolveEgressPolicy, resolveConfirmedToolCall, type EgressPolicy } from "@open-managed-agents/shared";
+import { resolveEgressPolicy, resolveConfirmedToolCall, subAgentParkedCalls, type EgressPolicy } from "@open-managed-agents/shared";
 import {
   runOutcomeSupervisor,
   type ActiveOutcomeState,
@@ -3656,7 +3656,9 @@ export class SessionDO extends DurableObject<Env> {
         const use = { id: pending.toolCallId, type: pending.eventType ?? ("agent.tool_use" as const) };
         let resultEvent: SessionEvent;
         const originalTool = confirmed.tool;
-        if (!originalTool?.execute) {
+        if (confirmed.error) {
+          resultEvent = toolResultEventFor(use, `Error: ${confirmed.error}`, true);
+        } else if (!originalTool?.execute) {
           // Never leave the call without a result — the next model turn
           // would replay an orphaned tool call.
           resultEvent = toolResultEventFor(use, `Error: tool ${confirmed.name} is not available`, true);
@@ -4121,6 +4123,10 @@ export class SessionDO extends DurableObject<Env> {
     // delegate) doesn't drop the inner controller's slot.
     const abortController = new AbortController();
     this._threadAbortControllers.set(threadId, abortController);
+    // Calls the sub-agent parks for approval / a client result. A sub-thread
+    // has no requires_action path, so they're closed out and reported to
+    // the delegating agent below instead of sitting unresolved.
+    const subPending: string[] = [];
 
     // Build sub-agent context: own history, shared sandbox, parent event log
     const subCtx: HarnessContext = {
@@ -4202,6 +4208,7 @@ export class SessionDO extends DurableObject<Env> {
         // root-cause analysis pointed at alarm body running LLM
         // streams as the actual eviction trigger.)
         keepAliveWhile: <T>(fn: () => Promise<T>) => fn(),
+        pendingConfirmations: subPending,
       },
     };
 
@@ -4219,6 +4226,14 @@ export class SessionDO extends DurableObject<Env> {
           return msg.content?.map((b) => b.type === "text" ? b.text : "").join("") || "";
         })
         .join("\n");
+
+      const stuck = subAgentParkedCalls(subEvents as never, subPending);
+      if (stuck) {
+        for (const call of stuck.parked) {
+          subCtx.runtime.broadcast(toolResultEventFor(call as never, `Not run: ${stuck.notice}`, true));
+        }
+        responseText = responseText ? `${responseText}\n\n${stuck.notice}` : stuck.notice;
+      }
     } finally {
       // Identity-guarded delete: a nested runSubAgent on the same threadId
       // would have replaced our slot — don't stomp on its controller.

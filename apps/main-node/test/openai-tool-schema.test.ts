@@ -139,6 +139,23 @@ describe("toOpenAiStrictSchema", () => {
     expect(linearListIssues).toEqual(copy);
   });
 
+  it("keeps strict for a lone array-of-objects branch beside a scalar, and strips its items", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        u: {
+          anyOf: [
+            { type: "array", items: { type: "object", properties: { q: { type: "string" } }, additionalProperties: false } },
+            { type: "string" },
+          ],
+        },
+      },
+      required: ["u"],
+    };
+    expect(toOpenAiStrictSchema(schema)).not.toBeNull();
+    expect(stripNullOptionals(schema, { u: [{ q: null }] })).toEqual({ u: [{}] });
+  });
+
   it("drops annotations OpenAI doesn't need ($schema, title)", () => {
     const strict = toOpenAiStrictSchema({
       $schema: "http://json-schema.org/draft-07/schema#",
@@ -169,6 +186,40 @@ describe("toOpenAiStrictSchema", () => {
         },
       },
       required: ["parent"],
+    }],
+    // stripNullOptionals can't tell which array branch an item came from.
+    ["union of arrays of objects", {
+      type: "object",
+      properties: {
+        u: {
+          anyOf: [
+            { type: "array", items: { type: "object", properties: { q: { type: "string" } }, additionalProperties: false } },
+            { type: "array", items: { type: "object", properties: { r: { type: "string" } }, additionalProperties: false } },
+          ],
+        },
+      },
+      required: ["u"],
+    }],
+    ["array of objects beside another array (z.union of arrays)", {
+      type: "object",
+      properties: {
+        u: {
+          anyOf: [
+            { type: "array", items: { type: "object", properties: { q: { type: "string" } }, additionalProperties: false } },
+            { type: "array", items: { type: "string" } },
+          ],
+        },
+      },
+      required: ["u"],
+    }],
+    // 4 × 250 values × 130 chars: under the per-enum and enum-count rules,
+    // over the 120k total — and the last enum is what crosses it.
+    ["over 120k total chars, crossed inside the last property", {
+      type: "object",
+      properties: Object.fromEntries(
+        ["a", "b", "c", "d"].map((k) => [k, { type: "string", enum: Array.from({ length: 250 }, (_, i) => `${k}${i}`.padEnd(130, "x")) }]),
+      ),
+      required: ["a", "b", "c", "d"],
     }],
     ["type beside anyOf", { type: "object", properties: { d: { type: "string", anyOf: [{ type: "string", format: "date" }, { type: "string", format: "date-time" }] } } }],
     ["root anyOf", { type: "object", properties: { a: { type: "string" } }, anyOf: [{ required: ["a"] }] }],

@@ -265,6 +265,32 @@ describe("SessionStateMachine human-in-the-loop", () => {
     expect(toolResult).toMatchObject({ tool_use_id: "toolu_meta", content: "ISS-1" });
   });
 
+  it("an approved call_mcp_tool with unparseable arguments errors instead of running the target with {}", async () => {
+    let calls = 0;
+    const run = async (ctx: HarnessInput) => {
+      if (++calls > 1) return;
+      ctx.eventLog.append({
+        type: "agent.tool_use",
+        id: "toolu_meta",
+        name: "call_mcp_tool",
+        input: { name: "mcp__linear__delete_issue", arguments: '{"id":"ISS-1"' },
+        evaluated_permission: "ask",
+      } as unknown as SessionEvent);
+      ctx.runtime?.pendingConfirmations?.push("toolu_meta");
+    };
+    const target = vi.fn(async () => "deleted");
+    const f = createMachine(run, {
+      runtime: () => ({ pendingConfirmations: [] }),
+      tools: () => ({ mcp__linear__delete_issue: { execute: target } }),
+    });
+    await f.machine.runTurn("agent_test", userMessage);
+    await f.machine.runTurn("agent_test", { type: "user.tool_confirmation", tool_use_id: "toolu_meta", result: "allow" } as never);
+    expect(target).not.toHaveBeenCalled();
+    const toolResult = (f.log.getEvents() as Array<Record<string, unknown>>).find((e) => e.type === "agent.tool_result");
+    expect(toolResult).toMatchObject({ tool_use_id: "toolu_meta", is_error: true });
+    expect(String(toolResult?.content)).toMatch(/must be a JSON object/);
+  });
+
   it("an approved call_mcp_tool never resolves to a non-MCP tool", async () => {
     let calls = 0;
     const run = async (ctx: HarnessInput) => {

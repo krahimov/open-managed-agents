@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import {
@@ -9,6 +9,7 @@ import {
   resolveOwningToolsetPermission,
   resolveToolCallPermission,
   resolveToolPermission,
+  subAgentParkedCalls,
   type ToolConfig,
 } from "@open-managed-agents/shared";
 import { getEnabledTools, getToolPermission } from "@open-managed-agents/agent/harness/tools";
@@ -242,7 +243,40 @@ describe("call_mcp_tool respects the deferred tool's permission", () => {
     await (tools[CALL_TOOL_NAME] as any).execute({ name: "mcp__linear__list_issues", arguments: '{"team":"t1"}' }, {});
     expect(seen).toEqual([{ team: "t1" }]);
     expect(resolveConfirmedToolCall({ mcp__linear__x: 1 }, "call_mcp_tool", { name: "mcp__linear__x", arguments: '{"a":1}' }).input).toEqual({ a: 1 });
-    expect(resolveConfirmedToolCall({ mcp__linear__x: 1 }, "call_mcp_tool", { name: "mcp__linear__x", arguments: "not json" }).input).toEqual({});
+  });
+
+  it("malformed arguments never run the target with {} (filters dropped, or not what the user approved)", async () => {
+    const seen: unknown[] = [];
+    const gated = tool({ description: "Delete a Linear issue", inputSchema: z.object({ id: z.string() }) });
+    const { tools } = applyToolBudget(
+      {
+        a: tool({ inputSchema: z.object({}), execute: exec }),
+        b: tool({ inputSchema: z.object({}), execute: exec }),
+        c: tool({ inputSchema: z.object({}), execute: exec }),
+        d: tool({ inputSchema: z.object({}), execute: exec }),
+        // All-optional args: {} would "succeed" and return everything.
+        mcp__linear__list_issues: tool({
+          inputSchema: z.object({ teamId: z.string().optional() }),
+          execute: async (args) => void seen.push(args) ?? "ran",
+        }),
+        mcp__linear__delete_issue: gated,
+      },
+      { maxTools: 4 },
+    );
+    const call = tools[CALL_TOOL_NAME] as any;
+    for (const bad of ['{"teamId":"T1"', "[1,2]", "42"]) {
+      expect(await call.execute({ name: "mcp__linear__list_issues", arguments: bad }, {})).toMatch(/Invalid arguments.*not run/);
+      // A gated target with unusable arguments isn't parked for approval.
+      expect(toolCallNeedsApproval(call, { name: "mcp__linear__delete_issue", arguments: bad })).toBe(false);
+      const confirmed = resolveConfirmedToolCall({ mcp__linear__x: 1 }, "call_mcp_tool", { name: "mcp__linear__x", arguments: bad });
+      expect(confirmed.error).toMatch(/must be a JSON object/);
+      expect(confirmed.tool).toBeUndefined();
+    }
+    expect(seen).toEqual([]);
+    // Absent arguments still mean "no arguments".
+    expect(await call.execute({ name: "mcp__linear__list_issues" }, {})).toBe("ran");
+    expect(seen).toEqual([{}]);
+    expect(toolCallNeedsApproval(call, { name: "mcp__linear__delete_issue", arguments: '{"id":"I1"}' })).toBe(true);
   });
 
   it("an approval of a tool whose name was shortened for OpenAI finds the original", () => {
@@ -262,6 +296,88 @@ describe("call_mcp_tool respects the deferred tool's permission", () => {
     // Only MCP targets — a forged name can't reach a built-in.
     expect(resolveConfirmedToolCall(built, "call_mcp_tool", { name: "bash", arguments: {} }).tool).toBeUndefined();
     expect(resolveConfirmedToolCall(built, "bash", { command: "ls" })).toEqual({ tool: built.bash, name: "bash", input: { command: "ls" } });
+  });
+});
+
+describe("sub-agent parked calls (CF runSubAgent has no requires_action path)", () => {
+  it("names each parked call (call_mcp_tool by its target) and tells the delegator it wasn't run", () => {
+    const events = [
+      { type: "user.message", content: [] },
+      { type: "agent.mcp_tool_use", id: "c1", name: "mcp__github__create_issue", input: {} },
+      { type: "agent.tool_use", id: "c2", name: "call_mcp_tool", input: { name: "mcp__linear__delete_issue" } },
+      { type: "agent.tool_use", id: "c3", name: "bash", input: {} }, // ran, not pending
+    ];
+    const out = subAgentParkedCalls(events, ["c1", "c2"])!;
+    expect(out.parked).toEqual([
+      { id: "c1", type: "agent.mcp_tool_use", name: "mcp__github__create_issue" },
+      { id: "c2", type: "agent.tool_use", name: "mcp__linear__delete_issue" },
+    ]);
+    expect(out.notice).toMatch(/mcp__github__create_issue, mcp__linear__delete_issue need the user's approval/);
+    expect(out.notice).toMatch(/not run/);
+    expect(subAgentParkedCalls(events, [])).toBeNull();
+    expect(subAgentParkedCalls(events, ["unknown"])).toBeNull();
+  });
+});
+
+describe("DefaultHarness parks a gated call_mcp_tool end to end", () => {
+  // An OpenAI agent past 128 tools → the harness budgets them, and the
+  // ask-gated deferred tool is reachable only through call_mcp_tool. The
+  // tool_use must be written as an ask (recovery/console key on it), land
+  // in pendingConfirmations, and never run.
+  it("over budget: the call is recorded as evaluated_permission ask, pending, and not executed", async () => {
+    const { MockLanguageModelV3 } = await import("ai/test");
+    const { DefaultHarness } = await import("@open-managed-agents/agent/harness/default-loop");
+    const usage = { inputTokens: { total: 1, noCache: 1, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 1, text: 1, reasoning: 0 } };
+    const finish = (unified: string) => ({ type: "finish", finishReason: { unified, raw: unified }, usage });
+    const stream = (parts: unknown[]) => new ReadableStream({ start(c) { parts.forEach((p) => c.enqueue(p)); c.close(); } });
+    let modelCalls = 0;
+    const model = new MockLanguageModelV3({
+      provider: "openai.chat",
+      doStream: async () => ({
+        stream: stream(++modelCalls === 1
+          ? [
+              { type: "stream-start", warnings: [] },
+              { type: "tool-call", toolCallId: "toolu_M", toolName: CALL_TOOL_NAME, input: JSON.stringify({ name: "mcp__linear__create_issue", arguments: { title: "Bug" } }) },
+              finish("tool-calls"),
+            ]
+          : [{ type: "stream-start", warnings: [] }, finish("stop")]),
+      }) as never,
+    });
+
+    const ran = vi.fn(async () => "ran");
+    const tools: ToolSet = {};
+    for (let i = 0; i < 126; i++) tools[`t${i}`] = tool({ inputSchema: z.object({}), execute: ran });
+    // always_ask → buildTools stripped execute.
+    tools.mcp__linear__create_issue = tool({ description: "Create a Linear issue", inputSchema: z.object({ title: z.string() }) });
+    tools.mcp__linear__list_issues = tool({ description: "List Linear issues", inputSchema: z.object({}), execute: ran });
+    tools.mcp__linear__get_team = tool({ description: "Get a Linear team", inputSchema: z.object({}), execute: ran });
+
+    const events: Array<Record<string, any>> = [{ type: "user.message", content: [{ type: "text", text: "file it" }] }];
+    const noop = vi.fn(async () => {});
+    const runtime = {
+      history: { getEvents: () => events.slice() },
+      broadcast: vi.fn((e: Record<string, any>) => void events.push(e)),
+      persist: vi.fn(async (e: Record<string, any>) => void events.push(e)),
+      broadcastStreamStart: noop, broadcastStreamEnd: noop, broadcastChunk: noop,
+      broadcastThinkingStart: noop, broadcastThinkingChunk: noop, broadcastThinkingEnd: noop,
+      broadcastToolInputStart: noop, broadcastToolInputChunk: noop, broadcastToolInputEnd: noop,
+      pendingConfirmations: [] as string[],
+    };
+    await new DefaultHarness().run({
+      agent: { id: "agent-test", model: "gpt-test", tools: [], mcp_servers: [{ name: "linear", type: "url", url: "https://mcp.linear.app/mcp" }] },
+      model, systemPrompt: "Test", env: {}, session_id: "sess-1",
+      userMessage: { type: "user.message", content: [{ type: "text", text: "file it" }] },
+      tools, runtime,
+    } as never);
+
+    const use = events.find((e) => e.id === "toolu_M");
+    expect(use).toMatchObject({ type: "agent.tool_use", name: CALL_TOOL_NAME, evaluated_permission: "ask" });
+    // Durable write-ahead carries the ask too (restart recovery reads this copy).
+    expect((runtime.persist.mock.calls as Array<[Record<string, any>]>).find(([e]) => e.id === "toolu_M")?.[0])
+      .toMatchObject({ evaluated_permission: "ask" });
+    expect(runtime.pendingConfirmations).toEqual(["toolu_M"]);
+    expect(events.some((e) => e.type === "agent.tool_result" && e.tool_use_id === "toolu_M")).toBe(false);
+    expect(ran).not.toHaveBeenCalled();
   });
 });
 
