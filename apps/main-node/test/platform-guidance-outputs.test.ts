@@ -13,6 +13,7 @@ import {
   composeSystemPrompt,
   platformGuidance,
   platformGuidanceFor,
+  pythonToolingGuidance,
   sessionOutputsGuidance,
   sessionOutputsGuidanceFor,
 } from "@open-managed-agents/agent/harness/platform-guidance";
@@ -54,6 +55,21 @@ describe("platformGuidanceFor", () => {
     expect(platformGuidanceFor({})).toBe(platformGuidance);
     expect(platformGuidanceFor({ outputsPath: undefined })).toBe(platformGuidance);
     expect(platformGuidance).toContain(DEFAULT_PATH);
+  });
+
+  it("tells agents python3/python and pip are available for on-demand installs", () => {
+    expect(platformGuidance).toContain(pythonToolingGuidance);
+    expect(pythonToolingGuidance).toContain("`python3` (usually also `python`) and `pip` are normally available");
+    expect(platformGuidance).toContain("`pip install` it on demand");
+  });
+
+  it("drops only the python line when the host says commands run outside a bootstrapped sandbox", () => {
+    const noPython = platformGuidanceFor({ pythonTooling: false });
+    expect(noPython).not.toContain(pythonToolingGuidance);
+    expect(noPython).not.toContain("pip");
+    expect(noPython).toBe(platformGuidance.replace(`${pythonToolingGuidance}\n\n`, ""));
+    expect(platformGuidanceFor({ pythonTooling: true })).toBe(platformGuidance);
+    expect(composeSystemPrompt("raw", undefined, { pythonTooling: false })).toBe(`raw\n\n${noPython}`);
   });
 
   it("swaps the outputs path and keeps every other guidance block", () => {

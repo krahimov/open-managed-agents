@@ -1295,6 +1295,11 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
         ? rawSystemPrompt
         : composeSystemPrompt(rawSystemPrompt, memoryContext.reminders, {
             outputsPath: outputsPathFor(input.sandbox),
+            // Python/pip are bootstrapped into Daytona boxes (the only
+            // executor reporting sandboxCapabilities). Host-workdir SDK
+            // harnesses and the subprocess provider run commands in the
+            // main-node container, which has no python.
+            pythonTooling: !hostWorkdirMemory && typeof input.sandbox?.sandboxCapabilities === "function",
           }),
       rawSystemPrompt,
       platformReminders: isSetup ? [] : memoryContext.reminders,

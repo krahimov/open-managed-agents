@@ -114,7 +114,7 @@ describe("DaytonaSandbox.startProcess", () => {
     const envFile = `/tmp/oma-procs/${h!.id}.env`;
     const pidFile = `/tmp/oma-procs/${h!.id}.pid`;
     expect(sb.readText(envFile)).toBe(
-      "export FOO='bar'\\''s'\nexport PATH_EXTRA='/opt/bin'\nexport OMA_SANDBOX_MAX_FILE_BYTES='1048576'\n",
+      "export PIP_BREAK_SYSTEM_PACKAGES='1'\nexport FOO='bar'\\''s'\nexport PATH_EXTRA='/opt/bin'\nexport OMA_SANDBOX_MAX_FILE_BYTES='1048576'\n",
     );
     // command-prefixed secrets only apply to matching commands
     expect(sb.readText(envFile)).not.toContain("GIT_TOKEN");

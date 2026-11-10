@@ -475,7 +475,9 @@ function ownsBox(sb: DaytonaSandboxInstance, row: AgentMachineRow): boolean {
   return sb.labels?.[OMA_BOX_LABELS.machine] === row.id && sb.labels?.[OMA_BOX_LABELS.tenant] === row.tenantId;
 }
 
-function canonicalSpec(spec: AgentMachineSpec): string {
+/** The frozen-config comparison `acquire()` uses. Exported so hosts can pin
+ *  their default spec: any drift fails every existing computer. */
+export function canonicalSpec(spec: AgentMachineSpec): string {
   return JSON.stringify({
     image: spec.snapshot ? null : spec.image,
     snapshot: spec.snapshot || null,
