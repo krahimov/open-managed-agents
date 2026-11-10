@@ -1326,6 +1326,44 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
               : undefined,
         } as never,
       });
+      if (body.type === "file" && body.file_id && router.mountFileResource) {
+        // The caller is about to tell the agent "your file is at <path>":
+        // write it now and answer with where it actually landed. A row whose
+        // bytes never reached the sandbox would be a silent lie, so roll it
+        // back and fail the request instead.
+        try {
+          const mountPath = await router.mountFileResource(sessionId, {
+            fileId: body.file_id,
+            mountPath: body.mount_path,
+          });
+          if (mountPath === null) {
+            // No sandbox will ever exist for this session (setup sessions
+            // run without a computer) — say so rather than keep a row the
+            // agent can never read.
+            await services.sessions
+              .deleteResource({ tenantId: t, sessionId, resourceId: added.resource.id })
+              .catch(() => undefined);
+            return c.json(
+              { error: "This session has no sandbox, so files cannot be attached to it" },
+              409,
+            );
+          }
+          return c.json({ ...added.resource, mount_path: mountPath }, 201);
+        } catch (err) {
+          services.logger?.warn?.(
+            { err, op: "sessions.resources.file_mount_failed", session_id: sessionId },
+            "failed to write file resource into the session sandbox",
+          );
+          await services.sessions
+            .deleteResource({ tenantId: t, sessionId, resourceId: added.resource.id })
+            .catch(() => undefined);
+          const msg = err instanceof Error ? err.message : String(err);
+          return c.json(
+            { error: `File could not be written to the session sandbox: ${msg}` },
+            502,
+          );
+        }
+      }
       await router.refreshResources?.(sessionId).catch((err) => {
         services.logger?.warn?.(
           { err, op: "sessions.resources.refresh_failed", session_id: sessionId },
