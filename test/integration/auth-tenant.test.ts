@@ -56,19 +56,33 @@ describe("API keys", () => {
   let createdKeyRaw: string;
   let createdKeyId: string;
 
-  it("creates an API key", async () => {
+  it("refuses to create an API key over API-key auth (keys can't mint keys)", async () => {
     const res = await api("/v1/api_keys", {
       method: "POST",
       headers: HEADERS,
       body: JSON.stringify({ name: "Test CLI Key" }),
     });
-    expect(res.status).toBe(201);
+    expect(res.status).toBe(403);
     const body = await res.json();
-    expect(body.key).toMatch(/^oma_/);
-    expect(body.name).toBe("Test CLI Key");
-    expect(body.prefix).toBe(body.key.slice(0, 8));
-    createdKeyRaw = body.key;
-    createdKeyId = body.id;
+    expect(body.error.type).toBe("permission_error");
+    expect(JSON.stringify(body)).not.toMatch(/oma_[A-Za-z0-9]{20}/);
+  });
+
+  it("seeds a key the way the console mint path stores it", async () => {
+    // Same KV layout as apps/main/src/lib/cf-api-key-storage.ts — minting
+    // itself needs a cookie session, which this suite has no fixture for.
+    createdKeyRaw = "oma_" + "k".repeat(36);
+    createdKeyId = "ak_seeded0000001";
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(createdKeyRaw));
+    const hash = [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+    const now = new Date().toISOString();
+    await env.CONFIG_KV.put(
+      `apikey:${hash}`,
+      JSON.stringify({ id: createdKeyId, tenant_id: "default", name: "Test CLI Key", created_at: now }),
+    );
+    const idx = JSON.parse((await env.CONFIG_KV.get("t:default:apikeys")) ?? "[]");
+    idx.push({ id: createdKeyId, name: "Test CLI Key", prefix: createdKeyRaw.slice(0, 8), hash, created_at: now });
+    await env.CONFIG_KV.put("t:default:apikeys", JSON.stringify(idx));
   });
 
   it("lists API keys", async () => {

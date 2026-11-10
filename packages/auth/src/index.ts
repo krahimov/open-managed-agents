@@ -51,13 +51,18 @@ export interface AuthMiddlewareDeps {
   bypassPath?(path: string): boolean;
 }
 
+/** How the request authenticated. Routes that must not be reachable with
+ *  a bare API key (minting more keys, binding an OAuth flow to a browser)
+ *  branch on this; "disabled" is the AUTH_DISABLED synthetic identity. */
+export type AuthType = "api_key" | "session" | "disabled";
+
 const DEFAULT_BYPASS = (path: string) =>
   path === "/health" || path.startsWith("/auth/");
 
 export function createAuthMiddleware(deps: AuthMiddlewareDeps) {
   const bypassPath = deps.bypassPath ?? DEFAULT_BYPASS;
   return createMiddleware<{
-    Variables: { tenant_id: string; user_id?: string };
+    Variables: { tenant_id: string; user_id?: string; auth_type?: AuthType };
   }>(async (c, next) => {
     if (bypassPath(c.req.path)) return next();
 
@@ -68,6 +73,7 @@ export function createAuthMiddleware(deps: AuthMiddlewareDeps) {
       // dev with "regenerate your API key" — nonsense advice when auth is
       // off entirely.
       c.set("user_id", "default");
+      c.set("auth_type", "disabled");
       return next();
     }
 
@@ -78,6 +84,7 @@ export function createAuthMiddleware(deps: AuthMiddlewareDeps) {
       if (!r) return c.json({ error: "Invalid API key" }, 401);
       c.set("tenant_id", r.tenantId);
       if (r.userId) c.set("user_id", r.userId);
+      c.set("auth_type", "api_key");
       return next();
     }
 
@@ -115,6 +122,7 @@ export function createAuthMiddleware(deps: AuthMiddlewareDeps) {
 
     c.set("tenant_id", tenantId);
     c.set("user_id", session.userId);
+    c.set("auth_type", "session");
     return next();
   });
 }

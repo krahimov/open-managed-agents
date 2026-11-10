@@ -13,7 +13,9 @@ async function sha256(data: string): Promise<string> {
 
 export const authMiddleware = createMiddleware<{
   Bindings: Env;
-  Variables: { tenant_id: string; user_id?: string };
+  // auth_type mirrors packages/auth: routes that must refuse bare API-key
+  // callers (key minting, OAuth initiator binding) branch on it.
+  Variables: { tenant_id: string; user_id?: string; auth_type?: "api_key" | "session" | "disabled" };
 }>(async (c, next) => {
   // Internal endpoints have their own header-secret auth (see routes/internal.ts)
   if (c.req.path.startsWith("/v1/internal/")) {
@@ -31,6 +33,7 @@ export const authMiddleware = createMiddleware<{
     // Legacy: check static API_KEY env var for backwards compat
     if (c.env.API_KEY && c.env.API_KEY !== "" && apiKey === c.env.API_KEY) {
       c.set("tenant_id", "default");
+      c.set("auth_type", "api_key");
       return next();
     }
     // Lookup hashed API key in KV. authMiddleware runs before servicesMiddleware,
@@ -71,6 +74,7 @@ export const authMiddleware = createMiddleware<{
         );
       }
     }
+    c.set("auth_type", "api_key");
     return next();
   }
 
@@ -118,6 +122,7 @@ export const authMiddleware = createMiddleware<{
         }
         c.set("tenant_id", tenantId);
         c.set("user_id", session.user.id);
+        c.set("auth_type", "session");
         return next();
       }
     } catch (err) {

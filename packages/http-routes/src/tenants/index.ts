@@ -14,9 +14,10 @@ import { Hono } from "hono";
 import { nanoid } from "nanoid";
 import type { RouteServicesArg } from "../types";
 import { resolveServices } from "../types";
+import { apiKeyMintForbidden } from "../api-keys";
 
 interface Vars {
-  Variables: { tenant_id: string; user_id?: string };
+  Variables: { tenant_id: string; user_id?: string; auth_type?: "api_key" | "session" | "disabled" };
 }
 
 interface MembershipRow {
@@ -169,6 +170,10 @@ export function buildMeRoutes(deps: MeRoutesDeps) {
   });
 
   app.post("/cli-tokens", async (c) => {
+    // A user-scoped API key also carries user_id — the check below alone
+    // let a key mint fresh long-lived keys for itself.
+    const forbidden = apiKeyMintForbidden(c.var.auth_type);
+    if (forbidden) return forbidden;
     const userId = c.var.user_id;
     const sessionTenant = c.var.tenant_id;
     if (!userId) {

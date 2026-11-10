@@ -429,18 +429,26 @@ function invokePackage(
   // names are namespaced so they can't collide with user-controlled
   // headers; a stray client-supplied `x-oma-tenant-id` is overwritten.
   const headers = new Headers(c.req.raw.headers);
+  // Drop client-supplied copies first: set() below only runs when the outer
+  // var exists, so a keyless-user request could otherwise smuggle its own.
+  headers.delete("x-oma-internal-tenant-id");
+  headers.delete("x-oma-internal-user-id");
   const tenantId = (c.var as { tenant_id?: string }).tenant_id;
   const userId = (c.var as { user_id?: string }).user_id;
+  const authType = (c.var as { auth_type?: string }).auth_type;
   if (tenantId) headers.set("x-oma-internal-tenant-id", tenantId);
   if (userId) headers.set("x-oma-internal-user-id", userId);
 
-  // One-shot middleware: re-hydrate vars on the inner context.
+  // One-shot middleware: re-hydrate vars on the inner context. auth_type
+  // rides the closure, never a header — package routes trust it to refuse
+  // API-key callers (key minting).
   const wrapped = new Hono();
   wrapped.use("*", async (innerC, next) => {
     const t = headers.get("x-oma-internal-tenant-id");
     const u = headers.get("x-oma-internal-user-id");
     if (t) innerC.set("tenant_id" as never, t as never);
     if (u) innerC.set("user_id" as never, u as never);
+    if (authType) innerC.set("auth_type" as never, authType as never);
     await next();
   });
   wrapped.route("/", packageApp as Parameters<typeof wrapped.route>[1]);

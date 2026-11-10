@@ -1668,17 +1668,29 @@ const commands: Cmd[] = [
     http: "GET    /v1/api_keys",
     async run(config) {
       const { data } = await apiFetch<{ data: Array<{ id: string; name: string; prefix: string; created_at: string }> }>(config, "/v1/api_keys");
-      if (!data.length) { console.log("No API keys. Create one with: oma keys create"); return; }
+      if (!data.length) { console.log("No API keys. Create one in the console (API Keys page), or run: oma auth login"); return; }
       table([["NAME", "ID", "PREFIX", "CREATED"], ...data.map(k => [k.name, k.id, k.prefix + "...", new Date(k.created_at).toLocaleDateString()])]);
     },
   },
   {
     group: "API Keys", match: ["keys", "create"],
-    usage: "oma keys create [name]", desc: "Create API key",
-    http: "POST   /v1/api_keys {name?} — raw key returned once",
+    usage: "oma keys create [name]", desc: "Create API key (console session only — keys can't mint keys)",
+    http: "POST   /v1/api_keys {name?} — raw key returned once; 403 over x-api-key",
     async run(config, args) {
-      const key = await apiFetch<{ id: string; key: string; name: string }>(config, "/v1/api_keys", { method: "POST", body: JSON.stringify({ name: args.join(" ") || "CLI key" }) });
-      console.log(`API key created: ${key.name}\n\n  ${key.key}\n\nSave this key — it won't be shown again.`);
+      // The server refuses key creation over API-key auth (a leaked key must
+      // not mint replacements that survive its revocation), and this CLI
+      // always authenticates with x-api-key — so point at the session paths.
+      try {
+        const key = await apiFetch<{ id: string; key: string; name: string }>(config, "/v1/api_keys", { method: "POST", body: JSON.stringify({ name: args.join(" ") || "CLI key" }) });
+        console.log(`API key created: ${key.name}\n\n  ${key.key}\n\nSave this key — it won't be shown again.`);
+      } catch (err) {
+        if (!/^403\b/.test(err instanceof Error ? err.message : "")) throw err;
+        console.error(
+          "API keys can't create API keys. Create one from a signed-in console session (API Keys page),\n" +
+            "or run `oma auth login` to mint a CLI token through the browser.",
+        );
+        process.exitCode = 1;
+      }
     },
   },
   {
