@@ -71,14 +71,16 @@ afterEach(() => {
   fetchMock.mockReset();
 });
 
-function renderEdit(props: { onSaved?: () => void; onOpenSetup?: () => void } = {}) {
+function renderEdit(
+  props: { onSaved?: () => void; onOpenSetup?: () => void; onClose?: () => void } = {},
+) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <QueryClientProvider client={client}>
       <MemoryRouter>
         <AgentFormDialog
           open
-          onClose={() => {}}
+          onClose={props.onClose ?? (() => {})}
           editAgent={agent}
           onSaved={props.onSaved}
           onOpenSetup={props.onOpenSetup}
@@ -149,5 +151,25 @@ describe("AgentFormDialog edit mode", () => {
     renderEdit({ onOpenSetup });
     fireEvent.click(screen.getByRole("button", { name: "Setup chat" }));
     expect(onOpenSetup).toHaveBeenCalledOnce();
+  });
+
+  it("closes on Escape when nothing changed, and asks once the config was edited", async () => {
+    const confirmMock = vi.fn(() => false);
+    vi.stubGlobal("confirm", confirmMock);
+    const onClose = vi.fn();
+    renderEdit({ onClose });
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/v1/environments"))).toBe(true),
+    );
+
+    fireEvent.change(screen.getByDisplayValue("Triage Bot"), { target: { value: "Triage Bot 2" } });
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(confirmMock).toHaveBeenCalledWith("Discard your changes to this agent? They will be lost.");
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.change(screen.getByDisplayValue("Triage Bot 2"), { target: { value: "Triage Bot" } });
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(confirmMock).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalledOnce();
   });
 });
