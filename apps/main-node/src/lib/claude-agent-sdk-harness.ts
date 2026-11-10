@@ -48,7 +48,16 @@ import {
   harnessView,
   autoRequestAccessForNewServers,
   describeAutoAccess,
+  runEnableMemory,
+  ENABLE_MEMORY_TOOL_DESCRIPTION,
 } from "./setup-harness.js";
+import type { EnableMemoryResult } from "./agent-memory-mode.js";
+import {
+  materializeMemory,
+  writeBackMemory,
+  type MaterializedMemory,
+  type SdkMemoryPort,
+} from "./sdk-harness-memory.js";
 
 /** Fields a setup session may change on its own harness. */
 export interface HarnessPatch {
@@ -188,7 +197,20 @@ export interface ClaudeAgentSdkHarnessDeps {
       prompt: string;
       wake_mode?: "observe" | "decide" | "act" | "escalate";
     },
-  ) => Promise<{ id: string; next_wake_at?: string }>;
+  ) => Promise<{ id: string; next_wake_at?: string; memory_note?: string }>;
+  /** Turn on the agent's memory (the setup session's `enable_memory` tool):
+   *  provisions the agent's store, sets the memory mode, and posts the
+   *  setup-panel card. Same helper as the DefaultHarness setup tool. */
+  enableMemory?: (
+    tenantId: string,
+    sessionId: string,
+    agentId: string,
+  ) => Promise<EnableMemoryResult>;
+  /** Memory bridge for working sessions: attached stores are materialized
+   *  into <cwd>/memory/<name>/ before the turn and changed files written
+   *  back after (see sdk-harness-memory.ts). Without it an agent on this
+   *  harness has no memory even when its memory mode is on. */
+  memory?: SdkMemoryPort;
   /** Skill discovery (the `find_skill` tool) — tenant store + curated
    *  catalog keyword search, same helper as the DefaultHarness hook. */
   findSkills?: (
@@ -404,10 +426,31 @@ export class ClaudeAgentSdkHarness {
       },
     );
 
+    const tools = [updateHarness];
+    if (this.#deps.enableMemory) {
+      tools.push(
+        tool(
+          "enable_memory",
+          ENABLE_MEMORY_TOOL_DESCRIPTION,
+          {} as unknown as SdkToolSchema,
+          async () => ({
+            content: [
+              {
+                type: "text" as const,
+                text: await runEnableMemory(() =>
+                  this.#deps.enableMemory!(tenantId, ctx.session_id ?? "", agentId),
+                ),
+              },
+            ],
+          }),
+        ),
+      );
+    }
+
     return createSdkMcpServer({
       name: "oma_setup",
       version: "1",
-      tools: [updateHarness],
+      tools,
     });
   }
 
@@ -629,6 +672,26 @@ export class ClaudeAgentSdkHarness {
       mcpServersForTurn = withInProcess;
     }
 
+    // Materialize attached memory stores into <cwd>/memory/<name>/ — the
+    // same bridge the codex-sdk harness uses. Best-effort: a memory failure
+    // must not block the turn.
+    let materializedMemory: MaterializedMemory = {
+      manifest: new Map(),
+      storeByName: new Map(),
+      guidance: "",
+    };
+    if (!isSetup && this.#deps.memory && ctx.tenant_id) {
+      try {
+        materializedMemory = await materializeMemory(this.#deps.memory, ctx.tenant_id, sessionId, cwd);
+      } catch (err) {
+        runtime.broadcast({
+          type: "session.warning",
+          source: "memory",
+          message: `memory materialization failed: ${err instanceof Error ? err.message : String(err)}`,
+        } as SessionEvent);
+      }
+    }
+
     // The pinned access policy (snapshot enrichment set at session create).
     // This harness never runs buildTools(), so the same policy is compiled
     // into SDK-native controls: a static disallowedTools list for exact-name
@@ -666,7 +729,9 @@ export class ClaudeAgentSdkHarness {
                 preset: "claude_code",
                 // CLI_NOTES: observed footguns in headless sessions (e.g. `gh
                 // api` with -f/-F silently switches GET→POST → bogus 404s).
-                append: [ctx.systemPrompt, CLI_NOTES].filter(Boolean).join("\n\n"),
+                append: [ctx.systemPrompt, materializedMemory.guidance, CLI_NOTES]
+                  .filter(Boolean)
+                  .join("\n\n"),
               },
           // Headless: OMA has no tool-confirmation round-trip on this path
           // yet, and the child is already scoped to a per-session workdir.
@@ -824,5 +889,26 @@ export class ClaudeAgentSdkHarness {
     // The endLiveText closure lives inside the try; any stream that died
     // mid-block was already ended as "aborted" by the recovery scan or the
     // catch above — nothing to clean up here.
+
+    // Turn finished cleanly (the catch above re-throws) — sync memory edits
+    // back to their stores. Best-effort: a write-back failure must not fail
+    // the turn the agent already completed.
+    if (!isSetup && this.#deps.memory && ctx.tenant_id) {
+      await writeBackMemory(this.#deps.memory, ctx.tenant_id, sessionId, cwd, materializedMemory)
+        .then(({ saved, conflicts }) => {
+          if (saved > 0 || conflicts.length > 0) {
+            runtime.broadcast({
+              type: "session.warning",
+              source: "memory",
+              message:
+                `memory sync: ${saved} file(s) saved` +
+                (conflicts.length > 0
+                  ? `; ${conflicts.length} kept remote copy on conflict (${conflicts.slice(0, 3).join(", ")}${conflicts.length > 3 ? "…" : ""})`
+                  : ""),
+            } as SessionEvent);
+          }
+        })
+        .catch(() => {});
+    }
   }
 }

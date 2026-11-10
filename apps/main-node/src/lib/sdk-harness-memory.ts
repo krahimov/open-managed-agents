@@ -38,6 +38,84 @@ export interface SdkMemoryPort {
   }) => Promise<{ ok: boolean; conflict?: boolean; error?: string }>;
 }
 
+export interface SdkMemoryPortDeps {
+  /** The stores bound to a session (createSessionMemoryContext.attachments):
+   *  environment defaults, session resources — including the agent's own
+   *  store from its memory mode — and legacy session_memory_stores rows.
+   *  Reading only the legacy table here used to leave resource-attached
+   *  stores invisible to the SDK harnesses. */
+  attachments: (
+    tenantId: string,
+    sessionId: string,
+  ) => Promise<Array<{ storeId: string; access: "read_write" | "read_only" }>>;
+  memoryService: {
+    getStore(o: { tenantId: string; storeId: string }): Promise<{ name: string } | null>;
+    listMemories(o: { tenantId: string; storeId: string }): Promise<Array<{ path: string }>>;
+    readByPath(o: { tenantId: string; storeId: string; path: string }): Promise<{ content?: string } | null>;
+    writeByPath(o: {
+      tenantId: string;
+      storeId: string;
+      path: string;
+      content: string;
+      precondition: { type: "not_exists" } | { type: "content_sha256"; content_sha256: string };
+      actor: { type: "agent_session"; id: string };
+    }): Promise<unknown>;
+  };
+}
+
+/** The memory-store-backed port both SDK harnesses use. */
+export function createSdkMemoryPort(deps: SdkMemoryPortDeps): SdkMemoryPort {
+  return {
+    resolve: async (tenantId, sessionId) => {
+      const out: Awaited<ReturnType<SdkMemoryPort["resolve"]>> = [];
+      for (const binding of await deps.attachments(tenantId, sessionId)) {
+        const store = await deps.memoryService
+          .getStore({ tenantId, storeId: binding.storeId })
+          .catch(() => null);
+        if (!store) continue;
+        const metas = await deps.memoryService
+          .listMemories({ tenantId, storeId: binding.storeId })
+          .catch(() => []);
+        const memories: Array<{ path: string; content: string }> = [];
+        for (const m of metas) {
+          const full = await deps.memoryService
+            .readByPath({ tenantId, storeId: binding.storeId, path: m.path })
+            .catch(() => null);
+          memories.push({ path: m.path, content: full?.content ?? "" });
+        }
+        out.push({
+          storeId: binding.storeId,
+          name: store.name,
+          access: binding.access === "read_only" ? "read_only" : "read_write",
+          memories,
+        });
+      }
+      return out;
+    },
+    write: async ({ tenantId, sessionId, storeId, path: memPath, content, baseSha256 }) => {
+      try {
+        await deps.memoryService.writeByPath({
+          tenantId,
+          storeId,
+          path: memPath,
+          content,
+          precondition: baseSha256
+            ? { type: "content_sha256", content_sha256: baseSha256 }
+            : { type: "not_exists" },
+          actor: { type: "agent_session", id: sessionId },
+        });
+        return { ok: true };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const conflict =
+          (err as { name?: string })?.name === "MemoryPreconditionFailedError" ||
+          /precondition|sha256|exists/i.test(msg);
+        return { ok: false, conflict, error: msg };
+      }
+    },
+  };
+}
+
 export interface MemoryManifestEntry {
   storeId: string;
   memPath: string;

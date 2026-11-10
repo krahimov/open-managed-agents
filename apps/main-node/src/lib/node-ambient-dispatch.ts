@@ -52,6 +52,16 @@ export interface AmbientDispatcherDeps {
     vaultIds: string[],
   ): Promise<Array<{ name: string; type: "url"; url: string }>>;
   resolveEnvironment?(tenantId: string, environmentId: string): Promise<import("@open-managed-agents/shared").EnvironmentConfig | null>;
+  /** Attach the agent's own memory store (per its memory mode) to the
+   *  spawned session. Each firing is a fresh session, so this is the only
+   *  continuity a recurring agent has between runs. Must not throw. */
+  attachAgentMemory?(input: {
+    tenantId: string;
+    sessionId: string;
+    agentId: string;
+    agentSnapshot: import("@open-managed-agents/shared").AgentConfig;
+    metadata?: Record<string, unknown> | null;
+  }): Promise<void>;
   now?(): number;
 }
 
@@ -159,6 +169,14 @@ export class NodeAmbientDispatcher {
       agentSnapshot: agentBase as never,
       environmentSnapshot: environmentSnapshot as never,
       metadata: { ambient: { rule_id: rule.id, wake_mode: rule.wake_mode } },
+    });
+    // Before the wake message: the store has to be bound when the runtime
+    // provisions the sandbox for the first turn.
+    await this.deps.attachAgentMemory?.({
+      tenantId: rule.tenant_id,
+      sessionId: session.id,
+      agentId: rule.agent_id,
+      agentSnapshot: agent,
     });
 
     const event: UserMessageEvent = {

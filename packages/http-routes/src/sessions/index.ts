@@ -79,6 +79,25 @@ export interface OutputsAdapter {
 }
 
 export interface SessionLifecycleHooks {
+  /**
+   * Agent-level memory (`_oma.memory.mode`): attach the agent's own memory
+   * store to the new session — `shared` per agent, `per_user` per (agent,
+   * principal). Runs after the row exists and BEFORE runtime init so the
+   * store is mounted on turn 1. Composes with explicit env / session
+   * attachments (those add stores; this governs the agent's own). Absent
+   * on runtimes without the hook. Failures are logged and never block
+   * session creation.
+   */
+  attachAgentMemory?: (input: {
+    tenantId: string;
+    sessionId: string;
+    agentId: string;
+    agentSnapshot: AgentConfig;
+    /** Session metadata as created (setup sessions are skipped). */
+    metadata?: Record<string, unknown>;
+    /** Calling principal for per_user partitioning (user id or API key id). */
+    principalId?: string;
+  }) => Promise<void>;
   /** Pre-create gate (USAGE_METER.canStartSandbox). Returns null to
    *  proceed; { status, body } to short-circuit. */
   preCreateGate?: (input: {
@@ -704,6 +723,26 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
     }
     const sessionId = session.id;
 
+    if (deps.lifecycle?.attachAgentMemory) {
+      try {
+        await deps.lifecycle.attachAgentMemory({
+          tenantId: t,
+          sessionId,
+          agentId,
+          agentSnapshot: sessionAgentSnapshot as AgentConfig,
+          metadata: body.metadata,
+          principalId: c.var.user_id,
+        });
+        // Report what the hook attached alongside the caller's resources.
+        const bound = await services.sessions.listResourcesBySession({ sessionId });
+        for (const row of bound) {
+          if (!createdResources.some((r) => r.id === row.id)) createdResources.push(row as never);
+        }
+      } catch (err) {
+        console.warn("[sessions] attachAgentMemory failed; session continues without agent memory", err);
+      }
+    }
+
     await persistGithubRepositoryResourceSecrets({
       services,
       tenantId: t,
@@ -1326,6 +1365,44 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
               : undefined,
         } as never,
       });
+      if (body.type === "file" && body.file_id && router.mountFileResource) {
+        // The caller is about to tell the agent "your file is at <path>":
+        // write it now and answer with where it actually landed. A row whose
+        // bytes never reached the sandbox would be a silent lie, so roll it
+        // back and fail the request instead.
+        try {
+          const mountPath = await router.mountFileResource(sessionId, {
+            fileId: body.file_id,
+            mountPath: body.mount_path,
+          });
+          if (mountPath === null) {
+            // No sandbox will ever exist for this session (setup sessions
+            // run without a computer) — say so rather than keep a row the
+            // agent can never read.
+            await services.sessions
+              .deleteResource({ tenantId: t, sessionId, resourceId: added.resource.id })
+              .catch(() => undefined);
+            return c.json(
+              { error: "This session has no sandbox, so files cannot be attached to it" },
+              409,
+            );
+          }
+          return c.json({ ...added.resource, mount_path: mountPath }, 201);
+        } catch (err) {
+          services.logger?.warn?.(
+            { err, op: "sessions.resources.file_mount_failed", session_id: sessionId },
+            "failed to write file resource into the session sandbox",
+          );
+          await services.sessions
+            .deleteResource({ tenantId: t, sessionId, resourceId: added.resource.id })
+            .catch(() => undefined);
+          const msg = err instanceof Error ? err.message : String(err);
+          return c.json(
+            { error: `File could not be written to the session sandbox: ${msg}` },
+            502,
+          );
+        }
+      }
       await router.refreshResources?.(sessionId).catch((err) => {
         services.logger?.warn?.(
           { err, op: "sessions.resources.refresh_failed", session_id: sessionId },

@@ -8,6 +8,7 @@
 //     DefaultHarness path (the claude-agent-sdk harness wraps the same
 //     handlers in an in-process MCP server instead — see
 //     claude-agent-sdk-harness.ts #setupServer)
+//   - runEnableMemory: the enable_memory handler all three harnesses share
 //
 // Extracted 2026-07-16: previously all of this lived inside the SDK harness,
 // which made the console setup panel cosmetic on deployments where that
@@ -24,6 +25,11 @@ import {
 import type { AgentConfig } from "@open-managed-agents/shared";
 import { generateEventId } from "@open-managed-agents/shared";
 import type { SessionEvent } from "@open-managed-agents/shared";
+import {
+  agentMemoryMode,
+  describeMemoryEnabled,
+  type EnableMemoryResult,
+} from "./agent-memory-mode.js";
 
 /** The user-meaningful slice of an AgentConfig (drops internal bookkeeping like
  *  id/version/created_at). Shared by the setup preamble and the broadcast. */
@@ -37,8 +43,25 @@ export function harnessView(agent: AgentConfig): Record<string, unknown> {
   if (agent.mcp_servers?.length) view.mcp_servers = agent.mcp_servers;
   if (agent.tools?.length) view.tools = agent.tools;
   if (agent.skills?.length) view.skills = agent.skills;
+  // Shown only when on, so the harness pane stays as it was for agents
+  // without memory.
+  if (agentMemoryMode(agent) !== "off") view.memory = agent.memory;
   return view;
 }
+
+/** The MEMORY STATUS line of the setup preamble — the setup agent may only
+ *  claim memory works when this (or a tool result) says it is on. */
+export function describeSetupMemoryStatus(agent: AgentConfig): string {
+  const mode = agentMemoryMode(agent);
+  if (mode === "per_user") return "ON (per-user: each user gets their own memory store).";
+  if (mode === "shared") return "ON — your memory store is attached to every new working session, including scheduled runs.";
+  return agent.memory?.mode === "off"
+    ? "OFF — the user turned memory off. Every session of you starts blank. Do not turn it back on unless the user asks you to remember."
+    : "OFF — not enabled yet. Every session of you starts blank until you call enable_memory.";
+}
+
+export const ENABLE_MEMORY_TOOL_DESCRIPTION =
+  "Turn on persistent memory for THIS agent: creates your own memory store (once) and attaches it to every new working session, including scheduled runs, where it is mounted as a directory you read and write with normal file tools. Call it when the user wants you to remember anything across sessions, track what changed since last time, or run on a schedule. Safe to call again — it reports the current state. The result states exactly what is enabled; only tell the user memory is on after this tool says so.";
 
 /** Setup-mode preamble. Replaces the agent's own system prompt entirely so it
  *  acts as a config designer refining ITS OWN harness, not a working agent.
@@ -58,12 +81,26 @@ export function buildSetupPrompt(
     JSON.stringify(harnessView(agent), null, 2),
     "```",
     "",
-    "You have exactly five tools and no file or shell access:",
+    "In THIS setup conversation you have only the setup tools below, and no file or shell access:",
     "- update_harness: change fields on your own harness. Call it after EACH meaningful answer so the live config on the user's screen stays in sync. Pass only the fields that changed.",
     "- request_access: pop a one-click connect card in the user's setup panel for a service that needs credentials. Pass the service slug and a one-line reason. The user authenticates in the popup and you get a message when the account is connected. NOTE: for MCP servers you add with update_harness this happens AUTOMATICALLY — the platform posts a connect card for every newly added server that isn't connected yet (the update_harness result tells you which). Use request_access only for services that aren't MCP servers (e.g. Composio apps) or to re-post a card the user asked for.",
     "- web_search: search the web. Use it to find a service's official MCP endpoint or docs instead of asking the user for URLs — e.g. search \"<service> MCP server\" and prefer the vendor's own domain.",
     "- web_fetch: fetch a URL as text. Use it to read MCP docs pages and extract the exact server URL before adding it with update_harness.",
-    "- create_ambient_rule: make yourself run on a schedule (a fresh session of you starts on the cron with the prompt you give it). This is THE way to set up recurring/monitoring work — there is no toggle for it in the setup UI, so never tell the user to \"enable ambient execution in the UI\"; agree on the cadence and create the rule yourself. The rule shows up as a card in the setup panel and on the agent page.",
+    "- create_ambient_rule: make yourself run on a schedule (a fresh session of you starts on the cron with the prompt you give it). This is THE way to set up recurring/monitoring work — there is no toggle for it in the setup UI, so never tell the user to \"enable ambient execution in the UI\"; agree on the cadence and create the rule yourself. The rule shows up as a card in the setup panel and on the agent page. Creating a rule also switches your memory on (unless the user turned it off) — the result says which.",
+    "- enable_memory: turn on your persistent memory (your own memory store, attached to every new working session). The result says exactly what is now enabled.",
+    "",
+    "SETUP MODE IS NOT HOW YOU WORK. The tools above exist only in this conversation. In a working session (a chat with the user, or a scheduled run) you get your full working toolset instead: a sandbox with file tools (read, write, edit, search) and a shell, web search and fetch, every MCP server on your harness, and — when memory is on — your memory store mounted as a directory (a `tools` list in the harness above can narrow this; nothing else does). So:",
+    "- Never write this conversation's limits into your system prompt. \"I cannot save files\", \"I have no shell\", \"storage is not enabled\" are false for the working you. Your system prompt describes the working you.",
+    "- Do not tell the user you can't create files, run code or keep notes. If you are unsure whether a capability exists in working sessions, say you'll verify it on the first run rather than denying it.",
+    "- A working session's sandbox files are scratch: a NEW session does not see an earlier session's workspace. What must survive goes to memory (to be remembered) or to the session's outputs folder (for the user to download).",
+    "",
+    `MEMORY STATUS: ${describeSetupMemoryStatus(agent)}`,
+    "Memory rules:",
+    "- Every session of you starts fresh, and so does each scheduled run. Memory is the only thing that carries over.",
+    "- When the user asks you to remember something, to track what changed over time, to compare against \"last time\", to avoid repeating yourself, or to run on a schedule: call enable_memory (create_ambient_rule does it for you), then tell the user memory is on.",
+    "- Never suggest external storage (GitHub, Google Drive, Notion, a database, a spreadsheet…) as a substitute for remembering. Those are for work products the user asks to keep there, not for your own continuity.",
+    "- Never say or imply that you will remember anything unless memory is ON — per MEMORY STATUS above or a tool result in this conversation. If it is off and stays off, say plainly that each session starts blank.",
+    "- Once memory is on, put into your system prompt WHAT to read at the start of a run and WHAT to record at the end (e.g. \"Start by reading your saved notes on what you reported before; finish by saving a dated note listing what you reported\"). Leave out paths and mechanics — working sessions are told where their memory is and what is in it.",
     "",
     "Harness fields you can refine:",
     "- name / description: a short label + one-line summary of what you do.",
@@ -77,7 +114,7 @@ export function buildSetupPrompt(
     "2. Ask ONE focused question at a time. After each answer, immediately call update_harness with what you can refine now — usually a sharper system prompt first, then name/description, then any MCP servers or skills.",
     "3. Keep tightening your system prompt as you learn more.",
     "4. Be concise. In a sentence, say what you just changed (e.g. \"I rewrote my system prompt around daily triage and added the Notion server\").",
-    "5. If your job is monitoring, polling, reporting or anything recurring, propose a cadence (e.g. every 15 minutes, every morning at 9:00 in the user's timezone), confirm it, then create the rule with create_ambient_rule before you declare yourself ready.",
+    "5. If your job is monitoring, polling, reporting or anything recurring, propose a cadence (e.g. every 15 minutes, every morning at 9:00 in the user's timezone), confirm it, then create the rule with create_ambient_rule before you declare yourself ready. Check its result for the memory line and tell the user whether runs will remember earlier runs.",
     "6. When the user is satisfied, confirm your harness is set and that you're ready to run — but ONLY once every MCP server you added is connected. You receive a \"[access granted] <name>\" message per server; until then, say which connections are still pending in the setup panel instead of claiming you're ready.",
     "",
     "Never invent credentials or secrets, and never ask the user to paste keys or tokens in chat. Adding an MCP server with update_harness automatically posts its connect card in the setup panel; never tell the user authentication will happen \"afterward\" — it happens right here, and you must wait for the grant messages.",
@@ -140,7 +177,10 @@ export interface SetupToolsDeps {
     timezone?: string;
     prompt: string;
     wake_mode?: "observe" | "decide" | "act" | "escalate";
-  }) => Promise<{ id: string; next_wake_at?: string }>;
+  }) => Promise<{ id: string; next_wake_at?: string; memory_note?: string }>;
+  /** Turn on the agent's memory (enableAgentMemory + the setup-panel card).
+   *  Absent → tool not offered. */
+  enableMemory?: () => Promise<EnableMemoryResult>;
   /** Env for the read-only research tools (Tavily upgrade for web_search). */
   env?: { TAVILY_API_KEY?: string };
 }
@@ -279,6 +319,17 @@ export function describeAutoAccess(r: AutoAccessResult): string {
   return parts.join(" ");
 }
 
+/** The enable_memory handler body, shared by all three harness bindings.
+ *  Never throws: a failure is reported as NOT enabled so the agent can't
+ *  go on to claim memory works. */
+export async function runEnableMemory(enable: () => Promise<EnableMemoryResult>): Promise<string> {
+  try {
+    return describeMemoryEnabled(await enable());
+  } catch (err) {
+    return `Memory was NOT enabled: ${err instanceof Error ? err.message : String(err)}. Do not tell the user memory is on; say it could not be switched on and that they can turn it on from the agent page.`;
+  }
+}
+
 /**
  * The DefaultHarness tool dict for a setup session: update_harness +
  * request_access + read-only web_search/web_fetch — no file or shell
@@ -396,11 +447,24 @@ export function buildSetupTools(
             }) => {
               try {
                 const res = await deps.createAmbientRule!(args);
-                return `Ambient rule "${args.name}" created (id ${res.id}, cron "${args.cron}"${args.timezone ? ` ${args.timezone}` : " UTC"}${res.next_wake_at ? `, first run ${res.next_wake_at}` : ""}). Tell the user it's active and where to manage it.`;
+                return `Ambient rule "${args.name}" created (id ${res.id}, cron "${args.cron}"${args.timezone ? ` ${args.timezone}` : " UTC"}${res.next_wake_at ? `, first run ${res.next_wake_at}` : ""}). Tell the user it's active and where to manage it.${res.memory_note ? ` ${res.memory_note}` : ""}`;
               } catch (err) {
                 return `Could not create the ambient rule: ${err instanceof Error ? err.message : String(err)}`;
               }
             },
+          }),
+        }
+      : {}),
+    // Memory is switched on HERE, in the handler — the store is created and
+    // the mode set before the tool returns. Before this tool existed the
+    // setup agent could only talk about remembering (prod 2026-11-10: it
+    // suggested GitHub/Drive, then admitted memory was "not enabled").
+    ...(deps.enableMemory
+      ? {
+          enable_memory: tool({
+            description: ENABLE_MEMORY_TOOL_DESCRIPTION,
+            inputSchema: z.object({}),
+            execute: async () => runEnableMemory(deps.enableMemory!),
           }),
         }
       : {}),

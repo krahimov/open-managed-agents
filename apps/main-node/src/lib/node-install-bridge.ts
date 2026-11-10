@@ -100,6 +100,9 @@ export interface NodeInstallBridgeOpts {
    *  unset, `InProcessSessionCreator.resume` is a no-op (older callers
    *  don't depend on it; main-node wires it). */
   appendUserEvent?: AppendUserEventHook;
+  /** Attach the agent's own memory store (per its memory mode) to a session
+   *  this bridge creates. Must not throw. */
+  attachAgentMemory?: (input: import("./agent-memory-mode.js").AttachAgentMemoryInput) => Promise<void>;
 }
 
 export class NodeInstallBridge implements InstallBridge {
@@ -594,6 +597,14 @@ class InProcessSessionCreator implements SessionCreator {
           checkout: resource.checkout,
         };
       }) as never,
+    });
+    await this.opts.attachAgentMemory?.({
+      tenantId,
+      sessionId: session.id,
+      agentId: input.agentId,
+      agentSnapshot: agentRow,
+      metadata: meta as Record<string, unknown> | undefined,
+      principalId: input.userId,
     });
     return { sessionId: session.id as SessionId };
   }

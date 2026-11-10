@@ -89,6 +89,18 @@ export class NodeSessionRouter implements SessionRouter {
     await this.deps.registry.refreshResources(sessionId, row.tenant_id);
   }
 
+  async mountFileResource(
+    sessionId: string,
+    resource: { fileId: string; mountPath?: string },
+  ): Promise<string | null> {
+    const row = await this.deps.sql
+      .prepare(`SELECT tenant_id FROM sessions WHERE id = ?`)
+      .bind(sessionId)
+      .first<{ tenant_id: string }>();
+    if (!row) return null;
+    return this.deps.registry.mountFileResource(sessionId, row.tenant_id, resource);
+  }
+
   async appendEvent(
     sessionId: string,
     event: SessionEvent,

@@ -1,7 +1,10 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
-import { DownloadIcon, TrashIcon } from "lucide-react";
-import { useApi, getActiveTenantId } from "../lib/api";
+import { DownloadIcon, TrashIcon, UploadIcon } from "lucide-react";
+import { useApi } from "../lib/api";
+import { downloadUploadedFile } from "../lib/session-outputs";
+import { MAX_ATTACHMENT_BYTES, uploadFile } from "../lib/attachments";
+import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { DataTable, type ColumnDef } from "../components/DataTable";
 import { FacetedFilter } from "../components/FacetedFilter";
@@ -90,31 +93,34 @@ export function FilesList() {
     return hit?.title?.trim() ? hit.title : scopeId;
   }, [scopeId, sessions]);
 
-  // Direct fetch for binary download — api() always parses JSON, and we need
-  // the raw blob. Mirror its tenant-pin header so downloads honor the active
-  // workspace, not the user's default tenant.
-  const download = async (f: FileRecord) => {
-    try {
-      const activeTenant = getActiveTenantId();
-      const res = await fetch(`/v1/files/${f.id}/content`, {
-        credentials: "include",
-        headers: activeTenant ? { "x-active-tenant": activeTenant } : {},
-      });
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        const message = (body as { error?: string }).error || `HTTP ${res.status}`;
-        toast.error(`Download failed: ${message}`);
-        return;
+  // Binary download — api() always parses JSON; downloadUploadedFile sends
+  // the same auth (cookie, Clerk bearer, workspace pin) and saves the blob.
+  const download = (f: FileRecord) => downloadUploadedFile(f.id, f.filename);
+
+  // Upload — same POST /v1/files the chat composer uses. Scoped to the
+  // session currently selected in the Scope filter, if any.
+  const fileInput = useRef<HTMLInputElement | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const upload = async (picked: File[]) => {
+    if (picked.length === 0) return;
+    setUploading(true);
+    let ok = 0;
+    for (const file of picked) {
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        toast.error(`"${file.name}" is too large — the limit is 25 MB per file.`);
+        continue;
       }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = f.filename;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      toast.error(`Download failed: ${e instanceof Error ? e.message : "network error"}`);
+      try {
+        await uploadFile(api, file, { scopeId: scopeId || undefined });
+        ok += 1;
+      } catch (e) {
+        toast.error(`Couldn't upload "${file.name}": ${e instanceof Error ? e.message : "upload failed"}`);
+      }
+    }
+    setUploading(false);
+    if (ok > 0) {
+      toast.success(ok === 1 ? "File uploaded" : `${ok} files uploaded`);
+      refreshFiles();
     }
   };
 
@@ -275,8 +281,31 @@ export function FilesList() {
     </FilterChip>
   );
 
+  const uploadButton = (
+    <>
+      <input
+        ref={fileInput}
+        type="file"
+        multiple
+        className="hidden"
+        aria-label="Upload files"
+        onChange={(e) => {
+          const picked = Array.from(e.currentTarget.files ?? []);
+          // Reset so picking the same file again still fires onChange.
+          e.currentTarget.value = "";
+          void upload(picked);
+        }}
+      />
+      <Button onClick={() => fileInput.current?.click()} disabled={uploading}>
+        <UploadIcon className="size-4" aria-hidden />
+        {uploading ? "Uploading…" : "Upload"}
+      </Button>
+    </>
+  );
+
   return (
     <DataTable<FileRecord>
+      headerActions={uploadButton}
       searchPlaceholder="Filter loaded files by name…"
       searchValue={search}
       onSearchChange={setSearch}
@@ -292,7 +321,7 @@ export function FilesList() {
       emptySubtitle={
         scopeId
           ? "Try clearing the scope filter, or check the session id."
-          : <>Upload via <code className="text-xs">POST /v1/files</code> or the AMA SDK <code className="text-xs">client.beta.files.create()</code>.</>
+          : <>Use <span className="font-medium">Upload</span> above, attach a file in a session chat, or call <code className="text-xs">POST /v1/files</code> / the AMA SDK <code className="text-xs">client.beta.files.create()</code>.</>
       }
       columns={columns}
     />

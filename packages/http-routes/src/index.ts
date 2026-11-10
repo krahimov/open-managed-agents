@@ -66,6 +66,17 @@ export type {
   HonoFetchable,
 } from "./deployments";
 
+export {
+  handleFileUpload,
+  contentDispositionAttachment,
+  sanitizeUploadFilename,
+  normalizeUploadMediaType,
+  resolveUploadMaxBytes,
+  DEFAULT_UPLOAD_MAX_BYTES,
+  MAX_UPLOAD_FILENAME_LENGTH,
+} from "./files/upload";
+export type { FileUploadDeps } from "./files/upload";
+
 export { buildIntegrationsRoutes } from "./integrations";
 export type {
   IntegrationsRoutesDeps,

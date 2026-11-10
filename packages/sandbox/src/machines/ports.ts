@@ -245,7 +245,7 @@ export interface AgentMachineStore {
 
 // ─── Errors ─────────────────────────────────────────────────────────
 
-export type MachineErrorCode = "machine_busy" | "machine_quota" | "machine_locked" | "machine_config_mismatch";
+export type MachineErrorCode = "machine_busy" | "machine_quota" | "machine_locked" | "machine_config_mismatch" | "agent_deleted";
 
 /** Base for typed machine errors — `code` maps 1:1 onto the API error
  *  strings (`409 machine_busy`, `session.error{error:"machine_quota"}`). */
@@ -289,6 +289,15 @@ export class MachineConfigMismatchError extends AgentMachineError {
   constructor() {
     super("This agent's existing computer uses another configuration. Use its current environment configuration to preserve the computer and its files.");
     this.name = "MachineConfigMismatchError";
+  }
+}
+
+/** The owning agent no longer exists, so no computer is created for it. */
+export class AgentDeletedError extends AgentMachineError {
+  readonly code = "agent_deleted" as const;
+  constructor() {
+    super("This agent was deleted, so its computer is no longer available. Start a session with another agent.");
+    this.name = "AgentDeletedError";
   }
 }
 

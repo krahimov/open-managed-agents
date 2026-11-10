@@ -3,10 +3,10 @@ import { createHash, randomUUID } from "node:crypto";
 import { generateAgentMachineId } from "@open-managed-agents/shared";
 import type { AcquiredBox, SandboxBoxProvider } from "../adapters/daytona-box-provider";
 import type { DaytonaClient, DaytonaModule, DaytonaSandboxInstance } from "../adapters/daytona-types";
-import { isDaytonaNotFound, loadDaytonaModule } from "../adapters/daytona-types";
+import { OMA_BOX_LABELS, isDaytonaBoxGone, isDaytonaNotFound, loadDaytonaModule, mapDaytonaProvisionError } from "../adapters/daytona-types";
 import { buildDaytonaBootstrapScript } from "../adapters/daytona";
 import type { SandboxBrowserEndpoint } from "../ports";
-import { DEFAULT_ATTACHMENT_STALE_MS, MachineBusyError, MachineLockedError, MachineConfigMismatchError } from "./ports";
+import { DEFAULT_ATTACHMENT_STALE_MS, AgentDeletedError, MachineBusyError, MachineLockedError, MachineConfigMismatchError } from "./ports";
 import type { AgentMachineRow, AgentMachineSpec, AgentMachineStore } from "./ports";
 
 export interface AgentMachineManagerOptions {
@@ -15,6 +15,13 @@ export interface AgentMachineManagerOptions {
   apiUrl?: string;
   daytonaModule?: DaytonaModule;
   workerId?: string;
+  /** Stamped on every created box (and backfilled onto this deployment's
+   *  older boxes) so cleanup can tell several OMA installs sharing one
+   *  provider account apart. */
+  deploymentId?: string;
+  /** Guard for box CREATION: a session that outlives its deleted agent must
+   *  not provision a fresh persistent computer nobody owns. */
+  agentExists?: (tenantId: string, agentId: string) => Promise<boolean>;
   bootstrap?: (sb: DaytonaSandboxInstance, spec: AgentMachineSpec) => Promise<void>;
   browserEndpoint?: (sb: DaytonaSandboxInstance, generation: number) => Promise<SandboxBrowserEndpoint | null>;
   snapshot?: (row: AgentMachineRow, sb: DaytonaSandboxInstance) => Promise<void>;
@@ -35,12 +42,20 @@ export interface AgentMachineProviderInput {
 const LOCK_TTL_MS = 60_000;
 const LOCK_WAIT_MS = 120_000;
 
-/** One durable machine per tenant + agent. No lifecycle operation deletes
- * a box: stopping preserves its disk, and detaching a session preserves
- * both the box and the other sessions using it. */
+export interface DestroyedMachine {
+  /** `null` when the agent had no computer. */
+  machineId: string | null;
+  /** Provider boxes removed (or found already gone) by this call. */
+  providerRefs: string[];
+}
+
+/** One durable machine per tenant + agent. Stopping preserves its disk, and
+ * detaching a session preserves both the box and the other sessions using
+ * it. Only `destroy` — the owning agent was deleted — removes a box. */
 export class AgentMachineManager {
   readonly workerId: string;
   private clientPromise: Promise<DaytonaClient> | null = null;
+  private loadedModule: DaytonaModule | null = null;
   private readonly providers = new Set<AgentBoxProvider>();
   private readonly heldLocks = new AsyncLocalStorage<ReadonlySet<string>>();
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -130,15 +145,75 @@ export class AgentMachineManager {
     });
   }
 
+  /** Permanently remove an agent's computer: every provider box labelled
+   * with this machine + tenant, then the row and its attachments. Called
+   * when the owning agent is deleted and by the orphan sweeper. Idempotent
+   * — no row, or a box that is already gone, is success. A provider failure
+   * leaves the row in `deleting` with the reason and rethrows, so the
+   * sweeper retries; the row is never dropped while its box may still exist. */
+  async destroy(tenantId: string, agentId: string, opts: { reason?: string } = {}): Promise<DestroyedMachine> {
+    const initial = await this.get(tenantId, agentId);
+    if (!initial) return { machineId: null, providerRefs: [] };
+    return this.withLock(initial.id, async () => {
+      const row = await this.options.store.getById(initial.id);
+      // A concurrent destroy finished while this one waited for the lease.
+      if (!row) return { machineId: initial.id, providerRefs: [] };
+      await this.options.store.update(row.id, { state: "deleting", desiredState: "stopped" }, this.now());
+      const providerRefs: string[] = [];
+      try {
+        const client = await this.client();
+        const mod = this.options.daytonaModule ?? this.loadedModule;
+        const boxes = new Map<string, DaytonaSandboxInstance>();
+        // Only a box carrying this machine's and tenant's labels — and not
+        // claimed by another deployment — is ever deleted.
+        const consider = (sb: DaytonaSandboxInstance) => {
+          const claimedBy = sb.labels?.[OMA_BOX_LABELS.deployment];
+          const foreign = !!claimedBy && !!this.options.deploymentId && claimedBy !== this.options.deploymentId;
+          if (ownsBox(sb, row) && !foreign) boxes.set(sb.id, sb);
+          else this.warn(`machine ${row.id}: provider box ${sb.id} is not this deployment's box for the machine; leaving it`);
+        };
+        if (row.providerRef) {
+          try { consider(await client.get(row.providerRef)); }
+          catch (err) { if (!isDaytonaBoxGone(err, mod)) throw err; }
+        }
+        // Also covers a box created just before a crash lost its id.
+        for await (const sb of client.list({ labels: { [OMA_BOX_LABELS.machine]: row.id } })) {
+          if (!boxes.has(sb.id)) consider(sb);
+        }
+        for (const sb of boxes.values()) {
+          try { await client.delete(sb, 60); }
+          catch (err) { if (!isDaytonaBoxGone(err, mod)) throw err; }
+          providerRefs.push(sb.id);
+        }
+        await this.event(row, "deleted", { reason: opts.reason ?? "agent_deleted", provider_refs: providerRefs });
+        await this.options.store.delete(row.id);
+        return { machineId: row.id, providerRefs };
+      } catch (err) {
+        await this.options.store.update(row.id, { state: "deleting", errorReason: String(err), errorCount: row.errorCount + 1 }, this.now());
+        await this.event(row, "delete_failed", { message: String(err), reason: opts.reason ?? "agent_deleted" });
+        throw err;
+      }
+    });
+  }
+
   async acquire(input: Pick<AgentMachineProviderInput, "tenantId" | "agentId" | "spec">): Promise<AcquiredBox> {
-    const { row } = await this.options.store.insertIfAbsent({
+    const { row, created: firstUse } = await this.options.store.insertIfAbsent({
       id: generateAgentMachineId(), tenantId: input.tenantId, agentId: input.agentId,
       provider: "daytona", spec: input.spec,
       bootstrapHash: createHash("sha256").update(JSON.stringify(input.spec)).digest("hex"), now: this.now(),
     });
+    // Checked only when the row is new, so the per-operation path of an
+    // existing computer pays nothing for it.
+    if (firstUse && !(await this.agentStillExists(row.tenantId, row.agentId))) {
+      await this.options.store.delete(row.id);
+      throw new AgentDeletedError();
+    }
     if (canonicalSpec(row.config) !== canonicalSpec(input.spec)) throw new MachineConfigMismatchError();
     return this.withLock(row.id, async () => {
-      const current = (await this.options.store.getById(row.id))!;
+      const current = await this.options.store.getById(row.id);
+      // The agent was deleted while this call waited for the lease: its
+      // computer is gone, or `deleting` and awaiting a retried removal.
+      if (!current || current.state === "deleting") throw new AgentDeletedError();
       const client = await this.client();
       let sb: DaytonaSandboxInstance | null = null;
       let created = false;
@@ -150,23 +225,29 @@ export class AgentMachineManager {
         if (!sb) {
           // Recover the create→DB-write crash window by the immutable
           // machine label before creating another chargeable box.
-          for await (const s of client.list({ labels: { "oma-machine-id": current.id } })) {
-            if (s.labels?.["oma-tenant-id"] === current.tenantId) { sb = s; break; }
+          for await (const s of client.list({ labels: { [OMA_BOX_LABELS.machine]: current.id } })) {
+            if (s.labels?.[OMA_BOX_LABELS.tenant] === current.tenantId) { sb = s; break; }
           }
         }
         const previousRef = current.providerRef;
         if (!sb) {
+          if (!firstUse && !(await this.agentStillExists(current.tenantId, current.agentId))) throw new AgentDeletedError();
           await this.options.store.update(current.id, { state: previousRef ? "recreating" : "creating", desiredState: "running" }, this.now());
           sb = await client.create({
             ...(current.snapshot ? { snapshot: current.snapshot } : { image: current.image }),
             name: current.id,
             ...(current.config.desktop ? { user: "root", envVars: { VNC_RESOLUTION: "1280x800" } } : {}),
-            labels: { "oma-machine-id": current.id, "oma-tenant-id": current.tenantId, "oma-agent-id": current.agentId },
+            labels: {
+              [OMA_BOX_LABELS.machine]: current.id, [OMA_BOX_LABELS.tenant]: current.tenantId, [OMA_BOX_LABELS.agent]: current.agentId,
+              ...(this.options.deploymentId ? { [OMA_BOX_LABELS.deployment]: this.options.deploymentId } : {}),
+            },
             public: false, ephemeral: false,
             autoDeleteInterval: -1, autoArchiveInterval: 0,
             autoStopInterval: current.idleStopMinutes,
           }, { timeout: 180 });
           created = true;
+        } else {
+          await this.claimForDeployment(sb, current);
         }
         const replacement = !!previousRef && previousRef !== sb.id;
         const generation = replacement ? current.generation + 1 : current.generation;
@@ -206,9 +287,27 @@ export class AgentMachineManager {
       } catch (err) {
         await this.options.store.update(current.id, { state: "error", errorReason: String(err), errorCount: current.errorCount + 1 }, this.now());
         await this.event(current, "error", { message: String(err) });
-        throw err;
+        // The row and server log keep the provider's text; the session gets
+        // a message it can act on.
+        const mapped = mapDaytonaProvisionError(err);
+        if (mapped !== err) this.warn(`machine ${current.id}: provider quota refused the computer`, err);
+        throw mapped;
       }
     });
+  }
+
+  private async agentStillExists(tenantId: string, agentId: string): Promise<boolean> {
+    return this.options.agentExists ? this.options.agentExists(tenantId, agentId) : true;
+  }
+
+  /** Boxes created before deployment labels existed get this deployment's
+   * label the next time their own machine row reaches them. Never rewrites
+   * a box that is already claimed. */
+  private async claimForDeployment(sb: DaytonaSandboxInstance, row: AgentMachineRow): Promise<void> {
+    const deploymentId = this.options.deploymentId;
+    if (!deploymentId || !ownsBox(sb, row) || sb.labels?.[OMA_BOX_LABELS.deployment]) return;
+    try { await sb.setLabels({ ...sb.labels, [OMA_BOX_LABELS.deployment]: deploymentId }); }
+    catch (err) { this.warn(`machine ${row.id}: could not label box ${sb.id} for this deployment`, err); }
   }
 
   /** The DB lease serializes lifecycle and tool operations across hosts.
@@ -218,8 +317,11 @@ export class AgentMachineManager {
     if (this.heldLocks.getStore()?.has(id)) return fn();
     const owner = `${this.workerId}:${randomUUID()}`;
     const deadline = Date.now() + LOCK_WAIT_MS;
-    while (!(await this.options.store.tryAcquireLock(id, owner, LOCK_TTL_MS, this.now()))) {
+    for (let attempt = 1; !(await this.options.store.tryAcquireLock(id, owner, LOCK_TTL_MS, this.now())); attempt++) {
       if (Date.now() >= deadline) throw new MachineLockedError();
+      // `destroy` removes the row; do not wait out the deadline for a lease
+      // that can no longer be granted.
+      if (attempt % 20 === 0 && !(await this.options.store.getById(id))) throw new AgentDeletedError();
       await new Promise((resolve) => setTimeout(resolve, 50));
     }
     let leaseError: Error | null = null;
@@ -356,6 +458,7 @@ export class AgentMachineManager {
       const apiKey = this.options.apiKey ?? process.env.DAYTONA_API_KEY;
       if (!apiKey) throw new Error("DAYTONA_API_KEY is required for agent machines");
       const mod = this.options.daytonaModule ?? await loadDaytonaModule();
+      this.loadedModule = mod;
       return new mod.Daytona({ apiKey, apiUrl: this.options.apiUrl ?? process.env.DAYTONA_API_URL });
     })().catch((err) => { this.clientPromise = null; throw err; });
     return this.clientPromise;
@@ -366,6 +469,10 @@ export class AgentMachineManager {
   }
 
   private warn(message: string, detail?: unknown): void { (this.options.logger ?? console).warn(message, detail); }
+}
+
+function ownsBox(sb: DaytonaSandboxInstance, row: AgentMachineRow): boolean {
+  return sb.labels?.[OMA_BOX_LABELS.machine] === row.id && sb.labels?.[OMA_BOX_LABELS.tenant] === row.tenantId;
 }
 
 function canonicalSpec(spec: AgentMachineSpec): string {

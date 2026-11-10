@@ -61,7 +61,13 @@ import { generateId } from "@open-managed-agents/shared";
 import type { HarnessPatch, McpTarget } from "./claude-agent-sdk-harness.js";
 import { startMcpHttpBridge, type BridgeTool, type McpHttpBridge } from "./mcp-http-bridge.js";
 import { codexComputerTools, computerCodexEnv, COMPUTER_CODEX_FEATURES } from "./codex-computer-tools.js";
-import { buildSetupPrompt, harnessView } from "./setup-harness.js";
+import {
+  buildSetupPrompt,
+  harnessView,
+  runEnableMemory,
+  ENABLE_MEMORY_TOOL_DESCRIPTION,
+} from "./setup-harness.js";
+import type { EnableMemoryResult } from "./agent-memory-mode.js";
 import {
   materializeMemory,
   writeBackMemory,
@@ -140,7 +146,13 @@ export interface CodexSdkHarnessDeps {
       prompt: string;
       wake_mode?: "observe" | "decide" | "act" | "escalate";
     },
-  ) => Promise<{ id: string; next_wake_at?: string }>;
+  ) => Promise<{ id: string; next_wake_at?: string; memory_note?: string }>;
+  /** Turn on the agent's memory (setup sessions' `enable_memory`). */
+  enableMemory?: (
+    tenantId: string,
+    sessionId: string,
+    agentId: string,
+  ) => Promise<EnableMemoryResult>;
   /** Skill discovery (`find_skill`). */
   findSkills?: (
     tenantId: string,
@@ -362,6 +374,17 @@ export class CodexSdkHarness {
           } as SessionEvent);
           return { text: `Updated: ${changed.join(", ")}.` };
         },
+      });
+    }
+
+    if (isSetup && deps.enableMemory) {
+      tools.push({
+        name: "enable_memory",
+        description: ENABLE_MEMORY_TOOL_DESCRIPTION,
+        inputSchema: {},
+        handler: async () => ({
+          text: await runEnableMemory(() => deps.enableMemory!(tenantId, sessionId, agentId)),
+        }),
       });
     }
 

@@ -48,6 +48,10 @@ function toHarnessView(agent: Record<string, unknown> | null): Harness {
     if (Array.isArray(value) && value.length === 0) continue;
     view[key] = value;
   }
+  // Memory rides the `_oma` envelope; shown only when on, matching the
+  // server's harness view.
+  const memory = (agent._oma as { memory?: { mode?: string } } | undefined)?.memory;
+  if (memory?.mode && memory.mode !== "off") view.memory = memory;
   return view;
 }
 
@@ -102,6 +106,15 @@ export function AgentSetup() {
     ) {
       setHarness(m.harness_config);
     }
+    // enable_memory / a new schedule switched memory on: no harness marker
+    // rides with it, so fold it into the pane here.
+    if (ev.type === "system.memory_enabled") {
+      const e = ev as unknown as { mode?: string; store_id?: string };
+      setHarness((h) => ({
+        ...h,
+        memory: { mode: e.mode ?? "shared", ...(e.store_id ? { store_id: e.store_id } : {}) },
+      }));
+    }
   }, []);
 
   // The setup chat edits the agent server-side; drop cached agent-page data
@@ -109,6 +122,8 @@ export function AgentSetup() {
   const refreshAgent = () => {
     void qc.invalidateQueries({ queryKey: [`/v1/agents/${id}`] });
     void qc.invalidateQueries({ queryKey: [`/v1/agents/${id}/versions`] });
+    void qc.invalidateQueries({ queryKey: [`/v1/agents/${id}/memory`] });
+    void qc.invalidateQueries({ queryKey: [`/v1/agents/${id}/ambient-rules`] });
   };
 
   const yamlText = useMemo(() => harnessToYaml(harness), [harness]);

@@ -12,10 +12,33 @@ import { AccessRequestCard } from "../components/AccessRequestCard";
 import { SavedLoginLine } from "../components/SavedLoginLine";
 import { grantedRequestIdsOf } from "./agents/SessionChat";
 import { AmbientRuleCard } from "../components/AmbientRuleCard";
+import { MemoryEnabledCard } from "../components/MemoryEnabledCard";
 import { SkillRequestCard } from "../components/SkillRequestCard";
 import { Button } from "@/components/ui/button";
 import { AgentIcon, ClockIcon, DurationIcon, EnvIcon, VaultIcon } from "../components/icons";
 import { FilesPanel, ResourcePanel } from "./session-detail/Panels";
+import {
+  AttachButton,
+  ComposerAttachments,
+  MessageAttachmentChips,
+  TurnFiles,
+} from "../components/SessionFiles";
+import {
+  AttachmentError,
+  MAX_ATTACHMENT_BYTES,
+  MAX_ATTACHMENTS_PER_MESSAGE,
+  attachmentsLabel,
+  attachmentsOf,
+  buildUserMessageEvent,
+  prepareAttachments,
+  type MessageAttachment,
+} from "../lib/attachments";
+import {
+  outputsByTurn,
+  refreshSessionOutputs,
+  useSessionOutputs,
+  type SessionOutputFile,
+} from "../lib/session-outputs";
 import {
   TrajectoryOutcomeChip,
   TrajectoryRewardChip,
@@ -44,8 +67,6 @@ import {
   PromptInputFooter,
   PromptInputTools,
   PromptInputSubmit,
-  PromptInputButton,
-  usePromptInputAttachments,
 } from "../components/ai-elements/prompt-input";
 import { SessionModelPicker } from "../components/SessionModelPicker";
 import { useComposerDraft } from "../lib/composer-draft";
@@ -646,89 +667,46 @@ export function SessionDetail() {
     return () => { abort.abort(); };
   }, [id]);
 
-  // Encode a File as base64 (no data: URL prefix) for inline content
-  // blocks. Used so OMA backend's userContentToParts can forward the
-  // bytes straight to the AI SDK (image vision / PDF parsing) without
-  // needing to async-resolve file_id sources.
-  const fileToBase64 = (file: File): Promise<string> =>
-    new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const r = reader.result as string;
-        const idx = r.indexOf(",");
-        resolve(idx >= 0 ? r.slice(idx + 1) : r);
-      };
-      reader.onerror = () => reject(reader.error ?? new Error("FileReader failed"));
-      reader.readAsDataURL(file);
-    });
+  // Session outputs (files the agent wrote under its outputs dir) — feeds
+  // link resolution in agent messages and the per-turn Files strip. Re-list
+  // whenever a turn ends: that's when new files exist.
+  const { outputs } = useSessionOutputs(id);
+  useEffect(() => {
+    if (id && status === "idle") void refreshSessionOutputs(id);
+  }, [id, status]);
 
-  const send = async (overrideText?: string, files?: File[]) => {
+  // Attachments that already uploaded, keyed by the picked File — a retry
+  // after a failed send reuses them instead of uploading twice.
+  const uploadedAttachments = useRef(new WeakMap<File, MessageAttachment>());
+
+  /** Resolves true once the message is accepted; false when it was not
+   *  sent (the composer then keeps the text + attachments for a retry). */
+  const send = async (overrideText?: string, files?: File[]): Promise<boolean> => {
     const text = (overrideText ?? input).trim();
-    if (!text && !files?.length) return;
-    if (!id) return;
+    if (!text && !files?.length) return true;
+    if (!id) return true;
     setInput("");
-    setLocalPending(text || (files?.length ? (files.length === 1 ? "🖼️ Image" : `🖼️ ${files.length} images`) : ""));
+    setLocalPending(text || (files?.length ? `📎 ${attachmentsLabel(files.length)}` : ""));
     setSending(true);
+    let sent = false;
     try {
-      // Upload attachments first so the user.message can reference them
-      // by file_id. Each file is scoped to this session via scope_id so
-      // it appears in the session's Files panel + the agent's mount.
-      // We mark them downloadable so the operator can re-download from
-      // the panel. Per-file failures don't block the others — the text
-      // still goes out and the user can retry the failed upload.
-      const uploaded: Array<{ id: string; filename: string; media_type: string }> = [];
-      if (files?.length) {
-        for (const file of files) {
-          try {
-            const fd = new FormData();
-            fd.append("file", file);
-            fd.append("scope_id", id);
-            fd.append("downloadable", "true");
-            const r = await api<{ id: string; filename: string; media_type: string }>(
-              `/v1/files`,
-              { method: "POST", body: fd },
-            );
-            uploaded.push({ id: r.id, filename: r.filename, media_type: r.media_type });
-          } catch (e) {
-            console.error("file upload failed", file.name, e);
-          }
-        }
-      }
-
-      // The + button is image-only — vision inputs go inline to the
-      // model. Non-vision file attachments belong on a separate path
-      // (env-mounted resources) and aren't reachable from this button,
-      // so this loop only emits `image` content blocks.
-      const content: Array<
-        | { type: "text"; text: string }
-        | { type: "image"; source: { type: "file"; file_id: string } }
-      > = [];
-      if (text) content.push({ type: "text", text });
-      for (const u of uploaded) {
-        if (u.media_type.startsWith("image/")) {
-          content.push({
-            type: "image",
-            source: { type: "file", file_id: u.id },
-          });
-        }
-        // non-images can't slip through the accept filter, but if one
-        // does (drag-drop on some browsers ignores accept) we drop it
-        // silently rather than fall back to a document block the model
-        // may not handle.
-      }
-      if (!text && uploaded.length) {
-        content.unshift({
-          type: "text",
-          text: uploaded.length === 1 ? "Attached image." : "Attached images.",
-        });
-      }
+      // Upload attachments first so the user.message can reference them.
+      // Images go inline as vision input; every other file is attached as
+      // a session resource, which the server writes into the sandbox
+      // before it answers — so the file is on disk before this turn runs.
+      // All-or-nothing: if any file fails, nothing is sent and the error
+      // names the file (no silently dropped attachments).
+      const attachments = files?.length
+        ? await prepareAttachments(api, id, files, uploadedAttachments.current)
+        : [];
 
       await api(`/v1/sessions/${id}/events`, {
         method: "POST",
         body: JSON.stringify({
-          events: [{ type: "user.message", content }],
+          events: [buildUserMessageEvent(text, attachments)],
         }),
       });
+      sent = true;
       // POST resolved → server already inserted the row + broadcast
       // system.user_message_pending. The outbox map will pick it up
       // (and likely already has by the time await unblocks here).
@@ -736,13 +714,18 @@ export function SessionDetail() {
       // entry — but only if the server's pending hasn't already cleared
       // it via the system.user_message_pending handler.
       setLocalPending((cur) => (cur === text ? null : cur));
-    } catch {
-      // api() already toasted the error; clear the optimistic slot so
-      // the user doesn't keep seeing a "stuck" pending row that will
-      // never actually run.
+    } catch (e) {
+      // api() already toasted request errors; attachment failures are
+      // reported here (their requests run with silentErrors so the toast
+      // can name the file). Clear the optimistic slot so the user doesn't
+      // keep seeing a "stuck" pending row that will never actually run.
+      if (e instanceof AttachmentError) {
+        toast.error(`${e.message}. Your message was not sent.`);
+      }
       setLocalPending(null);
     }
     setSending(false);
+    return sent;
   };
 
   // Stop button — posts user.interrupt to abort whatever turn(s) are
@@ -1039,6 +1022,7 @@ export function SessionDetail() {
                   const tid = (e as { session_thread_id?: string }).session_thread_id ?? "sthr_primary";
                   return tid === activeThreadId;
                 });
+                const turnFiles = outputsByTurn(filtered, outputs);
                 // Tool uses pair with their results (tool_use_id /
                 // mcp_tool_use_id) inside buildTimeline, which also groups
                 // consecutive calls and folds finished turns.
@@ -1088,6 +1072,8 @@ export function SessionDetail() {
                         grantedRequestIds={grantedRequestIds}
                         key={key}
                         event={e}
+                        sessionId={id}
+                        turnFiles={turnFiles.get(e)}
                         livePending={false}
                         modelErrorCause={
                           e.type === "session.error"
@@ -1154,7 +1140,7 @@ export function SessionDetail() {
               {Array.from(streams.entries()).map(([mid, text]) => (
                 <Message key={`stream-${mid}`} from="assistant">
                   <MessageContent>
-                    <Markdown>{text}</Markdown>
+                    <Markdown sessionId={id}>{text}</Markdown>
                     <span className="inline-block w-1.5 h-3.5 bg-fg-subtle/50 align-middle ml-0.5 animate-pulse" />
                   </MessageContent>
                 </Message>
@@ -1174,10 +1160,10 @@ export function SessionDetail() {
           {/* Prompt input. ai-elements <PromptInput> wraps a <form> with
               an InputGroup-based textarea + attachment lifecycle; we
               hand it our own onSubmit so the existing send() (POST
-              /events) stays the source of truth. The + button only
-              accepts images — they go inline to the model as vision
-              inputs. Non-image attachments belong on the mount-based
-              session resources path, not this button.
+              /events) stays the source of truth. The + button (and
+              drag-and-drop / paste) accepts any file: images go inline
+              to the model as vision inputs, everything else is attached
+              as a session file resource and written into the sandbox.
 
               Wireless treatment: composer sits flush against the
               conversation above on a `bg-bg` (white) surface — no
@@ -1185,27 +1171,44 @@ export function SessionDetail() {
               below. */}
           <div className="pl-3 pr-4 pb-4 bg-bg shrink-0">
             <PromptInput
-              accept="image/*"
               multiple
-              maxFiles={10}
-              maxFileSize={25 * 1024 * 1024}
-              onError={(err) => toast.error(err.message)}
+              maxFiles={MAX_ATTACHMENTS_PER_MESSAGE}
+              maxFileSize={MAX_ATTACHMENT_BYTES}
+              onError={(err) =>
+                toast.error(
+                  err.code === "max_file_size"
+                    ? "That file is too large — the limit is 25 MB per file."
+                    : err.message,
+                )
+              }
               globalDrop
-              onSubmit={async ({ text, files }) => {
+              onSubmit={async ({ text, files }, event) => {
                 // PromptInput captured the textarea's value into `text`
                 // and the picked/dropped files into `files`, then
                 // form.reset() before this handler runs. send() owns
                 // clearing the mirrored `input` state, the optimistic
                 // outbox slot, and the file uploads.
+                // (event.target, not currentTarget — React nulls the
+                // latter once PromptInput's own async submit work yields.)
+                const form = event.target instanceof HTMLFormElement ? event.target : null;
                 const rawFiles = files
                   .map((f) => (f as { file?: File }).file)
                   .filter((f): f is File => f instanceof File);
-                await send(text, rawFiles);
+                if (await send(text, rawFiles)) return;
+                // Not sent: put the text back and reject so PromptInput
+                // keeps the attachments — nothing the user composed is lost.
+                const box = form?.elements.namedItem("message");
+                if (box instanceof HTMLTextAreaElement && !box.value) {
+                  box.value = text;
+                  setInput(text);
+                }
+                throw new Error("message not sent");
               }}
             >
+              <ComposerAttachments />
               <PromptInputTextarea
                 {...draft}
-                placeholder="Send a message…  (drag an image in or click ＋)"
+                placeholder="Send a message…  (drag a file in or click ＋)"
                 disabled={sending}
                 onChange={(e) => setInput(e.currentTarget.value)}
               />
@@ -1446,38 +1449,21 @@ function RelativeTimeBadge({ iso }: { iso: string }) {
  *   anything else             → null  (timeline-only events that shouldn't appear in chat)
  */
 
-/**
- * Plain "+" button that opens the PromptInput file picker for images.
- * The stock `PromptInputActionAddAttachments` from ai-elements is a
- * DropdownMenuItem — meant to live inside an action-menu — so dropping
- * it directly into PromptInputTools threw "MenuItem must be used within
- * Menu" at render. This button reads the attachments controller from
- * context and calls `openFileDialog()` directly, no menu required.
- */
-function AttachButton() {
-  const attachments = usePromptInputAttachments();
-  return (
-    <PromptInputButton
-      type="button"
-      onClick={() => attachments.openFileDialog()}
-      aria-label="Add image"
-      title="Add image"
-    >
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-        <path d="M12 5v14M5 12h14" />
-      </svg>
-    </PromptInputButton>
-  );
-}
-
 function EventRender({
   event,
+  sessionId,
+  turnFiles,
   livePending = false,
   modelErrorCause,
   onApproveEnvironmentYaml,
   grantedRequestIds,
 }: {
   event: Event;
+  /** Session the event belongs to — lets agent-message links to output
+   *  files download them. */
+  sessionId?: string;
+  /** Outputs written during the turn this agent.message closes. */
+  turnFiles?: SessionOutputFile[];
   /** request_ids with a server-recorded system.access_granted. */
   grantedRequestIds?: Set<string>;
   /**
@@ -1581,6 +1567,9 @@ function EventRender({
           >
             {text}
           </MessageContent>
+          {/* Files sent with the message. The model-readable path note
+              rides in a later text block, which this bubble never shows. */}
+          <MessageAttachmentChips attachments={attachmentsOf(event)} />
         </Message>
       );
     }
@@ -1603,7 +1592,7 @@ function EventRender({
       return (
         <Message from="assistant">
           <MessageContent>
-            <Markdown>{text}</Markdown>
+            <Markdown sessionId={sessionId}>{text}</Markdown>
             {environmentYaml && onApproveEnvironmentYaml && (
               <div className="mt-3">
                 <Button
@@ -1614,6 +1603,9 @@ function EventRender({
                   Approve environment
                 </Button>
               </div>
+            )}
+            {sessionId && turnFiles && turnFiles.length > 0 && (
+              <TurnFiles sessionId={sessionId} files={turnFiles} />
             )}
           </MessageContent>
         </Message>
@@ -1670,6 +1662,8 @@ function EventRender({
 
     case "system.ambient_rule_created":
       return <AmbientRuleCard event={event} />;
+    case "system.memory_enabled":
+      return <MemoryEnabledCard event={event} />;
 
     case "system.skill_request":
       return <SkillRequestCard event={event} />;

@@ -33,6 +33,9 @@ export interface AgentRecord {
     aux_model?: { id: string; speed?: string };
     harness?: string;
     reasoning_level?: import("@open-managed-agents/api-types").ReasoningLevel;
+    /** Cross-session memory. Absent = off (and still eligible for the
+     *  automatic enable that comes with a first ambient rule). */
+    memory?: import("@open-managed-agents/api-types").AgentMemoryConfig;
     runtime_binding?: { runtime_id: string; acp_agent_id: string };
     appendable_prompts?: string[];
     default_environment_id?: string;

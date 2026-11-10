@@ -16,6 +16,7 @@ import { FilterChip, CreatedFilterChip } from "../components/FilterChip";
 import { RowActionsMenu } from "../components/RowActionsMenu";
 
 import type { SessionRecord as Session } from "../types/session";
+import { pickDefaultEnvironmentId, type EnvironmentChoice } from "../lib/default-environment";
 
 interface Vault { id: string; name: string; }
 interface FilePick { id: string; filename: string; size_bytes: number; }
@@ -228,7 +229,7 @@ export function SessionsList() {
   // toggles vaults. Lookups are by hostname (matches outbound proxy logic
   // in apps/main/src/routes/mcp-proxy.ts:resolveOutboundCredentialByHost).
   const [vaultCredHosts, setVaultCredHosts] = useState<Record<string, Set<string>>>({});
-  const [envs, setEnvs] = useState<Array<{ id: string; name: string }>>([]);
+  const [envs, setEnvs] = useState<Array<EnvironmentChoice & { name: string }>>([]);
   const [vaults, setVaults] = useState<Vault[]>([]);
   const [files, setFiles] = useState<FilePick[]>([]);
   const [memoryStores, setMemoryStores] = useState<MemoryStorePick[]>([]);
@@ -466,7 +467,7 @@ export function SessionsList() {
     try {
       const [a, e, v, f, m] = await Promise.all([
         api<{ data: AgentLite[] }>("/v1/agents?limit=200&status=any"),
-        api<{ data: Array<{ id: string; name: string }> }>("/v1/environments?limit=200"),
+        api<{ data: Array<EnvironmentChoice & { name: string }> }>("/v1/environments?limit=200"),
         api<{ data: Vault[] }>("/v1/vaults?limit=200").catch(() => ({ data: [] })),
         api<{ data: FilePick[] }>("/v1/files?limit=200").catch(() => ({ data: [] })),
         api<{ data: MemoryStorePick[] }>("/v1/memory_stores").catch(() => ({ data: [] })),
@@ -503,7 +504,9 @@ export function SessionsList() {
     reset({
       ...INITIAL_FORM_VALUES,
       agent: selectedAgentId,
-      environment_id: envs[0]?.id ?? "",
+      // An agent's own default environment is applied when its detail
+      // loads; without one, never preselect a persistent agent computer.
+      environment_id: pickDefaultEnvironmentId(envs),
     });
     setSelectedAgentDetail(selected);
     setAgentMcpUrls([]);
