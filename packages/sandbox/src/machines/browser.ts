@@ -89,21 +89,40 @@ export function buildAgentBrowserStartScript(desktop = false): string {
 // that list is part of the frozen machine config, and changing it would
 // fail every existing computer with MachineConfigMismatchError. Runs on the
 // snapshot path too, where python availability depends on the snapshot.
-// Debian's python3 has no bare `python`, so link it when missing.
+// Debian's python3 has no bare `python`, so link it when missing (a symlink,
+// not `python-is-python3`, which does not exist before bullseye/focal).
+//
+// This runs inside acquire()'s machine lease on every wake, so it must stay
+// well under LOCK_WAIT_MS (120 s): apt network waits are capped, the whole
+// exec is capped at PYTHON_SETUP_TIMEOUT_SEC, and a failure is remembered in
+// PYTHON_FAILED_MARKER so later wakes skip the install for
+// PYTHON_RETRY_AFTER_SEC instead of blocking on an unreachable mirror again.
 const PYTHON_READY_MARKER = "/var/lib/oma/python-ready";
-const PYTHON_APT_PACKAGES = ["python3", "python3-pip", "python3-venv", "python-is-python3"];
+const PYTHON_FAILED_MARKER = "/var/lib/oma/python-failed";
+const PYTHON_RETRY_AFTER_SEC = 6 * 60 * 60;
+const PYTHON_SETUP_TIMEOUT_SEC = 90;
+const PYTHON_APT_PACKAGES = ["python3", "python3-pip", "python3-venv"];
+const APT_NET_OPTS = "-o Acquire::Retries=0 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20";
 
 /** Exported for tests. Exits non-zero on failure; the caller only warns. */
 export function buildAgentComputerPythonScript(): string {
+  const failed = quote(PYTHON_FAILED_MARKER);
   return [
     'as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }',
+    `fail() { date +%s > ${failed} 2>/dev/null || true; exit "$1"; }`,
     `if [ -f ${quote(PYTHON_READY_MARKER)} ]; then exit 0; fi`,
-    "if ! command -v python3 >/dev/null 2>&1 || ! python3 -m pip --version >/dev/null 2>&1; then",
-    '  command -v apt-get >/dev/null 2>&1 || { echo "python3 is missing and apt-get is unavailable" >&2; exit 127; }',
-    "  as_root env DEBIAN_FRONTEND=noninteractive apt-get update -qq || exit 1",
-    `  as_root env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends ${PYTHON_APT_PACKAGES.join(" ")} || exit 1`,
+    `if [ -f ${failed} ]; then`,
+    `  last=$(cat ${failed} 2>/dev/null || echo 0)`,
+    '  case "$last" in ""|*[!0-9]*) last=0 ;; esac',
+    `  if [ $(( $(date +%s) - $last )) -lt ${PYTHON_RETRY_AFTER_SEC} ]; then exit 0; fi`,
     "fi",
-    'command -v python >/dev/null 2>&1 || as_root ln -sf "$(command -v python3)" /usr/local/bin/python || exit 1',
+    "if ! command -v python3 >/dev/null 2>&1 || ! python3 -m pip --version >/dev/null 2>&1; then",
+    '  command -v apt-get >/dev/null 2>&1 || { echo "python3 is missing and apt-get is unavailable" >&2; fail 127; }',
+    `  as_root env DEBIAN_FRONTEND=noninteractive apt-get ${APT_NET_OPTS} update -qq || fail 1`,
+    `  as_root env DEBIAN_FRONTEND=noninteractive apt-get ${APT_NET_OPTS} install -y -qq --no-install-recommends ${PYTHON_APT_PACKAGES.join(" ")} || fail 1`,
+    "fi",
+    'command -v python >/dev/null 2>&1 || as_root ln -sf "$(command -v python3)" /usr/local/bin/python || fail 1',
+    `rm -f ${failed}`,
     `touch ${quote(PYTHON_READY_MARKER)}`,
   ].join("\n");
 }
@@ -111,7 +130,7 @@ export function buildAgentComputerPythonScript(): string {
 /** Best-effort: a computer without Python is still a working computer. */
 async function ensurePython(sb: DaytonaSandboxInstance): Promise<void> {
   try {
-    const result = await sb.process.executeCommand(buildAgentComputerPythonScript(), undefined, undefined, 300);
+    const result = await sb.process.executeCommand(buildAgentComputerPythonScript(), undefined, undefined, PYTHON_SETUP_TIMEOUT_SEC);
     if (result.exitCode !== 0) {
       console.warn("[agent-computer] python setup failed; continuing without it", {
         sandboxId: sb.id, exitCode: result.exitCode, output: (result.result ?? "").slice(-1000),

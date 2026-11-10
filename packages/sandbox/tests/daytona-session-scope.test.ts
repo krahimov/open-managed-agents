@@ -13,6 +13,7 @@ import {
   sandboxGoneMessage,
 } from "./fake-daytona.js";
 import {
+  DAYTONA_PYTHON_LINK_LINE,
   DaytonaSandbox,
   type DaytonaSandboxOptions,
   buildDaytonaBootstrapScript,
@@ -97,8 +98,48 @@ describe("DaytonaSandbox (session scope) — box lifecycle", () => {
     expect(sb.unhandledCommands[1].args).toContain("ripgrep");
     // Data agents reach for bare `python` and `pip install` first.
     expect(sb.unhandledCommands[1].args).toEqual(
-      expect.arrayContaining(["python3", "python3-pip", "python3-venv", "python-is-python3"]),
+      expect.arrayContaining(["python3", "python3-pip", "python3-venv"]),
     );
+    // python-is-python3 does not exist before bullseye/focal; one unknown
+    // package would fail the whole install on e.g. node:18-buster.
+    expect(sb.unhandledCommands[1].args).not.toContain("python-is-python3");
+    expect(bootstrapRuns[0].command).toContain(DAYTONA_PYTHON_LINK_LINE);
+  });
+
+  it("links bare python best-effort after the install, and skips it when bootstrap tools are off", async () => {
+    const lnCalls: string[][] = [];
+    const fake = new FakeDaytona();
+    fake.onCreate = (box) => {
+      box.missingCommands.add("python");
+      box.commandHandlers.set("ln", ({ args }) => { lnCalls.push(args); return { exitCode: 0 }; });
+    };
+    expect(await makeSandbox(fake).exec("echo ok")).toBe("ok");
+    expect(lnCalls).toHaveLength(1);
+    expect(lnCalls[0][0]).toBe("-sf");
+    expect(lnCalls[0][1]).toMatch(/python3$/);
+    expect(lnCalls[0][2]).toBe("/usr/local/bin/python");
+    const run = onlyBox(fake).execLog.find((r) => r.command.includes("/tmp/.oma-daytona-tools-ready"));
+    expect(run?.command.split("\n").at(-2)).toBe(DAYTONA_PYTHON_LINK_LINE);
+
+    // A failed link (e.g. not root) never fails the bootstrap.
+    const failing = new FakeDaytona();
+    failing.onCreate = (box) => {
+      box.missingCommands.add("python");
+      box.commandHandlers.set("ln", () => ({ exitCode: 1, stderr: "ln: Permission denied\n" }));
+    };
+    expect(await makeSandbox(failing).exec("echo ok")).toBe("ok");
+
+    // An existing `python` (e.g. python-is-python2) is left alone.
+    const existing = new FakeDaytona();
+    const lnExisting = vi.fn(() => ({ exitCode: 0 }));
+    existing.onCreate = (box) => { box.commandHandlers.set("ln", lnExisting); };
+    expect(await makeSandbox(existing).exec("echo ok")).toBe("ok");
+    expect(lnExisting).not.toHaveBeenCalled();
+
+    const off = new FakeDaytona();
+    const b = makeSandbox(off, { bootstrapTools: false });
+    expect(await b.exec("echo ok")).toBe("ok");
+    expect(onlyBox(off).execLog.some((r) => r.command.includes(DAYTONA_PYTHON_LINK_LINE))).toBe(false);
   });
 
   it("lets pip install into the PEP 668 system Python, unless the environment overrides it", async () => {

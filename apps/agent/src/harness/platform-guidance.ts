@@ -37,10 +37,12 @@ export function sessionOutputsGuidanceFor(
 export const sessionOutputsGuidance = sessionOutputsGuidanceFor();
 
 // Prod QA: data-analysis agents hit `python: not found` and assumed pip was
-// unusable, then burned calls rewriting the work in awk/node. Both sandbox
-// images (CF venv, Daytona bootstrap) ship python3 + pip.
+// unusable, then burned calls rewriting the work in awk/node. The default
+// sandbox images (CF venv, Daytona bootstrap) ship python3 + pip; custom
+// images / bootstrap opt-outs may not, hence "normally". Hosts drop the line
+// (`pythonTooling: false`) where commands run outside such a sandbox.
 export const pythonToolingGuidance =
-  "`python3` (also `python`) and `pip` are available in the sandbox. If a Python library you need (e.g. pandas, beautifulsoup4) is missing, `pip install` it on demand instead of rewriting the work in another language.";
+  "`python3` (usually also `python`) and `pip` are normally available in the sandbox. If a Python library you need (e.g. pandas, beautifulsoup4) is missing, `pip install` it on demand instead of rewriting the work in another language.";
 
 export const externalServiceGuidance =
   "When a user asks about an OAuth-connected external service such as Google Drive, Gmail, Notion, Slack, GitHub, or Linear, use the available MCP tools for that service first. Do not expect provider CLIs, OAuth tokens, API keys, or credential files to exist in bash; those credentials are held by the platform and injected only through MCP/proxy calls. Before saying credentials are missing, check whether a matching MCP tool is available and use that tool.";
@@ -53,6 +55,10 @@ export interface PlatformGuidanceOptions {
   /** Absolute outputs dir (with or without trailing slash) to name in the
    *  session-outputs guidance. Omit for the default `/mnt/session/outputs/`. */
   outputsPath?: string;
+  /** Include `pythonToolingGuidance`. Default true (CF SessionDO, Daytona
+   *  sandboxes). Pass false when agent commands run on the host instead of
+   *  a bootstrapped sandbox (host-workdir SDK harnesses, subprocess). */
+  pythonTooling?: boolean;
 }
 
 /**
@@ -63,7 +69,8 @@ export function platformGuidanceFor(opts?: PlatformGuidanceOptions): string {
   const outputs = opts?.outputsPath
     ? sessionOutputsGuidanceFor(opts.outputsPath)
     : sessionOutputsGuidance;
-  return `${authenticatedCommandGuidance}\n\n${loopStopGuidance}\n\n${outputs}\n\n${pythonToolingGuidance}\n\n${externalServiceGuidance}\n\n${environmentProposalGuidance}`;
+  const python = opts?.pythonTooling === false ? "" : `${pythonToolingGuidance}\n\n`;
+  return `${authenticatedCommandGuidance}\n\n${loopStopGuidance}\n\n${outputs}\n\n${python}${externalServiceGuidance}\n\n${environmentProposalGuidance}`;
 }
 
 export const platformGuidance = platformGuidanceFor();

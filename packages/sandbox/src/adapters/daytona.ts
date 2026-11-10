@@ -79,9 +79,6 @@ const DEFAULT_BOOTSTRAP_APT_PACKAGES = [
   "jq",
   "less",
   "procps",
-  // Bare `python` (agents reach for it first); python3 alone leaves
-  // `python: not found`.
-  "python-is-python3",
   "python3",
   "python3-pip",
   "python3-venv",
@@ -90,6 +87,13 @@ const DEFAULT_BOOTSTRAP_APT_PACKAGES = [
   "unzip",
   "zip",
 ];
+// Bare `python` (agents reach for it first; Debian's python3 has none).
+// A symlink rather than `python-is-python3` in the list above: that package
+// does not exist before bullseye/focal, and one unknown package fails the
+// whole all-or-nothing install. Never replaces an existing `python` (e.g.
+// python-is-python2) and never fails the bootstrap.
+export const DAYTONA_PYTHON_LINK_LINE =
+  'if ! command -v python >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then ln -sf "$(command -v python3)" /usr/local/bin/python || true; fi';
 
 export interface DaytonaSandboxOptions {
   /** Per-session identifier — used as the Sandbox label so existing
@@ -960,10 +964,12 @@ export class DaytonaSandbox implements SandboxExecutor {
   }
 
   private async bootstrapSandbox(sb: DaytonaSandboxInstance): Promise<void> {
+    const bootstrapTools = this.opts.bootstrapTools ?? true;
     const script = buildDaytonaBootstrapScript({
       workdir: this.workdir(),
-      bootstrapTools: this.opts.bootstrapTools ?? true,
+      bootstrapTools,
       aptPackages: this.opts.bootstrapAptPackages ?? DEFAULT_BOOTSTRAP_APT_PACKAGES,
+      extraLines: bootstrapTools ? [DAYTONA_PYTHON_LINK_LINE] : [],
     });
     const result = await sb.process.executeCommand(script, undefined, undefined, 300);
     if (result.exitCode !== 0) {

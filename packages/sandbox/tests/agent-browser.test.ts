@@ -101,8 +101,12 @@ describe("agent computer python setup", () => {
     const script = buildAgentComputerPythonScript();
     expect(script).toContain("command -v python3");
     expect(script).toContain("python3 -m pip --version");
-    expect(script).toContain("apt-get install -y -qq --no-install-recommends python3 python3-pip python3-venv python-is-python3");
+    expect(script).toContain("install -y -qq --no-install-recommends python3 python3-pip python3-venv");
+    // python-is-python3 is missing before bullseye/focal; the symlink covers it.
+    expect(script).not.toContain("python-is-python3");
     expect(script).toContain("/usr/local/bin/python");
+    // Network waits are capped so the step stays inside the machine lease.
+    expect(script).toContain("-o Acquire::Retries=0 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20");
     expect(script).toContain("'/var/lib/oma/python-ready'");
     expect(() => execFileSync("sh", ["-n"], { input: script })).not.toThrow();
   });
@@ -114,15 +118,20 @@ describe("agent computer python setup", () => {
     const aptArgs: string[][] = [];
     sb.commandHandlers.set("apt-get", ({ args }) => {
       aptArgs.push(args);
-      if (args[0] === "install") { sb.missingCommands.delete("python3"); sb.missingCommands.delete("python"); }
+      if (args.includes("install")) sb.missingCommands.delete("python3");
       return { exitCode: 0 };
     });
     await bootstrapAgentComputer(asDaytona(sb), snapshotSpec);
-    expect(aptArgs.map((a) => a[0])).toEqual(["update", "install"]);
-    expect(aptArgs[1]).toEqual(["install", "-y", "-qq", "--no-install-recommends", "python3", "python3-pip", "python3-venv", "python-is-python3"]);
+    const netOpts = ["-o", "Acquire::Retries=0", "-o", "Acquire::http::Timeout=20", "-o", "Acquire::https::Timeout=20"];
+    expect(aptArgs).toEqual([
+      [...netOpts, "update", "-qq"],
+      [...netOpts, "install", "-y", "-qq", "--no-install-recommends", "python3", "python3-pip", "python3-venv"],
+    ]);
     const runs = sb.execLog.filter((r) => r.command === buildAgentComputerPythonScript());
     expect(runs).toHaveLength(1);
     expect(runs[0].exitCode).toBe(0);
+    expect(runs[0].timeout).toBe(90);
+    expect(sb.isFile("/usr/local/bin/python")).toBe(true);
     expect(sb.isFile("/var/lib/oma/python-ready")).toBe(true);
 
     sb.commandHandlers.set("apt-get", () => { throw new Error("apt-get must not run once the marker exists"); });
@@ -141,15 +150,36 @@ describe("agent computer python setup", () => {
     expect(sb.isFile("/var/lib/oma/python-ready")).toBe(true);
   });
 
-  it("is best-effort: a failed install warns, does not fail the bootstrap, and retries next time", async () => {
+  it("is best-effort: a failed install warns, does not fail the bootstrap, and backs off before retrying", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const sb = await fakeBox();
+      let clock = Date.UTC(2026, 10, 10);
+      const fake = new FakeDaytona();
+      fake.now = () => clock;
+      const sb = await fake.create({ snapshot: "daytona-small" });
       sb.missingCommands.add("python3");
-      sb.commandHandlers.set("apt-get", () => ({ exitCode: 100, stderr: "E: Unable to locate package\n" }));
+      const apt = vi.fn(() => ({ exitCode: 100, stderr: "E: Unable to locate package\n" }));
+      sb.commandHandlers.set("apt-get", apt);
       await expect(bootstrapAgentComputer(asDaytona(sb), snapshotSpec)).resolves.toBeUndefined();
       expect(warn).toHaveBeenCalledWith(expect.stringContaining("python setup failed"), expect.objectContaining({ exitCode: 1 }));
       expect(sb.isFile("/var/lib/oma/python-ready")).toBe(false);
+      expect(sb.readText("/var/lib/oma/python-failed")?.trim()).toBe(String(clock / 1000));
+      expect(apt).toHaveBeenCalledTimes(1);
+
+      // A wake within the back-off window skips apt (no mirror wait under the lease)...
+      warn.mockClear();
+      clock += 60 * 60 * 1000;
+      await bootstrapAgentComputer(asDaytona(sb), snapshotSpec);
+      expect(apt).toHaveBeenCalledTimes(1);
+      expect(warn).not.toHaveBeenCalled();
+
+      // ...and one after it tries again; success clears the failure marker.
+      clock += 6 * 60 * 60 * 1000;
+      apt.mockImplementation(() => { sb.missingCommands.delete("python3"); return { exitCode: 0, stderr: "" }; });
+      await bootstrapAgentComputer(asDaytona(sb), snapshotSpec);
+      expect(apt).toHaveBeenCalledTimes(3);
+      expect(sb.isFile("/var/lib/oma/python-ready")).toBe(true);
+      expect(sb.exists("/var/lib/oma/python-failed")).toBe(false);
 
       // A thrown provider error is swallowed the same way.
       const f = fakeSandbox();
