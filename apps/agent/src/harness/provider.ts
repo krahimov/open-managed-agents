@@ -295,14 +295,32 @@ function fnv1a(s: string): number {
 //   - Third-party ant-compatible / non-reasoning models → undefined.
 //
 // `level` unset = "medium" (DEFAULT_REASONING_LEVEL).
+//
+// `cache.promptCacheKey` (OpenAI Responses only): OpenAI routes requests to
+// prompt-cache machines by a hash of the prefix plus this key; the harness
+// passes the agent id so every session of one agent (same tools + system
+// prefix) lands on the same cache. Only on the Responses path — that model
+// is official OpenAI by construction (resolveModel), while chat/completions
+// also fronts third-party gateways that may reject unknown fields. The ZDR
+// clamp keeps it (clampCallOptions spreads providerOptions.openai) and it is
+// still official OpenAI there. promptCacheRetention is deliberately unset:
+// the extended ("24h") retention is only documented for specific models.
 
 export function reasoningProviderOptions(
   model: LanguageModel,
   modelId: string,
   level: ReasoningLevel | undefined,
   hasTools: boolean,
+  cache?: { promptCacheKey?: string },
 ):
-  | { openai: { reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh"; forceReasoning?: boolean; store?: boolean } }
+  | {
+      openai: {
+        reasoningEffort: "none" | "low" | "medium" | "high" | "xhigh";
+        forceReasoning?: boolean;
+        store?: boolean;
+        promptCacheKey?: string;
+      };
+    }
   | { anthropic: { thinking: { type: "enabled"; budgetTokens: number } } }
   | { anthropic: { thinking: { type: "adaptive" }; effort: "low" | "medium" | "high" | "max" } }
   | undefined {
@@ -323,6 +341,8 @@ export function reasoningProviderOptions(
           reasoningEffort: openAiReasoningEffort(bare, level),
           forceReasoning: true,
           store: false,
+          // Defensive length cap; agent ids are far shorter.
+          ...(cache?.promptCacheKey ? { promptCacheKey: cache.promptCacheKey.slice(0, 64) } : {}),
         },
       };
     }

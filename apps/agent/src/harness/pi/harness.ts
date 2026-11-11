@@ -50,7 +50,7 @@ import {
   type ToolSettlement,
 } from "../durable-tools";
 import { resolveCompactionStrategy } from "../compaction";
-import { OPENAI_MAX_TOOLS, applyToolBudget, toolCallNeedsApproval } from "../tool-budget";
+import { OPENAI_MAX_TOOLS, applyAgentToolBudget, toolBudgetWarning, toolCallNeedsApproval } from "../tool-budget";
 import { credentialsFromLanguageModel, resolvePiModel, type PiModelCredentials, type ResolvedPiModel } from "./model";
 import { ensureContinuableTail, modelMessagesToPi, providerOptionsFromThinking } from "./messages";
 import { adaptOmaTools, piContentToWire, type AdaptedTools, type OmaToolDetails } from "./tools";
@@ -456,19 +456,16 @@ export class PiHarness implements HarnessInterface {
     //    which the history projection below honors).
     await this.#maybeCompact(ctx, resolved.model.contextWindow);
 
-    // 2. OpenAI's 128-tool cap — same budget default-loop applies.
-    if (resolved.openAiToolNames && Object.keys(omaTools).length > OPENAI_MAX_TOOLS) {
-      const budget = applyToolBudget(omaTools as ToolSet, {
-        maxTools: OPENAI_MAX_TOOLS,
-        serverOrder: (agent.mcp_servers ?? []).map((s) => s.name).filter(Boolean) as string[],
-      });
-      omaTools = budget.tools as Record<string, unknown>;
-      runtime.broadcast({
-        type: "session.warning",
-        source: "tool_budget",
-        message: `Model accepts at most ${OPENAI_MAX_TOOLS} tools; deferred ${budget.deferred.size} MCP tools.`,
-      } as SessionEvent);
-    }
+    // 2. Tool budget — same one default-loop applies: MCP servers over the
+    //    size budget (every provider) or OpenAI's 128-tool cap are deferred
+    //    behind search_mcp_tools / call_mcp_tool. After the permission
+    //    gates (buildTools), deterministic per tool list.
+    const budget = applyAgentToolBudget(omaTools as ToolSet, agent, {
+      maxTools: resolved.openAiToolNames ? OPENAI_MAX_TOOLS : undefined,
+    });
+    omaTools = budget.tools as Record<string, unknown>;
+    const budgetWarning = toolBudgetWarning(budget, sessionId);
+    if (budgetWarning) runtime.broadcast(budgetWarning);
 
     // 3. Durable tool wrappers + pi adapters.
     const gates = new ToolUseGates();

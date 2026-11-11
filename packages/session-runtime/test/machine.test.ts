@@ -11,6 +11,7 @@ import type {
   SessionEvent,
   UserMessageEvent,
 } from "@open-managed-agents/shared";
+import { attachToolsRelease } from "@open-managed-agents/shared";
 import {
   SessionStateMachine,
   sessionErrorAlreadyEmitted,
@@ -263,6 +264,57 @@ describe("SessionStateMachine human-in-the-loop", () => {
     expect(target).toHaveBeenCalledWith({ title: "Bug" }, expect.objectContaining({ toolCallId: "toolu_meta" }));
     const toolResult = (f.log.getEvents() as Array<Record<string, unknown>>).find((e) => e.type === "agent.tool_result");
     expect(toolResult).toMatchObject({ tool_use_id: "toolu_meta", content: "ISS-1" });
+  });
+
+  it("releases each tool dict it built (MCP clients) once the turn or the approval is done with it", async () => {
+    let calls = 0;
+    const run = async (ctx: HarnessInput) => {
+      calls++;
+      if (calls > 1) return;
+      ctx.eventLog.append({
+        type: "agent.tool_use",
+        id: "toolu_rel",
+        name: "call_mcp_tool",
+        input: { name: "mcp__linear__create_issue", arguments: { title: "Bug" } },
+        evaluated_permission: "ask",
+      } as unknown as SessionEvent);
+      ctx.runtime?.pendingConfirmations?.push("toolu_rel");
+    };
+    const released: string[] = [];
+    const openWhileRunning: boolean[] = [];
+    let built = 0;
+    const f = createMachine(run, {
+      runtime: () => ({ pendingConfirmations: [] }),
+      tools: () => {
+        const id = `dict${++built}`;
+        const dict = {
+          mcp__linear__create_issue: {
+            execute: async () => {
+              // Still open while the approved call runs.
+              openWhileRunning.push(!released.includes(id));
+              return "ISS-2";
+            },
+          },
+        };
+        attachToolsRelease(dict, async () => void released.push(id));
+        return dict;
+      },
+    });
+    const settle = () => new Promise((r) => setTimeout(r, 0));
+    await f.machine.runTurn("agent_test", userMessage);
+    await settle();
+    expect(released).toEqual(["dict1"]);
+    await f.machine.runTurn("agent_test", {
+      type: "user.tool_confirmation",
+      tool_use_id: "toolu_rel",
+      result: "allow",
+    } as never);
+    await settle();
+    // dict2 = the confirmation turn's dict, dict3 = the approval rebuild.
+    expect(released.sort()).toEqual(["dict1", "dict2", "dict3"]);
+    expect(openWhileRunning).toEqual([true]);
+    expect((f.log.getEvents() as Array<Record<string, unknown>>).find((e) => e.type === "agent.tool_result"))
+      .toMatchObject({ tool_use_id: "toolu_rel", content: "ISS-2" });
   });
 
   it("an approved call_mcp_tool with unparseable arguments errors instead of running the target with {}", async () => {

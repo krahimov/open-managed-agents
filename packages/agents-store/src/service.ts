@@ -39,6 +39,7 @@ export interface NewAgentInput {
   aux_model?: AgentConfig["aux_model"];
   reasoning_level?: AgentConfig["reasoning_level"];
   memory?: AgentConfig["memory"];
+  mcp_tool_loading?: AgentConfig["mcp_tool_loading"];
   appendable_prompts?: string[];
   runtime_binding?: AgentConfig["runtime_binding"];
   enable_general_subagent?: boolean;
@@ -62,6 +63,7 @@ export interface UpdateAgentInput {
   aux_model?: AgentConfig["aux_model"] | null;
   reasoning_level?: AgentConfig["reasoning_level"] | null;
   memory?: AgentConfig["memory"] | null;
+  mcp_tool_loading?: AgentConfig["mcp_tool_loading"] | null;
   appendable_prompts?: string[] | null;
   runtime_binding?: AgentConfig["runtime_binding"] | null;
   enable_general_subagent?: boolean | null;
@@ -85,6 +87,7 @@ const UPDATABLE_FIELDS = [
   "aux_model",
   "reasoning_level",
   "memory",
+  "mcp_tool_loading",
   "metadata",
   "appendable_prompts",
   "runtime_binding",
@@ -154,6 +157,7 @@ export class AgentService {
       aux_model: opts.input.aux_model,
       reasoning_level: opts.input.reasoning_level,
       memory: opts.input.memory,
+      mcp_tool_loading: opts.input.mcp_tool_loading,
       appendable_prompts: opts.input.appendable_prompts,
       runtime_binding: opts.input.runtime_binding,
       enable_general_subagent: opts.input.enable_general_subagent,

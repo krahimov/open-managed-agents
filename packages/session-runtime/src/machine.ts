@@ -32,7 +32,7 @@
 // hintTurnInFlight callback).
 
 import { nanoid } from "nanoid";
-import { generateEventId, resolveConfirmedToolCall } from "@open-managed-agents/shared";
+import { generateEventId, releaseTools, resolveConfirmedToolCall } from "@open-managed-agents/shared";
 import type {
   AgentConfig,
   SessionEvent,
@@ -410,6 +410,9 @@ export class SessionStateMachine {
     let ending: "completed" | "interrupted" | "failed" | "silent" = "completed";
     let stopReason: TurnStopReason = { type: "end_turn" };
     let turnFromSeq: number | undefined;
+    // The turn's tool dict, released (MCP clients closed) once the turn is
+    // over — see packages/shared/src/tool-release.ts.
+    let tools: unknown;
     try {
       const before = await this.readEvents(log);
 
@@ -455,7 +458,7 @@ export class SessionStateMachine {
         await this.deps.mountSessionOutputs({ sandbox: this.deps.sandbox });
       }
 
-      const tools = await this.deps.buildTools(agent, this.deps.sandbox);
+      tools = await this.deps.buildTools(agent, this.deps.sandbox);
 
       let runHarness = true;
       if (event.type === "user.tool_confirmation" || event.type === "user.custom_tool_result") {
@@ -547,6 +550,9 @@ export class SessionStateMachine {
         throw wrapped;
       }
     } finally {
+      // Fire-and-forget: closing an MCP client sends a DELETE upstream,
+      // which must not hold up the turn's idle.
+      void releaseTools(tools);
       opts.signal?.removeEventListener("abort", onExternalAbort);
       this.activeTurnId = null;
       if (this.activeController === controller) this.activeController = null;
@@ -741,12 +747,14 @@ export class SessionStateMachine {
     // after per-turn tool budgeting, not in the rebuilt dict).
     let content: string;
     let isError = false;
+    let built: unknown;
     try {
-      const built = (await this.deps.buildTools(withAskGatesLifted(agent), this.deps.sandbox)) as Record<
+      built = await this.deps.buildTools(withAskGatesLifted(agent), this.deps.sandbox);
+      const builtTools = built as Record<
         string,
         { execute?: (input: unknown, opts: unknown) => Promise<unknown> } | undefined
       >;
-      const target = resolveConfirmedToolCall(built, use.name, use.input);
+      const target = resolveConfirmedToolCall(builtTools, use.name, use.input);
       if (target.error) throw new Error(target.error);
       const execute = target.tool?.execute;
       if (!execute) throw new Error(`tool ${target.name} is not available`);
@@ -760,6 +768,8 @@ export class SessionStateMachine {
       if (abortSignal.aborted) throw err;
       content = `Error: ${errorMessage(err)}`;
       isError = true;
+    } finally {
+      void releaseTools(built);
     }
     await this.appendAndPublish(log, toolResultEventFor(use, content, isError));
   }

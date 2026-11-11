@@ -23,10 +23,12 @@ import {
 } from "../../lib/composio-integrations";
 import {
   DEFAULT_REASONING_LEVEL,
+  MCP_TOOL_LOADING_MODES,
   REASONING_LEVEL_LABELS,
   UI_REASONING_LEVELS,
   isReasoningLevel,
   modelSupportsReasoning,
+  type McpToolLoading,
   type ModelCard,
   type ReasoningLevel,
 } from "@open-managed-agents/api-types";
@@ -257,6 +259,10 @@ const INITIAL_FORM = {
   toolOverrides: {} as Record<string, ToolOverride>,
   // Opt-in to the built-in `general_subagent` tool.
   enableGeneralSubagent: false,
+  // `_oma.mcp_tool_loading` (auto | eager | deferred). Not on the Form view
+  // yet — carried through the YAML/JSON config and edits so a value set
+  // there isn't dropped. "" = unset (auto).
+  mcpToolLoading: "" as McpToolLoading | "",
   ambientEnabled: false,
   ambientRuleName: "",
   ambientRuleDescription: "",
@@ -1156,6 +1162,12 @@ export function AgentFormDialog({
           reasoning_level: form.reasoningLevel,
         };
       }
+      if (form.mcpToolLoading && !form.runtimeId) {
+        payload._oma = {
+          ...((payload._oma as Record<string, unknown>) ?? {}),
+          mcp_tool_loading: form.mcpToolLoading,
+        };
+      }
 
       const agent = await api<Agent>("/v1/agents", {
         method: "POST",
@@ -1263,6 +1275,11 @@ export function AgentFormDialog({
         const currentLevel = editAgent._oma?.reasoning_level ?? null;
         if ((desiredLevel ?? DEFAULT_REASONING_LEVEL) !== (currentLevel ?? DEFAULT_REASONING_LEVEL)) {
           oma.reasoning_level = desiredLevel;
+        }
+        // null clears back to the default (auto); unchanged → not sent.
+        const desiredLoading = form.mcpToolLoading || null;
+        if (desiredLoading !== (editAgent._oma?.mcp_tool_loading ?? null)) {
+          oma.mcp_tool_loading = desiredLoading;
         }
       }
       payload._oma = oma;
@@ -1386,6 +1403,9 @@ export function AgentFormDialog({
     }
     if (reasoningLevelForWire(form.reasoningLevel) !== null && !form.runtimeId) {
       config._oma = { reasoning_level: form.reasoningLevel };
+    }
+    if (form.mcpToolLoading && !form.runtimeId) {
+      config._oma = { ...((config._oma as Record<string, unknown>) ?? {}), mcp_tool_loading: form.mcpToolLoading };
     }
     return config;
   };
@@ -1959,6 +1979,7 @@ function configToForm(parsed: Record<string, unknown>): FormState {
     harness?: string;
     runtime_binding?: { runtime_id?: string; acp_agent_id?: string; local_skill_blocklist?: string[] };
     reasoning_level?: unknown;
+    mcp_tool_loading?: unknown;
   };
   const rb =
     (parsed.runtime_binding as typeof oma.runtime_binding | undefined) ?? oma.runtime_binding;
@@ -1996,6 +2017,7 @@ function configToForm(parsed: Record<string, unknown>): FormState {
         : "";
   const multiagent = parsed.multiagent as { agents?: unknown } | null | undefined;
   const rl = (parsed.reasoning_level as unknown) ?? oma.reasoning_level;
+  const mtl = (parsed.mcp_tool_loading as unknown) ?? oma.mcp_tool_loading;
   return {
     ...INITIAL_FORM,
     name: String(parsed.name || ""),
@@ -2033,6 +2055,7 @@ function configToForm(parsed: Record<string, unknown>): FormState {
     toolOverrides: overrides,
     enableGeneralSubagent: parsed.enable_general_subagent === true,
     reasoningLevel: isReasoningLevel(rl) ? rl : DEFAULT_REASONING_LEVEL,
+    mcpToolLoading: (MCP_TOOL_LOADING_MODES as readonly unknown[]).includes(mtl) ? (mtl as McpToolLoading) : "",
   };
 }
 type FormSetter = React.Dispatch<React.SetStateAction<FormState>>;

@@ -11,7 +11,15 @@ import { llmLoggingMiddleware, llmLogKey } from "./llm-logging-middleware";
 import { isOpenAiCompatModel, isOpenAiResponsesModel, sanitizeOpenAiToolNames, reasoningProviderOptions } from "./provider";
 import { applyOpenAiStrictSchemas } from "./openai-tool-schema";
 import type { ToolSet } from "ai";
-import { OPENAI_MAX_TOOLS, SEARCH_TOOL_NAME, CALL_TOOL_NAME, applyToolBudget, toolCallNeedsApproval } from "./tool-budget";
+import {
+  OPENAI_MAX_TOOLS,
+  SEARCH_TOOL_NAME,
+  CALL_TOOL_NAME,
+  applyAgentToolBudget,
+  toolBudgetWarning,
+  toolCallNeedsApproval,
+} from "./tool-budget";
+import { isCallToolResult, mcpResultForModel, mcpWireText } from "./mcp-output";
 import { classifyTool, idempotencyKeyFor } from "@open-managed-agents/session-runtime";
 import type { ToolExecutionClass } from "@open-managed-agents/shared";
 import {
@@ -192,13 +200,18 @@ export function toolResultEvents(part: {
       ? { type: "error-text", value: String(part.error ?? "") }
       : (part.output ?? part.result);
 
-  const content = normalizeToolOutputForWire(raw);
+  // MCP tools already return the model-facing form (mcp-output.ts); a raw
+  // CallToolResult only reaches here from a tool dict built elsewhere, and
+  // gets the same conversion so the stored copy is what the model saw.
+  const content =
+    isMcpTool(toolName) && isCallToolResult(raw) ? mcpResultForModel(raw) : normalizeToolOutputForWire(raw);
 
   if (isMcpTool(toolName)) {
     out.push({
       type: "agent.mcp_tool_result",
       mcp_tool_use_id: toolCallId,
-      content: typeof content === "string" ? content : JSON.stringify(content),
+      // string on the wire: images become a placeholder (mcpWireText).
+      content: mcpWireText(content),
       // v1-additive: causal predecessor is the matching agent.mcp_tool_use,
       // whose EventBase.id is set explicitly to toolCallId in
       // toolCallEvents above. Same identity, no extra plumbing.
@@ -382,6 +395,21 @@ export class DefaultHarness implements HarnessInterface {
       } as SessionEvent);
     }
 
+    // Tool budget (tool-budget.ts), every provider: MCP servers whose
+    // definitions don't fit the size budget — or OpenAI's 128-tool cap —
+    // are deferred behind search_mcp_tools / call_mcp_tool. Runs on the
+    // dict buildTools returned, i.e. after the permission gates (denied
+    // tools are gone, ask-gated ones have no execute). Pure function of
+    // the tool list, so the split (and the request prefix) is the same
+    // every turn. Compaction gets the same tools so its request shares
+    // the main loop's cached prefix.
+    const budget = applyAgentToolBudget(tools as ToolSet, agent, {
+      maxTools: isOpenAiCompatModel(model) ? OPENAI_MAX_TOOLS : undefined,
+    });
+    const turnTools = budget.tools as Record<string, any>;
+    const budgetWarning = toolBudgetWarning(budget, sessionId);
+    if (budgetWarning) runtime.broadcast(budgetWarning);
+
     // --- Harness decides HOW to deliver context to the model ---
 
     // 1. Compaction check: ask the harness's own shouldCompact + compact
@@ -393,7 +421,7 @@ export class DefaultHarness implements HarnessInterface {
     const ctxWindow = resolveContextWindowTokens(model);
     if (this.shouldCompact && this.compact && this.shouldCompact(allEvents, { contextWindowTokens: ctxWindow })) {
       try {
-        await this.compact(allEvents, runtime, { model, systemPrompt, tools });
+        await this.compact(allEvents, runtime, { model, systemPrompt, tools: turnTools });
       } catch (err) {
         // Compaction is best-effort. Log and continue — the next turn will
         // try again. Don't fail the whole turn over a summarize error.
@@ -425,30 +453,14 @@ export class DefaultHarness implements HarnessInterface {
     // provider exposes its own knobs via providerOptions. We branch on
     // model.provider here. To add OpenAI/Gemini cache support later, extend
     // the strategy table below; the harness loop above doesn't change.
-    const cached = applyProviderCacheStrategy(model, systemPrompt, tools, messages);
+    // Budgeted BEFORE the cache strategy so Anthropic's last-tool
+    // breakpoint lands on the tools actually sent (the meta tools close
+    // the array when anything was deferred).
+    const cached = applyProviderCacheStrategy(model, systemPrompt, turnTools, messages);
     // OpenAI hard-caps function names at 64 chars — in the tools array AND
     // in replayed history tool_calls. Long MCP names (Composio) 400 the
     // whole turn otherwise. Deterministic mangle; no-op for other providers.
     if (isOpenAiCompatModel(model)) {
-      // …and the tools array at 128 entries. Keep built-ins + whole MCP
-      // servers in harness order while they fit; the rest stay reachable
-      // via search_mcp_tools / call_mcp_tool (see tool-budget.ts). Seen
-      // live: 6 servers → 224 tools → 400 on every turn.
-      if (cached.tools && Object.keys(cached.tools).length > OPENAI_MAX_TOOLS) {
-        const budget = applyToolBudget(cached.tools as ToolSet, {
-          maxTools: OPENAI_MAX_TOOLS,
-          serverOrder: (agent.mcp_servers ?? []).map((srv) => srv.name).filter(Boolean) as string[],
-        });
-        cached.tools = budget.tools as typeof cached.tools;
-        runtime.broadcast({
-          type: "session.warning",
-          source: "tool_budget",
-          message:
-            `Model accepts at most ${OPENAI_MAX_TOOLS} tools; deferred ${budget.deferred.size} MCP tools from ` +
-            `${Object.entries(budget.deferredByServer).map(([srv, n]) => `${srv} (${n})`).join(", ")} — ` +
-            `reachable via ${SEARCH_TOOL_NAME} / ${CALL_TOOL_NAME}.`,
-        } as SessionEvent);
-      }
       // The Responses API applies strict mode on its own when `strict` is
       // omitted, forcing every optional argument to be filled ("" / 0 /
       // null → MCP servers reject the call). Send strict explicitly, with
@@ -832,11 +844,15 @@ export class DefaultHarness implements HarnessInterface {
       // when function tools are present unless reasoning_effort is
       // 'none'. Undefined for every other model — omitted from the
       // request.
+      // promptCacheKey (OpenAI Responses only): routes every session of
+      // this agent to the same prompt-cache shard — they share the tools +
+      // system prefix.
       providerOptions: reasoningProviderOptions(
         model,
         modelId,
         agent.reasoning_level,
         Object.keys(cached.tools ?? {}).length > 0,
+        { promptCacheKey: agent.id },
       ),
       stopWhen: stepCountIs(100),
       abortSignal: runtime.abortSignal,
@@ -1411,7 +1427,8 @@ function resolveContextWindowTokens(model: LanguageModel): number {
 // AI SDK has no provider-agnostic cache abstraction. Each provider exposes
 // its own knobs via providerOptions, so we branch on model.provider:
 //   anthropic: cache_control breakpoints on system / last tool / mid / last msg
-//   openai:    automatic on the API side (no client-side knob to set)
+//   openai:    automatic on the API side; the harness only sets
+//              promptCacheKey (per agent) via reasoningProviderOptions
 //   google:    cachedContent (different model — explicit cache resource creation)
 //   others:    no-op
 //

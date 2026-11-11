@@ -13,6 +13,7 @@
     "./harness/pi": "./src/harness/pi/index.ts",
     "./harness/provider": "./src/harness/provider.ts",
     "./harness/tool-budget": "./src/harness/tool-budget.ts",
+    "./harness/mcp-output": "./src/harness/mcp-output.ts",
     "./harness/openai-tool-schema": "./src/harness/openai-tool-schema.ts",
     "./harness/platform-guidance": "./src/harness/platform-guidance.ts",
     "./runtime/history": "./src/runtime/history.ts",

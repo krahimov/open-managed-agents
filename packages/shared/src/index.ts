@@ -21,3 +21,4 @@ export * from "./policy";
 export * from "./tool-permission";
 export * from "./sql-like";
 export * from "./egress";
+export * from "./tool-release";

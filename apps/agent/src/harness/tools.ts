@@ -4,11 +4,12 @@ import { z } from "zod";
 import { anthropic } from "@ai-sdk/anthropic";
 import type { LanguageModel } from "ai";
 import type { AgentConfig, ToolsetConfig, CustomToolConfig, SessionEvent } from "@open-managed-agents/shared";
-import { evaluatePolicy, resolveToolPermission } from "@open-managed-agents/shared";
+import { attachToolsRelease, evaluatePolicy, resolveToolPermission } from "@open-managed-agents/shared";
 import type { ToMarkdownProvider } from "@open-managed-agents/markdown";
 import type { SandboxExecutor, ProcessHandle } from "./interface";
 import { nanoid } from "nanoid";
 import { idempotencyKeyFor } from "@open-managed-agents/session-runtime";
+import { mcpModelOutput, mcpResultForModel, truncateResult } from "./mcp-output";
 // Browser tools depend on the runtime-agnostic BrowserHarness interface.
 // Concrete adapters (CF / Node / CDP / Disabled) live in the package and
 // dynamic-import their workerd / Node peers only at first launch().
@@ -39,7 +40,8 @@ export const OPT_IN_TOOLS = ["browser"];
 /** Backwards-compat union — used as the recognised-tool-name set for
  *  validation. New callers should prefer DEFAULT_TOOLS or OPT_IN_TOOLS. */
 export const ALL_TOOLS = [...DEFAULT_TOOLS, ...OPT_IN_TOOLS];
-const MAX_TOOL_RESULT_CHARS = 50000;
+// MAX_TOOL_RESULT_CHARS / truncateResult live in ./mcp-output.ts — MCP
+// results are capped with the same limit as built-ins.
 const DEFAULT_BASH_TIMEOUT = 120000;  // 2 minutes (CC default)
 const MAX_BASH_TIMEOUT = 600000;      // 10 minutes (CC max)
 // Cap MCP client init + tools/list. Without this, a hung upstream
@@ -343,18 +345,6 @@ async function stampMcpIdempotencyKey(req: Request, pendingKeys: Map<string, str
     body: JSON.stringify(msg),
     signal: req.signal,
   });
-}
-
-/**
- * Truncate tool results that exceed the maximum size.
- * CC persists to disk; we truncate with preview since we don't have
- * local filesystem access from the harness layer.
- */
-function truncateResult(result: string): string {
-  if (result.length > MAX_TOOL_RESULT_CHARS) {
-    return result.slice(0, MAX_TOOL_RESULT_CHARS) + `\n...(truncated, total ${result.length} chars)`;
-  }
-  return result;
 }
 
 /** Shell-quote an argument safely (POSIX single-quote escaping). */
@@ -1506,6 +1496,12 @@ export async function buildTools(
       const mcpBinding = env.mcpBinding;
       const tenantId = env.tenantId;
       const sessionId = env.sessionId;
+      // Closed by releaseTools() when the turn (or approval) is done with
+      // this dict — see packages/shared/src/tool-release.ts.
+      const mcpClients: Array<{ close(): Promise<void> }> = [];
+      attachToolsRelease(tools, async () => {
+        await Promise.allSettled(mcpClients.splice(0).map((c) => c.close()));
+      });
       for (const server of agentConfig.mcp_servers) {
         if (!server.url) {
           // stdio MCP whose sandbox-side spawn hasn't recorded a URL yet
@@ -1554,6 +1550,7 @@ export async function buildTools(
             }),
             timeoutPromise,
           ]);
+          mcpClients.push(mcpClient);
           // listTools + toolsFromDefinitions (instead of tools()) so the
           // server's ToolAnnotations survive — readOnlyHint/idempotentHint
           // drive crash-recovery classification (classifyTool).
@@ -1573,17 +1570,21 @@ export async function buildTools(
             tools[`mcp__${server.name}__${toolName}`] = {
               ...baseTool,
               ...(annotationsByName.has(toolName) ? { annotations: annotationsByName.get(toolName) } : {}),
+              // execute returns the model-facing form (string, or
+              // ContentBlock[] with images), capped like built-ins — the
+              // same value is persisted and replayed (see mcp-output.ts).
+              toModelOutput: mcpModelOutput,
               ...(origExecute
                 ? {
                     execute: async (args: unknown, options: ToolExecuteOptions) => {
-                      if (!options?.toolCallId) return origExecute(args, options);
+                      if (!options?.toolCallId) return mcpResultForModel(await origExecute(args, options));
                       const key = idempotencyKeyFor(sessionId, options.toolCallId);
                       const sig = mcpCallSignature(toolName, args);
                       const queue = pendingKeys.get(sig) ?? [];
                       queue.push(key);
                       pendingKeys.set(sig, queue);
                       try {
-                        return await origExecute(args, options);
+                        return mcpResultForModel(await origExecute(args, options));
                       } finally {
                         const q = pendingKeys.get(sig);
                         if (q) {

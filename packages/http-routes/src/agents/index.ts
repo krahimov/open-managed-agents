@@ -18,9 +18,10 @@ import { Hono } from "hono";
 import type {
   AgentConfig,
   AgentMemoryConfig,
+  McpToolLoading,
   ReasoningLevel,
 } from "@open-managed-agents/shared";
-import { AGENT_MEMORY_MODES, REASONING_LEVELS } from "@open-managed-agents/shared";
+import { AGENT_MEMORY_MODES, MCP_TOOL_LOADING_MODES, REASONING_LEVELS } from "@open-managed-agents/shared";
 import {
   AgentNotFoundError,
   AgentVersionMismatchError,
@@ -51,6 +52,7 @@ function formatAgent(agent: AgentConfig) {
   if (agent.harness) oma.harness = agent.harness;
   if (agent.reasoning_level) oma.reasoning_level = agent.reasoning_level;
   if (agent.memory) oma.memory = agent.memory;
+  if (agent.mcp_tool_loading) oma.mcp_tool_loading = agent.mcp_tool_loading;
   if (agent.runtime_binding) oma.runtime_binding = agent.runtime_binding;
   if (agent.appendable_prompts && agent.appendable_prompts.length > 0) {
     oma.appendable_prompts = agent.appendable_prompts;
@@ -84,6 +86,7 @@ function formatAgent(agent: AgentConfig) {
     harness: _harness,
     reasoning_level: _rl,
     memory: _mem,
+    mcp_tool_loading: _mtl,
     runtime_binding: _rb,
     appendable_prompts: _ap,
     callable_agents: _ca,
@@ -206,6 +209,16 @@ function invalidReasoningLevel(value: unknown): string | null {
   return `reasoning_level must be one of ${REASONING_LEVELS.join("|")}`;
 }
 
+/** Validate an _oma.mcp_tool_loading value. `undefined`/`null` are fine
+ *  (unset / clear = "auto"); anything else must be one of the enum values. */
+function invalidMcpToolLoading(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string" && (MCP_TOOL_LOADING_MODES as readonly string[]).includes(value)) {
+    return null;
+  }
+  return `mcp_tool_loading must be one of ${MCP_TOOL_LOADING_MODES.join("|")}`;
+}
+
 export interface AgentRoutesDeps extends AmbientWebhookDeps {
   services: RouteServicesArg;
   /** Optional model card validation. CF passes a function backed by
@@ -280,6 +293,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
         harness?: string;
         reasoning_level?: ReasoningLevel;
         memory?: AgentMemoryConfig;
+        mcp_tool_loading?: McpToolLoading;
         runtime_binding?: AgentConfig["runtime_binding"];
         appendable_prompts?: string[];
       };
@@ -292,6 +306,8 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
     if (rlError) return c.json({ error: rlError }, 400);
     const memError = invalidMemoryConfig(raw._oma?.memory);
     if (memError) return c.json({ error: memError }, 400);
+    const mtlError = invalidMcpToolLoading(raw._oma?.mcp_tool_loading);
+    if (mtlError) return c.json({ error: mtlError }, 400);
 
     const body = {
       ...raw,
@@ -300,6 +316,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
       harness: raw._oma?.harness,
       reasoning_level: raw._oma?.reasoning_level,
       memory: raw._oma?.memory,
+      mcp_tool_loading: raw._oma?.mcp_tool_loading,
       runtime_binding: raw._oma?.runtime_binding,
       appendable_prompts: raw._oma?.appendable_prompts,
     };
@@ -378,6 +395,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
         aux_model: body.aux_model,
         reasoning_level: body.reasoning_level,
         memory: body.memory,
+        mcp_tool_loading: body.mcp_tool_loading,
         appendable_prompts: body.appendable_prompts,
         runtime_binding: body.runtime_binding,
         enable_general_subagent: (body as { enable_general_subagent?: boolean })
@@ -700,6 +718,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
         harness?: string;
         reasoning_level?: ReasoningLevel | null;
         memory?: AgentMemoryConfig | null;
+        mcp_tool_loading?: McpToolLoading | null;
         runtime_binding?: AgentConfig["runtime_binding"] | null;
         appendable_prompts?: string[] | null;
       };
@@ -718,6 +737,8 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
     if (rlError) return c.json({ error: rlError }, 400);
     const memError = invalidMemoryConfig(raw._oma?.memory);
     if (memError) return c.json({ error: memError }, 400);
+    const mtlError = invalidMcpToolLoading(raw._oma?.mcp_tool_loading);
+    if (mtlError) return c.json({ error: mtlError }, 400);
 
     const body = {
       ...raw,
@@ -726,6 +747,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
       harness: raw._oma?.harness,
       reasoning_level: raw._oma?.reasoning_level,
       memory: raw._oma?.memory,
+      mcp_tool_loading: raw._oma?.mcp_tool_loading,
       runtime_binding: raw._oma?.runtime_binding,
       appendable_prompts: raw._oma?.appendable_prompts,
     };
@@ -774,6 +796,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
           aux_model: body.aux_model,
           reasoning_level: body.reasoning_level,
           memory: body.memory,
+          mcp_tool_loading: body.mcp_tool_loading,
           appendable_prompts: body.appendable_prompts,
           runtime_binding: body.runtime_binding,
           enable_general_subagent: (body as { enable_general_subagent?: boolean })
