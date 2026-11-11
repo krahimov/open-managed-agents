@@ -40,6 +40,30 @@ describe("describeTool", () => {
     });
     expect(describeTool("mcp__linear__list_issues", {})).toMatchObject({ kind: "mcp", verb: "Linear · list issues" });
   });
+
+  it("labels call_mcp_tool as its deferred target", () => {
+    const direct = describeTool("mcp__linear__create_issue", { title: "Bug" });
+    expect(describeTool("call_mcp_tool", { name: "mcp__linear__create_issue", arguments: { title: "Bug" } })).toEqual(direct);
+    expect(describeTool("call_mcp_tool", { name: "mcp__linear__create_issue", arguments: '{"title":"Bug"}' })).toEqual(direct);
+    expect(describeTool("call_mcp_tool", { name: "mcp__github__repos__create_pr", arguments: {} })).toMatchObject({
+      kind: "mcp",
+      server: "GitHub",
+      tool: "repos create pr",
+    });
+    // missing / malformed target → the generic row
+    expect(describeTool("call_mcp_tool", { arguments: { title: "Bug" } })).toMatchObject({ kind: "other", verb: "Call mcp tool" });
+    expect(describeTool("call_mcp_tool", { name: "create_issue" })).toMatchObject({ kind: "other", verb: "Call mcp tool" });
+  });
+
+  it("labels search_mcp_tools as a tool search", () => {
+    expect(describeTool("search_mcp_tools", { query: "create issue", server: "linear" })).toEqual({
+      kind: "tool_search",
+      verb: "Searched Linear tools for",
+      target: '"create issue"',
+    });
+    expect(describeTool("search_mcp_tools", { query: "pages", limit: 3 })).toMatchObject({ verb: "Searched all tools for", target: '"pages"' });
+    expect(describeTool("search_mcp_tools", {})).toMatchObject({ kind: "other", verb: "Search mcp tools" });
+  });
 });
 
 describe("buildTimeline", () => {
@@ -122,6 +146,31 @@ describe("buildTimeline", () => {
     expect(work(items)).toHaveLength(0);
   });
 
+  it("unwraps call_mcp_tool to its target name and arguments, keeping the call id", () => {
+    const { items } = buildTimeline([
+      user("u1", 0),
+      ev({
+        type: "agent.tool_use",
+        id: "d1",
+        name: "call_mcp_tool",
+        input: { name: "mcp__linear__create_issue", arguments: '{"title":"Bug"}' },
+        processed_at: at(1),
+      }),
+      result("d1", 2, "LIN-1"),
+      ev({ type: "agent.tool_use", id: "d2", name: "call_mcp_tool", input: { arguments: { x: 1 } }, processed_at: at(3) }),
+    ]);
+    const [deferred, malformed] = tools(work(items)[0].steps);
+    expect(deferred).toMatchObject({
+      id: "d1",
+      name: "mcp__linear__create_issue",
+      input: { title: "Bug" },
+      status: "completed",
+      output: "LIN-1",
+      descriptor: { kind: "mcp", server: "Linear", tool: "create issue" },
+    });
+    expect(malformed).toMatchObject({ name: "call_mcp_tool", input: { arguments: { x: 1 } }, descriptor: { kind: "other" } });
+  });
+
   it("labels an interrupted turn as stopped", () => {
     const { items } = buildTimeline([user("u1", 0), bash("c1", 1), ev({ type: "user.interrupt", id: "x" }), idle("i1", 9)]);
     expect(items.find((i) => i.kind === "fold")).toMatchObject({ label: "Stopped after 9s" });
@@ -155,6 +204,16 @@ describe("summarizeSteps", () => {
       ev({ type: "agent.tool_use", id: "g1", name: "grep", input: { pattern: "x" } }),
     ]);
     expect(summarizeSteps(work(mcp.items)[0].steps).label).toBe("Used Slack and Linear, ran 1 command, searched code");
+  });
+
+  it("counts deferred MCP calls as their server and tool searches on their own", () => {
+    const { items } = buildTimeline([
+      user("u1", 0),
+      ev({ type: "agent.tool_use", id: "s1", name: "search_mcp_tools", input: { query: "issue", server: "linear" } }),
+      ev({ type: "agent.tool_use", id: "s2", name: "search_mcp_tools", input: { query: "page" } }),
+      ev({ type: "agent.tool_use", id: "d1", name: "call_mcp_tool", input: { name: "mcp__linear__create_issue", arguments: {} } }),
+    ]);
+    expect(summarizeSteps(work(items)[0].steps)).toMatchObject({ label: "Used Linear, searched tools 2 times", kind: "mcp" });
   });
 });
 

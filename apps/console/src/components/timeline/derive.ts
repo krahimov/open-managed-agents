@@ -1,6 +1,7 @@
 import { formatDuration } from "../../lib/format";
 import type { Event } from "../../lib/events";
 import { buildToolCallIndex, TOOL_STATUS_LABEL } from "../../lib/tool-status";
+import { parseSearchMcpTools, unwrapCallMcpTool } from "../../lib/deferred-mcp";
 import type { Span, Turn, TurnTriggerKind } from "./types";
 
 /**
@@ -145,10 +146,17 @@ export function deriveSpans(
       const endMs = result ? result.t - t0 : startMs;
       if (result) sourceEvents.push(result.e);
       const status = toolIndex.info(typeof e.id === "string" ? e.id : undefined).status;
+      // Deferred MCP meta tools: call_mcp_tool reads like a direct MCP span.
+      const deferred = e.type === "agent.tool_use" ? unwrapCallMcpTool(e.name, e.input) : null;
+      const search = e.type === "agent.tool_use" ? parseSearchMcpTools(e.name, e.input) : null;
       pushSpan({
         key: `tool-${e.id ?? i}`,
-        family: e.type === "agent.tool_use" ? "tool" : "custom_tool",
-        label: String(e.name ?? "tool"),
+        family: deferred ? "mcp" : e.type === "agent.tool_use" ? "tool" : "custom_tool",
+        label: deferred
+          ? `${deferred.server}:${deferred.tool}`
+          : search
+            ? `Searched ${search.server ?? "all"} tools for "${search.query}"`
+            : String(e.name ?? "tool"),
         detail: TOOL_STATUS_LABEL[status],
         ...(status === "failed" || status === "denied" ? { isError: true } : {}),
         startMs,

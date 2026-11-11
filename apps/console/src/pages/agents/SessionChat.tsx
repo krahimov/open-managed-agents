@@ -5,6 +5,7 @@ import {
 } from "@open-managed-agents/api-types";
 import { useApi } from "../../lib/api";
 import type { Event } from "../../lib/events";
+import { unwrapCallMcpTool } from "../../lib/deferred-mcp";
 import { Markdown } from "../../components/Markdown";
 import {
   Conversation,
@@ -76,7 +77,8 @@ function isHarnessUpdate(ev: Event): boolean {
 function isSetupTool(ev: Event): boolean {
   return (
     (typeof ev.name === "string" && ev.name.startsWith("mcp__oma_setup__")) ||
-    ev.mcp_server_name === "oma_setup"
+    ev.mcp_server_name === "oma_setup" ||
+    unwrapCallMcpTool(ev.name, ev.input)?.server === "oma_setup"
   );
 }
 

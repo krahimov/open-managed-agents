@@ -19,11 +19,17 @@ export function ToolConfirmationControls({
   sessionId,
   toolUseId,
   threadId,
+  server,
+  tool,
 }: {
   sessionId: string;
   toolUseId: string;
   /** Non-primary threads are addressed explicitly, like user.interrupt. */
   threadId?: string;
+  /** MCP service and tool being approved ("Linear", "create issue"),
+   *  named in the prompt so the approver sees what will run. */
+  server?: string;
+  tool?: string;
 }) {
   const { api } = useApi();
   const [mode, setMode] = useState<"choose" | "deny">("choose");
@@ -68,7 +74,15 @@ export function ToolConfirmationControls({
 
   return (
     <div className="rounded-md border border-border bg-bg-surface px-3 py-2.5 space-y-2">
-      <div className="text-xs text-fg-muted">This tool call needs your approval before it runs.</div>
+      {server && tool ? (
+        <div className="text-xs text-fg-muted">
+          <span className="font-medium text-fg">{server}</span>
+          <span className="text-fg-subtle"> · </span>
+          <span className="font-medium text-fg">{tool}</span> needs your approval before it runs.
+        </div>
+      ) : (
+        <div className="text-xs text-fg-muted">This tool call needs your approval before it runs.</div>
+      )}
       {mode === "choose" ? (
         <div className="flex items-center gap-2">
           <Button size="sm" onClick={() => void respond("allow")} disabled={busy !== null}>
