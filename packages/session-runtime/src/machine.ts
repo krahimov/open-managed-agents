@@ -32,9 +32,15 @@
 // hintTurnInFlight callback).
 
 import { nanoid } from "nanoid";
-import { generateEventId, releaseTools, resolveConfirmedToolCall } from "@open-managed-agents/shared";
+import {
+  generateEventId,
+  releaseTools,
+  resolveConfirmedToolCall,
+  toolExecutionResultContent,
+} from "@open-managed-agents/shared";
 import type {
   AgentConfig,
+  ContentBlock,
   SessionEvent,
   UserCustomToolResultEvent,
   UserMessageEvent,
@@ -43,7 +49,12 @@ import type {
 import type { LanguageModel } from "ai";
 import type { EventLogRepo } from "@open-managed-agents/event-log";
 import { recoverInterruptedState } from "./recovery";
-import { buildInterruptedToolResult, classifyTool, type ToolExecutionClass } from "./tool-classification";
+import {
+  buildInterruptedToolResult,
+  classifyTool,
+  type McpToolAnnotations,
+  type ToolExecutionClass,
+} from "./tool-classification";
 import type { OrphanTurn, RuntimeAdapter, TurnId } from "./ports";
 import type { SandboxExecutor } from "@open-managed-agents/sandbox";
 import {
@@ -720,24 +731,6 @@ export class SessionStateMachine {
       await this.appendAndPublish(log, toolResultEventFor(use, `Denied: ${denyMsg}`, true));
       return;
     }
-    // A previous attempt at this confirmation died with the approved call
-    // possibly mid-execution (its intent is durable; its result isn't).
-    // Never repeat a side effect blindly — record the unknown outcome.
-    // (An ask-gated call may be stamped "client"; judge the tool itself.)
-    const stamped = use.execution_class as ToolExecutionClass | undefined;
-    const cls = stamped && stamped !== "client" ? stamped : classifyTool(use.name);
-    if (resuming && cls !== "idempotent") {
-      const result = buildInterruptedToolResult({
-        tool_use_id: use.id,
-        event_type: use.type,
-        name: use.name,
-        input: use.input,
-        execution_class: "side_effect",
-        ...(use.idempotency_key ? { idempotency_key: use.idempotency_key } : {}),
-      });
-      if (result) await this.appendAndPublish(log, result);
-      return;
-    }
     // Allowed: rebuild the tool dict with the ask-gates lifted so the
     // tool carries its execute function (buildTools strips it for
     // always_ask / policy-ask tools), then run exactly this call. The
@@ -745,33 +738,70 @@ export class SessionStateMachine {
     // is persisted as soon as it settles. An approved call_mcp_tool runs
     // the deferred MCP tool it names (call_mcp_tool itself only exists
     // after per-turn tool budgeting, not in the rebuilt dict).
-    let content: string;
-    let isError = false;
-    let built: unknown;
-    try {
-      built = await this.deps.buildTools(withAskGatesLifted(agent), this.deps.sandbox);
-      const builtTools = built as Record<
+    type BuiltTool = {
+      execute?: (input: unknown, opts: unknown) => Promise<unknown>;
+      annotations?: McpToolAnnotations;
+    };
+    const buildLifted = async () =>
+      (await this.deps.buildTools(withAskGatesLifted(agent), this.deps.sandbox)) as Record<
         string,
-        { execute?: (input: unknown, opts: unknown) => Promise<unknown> } | undefined
+        BuiltTool | undefined
       >;
-      const target = resolveConfirmedToolCall(builtTools, use.name, use.input);
-      if (target.error) throw new Error(target.error);
-      const execute = target.tool?.execute;
-      if (!execute) throw new Error(`tool ${target.name} is not available`);
-      const result = await execute(target.input, {
-        toolCallId: use.id,
-        messages: [],
-        abortSignal,
-      });
-      content = typeof result === "string" ? result : JSON.stringify(result);
-    } catch (err) {
-      if (abortSignal.aborted) throw err;
-      content = `Error: ${errorMessage(err)}`;
-      isError = true;
+    let built: Record<string, BuiltTool | undefined> | undefined;
+    try {
+      // A previous attempt at this confirmation died with the approved call
+      // possibly mid-execution (its intent is durable; its result isn't).
+      // Never repeat a side effect blindly — record the unknown outcome.
+      // An ask-gated call is stamped "client"; judge the tool itself — for
+      // call_mcp_tool the deferred target it names — by its MCP annotations,
+      // which only the built dict carries (a failed build → by name).
+      if (resuming) {
+        const stamped = use.execution_class as ToolExecutionClass | undefined;
+        let cls: ToolExecutionClass | undefined = stamped && stamped !== "client" ? stamped : undefined;
+        if (!cls) {
+          built = await buildLifted().catch(() => undefined);
+          const t = resolveConfirmedToolCall(built, use.name, use.input);
+          cls = classifyTool(t.name, { annotations: t.tool?.annotations });
+        }
+        if (cls !== "idempotent") {
+          const result = buildInterruptedToolResult({
+            tool_use_id: use.id,
+            event_type: use.type,
+            name: use.name,
+            input: use.input,
+            execution_class: "side_effect",
+            ...(use.idempotency_key ? { idempotency_key: use.idempotency_key } : {}),
+          });
+          if (result) await this.appendAndPublish(log, result);
+          return;
+        }
+      }
+
+      let content: string | ContentBlock[];
+      let isError = false;
+      try {
+        built ??= await buildLifted();
+        const target = resolveConfirmedToolCall(built, use.name, use.input);
+        if (target.error) throw new Error(target.error);
+        const execute = target.tool?.execute;
+        if (!execute) throw new Error(`tool ${target.name} is not available`);
+        const result = await execute(target.input, {
+          toolCallId: use.id,
+          messages: [],
+          abortSignal,
+        });
+        // MCP image results (ContentBlock[]) are stored like the in-turn
+        // path stores them, not as base64 JSON text.
+        content = toolExecutionResultContent(result);
+      } catch (err) {
+        if (abortSignal.aborted) throw err;
+        content = `Error: ${errorMessage(err)}`;
+        isError = true;
+      }
+      await this.appendAndPublish(log, toolResultEventFor(use, content, isError));
     } finally {
       void releaseTools(built);
     }
-    await this.appendAndPublish(log, toolResultEventFor(use, content, isError));
   }
 
   /**

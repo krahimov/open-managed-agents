@@ -6,6 +6,8 @@ export interface FakeMcpTool {
   name: string;
   description?: string;
   inputSchema?: Record<string, unknown>;
+  /** MCP ToolAnnotations (readOnlyHint …), listed as the server sends them. */
+  annotations?: Record<string, unknown>;
 }
 
 export interface FakeMcpServer {
@@ -52,6 +54,7 @@ export function fakeMcpBinding(servers: Record<string, FakeMcpServer>): FakeMcpB
             name: t.name,
             description: t.description ?? "",
             inputSchema: t.inputSchema ?? { type: "object", properties: {} },
+            ...(t.annotations ? { annotations: t.annotations } : {}),
           })),
         });
       case "tools/call": {

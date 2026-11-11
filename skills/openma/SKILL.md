@@ -204,7 +204,9 @@ Agents can also spawn stdio MCP servers inside their sandbox via the
 **Large MCP servers load on demand.** On the default and pi harnesses, MCP
 servers whose tool definitions exceed ~8k tokens (or OpenAI's 128-tool cap)
 are deferred whole, in declared order: the model finds their tools with
-`search_mcp_tools` and runs them with `call_mcp_tool` (one extra round trip
+`search_mcp_tools` (its description lists every deferred tool name; an
+exact name returns that tool's full description and schema) and runs them
+with `call_mcp_tool` (one extra round trip
 the first time; permissions apply as usual). A `tool_budget` session warning
 names the deferred servers. Per agent: `_oma.mcp_tool_loading` = `auto`
 (default) | `eager` (send every definition every call) | `deferred` (defer

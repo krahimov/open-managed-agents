@@ -163,6 +163,9 @@ async function runScripted(opts: {
   agent: AgentConfig;
   binding: FakeMcpBinding;
   turns: number;
+  /** Event log of an interrupted turn: the first run resumes it (its last
+   *  user.message, no new one). */
+  resume?: Array<Record<string, any>>;
 }) {
   const { MockLanguageModelV3 } = await import("ai/test");
   const { DefaultHarness } = await import("@open-managed-agents/agent/harness/default-loop");
@@ -172,11 +175,15 @@ async function runScripted(opts: {
     modelId: opts.modelId,
     doStream: async () => ({ stream: stream(opts.script[n++] ?? text("done")) }) as never,
   });
-  const events: Array<Record<string, any>> = [];
+  const events: Array<Record<string, any>> = opts.resume ?? [];
   const runtimes: ReturnType<typeof harnessRuntime>[] = [];
   for (let i = 0; i < opts.turns; i++) {
-    const userMessage = { type: "user.message", content: [{ type: "text", text: `turn ${i}` }] };
-    events.push(userMessage);
+    let userMessage: Record<string, any> | undefined;
+    if (i === 0 && opts.resume) userMessage = events.findLast((e) => e.type === "user.message");
+    if (!userMessage) {
+      userMessage = { type: "user.message", content: [{ type: "text", text: `turn ${i}` }] };
+      events.push(userMessage);
+    }
     const runtime = harnessRuntime(events);
     runtimes.push(runtime);
     const tools = await build(opts.agent, opts.binding);
@@ -196,6 +203,18 @@ const toolResultIn = (prompt: unknown, toolCallId: string) =>
     .filter((m) => m.role === "tool")
     .flatMap((m) => m.content)
     .find((p) => p.type === "tool-result" && p.toolCallId === toolCallId);
+const toolCallIn = (prompt: unknown, toolCallId: string) =>
+  (prompt as PromptMsg[])
+    .filter((m) => m.role === "assistant")
+    .flatMap((m) => m.content)
+    .find((p) => p.type === "tool-call" && p.toolCallId === toolCallId);
+/** The prompt without providerOptions (Anthropic cache breakpoints move to
+ *  the newest messages every call; they are not part of the cached text). */
+const withoutCacheMarkers = (v: unknown): unknown =>
+  Array.isArray(v) ? v.map(withoutCacheMarkers)
+  : v && typeof v === "object"
+    ? Object.fromEntries(Object.entries(v).filter(([k]) => k !== "providerOptions").map(([k, x]) => [k, withoutCacheMarkers(x)]))
+    : v;
 
 describe("persisted MCP output = what the model saw", () => {
   for (const [provider, modelId] of [["anthropic.messages", "claude-opus-5-5"], ["openai.responses", "gpt-6.1-sol"]] as const) {
@@ -213,8 +232,18 @@ describe("persisted MCP output = what the model saw", () => {
       const replayed = toolResultIn(calls[2].prompt, "toolu_1");
       expect(inTurn?.output).toEqual({ type: "text", value: "Issue SENTRY-1: TypeError" });
       expect(JSON.stringify(replayed?.output)).toBe(JSON.stringify(inTurn?.output));
+      // The tool-call part and the result's toolName replay as the model
+      // called them (history used to rebuild "mcp__sentry__get_call").
+      expect(toolCallIn(calls[2].prompt, "toolu_1")).toEqual(toolCallIn(calls[1].prompt, "toolu_1"));
+      expect(toolCallIn(calls[2].prompt, "toolu_1")).toMatchObject({ toolName: "mcp__sentry__get_issue" });
+      expect(replayed?.toolName).toBe("mcp__sentry__get_issue");
+      // Whole request prefix: turn 2 starts with exactly what turn 1's
+      // second call sent (cache markers aside), so the provider cache hits.
+      const turn1 = withoutCacheMarkers(calls[1].prompt) as unknown[];
+      expect(JSON.stringify((withoutCacheMarkers(calls[2].prompt) as unknown[]).slice(0, turn1.length))).toBe(JSON.stringify(turn1));
       const stored = events.find((e) => e.type === "agent.mcp_tool_result" && e.mcp_tool_use_id === "toolu_1");
       expect(stored?.content).toBe("Issue SENTRY-1: TypeError");
+      expect(events.find((e) => e.type === "agent.mcp_tool_use")).toMatchObject({ mcp_server_name: "sentry" });
     });
   }
 
@@ -297,5 +326,60 @@ describe("deferred MCP tools stay behind the permission gates", () => {
     expect(result).toBe('create_page {"field_0":"Plan"}');
     expect(binding.calls).toEqual([{ server: "notion", name: "create_page", args: { field_0: "Plan" } }]);
     await releaseTools(lifted);
+  });
+});
+
+describe("deferred MCP calls keep their target's crash-recovery class", () => {
+  // Deferred (~50k tokens) server with one read-only tool, as Notion's search is.
+  const notionOnly = agentConfig({ mcp_servers: [{ name: "notion", type: "url", url: "https://mcp.notion.test/mcp" }] } as Partial<AgentConfig>);
+  const readOnlyServers = (call?: (name: string, args: Record<string, unknown>) => unknown) =>
+    fakeMcpBinding({
+      notion: {
+        tools: [
+          { ...syntheticMcpTool("search", 1250), annotations: { readOnlyHint: true } },
+          ...Array.from({ length: 39 }, (_, i) => syntheticMcpTool(i === 0 ? "create_page" : `op_${i}`, 1250)),
+        ],
+        call,
+      },
+    });
+
+  it("call_mcp_tool is stamped by its target's annotations: a deferred read is idempotent, a write side_effect", async () => {
+    const binding = readOnlyServers();
+    const { events } = await runScripted({
+      provider: "anthropic.messages", modelId: "claude-opus-5-5", binding, agent: notionOnly, turns: 1,
+      script: [
+        toolCall("toolu_read", CALL_TOOL_NAME, { name: "mcp__notion__search", arguments: { field_0: "roadmap" } }),
+        toolCall("toolu_write", CALL_TOOL_NAME, { name: "mcp__notion__create_page", arguments: { field_0: "x" } }),
+      ],
+    });
+    expect(events.find((e) => e.id === "toolu_read")).toMatchObject({ type: "agent.tool_use", execution_class: "idempotent" });
+    expect(events.find((e) => e.id === "toolu_write")).toMatchObject({ type: "agent.tool_use", execution_class: "side_effect" });
+  });
+
+  it("an interrupted idempotent call_mcp_tool is re-run through its target on the next turn", async () => {
+    const binding = readOnlyServers((name, args) => ({ content: [{ type: "text", text: `${name} found ${String(args.field_0)}` }] }));
+    const interrupted: Array<Record<string, any>> = [
+      { type: "user.message", content: [{ type: "text", text: "find the roadmap" }] },
+      {
+        type: "agent.tool_use",
+        id: "toolu_orphan",
+        name: CALL_TOOL_NAME,
+        input: { name: "mcp__notion__search", arguments: { field_0: "roadmap" } },
+        execution_class: "idempotent",
+        idempotency_key: "sess_mcp:toolu_orphan",
+      },
+    ];
+    const { events } = await runScripted({
+      provider: "anthropic.messages", modelId: "claude-opus-5-5", binding, agent: notionOnly, turns: 1,
+      resume: interrupted, script: [text("found it")],
+    });
+    expect(binding.calls).toEqual([{ server: "notion", name: "search", args: { field_0: "roadmap" } }]);
+    expect(events.find((e) => e.type === "agent.tool_result" && e.tool_use_id === "toolu_orphan")).toMatchObject({
+      content: "search found roadmap",
+    });
+    expect(events.find((e) => e.type === "session.warning" && e.source === "tool_call_recovered")?.details).toMatchObject({
+      reexecuted: ["toolu_orphan"],
+      injected: [],
+    });
   });
 });

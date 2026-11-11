@@ -19,8 +19,10 @@
 //      servers are still tried.
 //   3. Servers that don't fit are "deferred": their tools leave the array
 //      and become reachable through two meta tools — `search_mcp_tools`
-//      (find by keyword, returns names + input schemas) and `call_mcp_tool`
-//      (invoke a deferred tool by full name). Same idea as Claude Code's
+//      (find by keyword, returns names + input schemas + the start of each
+//      description; an exact tool name returns its full description, and
+//      the search tool's own description lists every deferred name) and
+//      `call_mcp_tool` (invoke a deferred tool by full name). Same idea as Claude Code's
 //      deferred ToolSearch / Anthropic's tool-search: the model can still
 //      do everything, it just discovers the long tail on demand — at the
 //      cost of one extra round trip the first time it needs such a tool.
@@ -45,6 +47,7 @@
 import { asSchema, jsonSchema, tool, type Tool, type ToolSet } from "ai";
 import { z } from "zod";
 import type { AgentConfig, McpToolLoading, SessionEvent } from "@open-managed-agents/shared";
+import type { McpToolAnnotations } from "@open-managed-agents/session-runtime";
 import {
   CALL_MCP_BAD_ARGUMENTS,
   CALL_MCP_TOOL_NAME,
@@ -143,6 +146,25 @@ export function toolCallNeedsApproval(t: unknown, input: unknown): boolean {
   }
 }
 
+/**
+ * MCP annotations that classify a call for crash recovery (classifyTool):
+ * a call_mcp_tool call takes its deferred TARGET's (readOnlyHint /
+ * idempotentHint), so a deferred read stays idempotent like the direct
+ * call would be; any other tool its own.
+ */
+export function classificationAnnotations(
+  toolName: string,
+  t: unknown,
+  input: unknown,
+  deferred: ReadonlyMap<string, unknown> | undefined,
+): McpToolAnnotations | undefined {
+  type Annotated = { annotations?: McpToolAnnotations } | undefined;
+  if (toolName !== CALL_TOOL_NAME) return (t as Annotated)?.annotations;
+  const target = (input as { name?: unknown } | null | undefined)?.name;
+  if (typeof target !== "string") return undefined;
+  return (deferred?.get(target) as Annotated)?.annotations;
+}
+
 function jsonSchemaOf(t: Tool): unknown {
   const schema = (t as { inputSchema?: unknown; parameters?: unknown }).inputSchema ??
     (t as { parameters?: unknown }).parameters;
@@ -176,6 +198,107 @@ export function normalizeMcpToolLoading(v: unknown): McpToolLoading {
   return typeof v === "string" && (MCP_TOOL_LOADING_MODES as readonly string[]).includes(v)
     ? (v as McpToolLoading)
     : "auto";
+}
+
+/** search_mcp_tools: description chars per hit unless the full one is asked for. */
+const SEARCH_DESCRIPTION_CHARS = 400;
+/** Cap on the deferred-tool name list in the search tool's description
+ *  (~1k tokens). Deterministic, so the cached prefix holds. */
+const CATALOG_MAX_CHARS = 4_000;
+
+/** Tool name without the shared `mcp__<server>__` prefix. */
+function bareToolName(name: string): string {
+  const srv = mcpServerOf(name);
+  return srv ? name.slice(MCP_PREFIX.length + srv.length + 2) : name;
+}
+
+/** "notion: a, b, c; linear: d, e" — bare names per server in deferred
+ *  (declared) order, capped at CATALOG_MAX_CHARS. Gives the model the
+ *  catalog keyword search alone can't: a generic word ("page") fills
+ *  every slot with the tools that carry it in their name. */
+function deferredCatalog(deferred: Map<string, Tool>): string {
+  const byServer = new Map<string, string[]>();
+  for (const name of deferred.keys()) {
+    const srv = mcpServerOf(name) ?? "";
+    const list = byServer.get(srv) ?? [];
+    list.push(bareToolName(name));
+    byServer.set(srv, list);
+  }
+  let out = "";
+  let listed = 0;
+  outer: for (const [srv, list] of byServer) {
+    const head = `${out ? "; " : ""}${srv}: `;
+    if (out.length + head.length > CATALOG_MAX_CHARS) break;
+    out += head;
+    for (let i = 0; i < list.length; i++) {
+      const item = `${i ? ", " : ""}${list[i]}`;
+      if (out.length + item.length > CATALOG_MAX_CHARS) break outer;
+      out += item;
+      listed++;
+    }
+  }
+  const rest = deferred.size - listed;
+  return rest > 0 ? `${out} … (+${rest} more — search by keyword)` : out;
+}
+
+// Words that say nothing about which tool is meant ("find the page about …").
+const SEARCH_STOPWORDS = new Set([
+  "a", "an", "the", "of", "to", "in", "on", "for", "and", "or", "with", "by", "from", "at", "about", "into",
+  "my", "me", "i", "it", "is", "are", "be", "this", "that", "some", "any", "all", "tool", "tools", "mcp", "find",
+]);
+
+/** Query → scoring terms: stopwords and deferred server names dropped
+ *  (every tool on a server tends to carry the latter). Falls back to the
+ *  raw terms when nothing is left. */
+function searchTerms(query: string, servers: string[]): string[] {
+  const raw = query.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  const skip = new Set([...SEARCH_STOPWORDS, ...servers.map((s) => s.toLowerCase())]);
+  const kept = raw.filter((t) => !skip.has(t));
+  return kept.length > 0 ? kept : raw;
+}
+
+/** 1 for the same word, 0.75 for either side with a short suffix
+ *  ("page" ~ "pages", "comments" ~ "comment"), 0 otherwise. */
+function wordMatch(words: string[], term: string): number {
+  if (words.includes(term)) return 1;
+  const near = (long: string, short: string) =>
+    short.length >= 3 && long.startsWith(short) && long.length - short.length <= 2;
+  return words.some((w) => near(w, term) || near(term, w)) ? 0.75 : 0;
+}
+
+/** Per term: a word of the bare name 4 (3 for a near word), a substring
+ *  of it 2, a word of the description 1 (0.75), a substring of it 0.5.
+ *  The `mcp__<server>__` prefix is shared by every candidate, so it never
+ *  scores. */
+function scoreTool(name: string, t: Tool, terms: string[]): number {
+  const bare = bareToolName(name).toLowerCase();
+  const nameWords = bare.split(/[^a-z0-9]+/).filter(Boolean);
+  const desc = toolDescription(t).toLowerCase();
+  const descWords = desc.split(/[^a-z0-9]+/).filter(Boolean);
+  let score = 0;
+  for (const term of terms) {
+    const inName = wordMatch(nameWords, term);
+    const inDesc = wordMatch(descWords, term);
+    if (inName) score += 4 * inName;
+    else if (bare.includes(term)) score += 2;
+    else if (inDesc) score += inDesc;
+    else if (desc.includes(term)) score += 0.5;
+  }
+  return score;
+}
+
+/** One search result. Descriptions are cut to SEARCH_DESCRIPTION_CHARS
+ *  unless `fullDescription` — and a cut one says how to get the rest. */
+function searchHit(name: string, t: Tool, fullDescription: boolean): Record<string, unknown> {
+  const d = toolDescription(t);
+  const cut = !fullDescription && d.length > SEARCH_DESCRIPTION_CHARS;
+  return {
+    name,
+    server: mcpServerOf(name),
+    description: cut ? `${d.slice(0, SEARCH_DESCRIPTION_CHARS)}… (truncated — search "${name}" for the full description)` : d,
+    input_schema: jsonSchemaOf(t) ?? "(see description)",
+    ...(hasExecute(t) ? {} : { requires_approval: true }),
+  };
 }
 
 /**
@@ -260,49 +383,49 @@ export function applyToolBudget(tools: ToolSet, opts: ToolBudgetOptions = {}): T
     : overCount && Number.isFinite(maxTools) ? `this model accepts at most ${maxTools} tools`
     : "their definitions are too large to send with every request";
 
+  const catalog = deferredCatalog(deferred);
   direct[SEARCH_TOOL_NAME] = tool({
     description:
       `Find tools from MCP servers that are NOT loaded directly because ${why}. ` +
       `Deferred servers: ${serverSummary}. Search by keyword (tool name or what it does) and optionally restrict to one server; ` +
-      `returns matching tool names with their input schemas. Then invoke one with ${CALL_TOOL_NAME}.`,
+      `returns matching tool names with their input schemas and the start of each description. ` +
+      `Search a tool's exact name to get its FULL description (usage rules, argument formats) before calling it. ` +
+      `Then invoke one with ${CALL_TOOL_NAME}. Deferred tools: ${catalog}`,
     inputSchema: z.object({
-      query: z.string().min(1).max(200).describe("Keywords, e.g. \"create issue\", \"list projects\", \"post message\""),
+      query: z
+        .string()
+        .min(1)
+        .max(200)
+        .describe("Keywords, e.g. \"create issue\", \"list projects\", \"post message\" — or one exact tool name"),
       server: z.string().optional().describe(`Restrict to one deferred server: ${Object.keys(deferredByServer).join(", ")}`),
       limit: z.number().int().min(1).max(40).optional().describe(`Max results (default ${DEFAULT_SEARCH_LIMIT})`),
     }),
     execute: async ({ query, server, limit }: { query: string; server?: string; limit?: number }) => {
-      const terms = query.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+      const inScope = [...deferred].filter(([name]) => !server || mcpServerOf(name) === server);
+      // An exact tool name (full or bare) asks for that tool's whole
+      // definition — the only way the model sees a deferred tool's full
+      // description (Notion's carry its markdown and property-format rules).
+      const q = query.trim().toLowerCase();
+      const exact = inScope.filter(([name]) => name.toLowerCase() === q || bareToolName(name).toLowerCase() === q);
+      if (exact.length > 0) return JSON.stringify(exact.map(([name, t]) => searchHit(name, t, true)), null, 1);
+
+      const terms = searchTerms(query, Object.keys(deferredByServer));
       const scored: Array<{ name: string; score: number }> = [];
-      for (const [name, t] of deferred) {
-        const srv = mcpServerOf(name) ?? "";
-        if (server && srv !== server) continue;
-        const hay = `${name} ${toolDescription(t)}`.toLowerCase();
-        let score = 0;
-        for (const term of terms) {
-          if (name.toLowerCase().includes(term)) score += 3;
-          else if (hay.includes(term)) score += 1;
-        }
-        if (score > 0 || terms.length === 0) scored.push({ name, score });
+      for (const [name, t] of inScope) {
+        const score = scoreTool(name, t, terms);
+        if (score > 0) scored.push({ name, score });
       }
       scored.sort((a, b) => b.score - a.score || a.name.localeCompare(b.name));
       const top = scored.slice(0, limit ?? DEFAULT_SEARCH_LIMIT);
       if (top.length === 0) {
-        return `No deferred tools matched "${query}"${server ? ` on ${server}` : ""}. Deferred servers: ${serverSummary}.`;
+        // Name what there is, so a miss doesn't read as "no such capability".
+        return (
+          `No deferred tools matched "${query}"${server ? ` on ${server}` : ""}. ` +
+          `Deferred tools: ${server ? deferredCatalog(new Map(inScope)) : catalog}`
+        );
       }
-      return JSON.stringify(
-        top.map(({ name }) => {
-          const t = deferred.get(name)!;
-          return {
-            name,
-            server: mcpServerOf(name),
-            description: toolDescription(t).slice(0, 400),
-            input_schema: jsonSchemaOf(t) ?? "(see description)",
-            ...(hasExecute(t) ? {} : { requires_approval: true }),
-          };
-        }),
-        null,
-        1,
-      );
+      // One hit (or limit 1) → its full description, nothing to economize.
+      return JSON.stringify(top.map(({ name }) => searchHit(name, deferred.get(name)!, top.length === 1)), null, 1);
     },
   });
 

@@ -79,10 +79,7 @@ export function eventsToMessages(events: SessionEvent[]): ModelMessage[] {
       event.type === "agent.custom_tool_use"
     ) {
       const e = event as AgentToolUseEvent | AgentMcpToolUseEvent | AgentCustomToolUseEvent;
-      const name = event.type === "agent.mcp_tool_use"
-        ? `mcp_${(e as AgentMcpToolUseEvent).mcp_server_name}_call`
-        : (e as AgentToolUseEvent | AgentCustomToolUseEvent).name;
-      toolNameById.set(e.id, name);
+      toolNameById.set(e.id, toolUseName(e));
     }
   }
 
@@ -175,10 +172,7 @@ export async function eventsToMessagesAsync(
       event.type === "agent.custom_tool_use"
     ) {
       const e = event as AgentToolUseEvent | AgentMcpToolUseEvent | AgentCustomToolUseEvent;
-      const name = event.type === "agent.mcp_tool_use"
-        ? `mcp_${(e as AgentMcpToolUseEvent).mcp_server_name}_call`
-        : (e as AgentToolUseEvent | AgentCustomToolUseEvent).name;
-      toolNameById.set(e.id, name);
+      toolNameById.set(e.id, toolUseName(e));
     }
   }
 
@@ -313,6 +307,22 @@ class MessageAccumulator {
 }
 
 /**
+ * The tool name a replayed tool-call (and its result) carries: the name the
+ * model called, as the event stores it. agent.mcp_tool_use used to be
+ * rebuilt as `mcp_${mcp_server_name}_call` — for "mcp__sentry__get_issue"
+ * that was "mcp__sentry__get_call" (the server name was mis-parsed too), a
+ * tool that doesn't exist, and the request prefix stopped matching the
+ * in-turn one from the first direct MCP call on. The legacy form stays
+ * only for events without a name.
+ */
+function toolUseName(e: AgentToolUseEvent | AgentMcpToolUseEvent | AgentCustomToolUseEvent): string {
+  if (e.type === "agent.mcp_tool_use") {
+    return typeof e.name === "string" && e.name ? e.name : `mcp_${e.mcp_server_name}_call`;
+  }
+  return e.name;
+}
+
+/**
  * Project one non-user event into the accumulator. Shared by the sync and
  * async builders (only `user.message` content conversion differs).
  */
@@ -349,13 +359,10 @@ function projectAgentEvent(
     case "agent.custom_tool_use": {
       acc.beginAssistantPart(event);
       const e = event as AgentToolUseEvent | AgentMcpToolUseEvent | AgentCustomToolUseEvent;
-      const toolName = event.type === "agent.mcp_tool_use"
-        ? `mcp_${(e as AgentMcpToolUseEvent).mcp_server_name}_call`
-        : (e as AgentToolUseEvent | AgentCustomToolUseEvent).name;
       acc.pushAssistant({
         type: "tool-call",
         toolCallId: e.id,
-        toolName,
+        toolName: toolUseName(e),
         input: e.input,
       });
       return;

@@ -22,3 +22,4 @@ export * from "./tool-permission";
 export * from "./sql-like";
 export * from "./egress";
 export * from "./tool-release";
+export * from "./tool-result";

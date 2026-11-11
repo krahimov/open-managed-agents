@@ -16,7 +16,7 @@
 // `tool_use_id` (user.custom_tool_result by `custom_tool_use_id`);
 // agent.mcp_tool_result closes agent.mcp_tool_use by `mcp_tool_use_id`.
 
-import type { AgentConfig, SessionEvent } from "@open-managed-agents/shared";
+import { mcpWireText, type AgentConfig, type ContentBlock, type SessionEvent } from "@open-managed-agents/shared";
 
 export type ToolUseEventType =
   | "agent.tool_use"
@@ -144,17 +144,20 @@ export function computeStopReason(
   };
 }
 
-/** Result event closing `use` (tool_result vs mcp_tool_result shape). */
+/** Result event closing `use` (tool_result vs mcp_tool_result shape).
+ *  ContentBlock[] content (an MCP image result) is kept on agent.tool_result
+ *  and becomes text + image placeholders on agent.mcp_tool_result (string
+ *  on the wire) — the same content the in-turn harness stores. */
 export function toolResultEventFor(
   use: Pick<UnresolvedToolUse, "id" | "type">,
-  content: string,
+  content: string | ContentBlock[],
   isError = false,
 ): SessionEvent {
   if (use.type === "agent.mcp_tool_use") {
     return {
       type: "agent.mcp_tool_result",
       mcp_tool_use_id: use.id,
-      content,
+      content: mcpWireText(content),
       ...(isError ? { is_error: true } : {}),
       parent_event_id: use.id,
     } as unknown as SessionEvent;

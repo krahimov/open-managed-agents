@@ -221,6 +221,116 @@ describe("applyToolBudget — size budget (every provider)", () => {
   });
 });
 
+// A Notion-shaped deferred server: generic words ("page") sit in many tool
+// names, and the definitions that matter carry long usage rules.
+const CREATE_PAGES_RULES =
+  "Creates one or more Notion pages with the specified properties and content. " +
+  "Content uses Notion-flavored markdown: callouts are <callout icon=…>, toggles are <details>, no raw HTML. " +
+  "When the parent is a data source, set parent.data_source_id and pass properties that match its schema. " +
+  "Property formats: title and text properties are strings; number properties are numbers; checkboxes are \"__YES__\" / \"__NO__\". " +
+  "Date properties are expanded into three keys: \"date:<Property>:start\", \"date:<Property>:end\" and \"date:<Property>:is_datetime\" — " +
+  "e.g. \"date:Due Date:start\": \"2026-11-12\", \"date:Due Date:is_datetime\": 0. A plain \"Due Date\": \"2026-11-12\" is rejected.";
+const NOTION_TOOLS: Record<string, string> = {
+  "notion-search": "Search the Notion workspace and connected sources for pages, databases and their content.",
+  "notion-fetch": "Retrieve a Notion page or database by URL or ID and return its full content as Notion-flavored markdown.",
+  "notion-create-pages": CREATE_PAGES_RULES,
+  "notion-update-page": "Update a page's properties or content.",
+  "notion-move-pages": "Move pages to a new parent.",
+  "notion-duplicate-page": "Duplicate a page.",
+  "notion-delete-pages": "Move pages to the trash.",
+  "notion-restore-pages": "Restore pages from the trash.",
+  "notion-list-private-pages": "List the user's private pages.",
+  "notion-list-recent-pages": "List recently visited pages.",
+  "notion-create-database": "Create a database with a schema.",
+  "notion-update-data-source": "Update a data source's schema.",
+  "notion-query-data-sources": "Query rows of one or more data sources with filters.",
+  "notion-create-comment": "Add a comment to a page.",
+  "notion-get-comments": "List the comments on a page.",
+  "notion-get-users": "List workspace users.",
+  "notion-get-teams": "List teamspaces.",
+  "notion-get-self": "Who the integration is.",
+};
+function notionServer(): ToolSet {
+  const out: ToolSet = {};
+  for (const [name, desc] of Object.entries(NOTION_TOOLS)) {
+    out[`mcp__notion__${name}`] = tool({
+      description: desc,
+      inputSchema: jsonSchema({ type: "object", properties: { id: { type: "string" } } }),
+      execute: async () => `${name} ran`,
+    } as never);
+  }
+  return out;
+}
+type Hit = { name: string; description: string };
+async function searchNotion(args: Record<string, unknown>) {
+  const r = applyToolBudget({ ...builtins(3), ...notionServer() }, { mode: "deferred" });
+  const search = r.tools[SEARCH_TOOL_NAME] as { description: string; execute: (a: unknown, o: unknown) => Promise<string> };
+  return { r, search, out: await search.execute(args, {}) };
+}
+const hitNames = (out: string) => (JSON.parse(out) as Hit[]).map((h) => h.name.replace("mcp__notion__", ""));
+
+describe("search_mcp_tools — finding the right deferred tool", () => {
+  it("lists every deferred tool name in its own description (stable across turns)", async () => {
+    const { search } = await searchNotion({ query: "x" });
+    expect(search.description).toContain("notion: notion-search, notion-fetch, notion-create-pages");
+    expect(search.description).toContain("notion-get-self");
+    expect(search.description).toMatch(/exact name to get its FULL description/);
+    const again = applyToolBudget({ ...builtins(3), ...notionServer() }, { mode: "deferred" });
+    expect((again.tools[SEARCH_TOOL_NAME] as { description: string }).description).toBe(search.description);
+  });
+
+  it("caps the name list in the description and says how many are left out", () => {
+    const many: ToolSet = {};
+    for (let i = 0; i < 400; i++) many[`mcp__composio__COMPOSIO_TOOLKIT_ACTION_NUMBER_${i}`] = mk("x");
+    const r = applyToolBudget(many, { mode: "deferred" });
+    const d = (r.tools[SEARCH_TOOL_NAME] as { description: string }).description;
+    expect(d.length).toBeLessThan(5_000);
+    expect(d).toMatch(/\(\+\d+ more — search by keyword\)/);
+  });
+
+  it("an exact tool name returns its full description — the usage rules survive deferral", async () => {
+    for (const query of ["mcp__notion__notion-create-pages", "notion-create-pages", " Notion-Create-Pages "]) {
+      const { out } = await searchNotion({ query });
+      const hits = JSON.parse(out) as Hit[];
+      expect(hits).toHaveLength(1);
+      expect(hits[0].name).toBe("mcp__notion__notion-create-pages");
+      expect(hits[0].description).toBe(CREATE_PAGES_RULES);
+      expect(hits[0].description).toContain("date:Due Date:start");
+    }
+  });
+
+  it("keyword hits are cut at 400 chars and say how to get the rest; a single hit is whole", async () => {
+    const { out } = await searchNotion({ query: "create", limit: 5 });
+    const cut = (JSON.parse(out) as Hit[]).find((h) => h.name === "mcp__notion__notion-create-pages")!;
+    expect(cut.description).not.toContain("date:Due Date:start");
+    expect(cut.description).toContain('truncated — search "mcp__notion__notion-create-pages" for the full description');
+    const single = JSON.parse((await searchNotion({ query: "create pages", limit: 1 })).out) as Hit[];
+    expect(single.map((h) => h.description)).toEqual([CREATE_PAGES_RULES]);
+  });
+
+  it("a miss names the deferred tools instead of only the server", async () => {
+    const { out } = await searchNotion({ query: "roadmap" });
+    expect(out).toMatch(/No deferred tools matched "roadmap"/);
+    expect(out).toContain("notion-fetch");
+    expect(out).toContain("notion-search");
+    const scoped = (await searchNotion({ query: "roadmap", server: "notion" })).out;
+    expect(scoped).toContain("notion-fetch");
+  });
+
+  it("server names and stopwords don't score; name words beat description words", async () => {
+    // "notion" is in every bare name and "the"/"find" in many descriptions.
+    expect(hitNames((await searchNotion({ query: "find the notion search" })).out)[0]).toBe("notion-search");
+    expect(hitNames((await searchNotion({ query: "fetch" })).out)).toEqual(["notion-fetch"]);
+    // Whole word in the name (comments) ranks above a description mention.
+    expect(hitNames((await searchNotion({ query: "comments" })).out).slice(0, 2)).toEqual([
+      "notion-get-comments",
+      "notion-create-comment",
+    ]);
+    // "query" names a tool; it is not dropped as filler.
+    expect(hitNames((await searchNotion({ query: "query data sources" })).out)[0]).toBe("notion-query-data-sources");
+  });
+});
+
 describe("promptCacheKey", () => {
   const model = (provider: string, modelId: string) => ({ provider, modelId, specificationVersion: "v3" }) as never;
   it("is set per agent on the OpenAI Responses path only", () => {

@@ -16,6 +16,8 @@ import {
   SEARCH_TOOL_NAME,
   CALL_TOOL_NAME,
   applyAgentToolBudget,
+  classificationAnnotations,
+  mcpServerOf,
   toolBudgetWarning,
   toolCallNeedsApproval,
 } from "./tool-budget";
@@ -50,9 +52,15 @@ export const isBuiltinTool = (name: string): boolean =>
 
 
 /**
- * Extract the MCP server name from a tool name like "mcp_github_call" or "mcp_github_list_tools".
+ * Extract the MCP server name from a tool name: "mcp__github__list_repos"
+ * (the AI SDK MCP client's naming, buildTools) or the legacy
+ * "mcp_github_call" / "mcp_github_list_tools".
  */
 function extractMcpServerName(toolName: string): string {
+  // mcp__{server}__{tool} — the legacy parse below cut these at the last
+  // "_" ("mcp__sentry__get_issue" → "_sentry__get").
+  const server = mcpServerOf(toolName);
+  if (server) return server;
   // mcp_{server_name}_{call|list_tools}
   const withoutPrefix = toolName.slice(4); // Remove "mcp_"
   const lastUnderscore = withoutPrefix.lastIndexOf("_");
@@ -570,9 +578,12 @@ export class DefaultHarness implements HarnessInterface {
         // call_mcp_tool has an execute but parks (needsApproval) when its
         // target is an always_ask / policy-ask deferred tool.
         const hasExecute = typeof t?.execute === "function" && !toolCallNeedsApproval(t, input);
+        // call_mcp_tool is classified by its deferred target's annotations
+        // (a deferred readOnlyHint tool stays idempotent for recovery).
+        const annotations = classificationAnnotations(toolName, t, input, budget.deferred);
         return {
           idempotency_key: idempotencyKeyFor(sessionId, toolCallId),
-          execution_class: classifyTool(toolName, { hasExecute, annotations: t?.annotations }),
+          execution_class: classifyTool(toolName, { hasExecute, annotations }),
           model_request_start_id: stepStartId ?? undefined,
           pending: !hasExecute,
         };

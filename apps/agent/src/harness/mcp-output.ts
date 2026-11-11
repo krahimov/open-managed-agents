@@ -27,21 +27,12 @@
 // and replay exactly as before.
 
 import type { JSONValue } from "ai";
-import type { ContentBlock } from "@open-managed-agents/shared";
+import { isContentBlockArray, truncateResult, type ContentBlock } from "@open-managed-agents/shared";
 
-export const MAX_TOOL_RESULT_CHARS = 50000;
-
-/**
- * Truncate tool results that exceed the maximum size.
- * CC persists to disk; we truncate with preview since we don't have
- * local filesystem access from the harness layer.
- */
-export function truncateResult(result: string): string {
-  if (result.length > MAX_TOOL_RESULT_CHARS) {
-    return result.slice(0, MAX_TOOL_RESULT_CHARS) + `\n...(truncated, total ${result.length} chars)`;
-  }
-  return result;
-}
+// The cap, ContentBlock[] check and wire placeholder live in shared
+// (packages/shared/src/tool-result.ts) — the approval paths in
+// session-runtime and session-do store results with them too.
+export { MAX_TOOL_RESULT_CHARS, isContentBlockArray, mcpWireText, truncateResult } from "@open-managed-agents/shared";
 
 interface McpContentPart {
   type?: unknown;
@@ -66,14 +57,6 @@ export function isCallToolResult(raw: unknown): raw is CallToolResultLike {
   return Array.isArray(r.content) || "structuredContent" in r || "toolResult" in r;
 }
 
-/** True for a wire ContentBlock[] (what mcpResultForModel returns for image results). */
-export function isContentBlockArray(v: unknown): v is ContentBlock[] {
-  return (
-    Array.isArray(v) &&
-    v.length > 0 &&
-    v.every((b) => !!b && typeof b === "object" && typeof (b as { type?: unknown }).type === "string")
-  );
-}
 
 /**
  * Raw MCP tool output → the value the model sees (and the harness
@@ -112,21 +95,6 @@ export function mcpResultForModel(raw: unknown): string | ContentBlock[] {
   text = truncateResult(text);
   if (images.length === 0) return text;
   return [...(text ? [{ type: "text", text } as ContentBlock] : []), ...images];
-}
-
-/** A ContentBlock[] as plain text for agent.mcp_tool_result (string on the
- *  wire): text kept, each image replaced by a short placeholder. */
-export function mcpWireText(content: string | ContentBlock[]): string {
-  if (typeof content === "string") return content;
-  return content
-    .map((b) => {
-      if (b.type === "text") return b.text;
-      if (b.type === "image") {
-        return `[image ${b.source.media_type ?? ""} returned by the tool — shown when it ran, not kept in history]`;
-      }
-      return JSON.stringify(b);
-    })
-    .join("\n");
 }
 
 type ModelOutput =
