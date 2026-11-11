@@ -22,7 +22,7 @@
 // call instead of treating it as crashed, and "claims" the result slot so
 // exactly one result event is ever persisted per tool call.
 
-import type { SessionEvent } from "@open-managed-agents/shared";
+import { resolveConfirmedToolCall, type SessionEvent } from "@open-managed-agents/shared";
 import {
   findOrphanToolUses,
   buildInterruptedToolResult,
@@ -286,9 +286,14 @@ export async function reconcileOrphanedToolCalls(deps: ReconcileDeps): Promise<R
       inflight.claimed = true;
     }
 
-    const tool = orphan.name ? deps.tools[orphan.name] : undefined;
+    // call_mcp_tool only exists after per-turn budgeting, not in this
+    // (unbudgeted) dict: re-run the deferred target it names, with its
+    // arguments. Stamped idempotent only when the target is (default-loop
+    // toolUseExtras). The result still pairs with the call_mcp_tool use.
+    const target = orphan.name ? resolveConfirmedToolCall(deps.tools, orphan.name, orphan.input ?? {}) : undefined;
+    const tool = target && !target.error ? target.tool : undefined;
     if (orphan.execution_class === "idempotent" && tool && typeof tool.execute === "function") {
-      const settlement = await reexecute(orphan, tool, deps.abortSignal);
+      const settlement = await reexecute(orphan, tool, target!.input, deps.abortSignal);
       const events = deps.resultEvents(settlement);
       for (const e of events) await deps.persist(e);
       report.extraEvents.push(...events);
@@ -309,11 +314,12 @@ async function reexecute(
   orphan: OrphanToolUse,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   tool: any,
+  input: Record<string, unknown>,
   abortSignal?: AbortSignal,
 ): Promise<ToolSettlement> {
   const toolName = orphan.name ?? "unknown";
   try {
-    const output = await tool.execute(orphan.input ?? {}, {
+    const output = await tool.execute(input, {
       toolCallId: orphan.tool_use_id,
       messages: [],
       abortSignal,

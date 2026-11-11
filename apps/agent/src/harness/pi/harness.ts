@@ -50,7 +50,13 @@ import {
   type ToolSettlement,
 } from "../durable-tools";
 import { resolveCompactionStrategy } from "../compaction";
-import { OPENAI_MAX_TOOLS, applyToolBudget, toolCallNeedsApproval } from "../tool-budget";
+import {
+  OPENAI_MAX_TOOLS,
+  applyAgentToolBudget,
+  classificationAnnotations,
+  toolBudgetWarning,
+  toolCallNeedsApproval,
+} from "../tool-budget";
 import { credentialsFromLanguageModel, resolvePiModel, type PiModelCredentials, type ResolvedPiModel } from "./model";
 import { ensureContinuableTail, modelMessagesToPi, providerOptionsFromThinking } from "./messages";
 import { adaptOmaTools, piContentToWire, type AdaptedTools, type OmaToolDetails } from "./tools";
@@ -104,6 +110,9 @@ export interface PiEventBridgeOptions {
   /** OMA tool lookup, for execution-class classification. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   omaTools: Record<string, any>;
+  /** The turn's deferred MCP tools (tool budget) — call_mcp_tool calls
+   *  are classified by their target. */
+  deferredTools?: ReadonlyMap<string, unknown>;
 }
 
 /**
@@ -357,7 +366,10 @@ export class PiEventBridge {
         { toolCallId: call.id, toolName, input: call.arguments ?? {} },
         {
           idempotency_key: idempotencyKeyFor(this.opts.sessionId, call.id),
-          execution_class: classifyTool(toolName, { hasExecute, annotations: t?.annotations }),
+          execution_class: classifyTool(toolName, {
+            hasExecute,
+            annotations: classificationAnnotations(toolName, t, call.arguments, this.opts.deferredTools),
+          }),
           model_request_start_id: stepId,
           pending: !hasExecute,
         },
@@ -456,19 +468,16 @@ export class PiHarness implements HarnessInterface {
     //    which the history projection below honors).
     await this.#maybeCompact(ctx, resolved.model.contextWindow);
 
-    // 2. OpenAI's 128-tool cap — same budget default-loop applies.
-    if (resolved.openAiToolNames && Object.keys(omaTools).length > OPENAI_MAX_TOOLS) {
-      const budget = applyToolBudget(omaTools as ToolSet, {
-        maxTools: OPENAI_MAX_TOOLS,
-        serverOrder: (agent.mcp_servers ?? []).map((s) => s.name).filter(Boolean) as string[],
-      });
-      omaTools = budget.tools as Record<string, unknown>;
-      runtime.broadcast({
-        type: "session.warning",
-        source: "tool_budget",
-        message: `Model accepts at most ${OPENAI_MAX_TOOLS} tools; deferred ${budget.deferred.size} MCP tools.`,
-      } as SessionEvent);
-    }
+    // 2. Tool budget — same one default-loop applies: MCP servers over the
+    //    size budget (every provider) or OpenAI's 128-tool cap are deferred
+    //    behind search_mcp_tools / call_mcp_tool. After the permission
+    //    gates (buildTools), deterministic per tool list.
+    const budget = applyAgentToolBudget(omaTools as ToolSet, agent, {
+      maxTools: resolved.openAiToolNames ? OPENAI_MAX_TOOLS : undefined,
+    });
+    omaTools = budget.tools as Record<string, unknown>;
+    const budgetWarning = toolBudgetWarning(budget, sessionId);
+    if (budgetWarning) runtime.broadcast(budgetWarning);
 
     // 3. Durable tool wrappers + pi adapters.
     const gates = new ToolUseGates();
@@ -487,6 +496,7 @@ export class PiHarness implements HarnessInterface {
       persist,
       gates,
       omaTools: omaTools as never,
+      deferredTools: budget.deferred,
     });
 
     // 4. Transcript — rebuilt from the event log every turn.

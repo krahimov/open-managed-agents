@@ -36,6 +36,8 @@ export interface AgentRecord {
     /** Cross-session memory. Absent = off (and still eligible for the
      *  automatic enable that comes with a first ambient rule). */
     memory?: import("@open-managed-agents/api-types").AgentMemoryConfig;
+    /** MCP tool-definition loading. Absent = auto. */
+    mcp_tool_loading?: import("@open-managed-agents/api-types").McpToolLoading;
     /** "all" = every MCP credential in the session's vaults also becomes a
      *  session server (legacy). Absent = "declared": vaults only
      *  authenticate the agent's own mcp_servers. */

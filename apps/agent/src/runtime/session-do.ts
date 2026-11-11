@@ -69,7 +69,13 @@ import type { ApiCompat } from "../harness/provider";
 import type { LanguageModel } from "ai";
 import { generateText } from "ai";
 import { extractTextFromContent, type JudgeFn } from "@open-managed-agents/shared";
-import { resolveEgressPolicy, resolveConfirmedToolCall, subAgentParkedCalls, type EgressPolicy } from "@open-managed-agents/shared";
+import {
+  resolveEgressPolicy,
+  resolveConfirmedToolCall,
+  subAgentParkedCalls,
+  toolExecutionResultContent,
+  type EgressPolicy,
+} from "@open-managed-agents/shared";
 import {
   runOutcomeSupervisor,
   type ActiveOutcomeState,
@@ -3669,7 +3675,9 @@ export class SessionDO extends DurableObject<Env> {
               messages: [],
               abortSignal: undefined,
             });
-            resultEvent = toolResultEventFor(use, typeof result === "string" ? result : JSON.stringify(result));
+            // MCP image results stored like the in-turn path (placeholder on
+            // agent.mcp_tool_result), not as base64 JSON text.
+            resultEvent = toolResultEventFor(use, toolExecutionResultContent(result));
           } catch (e) {
             resultEvent = toolResultEventFor(use, `Error: ${e instanceof Error ? e.message : String(e)}`, true);
           }

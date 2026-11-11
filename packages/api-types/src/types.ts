@@ -48,6 +48,18 @@ export type ToolConfig = ToolsetConfig | CustomToolConfig;
 export type AgentMemoryMode = "off" | "shared" | "per_user";
 export const AGENT_MEMORY_MODES: readonly AgentMemoryMode[] = ["off", "shared", "per_user"];
 
+/** How the DefaultHarness / pi send MCP tool definitions to the model
+ *  (rides the `_oma` wire envelope).
+ *    auto     — whole servers load directly while their definitions fit
+ *               the size budget (and the provider's tool-count cap); the
+ *               rest are deferred behind search_mcp_tools / call_mcp_tool.
+ *    eager    — every server loads directly (the provider's hard tool-count
+ *               cap still applies).
+ *    deferred — every MCP server is deferred, whatever its size.
+ *  Unset = auto. */
+export type McpToolLoading = "auto" | "eager" | "deferred";
+export const MCP_TOOL_LOADING_MODES: readonly McpToolLoading[] = ["auto", "eager", "deferred"];
+
 export interface AgentMemoryConfig {
   mode: AgentMemoryMode;
   /** The agent's own store for `shared`. Auto-provisioned (and pinned back
@@ -122,6 +134,11 @@ export interface AgentConfig {
    * session, so memory is the only continuity).
    */
   memory?: AgentMemoryConfig;
+  /**
+   * MCP tool-definition loading (see McpToolLoading). OMA-only, rides the
+   * `_oma` wire envelope. Unset = "auto".
+   */
+  mcp_tool_loading?: McpToolLoading;
   /**
    * What the session's vaults contribute to its MCP servers. OMA-only,
    * rides the `_oma` wire envelope.

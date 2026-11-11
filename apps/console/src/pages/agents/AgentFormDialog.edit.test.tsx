@@ -72,7 +72,7 @@ afterEach(() => {
 });
 
 function renderEdit(
-  props: { onSaved?: () => void; onOpenSetup?: () => void; onClose?: () => void } = {},
+  props: { onSaved?: () => void; onOpenSetup?: () => void; onClose?: () => void; editAgent?: AgentRecord } = {},
 ) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -81,7 +81,7 @@ function renderEdit(
         <AgentFormDialog
           open
           onClose={props.onClose ?? (() => {})}
-          editAgent={agent}
+          editAgent={props.editAgent ?? agent}
           onSaved={props.onSaved}
           onOpenSetup={props.onOpenSetup}
           allAgents={[]}
@@ -175,6 +175,43 @@ describe("AgentFormDialog edit mode", () => {
     await waitFor(() => expect(onSaved).toHaveBeenCalled());
     // Unchanged → not re-sent, and in particular not cleared back to "declared".
     expect((savedBody()._oma as Record<string, unknown>).vault_mcp_servers).toBeUndefined();
+  });
+
+  it("round-trips _oma.mcp_tool_loading through the JSON view and only sends it when it changed", async () => {
+    const onSaved = vi.fn();
+    renderEdit({ onSaved, editAgent: { ...agent, _oma: { ...agent._oma, mcp_tool_loading: "deferred" } } });
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/v1/environments"))).toBe(true),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "JSON" }));
+    const editor = await waitFor(() => {
+      const el = document.querySelector("textarea.font-mono") as HTMLTextAreaElement | null;
+      expect(el?.value).toContain("{");
+      return el!;
+    });
+    const config = JSON.parse(editor.value) as { _oma?: Record<string, unknown> };
+    expect(config._oma?.mcp_tool_loading).toBe("deferred");
+
+    // Edit it in the raw config, back to the form, save.
+    fireEvent.change(editor, {
+      target: { value: JSON.stringify({ ...config, _oma: { ...config._oma, mcp_tool_loading: "eager" } }) },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Form" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    expect((savedBody()._oma as Record<string, unknown>).mcp_tool_loading).toBe("eager");
+  });
+
+  it("does not re-send an unchanged mcp_tool_loading", async () => {
+    const onSaved = vi.fn();
+    renderEdit({ onSaved, editAgent: { ...agent, _oma: { ...agent._oma, mcp_tool_loading: "deferred" } } });
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/v1/environments"))).toBe(true),
+    );
+    fireEvent.change(screen.getByDisplayValue("Triage Bot"), { target: { value: "Triage Bot 2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    expect(savedBody()._oma as Record<string, unknown>).not.toHaveProperty("mcp_tool_loading");
   });
 
   it("hands off to the setup chat", () => {

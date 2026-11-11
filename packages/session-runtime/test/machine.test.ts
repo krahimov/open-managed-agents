@@ -11,6 +11,7 @@ import type {
   SessionEvent,
   UserMessageEvent,
 } from "@open-managed-agents/shared";
+import { attachToolsRelease } from "@open-managed-agents/shared";
 import {
   SessionStateMachine,
   sessionErrorAlreadyEmitted,
@@ -265,6 +266,100 @@ describe("SessionStateMachine human-in-the-loop", () => {
     expect(toolResult).toMatchObject({ tool_use_id: "toolu_meta", content: "ISS-1" });
   });
 
+  it("an approved MCP image result is stored like the in-turn one: placeholder on mcp_tool_result, blocks on tool_result", async () => {
+    const png = "A".repeat(1_400_000); // ~1 MB screenshot, base64
+    const blocks = [
+      { type: "text", text: "Screenshot of the dashboard" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: png } },
+    ];
+    const run = async (ctx: HarnessInput) => {
+      if ((ctx.eventLog.getEvents() as SessionEvent[]).some((e) => e.type === "agent.mcp_tool_use")) return;
+      ctx.eventLog.append({
+        type: "agent.mcp_tool_use",
+        id: "toolu_img",
+        name: "mcp__browser__screenshot",
+        mcp_server_name: "browser",
+        input: {},
+        evaluated_permission: "ask",
+      } as unknown as SessionEvent);
+      ctx.eventLog.append({
+        type: "agent.tool_use",
+        id: "toolu_img2",
+        name: "call_mcp_tool",
+        input: { name: "mcp__browser__screenshot", arguments: {} },
+        evaluated_permission: "ask",
+      } as unknown as SessionEvent);
+      ctx.runtime?.pendingConfirmations?.push("toolu_img", "toolu_img2");
+    };
+    // MCP tools return the model-facing form: ContentBlock[] for images.
+    const f = createMachine(run, {
+      runtime: () => ({ pendingConfirmations: [] }),
+      tools: () => ({ mcp__browser__screenshot: { execute: async () => blocks } }),
+    });
+    await f.machine.runTurn("agent_test", userMessage);
+    for (const id of ["toolu_img", "toolu_img2"]) {
+      await f.machine.runTurn("agent_test", { type: "user.tool_confirmation", tool_use_id: id, result: "allow" } as never);
+    }
+    const events = f.log.getEvents() as Array<Record<string, unknown>>;
+    const direct = events.find((e) => e.type === "agent.mcp_tool_result");
+    expect(direct?.content).toBe(
+      "Screenshot of the dashboard\n[image image/png returned by the tool — shown when it ran, not kept in history]",
+    );
+    // agent.tool_result carries ContentBlock[] — the same blocks call_mcp_tool stores in-turn.
+    expect(events.find((e) => e.type === "agent.tool_result")).toMatchObject({ tool_use_id: "toolu_img2", content: blocks });
+  });
+
+  it("releases each tool dict it built (MCP clients) once the turn or the approval is done with it", async () => {
+    let calls = 0;
+    const run = async (ctx: HarnessInput) => {
+      calls++;
+      if (calls > 1) return;
+      ctx.eventLog.append({
+        type: "agent.tool_use",
+        id: "toolu_rel",
+        name: "call_mcp_tool",
+        input: { name: "mcp__linear__create_issue", arguments: { title: "Bug" } },
+        evaluated_permission: "ask",
+      } as unknown as SessionEvent);
+      ctx.runtime?.pendingConfirmations?.push("toolu_rel");
+    };
+    const released: string[] = [];
+    const openWhileRunning: boolean[] = [];
+    let built = 0;
+    const f = createMachine(run, {
+      runtime: () => ({ pendingConfirmations: [] }),
+      tools: () => {
+        const id = `dict${++built}`;
+        const dict = {
+          mcp__linear__create_issue: {
+            execute: async () => {
+              // Still open while the approved call runs.
+              openWhileRunning.push(!released.includes(id));
+              return "ISS-2";
+            },
+          },
+        };
+        attachToolsRelease(dict, async () => void released.push(id));
+        return dict;
+      },
+    });
+    const settle = () => new Promise((r) => setTimeout(r, 0));
+    await f.machine.runTurn("agent_test", userMessage);
+    await settle();
+    expect(released).toEqual(["dict1"]);
+    await f.machine.runTurn("agent_test", {
+      type: "user.tool_confirmation",
+      tool_use_id: "toolu_rel",
+      result: "allow",
+    } as never);
+    await settle();
+    // dict2 = the confirmation turn's dict, dict3 = the approval rebuild.
+    expect(released.sort()).toEqual(["dict1", "dict2", "dict3"]);
+    expect(openWhileRunning).toEqual([true]);
+    expect((f.log.getEvents() as Array<Record<string, unknown>>).find((e) => e.type === "agent.tool_result"))
+      .toMatchObject({ tool_use_id: "toolu_rel", content: "ISS-2" });
+  });
+
   it("an approved call_mcp_tool with unparseable arguments errors instead of running the target with {}", async () => {
     let calls = 0;
     const run = async (ctx: HarnessInput) => {
@@ -422,6 +517,44 @@ describe("SessionStateMachine resume (retried work item)", () => {
     );
     expect(result).toMatchObject({ tool_use_id: "toolu_1", is_error: true });
     expect(String(result?.content)).toMatch(/MAY have taken effect/);
+  });
+
+  it("re-runs an approved call_mcp_tool whose deferred target is read-only (its annotations, not call_mcp_tool's)", async () => {
+    const parked = (target: string) => async (ctx: HarnessInput) => {
+      if ((ctx.eventLog.getEvents() as SessionEvent[]).some((e) => e.type === "agent.tool_use")) return;
+      ctx.eventLog.append({
+        type: "agent.tool_use",
+        id: "toolu_ro",
+        name: "call_mcp_tool",
+        input: { name: target, arguments: { query: "roadmap" } },
+        evaluated_permission: "ask",
+        execution_class: "client",
+      } as unknown as SessionEvent);
+      ctx.runtime?.pendingConfirmations?.push("toolu_ro");
+    };
+    const execute = vi.fn(async () => "3 pages");
+    const tools = () => ({
+      mcp__notion__search: { execute, annotations: { readOnlyHint: true } },
+      mcp__notion__create_pages: { execute },
+    });
+    for (const [target, reruns] of [["mcp__notion__search", true], ["mcp__notion__create_pages", false]] as const) {
+      execute.mockClear();
+      const f = createMachine(parked(target), { runtime: () => ({ pendingConfirmations: [] }), tools });
+      withIdLookup(f.log);
+      await f.machine.runTurn("agent_test", userMessage);
+      const confirmation = { type: "user.tool_confirmation", id: "sevt-c", tool_use_id: "toolu_ro", result: "allow" } as never;
+      f.log.append({ ...(confirmation as object), processed_at: "x" } as SessionEvent);
+      await f.machine.runTurn("agent_test", confirmation);
+
+      const result = (f.log.getEvents() as Array<Record<string, unknown>>).find((e) => e.type === "agent.tool_result");
+      if (reruns) {
+        expect(execute).toHaveBeenCalledWith({ query: "roadmap" }, expect.objectContaining({ toolCallId: "toolu_ro" }));
+        expect(result).toMatchObject({ tool_use_id: "toolu_ro", content: "3 pages" });
+      } else {
+        expect(execute).not.toHaveBeenCalled();
+        expect(String(result?.content)).toMatch(/MAY have taken effect/);
+      }
+    }
   });
 
   it("leaves the turn's own unresolved calls to the harness when resuming a user.message", async () => {

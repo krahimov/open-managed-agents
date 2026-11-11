@@ -130,7 +130,7 @@ Code lives in `apps/agent/src/harness/pi/` and is exported as
   - Tools without `execute` (always_ask, custom) return a pending sentinel and never run.
   - OpenAI tool names are capped at 64 characters with `openAiSafeToolName` and mapped back on emit.
 - `harness.ts` (`PiHarness`):
-  - Reconciles orphaned tool calls, compacts through the platform strategies, and applies the OpenAI 128-tool budget.
+  - Reconciles orphaned tool calls, compacts through the platform strategies, and applies the shared tool budget (MCP servers over the ~8k-token definition budget or OpenAI's 128-tool cap are deferred behind `search_mcp_tools` / `call_mcp_tool`).
   - Rebuilds the transcript, then runs `runAgentLoopContinue` with a leading `SystemMessage` that holds `ctx.systemPrompt` and the tool declarations.
   - Event mapping:
     - Deltas go to `broadcastStreamStart`/`Chunk`/`End`, the Thinking equivalents, and the ToolInput equivalents.
