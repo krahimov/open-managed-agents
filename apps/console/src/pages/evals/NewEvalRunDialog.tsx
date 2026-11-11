@@ -10,6 +10,7 @@
 // under eval.
 
 import { useEffect, useState } from "react";
+import posthog from "posthog-js";
 import { useNavigate } from "react-router";
 import { useApi } from "../../lib/api";
 import { useApiQuery, useQueryClient } from "../../lib/useApiQuery";
@@ -18,6 +19,10 @@ import { Modal } from "../../components/Modal";
 import { Select, SelectOption } from "../../components/Select";
 import { Button } from "@/components/ui/button";
 import type { ModelCard } from "@open-managed-agents/api-types";
+
+const posthogConfigured = Boolean(
+  import.meta.env.VITE_PUBLIC_POSTHOG_PROJECT_TOKEN && import.meta.env.VITE_PUBLIC_POSTHOG_HOST,
+);
 
 interface AgentRow {
   id: string;
@@ -165,6 +170,13 @@ export function NewEvalRunDialog({
           tasks,
         }),
       });
+      if (posthogConfigured) {
+        posthog.capture("eval_run_started", {
+          task_count: tasks.length,
+          judge_model_selection: judgeCardId === AUTO_JUDGE ? "auto" : "selected",
+          judge_reasoning_level: judgeLevel,
+        });
+      }
       void queryClient.invalidateQueries({ queryKey: ["/v1/evals/runs"] });
       onClose();
       nav(`/evals/${res.run_id}`);

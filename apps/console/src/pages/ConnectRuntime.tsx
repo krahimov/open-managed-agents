@@ -1,9 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
+import posthog from "posthog-js";
 import { useApi } from "../lib/api";
 import { useApiQuery } from "../lib/useApiQuery";
 import { Button } from "@/components/ui/button";
 import { Logo } from "../components/Logo";
 import { BRAND_NAME } from "../lib/brand";
+
+const posthogConfigured = Boolean(
+  import.meta.env.VITE_PUBLIC_POSTHOG_PROJECT_TOKEN && import.meta.env.VITE_PUBLIC_POSTHOG_HOST,
+);
 
 /** Browser-side handler for `oma bridge setup`. The CLI binds a random
  *  127.0.0.1 port and opens this URL with `?cb=http://127.0.0.1:<port>/cb&state=<nonce>`.
@@ -93,6 +98,7 @@ export function ConnectRuntime() {
           body: JSON.stringify({ state }),
         },
       );
+      if (posthogConfigured) posthog.capture("runtime_connection_authorized");
       const url = new URL(callback);
       url.searchParams.set("code", code);
       url.searchParams.set("state", state);

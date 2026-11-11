@@ -1,7 +1,12 @@
-import { createContext, useContext, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useRef, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
+import posthog from "posthog-js";
 import { authClient } from "./auth-client";
 import { clerkEnabled, useClerkMappedUser } from "./clerk-auth";
+
+const posthogConfigured = Boolean(
+  import.meta.env.VITE_PUBLIC_POSTHOG_PROJECT_TOKEN && import.meta.env.VITE_PUBLIC_POSTHOG_HOST,
+);
 
 interface User {
   id: string;
@@ -51,6 +56,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           isAuthenticated: true,
         }}
       >
+        <PostHogIdentity user={{ id: "dev-auth-disabled", name: "Local Dev", email: "dev@localhost" }} />
         {children}
       </AuthContext.Provider>
     );
@@ -80,7 +86,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
 function ClerkAuthBridge({ children }: { children: ReactNode }) {
   const value = useClerkMappedUser();
-  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+  return (
+    <AuthContext.Provider value={value}>
+      <PostHogIdentity user={value.user} />
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+function PostHogIdentity({ user }: { user: User | null }) {
+  const identifiedUserId = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!posthogConfigured || !user || identifiedUserId.current === user.id) return;
+
+    if (identifiedUserId.current) posthog.reset();
+
+    posthog.identify(user.id, {
+      ...(user.email ? { email: user.email } : {}),
+      ...(user.name ? { name: user.name } : {}),
+    });
+    identifiedUserId.current = user.id;
+  }, [user]);
+
+  return null;
 }
 
 function SessionAuthProvider({ children }: { children: ReactNode }) {
@@ -111,6 +140,7 @@ function SessionAuthProvider({ children }: { children: ReactNode }) {
         isAuthenticated: !!user,
       }}
     >
+      <PostHogIdentity user={user} />
       {children}
     </AuthContext.Provider>
   );

@@ -20,6 +20,7 @@ import {
 import { useAuth } from "../lib/auth";
 import { useTheme } from "../lib/theme";
 import { authClient } from "../lib/auth-client";
+import posthog from "posthog-js";
 import { Avatar } from "./Avatar";
 import { BRAND_DOCS_URL } from "../lib/brand";
 
@@ -51,6 +52,9 @@ export function UserProfile() {
   if (!user) return null;
 
   const handleSignOut = async () => {
+    if (import.meta.env.VITE_PUBLIC_POSTHOG_PROJECT_TOKEN && import.meta.env.VITE_PUBLIC_POSTHOG_HOST) {
+      posthog.reset();
+    }
     await authClient.signOut();
     window.location.href = "/login";
   };

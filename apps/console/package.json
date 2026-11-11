@@ -21,6 +21,7 @@
     "@open-managed-agents/acp-runtime": "workspace:*",
     "@open-managed-agents/api-types": "workspace:*",
     "@open-managed-agents/integrations-core": "workspace:*",
+    "posthog-js": "1",
     "@radix-ui/react-collapsible": "^1.1.12",
     "@radix-ui/react-dialog": "^1.1.15",
     "@radix-ui/react-popover": "^1.1.15",
