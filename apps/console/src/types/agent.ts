@@ -38,6 +38,10 @@ export interface AgentRecord {
     memory?: import("@open-managed-agents/api-types").AgentMemoryConfig;
     /** MCP tool-definition loading. Absent = auto. */
     mcp_tool_loading?: import("@open-managed-agents/api-types").McpToolLoading;
+    /** "all" = every MCP credential in the session's vaults also becomes a
+     *  session server (legacy). Absent = "declared": vaults only
+     *  authenticate the agent's own mcp_servers. */
+    vault_mcp_servers?: import("@open-managed-agents/api-types").VaultMcpServersMode;
     runtime_binding?: { runtime_id: string; acp_agent_id: string };
     appendable_prompts?: string[];
     default_environment_id?: string;

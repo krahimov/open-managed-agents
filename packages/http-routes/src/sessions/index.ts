@@ -21,6 +21,7 @@ import {
   guessSessionOutputMime,
   REASONING_LEVELS,
   isReasoningLevel,
+  withVaultMcpServers,
 } from "@open-managed-agents/shared";
 import type {
   AgentConfig,
@@ -316,7 +317,6 @@ async function persistGithubRepositoryResourceSecrets(input: {
   }
 }
 
-type McpServer = NonNullable<AgentConfig["mcp_servers"]>[number];
 type VaultCredentialSnapshot = Array<{ vault_id: string; credentials: CredentialConfig[] }>;
 type VaultCredentialSnapshotInput = Array<{
   vault_id: string;
@@ -343,101 +343,6 @@ function normalizeVaultCredentialSnapshot(
       archived_at: credential.archived_at ?? undefined,
     })),
   }));
-}
-
-function withVaultMcpServers(
-  agent: AgentConfig,
-  vaultCredentials: VaultCredentialSnapshot,
-): AgentConfig {
-  const inferred = inferMcpServersFromVaultCredentials(agent.mcp_servers ?? [], vaultCredentials);
-  if (inferred.length === 0) return agent;
-  return {
-    ...agent,
-    mcp_servers: [...(agent.mcp_servers ?? []), ...inferred],
-  };
-}
-
-function inferMcpServersFromVaultCredentials(
-  existingServers: McpServer[],
-  vaultCredentials: VaultCredentialSnapshot,
-): McpServer[] {
-  const existingUrls = new Set(
-    existingServers
-      .map((server) => server.url)
-      .filter((url): url is string => typeof url === "string" && url.length > 0)
-      .map(normalizeMcpUrlForSessionSnapshot)
-      .filter((url): url is string => Boolean(url)),
-  );
-  const usedNames = new Set(existingServers.map((server) => server.name).filter(Boolean));
-  const inferred: McpServer[] = [];
-
-  for (const vault of vaultCredentials) {
-    for (const credential of vault.credentials) {
-      if (credential.archived_at) continue;
-      const auth = credential.auth;
-      const url = auth.mcp_server_url;
-      if (!url || !isMcpCredentialType(auth.type)) continue;
-
-      const normalizedUrl = normalizeMcpUrlForSessionSnapshot(url);
-      if (normalizedUrl && existingUrls.has(normalizedUrl)) continue;
-      if (normalizedUrl) existingUrls.add(normalizedUrl);
-
-      inferred.push({
-        name: uniqueMcpServerName(mcpServerNameBase(auth, url), usedNames),
-        type: "url",
-        url,
-      });
-    }
-  }
-
-  return inferred;
-}
-
-function isMcpCredentialType(type: CredentialConfig["auth"]["type"]): boolean {
-  return type === "mcp_oauth" || type === "static_bearer" || type === "composio_mcp";
-}
-
-function mcpServerNameBase(auth: CredentialConfig["auth"], url: string): string {
-  if (auth.type === "composio_mcp") {
-    const toolkits = Array.isArray(auth.composio_toolkits)
-      ? auth.composio_toolkits
-          .map((toolkit) => toolkit.toLowerCase().replace(/[^a-z0-9]+/g, "_"))
-          .filter(Boolean)
-      : [];
-    return ["composio", ...toolkits.slice(0, 3)].join("_");
-  }
-  try {
-    return new URL(url).hostname.split(".").filter(Boolean)[0] || "mcp";
-  } catch {
-    return "mcp";
-  }
-}
-
-function uniqueMcpServerName(base: string, usedNames: Set<string>): string {
-  const cleanBase = (base || "mcp").toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^_+|_+$/g, "") || "mcp";
-  const trimmedBase = cleanBase.slice(0, 48);
-  if (!usedNames.has(trimmedBase)) {
-    usedNames.add(trimmedBase);
-    return trimmedBase;
-  }
-  for (let i = 2; ; i++) {
-    const suffix = `_${i}`;
-    const candidate = `${trimmedBase.slice(0, 48 - suffix.length)}${suffix}`;
-    if (!usedNames.has(candidate)) {
-      usedNames.add(candidate);
-      return candidate;
-    }
-  }
-}
-
-function normalizeMcpUrlForSessionSnapshot(raw: string): string | null {
-  try {
-    const url = new URL(raw);
-    const path = url.pathname.replace(/\/+$/, "") || "/";
-    return `${url.origin}${path}`;
-  } catch {
-    return null;
-  }
 }
 
 /** Validate the per-session model / reasoning override keys in a metadata
@@ -660,6 +565,8 @@ export function buildSessionRoutes(deps: SessionRoutesDeps) {
       : vaultIds.length > 0
         ? await services.credentials.listByVaults({ tenantId: t, vaultIds })
         : []);
+    // Vault credentials authenticate the agent's declared servers; they add
+    // servers only for agents that opted into `_oma.vault_mcp_servers: "all"`.
     const sessionAgentSnapshot = withVaultMcpServers(
       agentSnapshot as AgentConfig,
       vaultCreds,

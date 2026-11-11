@@ -26,6 +26,7 @@ import type {
 } from "@open-managed-agents/agents-store";
 import type { SessionService } from "@open-managed-agents/sessions-store";
 import type { UserMessageEvent } from "@open-managed-agents/shared";
+import { normalizeMcpServerUrl, vaultMcpServersMode } from "@open-managed-agents/shared";
 import { getLogger } from "@open-managed-agents/observability";
 
 const log = getLogger("ambient-dispatch");
@@ -42,14 +43,14 @@ export interface AmbientDispatcherDeps {
     agentId: string,
     event: UserMessageEvent,
   ): Promise<void>;
-  /** Derive MCP server entries from the vaults' credentials (Composio
-   *  tool-router URLs). Console sessions get these injected into the
-   *  snapshot at create time by the client; ambient sessions must do the
-   *  equivalent server-side or the spawned agent has no integration
-   *  tools (GitHub/Linear/Notion) even though the vault creds attach. */
+  /** MCP servers the vaults' credentials add on top of `declared` — only
+   *  consulted for agents with `vault_mcp_servers: "all"` (the legacy
+   *  inference, same rule the sessions route applies). By default vault
+   *  credentials only authenticate the agent's declared servers. */
   resolveVaultMcpServers?(
     tenantId: string,
     vaultIds: string[],
+    declared: Array<{ name: string; type: string; url?: string }>,
   ): Promise<Array<{ name: string; type: "url"; url: string }>>;
   resolveEnvironment?(tenantId: string, environmentId: string): Promise<import("@open-managed-agents/shared").EnvironmentConfig | null>;
   /** Attach the agent's own memory store (per its memory mode) to the
@@ -140,18 +141,19 @@ export class NodeAmbientDispatcher {
     const vaultIds = Array.isArray(metaVaults)
       ? metaVaults.filter((id): id is string => typeof id === "string" && id.length > 0)
       : [];
-    // Materialize vault-derived MCP servers into the snapshot — parity
-    // with console-created sessions, where the client injects the
-    // Composio tool-router entry. Config-declared servers keep priority;
-    // vault-derived ones are appended (deduped by url).
-    if (vaultIds.length > 0 && this.deps.resolveVaultMcpServers) {
+    // Vault credentials authenticate the declared servers. Only an agent
+    // that opted into `vault_mcp_servers: "all"` also gets a server per
+    // vault credential — parity with the sessions route. Declared servers
+    // keep priority; vault-derived ones are appended (deduped by url).
+    if (vaultIds.length > 0 && this.deps.resolveVaultMcpServers && vaultMcpServersMode(agent) === "all") {
       try {
-        const derived = await this.deps.resolveVaultMcpServers(rule.tenant_id, vaultIds);
         const existing = Array.isArray(agentBase.mcp_servers)
-          ? (agentBase.mcp_servers as Array<{ url?: string }>)
+          ? (agentBase.mcp_servers as Array<{ name: string; type: string; url?: string }>)
           : [];
-        const known = new Set(existing.map((s) => s.url));
-        const merged = [...existing, ...derived.filter((s) => !known.has(s.url))];
+        const derived = await this.deps.resolveVaultMcpServers(rule.tenant_id, vaultIds, existing);
+        const key = (url?: string) => (url ? (normalizeMcpServerUrl(url) ?? url) : undefined);
+        const known = new Set(existing.map((s) => key(s.url)));
+        const merged = [...existing, ...derived.filter((s) => !known.has(key(s.url)))];
         if (merged.length > 0) agentBase.mcp_servers = merged;
       } catch (err) {
         log.warn(

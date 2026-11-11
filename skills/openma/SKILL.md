@@ -188,10 +188,25 @@ Providers: `ant`, `oai`, `ant-compatible`, `oai-compatible`.
 
 ## MCP Server Connections
 
+An agent gets an MCP server's tools only when the server is DECLARED in its
+`mcp_servers`. A vault credential only authenticates a declared server: a
+login in an attached vault does not, on its own, give the agent that server.
+So connecting a server takes both steps:
+
 ```bash
+# 1. Declare the server on the agent
+#    (mcp_servers: [{ "name": "github", "type": "url", "url": "https://api.githubcopilot.com/mcp/" }])
+# 2. Put a login for it in a vault the agent's sessions use (metadata.default_vault_ids)
 oma vaults create "my-vault"
 oma connect github --vault <vault-id>
 ```
+
+The proxy matches the credential to the declared server by URL, ignoring a
+trailing slash. Connect cards in the console (an agent's `request_access`)
+do both steps for you. `_oma.vault_mcp_servers: "all"` restores the old
+behavior (every MCP credential in the session's vaults becomes a server) for
+one agent; avoid it: each extra server's tool definitions are sent on every
+model call.
 
 Known servers: `airtable`, `amplitude`, `apollo`, `asana`, `atlassian`, `clickup`,
 `github`, `intercom`, `linear`, `notion`, `sentry`, `slack`.

@@ -263,6 +263,9 @@ const INITIAL_FORM = {
   // yet — carried through the YAML/JSON config and edits so a value set
   // there isn't dropped. "" = unset (auto).
   mcpToolLoading: "" as McpToolLoading | "",
+  // `_oma.vault_mcp_servers`. No form control — carried so the code view
+  // and edits round-trip it ("all" = legacy vault-implied servers).
+  vaultMcpServers: "declared" as "declared" | "all",
   ambientEnabled: false,
   ambientRuleName: "",
   ambientRuleDescription: "",
@@ -1168,6 +1171,13 @@ export function AgentFormDialog({
           mcp_tool_loading: form.mcpToolLoading,
         };
       }
+      // Same for vault_mcp_servers: unset means "declared".
+      if (form.vaultMcpServers === "all") {
+        payload._oma = {
+          ...((payload._oma as Record<string, unknown>) ?? {}),
+          vault_mcp_servers: "all",
+        };
+      }
 
       const agent = await api<Agent>("/v1/agents", {
         method: "POST",
@@ -1281,6 +1291,9 @@ export function AgentFormDialog({
         if (desiredLoading !== (editAgent._oma?.mcp_tool_loading ?? null)) {
           oma.mcp_tool_loading = desiredLoading;
         }
+      }
+      if (form.vaultMcpServers !== (editAgent._oma?.vault_mcp_servers ?? "declared")) {
+        oma.vault_mcp_servers = form.vaultMcpServers === "all" ? "all" : null;
       }
       payload._oma = oma;
 
@@ -1406,6 +1419,9 @@ export function AgentFormDialog({
     }
     if (form.mcpToolLoading && !form.runtimeId) {
       config._oma = { ...((config._oma as Record<string, unknown>) ?? {}), mcp_tool_loading: form.mcpToolLoading };
+    }
+    if (form.vaultMcpServers === "all") {
+      config._oma = { ...((config._oma as Record<string, unknown>) ?? {}), vault_mcp_servers: "all" };
     }
     return config;
   };
@@ -1969,7 +1985,7 @@ type FormState = typeof INITIAL_FORM;
 /**
  * Best-effort inverse of the create payload: maps an agent config — either a
  * pasted YAML/JSON config or a GET /v1/agents/:id response (where
- * runtime_binding / reasoning_level live under `_oma` and `model` is an
+ * runtime_binding / reasoning_level / vault_mcp_servers live under `_oma` and `model` is an
  * `{ id, speed }` object) — back onto the form. Tool policy round-trips from
  * the first agent_toolset_20260401 entry; custom tools and MCP toolsets
  * aren't editable in the Form view and are carried separately by the caller.
@@ -1980,6 +1996,7 @@ function configToForm(parsed: Record<string, unknown>): FormState {
     runtime_binding?: { runtime_id?: string; acp_agent_id?: string; local_skill_blocklist?: string[] };
     reasoning_level?: unknown;
     mcp_tool_loading?: unknown;
+    vault_mcp_servers?: unknown;
   };
   const rb =
     (parsed.runtime_binding as typeof oma.runtime_binding | undefined) ?? oma.runtime_binding;
@@ -2018,6 +2035,7 @@ function configToForm(parsed: Record<string, unknown>): FormState {
   const multiagent = parsed.multiagent as { agents?: unknown } | null | undefined;
   const rl = (parsed.reasoning_level as unknown) ?? oma.reasoning_level;
   const mtl = (parsed.mcp_tool_loading as unknown) ?? oma.mcp_tool_loading;
+  const vms = (parsed.vault_mcp_servers as unknown) ?? oma.vault_mcp_servers;
   return {
     ...INITIAL_FORM,
     name: String(parsed.name || ""),
@@ -2056,6 +2074,7 @@ function configToForm(parsed: Record<string, unknown>): FormState {
     enableGeneralSubagent: parsed.enable_general_subagent === true,
     reasoningLevel: isReasoningLevel(rl) ? rl : DEFAULT_REASONING_LEVEL,
     mcpToolLoading: (MCP_TOOL_LOADING_MODES as readonly unknown[]).includes(mtl) ? (mtl as McpToolLoading) : "",
+    vaultMcpServers: vms === "all" ? "all" : "declared",
   };
 }
 type FormSetter = React.Dispatch<React.SetStateAction<FormState>>;

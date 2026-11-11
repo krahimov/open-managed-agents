@@ -144,6 +144,37 @@ describe("AgentFormDialog edit mode", () => {
     expect(body.metadata).toBeUndefined();
     // Harness unchanged → not re-sent.
     expect((body._oma as Record<string, unknown>).harness).toBeUndefined();
+    // Unset vault_mcp_servers stays unset ("declared").
+    expect((body._oma as Record<string, unknown>).vault_mcp_servers).toBeUndefined();
+  });
+
+  it("round-trips _oma.vault_mcp_servers: all through an edit", async () => {
+    const onSaved = vi.fn();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <AgentFormDialog
+            open
+            onClose={() => {}}
+            editAgent={{ ...agent, _oma: { ...agent._oma, vault_mcp_servers: "all" } }}
+            onSaved={onSaved}
+            allAgents={[]}
+            customSkills={[]}
+            modelCards={[]}
+            runtimes={[]}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/v1/environments"))).toBe(true),
+    );
+    fireEvent.change(screen.getByDisplayValue("Triage Bot"), { target: { value: "Triage Bot 2" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    // Unchanged → not re-sent, and in particular not cleared back to "declared".
+    expect((savedBody()._oma as Record<string, unknown>).vault_mcp_servers).toBeUndefined();
   });
 
   it("round-trips _oma.mcp_tool_loading through the JSON view and only sends it when it changed", async () => {
