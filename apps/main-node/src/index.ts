@@ -203,6 +203,7 @@ import {
 } from "./lib/node-oauth-routes.js";
 import {
   credentialMatchesMcpServerUrl,
+  orderMatchingCredentials,
   forwardNodeMcpRequestWithRefresh,
   verifyMcpCredential,
   type NodeMcpProxyRefresh,
@@ -4076,73 +4077,69 @@ async function resolveNodeMcpProxyTarget(
   const listed = await credentialService
     .listByVaults({ tenantId, vaultIds })
     .catch(() => []);
-  // First match wins below, so the vault this agent is bound to for this
-  // server (Switch account, the saved-login line) has to come first.
+  // First usable match wins below: the vault this agent is bound to for
+  // this server (Switch account, the saved-login line) comes first, and an
+  // exact-URL credential beats a cosmetic look-alike (orderMatchingCredentials).
   const bound = boundVaultId(agent?.metadata, server.url);
-  const grouped = bound ? preferVaults(listed, [bound]) : listed;
   const composioCandidates: NodeMcpProxyTarget[] = [];
-  for (const group of grouped) {
-    for (const credential of group.credentials) {
-      if ((credential as { archived_at?: string | null }).archived_at) continue;
-      const auth = (credential as unknown as CredentialConfig).auth as
-        | {
-            type?: string;
-            mcp_server_url?: string;
-            bearer_token?: string;
-            token?: string;
-            access_token?: string;
-            api_key?: string;
-            api_key_env?: string;
-            refresh_token?: string;
-            token_endpoint?: string;
-            client_id?: string;
-            client_secret?: string;
-            expires_at?: string;
-          }
-        | undefined;
-      if (!auth || !credentialMatchesMcpServerUrl(auth, server.url)) continue;
+  for (const { vault_id: vaultId, credential } of orderMatchingCredentials(listed, server.url, bound)) {
+    const auth = (credential as unknown as CredentialConfig).auth as
+      | {
+          type?: string;
+          mcp_server_url?: string;
+          bearer_token?: string;
+          token?: string;
+          access_token?: string;
+          api_key?: string;
+          api_key_env?: string;
+          refresh_token?: string;
+          token_endpoint?: string;
+          client_id?: string;
+          client_secret?: string;
+          expires_at?: string;
+        }
+      | undefined;
+    if (!auth) continue;
 
-      if (auth.type === "composio_mcp") {
-        const apiKey = resolveNodeComposioApiKey(auth);
-        if (!apiKey) continue;
-        composioCandidates.push({
-          upstreamUrl: auth.mcp_server_url || server.url,
-          upstreamToken: apiKey,
-          upstreamAuthHeader: { name: "x-api-key", value: apiKey },
-        });
-        continue;
-      }
-
-      const token = auth.bearer_token ?? auth.token ?? auth.access_token;
-      if (!token) continue;
-      const credentialId = (credential as { id: string }).id;
-      const vaultId = group.vault_id;
-      const refresh: NodeMcpProxyRefresh | undefined =
-        auth.type === "mcp_oauth" && auth.refresh_token && auth.token_endpoint
-          ? {
-              refreshToken: auth.refresh_token,
-              tokenEndpoint: auth.token_endpoint,
-              clientId: auth.client_id,
-              clientSecret: auth.client_secret,
-              expiresAtMs: auth.expires_at ? Date.parse(auth.expires_at) || undefined : undefined,
-              persist: async (t) => {
-                await credentialService.refreshAuth({
-                  tenantId,
-                  vaultId,
-                  credentialId,
-                  auth: {
-                    access_token: t.access_token,
-                    refresh_token: t.refresh_token,
-                    expires_at: t.expires_in
-                      ? new Date(Date.now() + t.expires_in * 1000).toISOString()
-                      : undefined,
-                  },
-                });
-              },
-            }
-          : undefined;
-      return { upstreamUrl: server.url, upstreamToken: token, ...(refresh ? { refresh } : {}) };
+    if (auth.type === "composio_mcp") {
+      const apiKey = resolveNodeComposioApiKey(auth);
+      if (!apiKey) continue;
+      composioCandidates.push({
+        upstreamUrl: auth.mcp_server_url || server.url,
+        upstreamToken: apiKey,
+        upstreamAuthHeader: { name: "x-api-key", value: apiKey },
+      });
+      continue;
     }
+
+    const token = auth.bearer_token ?? auth.token ?? auth.access_token;
+    if (!token) continue;
+    const credentialId = (credential as { id: string }).id;
+    const refresh: NodeMcpProxyRefresh | undefined =
+      auth.type === "mcp_oauth" && auth.refresh_token && auth.token_endpoint
+        ? {
+            refreshToken: auth.refresh_token,
+            tokenEndpoint: auth.token_endpoint,
+            clientId: auth.client_id,
+            clientSecret: auth.client_secret,
+            expiresAtMs: auth.expires_at ? Date.parse(auth.expires_at) || undefined : undefined,
+            persist: async (t) => {
+              await credentialService.refreshAuth({
+                tenantId,
+                vaultId,
+                credentialId,
+                auth: {
+                  access_token: t.access_token,
+                  refresh_token: t.refresh_token,
+                  expires_at: t.expires_in
+                    ? new Date(Date.now() + t.expires_in * 1000).toISOString()
+                    : undefined,
+                },
+              });
+            },
+          }
+        : undefined;
+    return { upstreamUrl: server.url, upstreamToken: token, ...(refresh ? { refresh } : {}) };
   }
   // Composio credential selection: any tool-router URL matches any other
   // (credentialMatchesMcpServerUrl), so the vault can yield several

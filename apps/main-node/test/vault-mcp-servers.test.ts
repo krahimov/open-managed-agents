@@ -21,7 +21,7 @@ import {
 } from "@open-managed-agents/shared";
 import type { AgentConfig } from "@open-managed-agents/shared";
 import { NodeAmbientDispatcher } from "../src/lib/node-ambient-dispatch";
-import { credentialMatchesMcpServerUrl } from "../src/lib/node-mcp-proxy";
+import { credentialMatchesMcpServerUrl, orderMatchingCredentials } from "../src/lib/node-mcp-proxy";
 import { attachGrantToAgent, withDeclaredMcpServer } from "../src/lib/setup-harness";
 
 const TENANT = "tnt_vault_mcp";
@@ -278,6 +278,72 @@ describe("Node MCP proxy credential match", () => {
   it("keeps the Composio router cross-match", () => {
     expect(credentialMatchesMcpServerUrl({ type: "composio_mcp", mcp_server_url: COMPOSIO }, COMPOSIO_GENERIC)).toBe(true);
     expect(credentialMatchesMcpServerUrl({ type: "mcp_oauth", mcp_server_url: COMPOSIO }, COMPOSIO_GENERIC)).toBe(false);
+  });
+
+  it("treats the query as part of a non-Composio server's identity (only param order is cosmetic)", () => {
+    const A = "https://mcp.supabase.com/mcp?project_ref=aaa";
+    const B = "https://mcp.supabase.com/mcp?project_ref=bbb";
+    for (const type of ["mcp_oauth", "static_bearer"]) {
+      expect(credentialMatchesMcpServerUrl({ type, mcp_server_url: A }, B)).toBe(false);
+      expect(credentialMatchesMcpServerUrl({ type, mcp_server_url: A }, "https://mcp.supabase.com/mcp")).toBe(false);
+      expect(credentialMatchesMcpServerUrl({ type, mcp_server_url: A }, "https://mcp.supabase.com/mcp/?project_ref=aaa")).toBe(true);
+      expect(
+        credentialMatchesMcpServerUrl({ type, mcp_server_url: "https://x.example.com/mcp?a=1&b=2" }, "https://x.example.com/mcp?b=2&a=1"),
+      ).toBe(true);
+    }
+    expect(
+      credentialMatchesMcpServerUrl({ type: "composio_mcp", mcp_server_url: `${COMPOSIO}?user_id=u1` }, COMPOSIO),
+    ).toBe(true);
+  });
+});
+
+describe("Node MCP proxy credential order (orderMatchingCredentials)", () => {
+  const cred = (id: string, mcp_server_url: string, extra: Record<string, unknown> = {}) => ({
+    id,
+    auth: { type: "mcp_oauth", mcp_server_url },
+    ...extra,
+  });
+  const ids = (out: Array<{ credential: { id: string } }>) => out.map((m) => m.credential.id);
+
+  it("an exact-URL credential beats an older look-alike in the same vault", () => {
+    // Vault page connected `…/mcp/` first; the connect card later stored the
+    // declared `…/mcp` as a second row (raw-string unique index).
+    const groups = [{ vault_id: "vlt_apps", credentials: [cred("old_slash", `${NOTION}/`), cred("exact", NOTION)] }];
+    expect(ids(orderMatchingCredentials(groups, NOTION))).toEqual(["exact", "old_slash"]);
+  });
+
+  it("an exact-URL credential in a later vault beats a look-alike in an earlier one", () => {
+    const groups = [
+      { vault_id: "vlt_personal", credentials: [cred("personal", "https://api.githubcopilot.com/mcp")] },
+      { vault_id: "vlt_work", credentials: [cred("work", GITHUB)] },
+    ];
+    expect(ids(orderMatchingCredentials(groups, GITHUB))).toEqual(["work", "personal"]);
+  });
+
+  it("the bound vault still comes first, exact before loose inside it", () => {
+    const groups = [
+      { vault_id: "vlt_a", credentials: [cred("a_exact", NOTION)] },
+      { vault_id: "vlt_b", credentials: [cred("b_slash", `${NOTION}/`), cred("b_exact", NOTION)] },
+    ];
+    expect(ids(orderMatchingCredentials(groups, NOTION, "vlt_b"))).toEqual(["b_exact", "b_slash", "a_exact"]);
+  });
+
+  it("skips archived and non-matching credentials, and never cross-matches query-scoped accounts", () => {
+    const A = "https://mcp.supabase.com/mcp?project_ref=aaa";
+    const B = "https://mcp.supabase.com/mcp?project_ref=bbb";
+    const groups = [
+      {
+        vault_id: "vlt_apps",
+        credentials: [
+          cred("sb_a", A),
+          cred("sb_b_archived", B, { archived_at: "2026-11-01T00:00:00Z" }),
+          cred("sb_b", B),
+          cred("sentry", SENTRY),
+        ],
+      },
+    ];
+    expect(ids(orderMatchingCredentials(groups, B))).toEqual(["sb_b"]);
+    expect(ids(orderMatchingCredentials(groups, A))).toEqual(["sb_a"]);
   });
 });
 

@@ -276,11 +276,14 @@ function normalizePath(pathname: string): string {
 // (resolveNodeMcpProxyTarget). Vault credentials only AUTHENTICATE the
 // agent's declared servers — they no longer add servers of their own (see
 // packages/shared/src/vault-mcp-servers.ts) — so a declared URL that differs
-// from the stored credential URL only cosmetically (trailing slash, query,
-// host case) must still match, for every credential type. Same rule as the
-// CF proxy (apps/main/src/routes/mcp-proxy.ts credentialMatchesServerUrl).
+// from the stored credential URL only cosmetically (trailing slash, host
+// case, query param order) must still match, for every credential type.
 // Before, Node matched non-Composio credentials by exact string, so `…/mcp`
-// vs `…/mcp/` silently went unauthenticated.
+// vs `…/mcp/` silently went unauthenticated. The query is NOT cosmetic for
+// non-Composio credentials: `…/mcp?project_ref=aaa` and `…?project_ref=bbb`
+// are different accounts, so their params must agree. Composio keeps the
+// query-free compare (its router URLs cross-match anyway). Mirrored in the
+// CF proxy (apps/main/src/routes/mcp-proxy.ts credentialMatchesServerUrl).
 
 export function credentialMatchesMcpServerUrl(
   auth: { type?: string; mcp_server_url?: string },
@@ -289,9 +292,60 @@ export function credentialMatchesMcpServerUrl(
   if (!auth.mcp_server_url) return false;
   if (auth.mcp_server_url === serverUrl) return true;
   const credentialUrl = normalizeMcpServerUrl(auth.mcp_server_url);
-  if (credentialUrl && credentialUrl === normalizeMcpServerUrl(serverUrl)) return true;
+  if (credentialUrl && credentialUrl === normalizeMcpServerUrl(serverUrl)) {
+    if (auth.type === "composio_mcp") return true;
+    if (canonicalMcpQuery(auth.mcp_server_url) === canonicalMcpQuery(serverUrl)) return true;
+  }
   // Composio: any tool-router URL matches any other — the proxy prefers a
   // concrete per-session router over the generic sentinel among candidates.
   if (auth.type !== "composio_mcp") return false;
   return isComposioMcpUrl(auth.mcp_server_url) && isComposioMcpUrl(serverUrl);
+}
+
+/** Search params sorted by key then value, so only their order is cosmetic. */
+function canonicalMcpQuery(raw: string): string {
+  try {
+    const params = [...new URL(raw).searchParams.entries()];
+    const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+    params.sort(([ak, av], [bk, bv]) => (ak === bk ? cmp(av, bv) : cmp(ak, bk)));
+    return new URLSearchParams(params).toString();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * The credentials that may authenticate `serverUrl`, in the order the proxy
+ * tries them (first usable one wins): the vault bound for this server
+ * (Switch account, `metadata.mcp_vault_bindings`) first, then the rest in
+ * listing order; within each, a credential stored under exactly `serverUrl`
+ * before a cosmetic look-alike. One vault can hold both `…/mcp/` and
+ * `…/mcp` (the unique index is on the raw string, and the OAuth reconnect
+ * lookup compares raw strings too), so without the exact-first pass the
+ * older look-alike shadowed the exact credential — and once its login
+ * lapsed the declared server 401'd for good.
+ */
+export function orderMatchingCredentials<C extends { auth?: unknown; archived_at?: string | null }>(
+  groups: ReadonlyArray<{ vault_id: string; credentials: ReadonlyArray<C> }>,
+  serverUrl: string,
+  boundVaultId?: string | null,
+): Array<{ vault_id: string; credential: C }> {
+  const tiers = boundVaultId
+    ? [groups.filter((g) => g.vault_id === boundVaultId), groups.filter((g) => g.vault_id !== boundVaultId)]
+    : [groups];
+  const ordered: Array<{ vault_id: string; credential: C }> = [];
+  for (const tier of tiers) {
+    const exact: typeof ordered = [];
+    const loose: typeof ordered = [];
+    for (const group of tier) {
+      for (const credential of group.credentials) {
+        if (credential.archived_at) continue;
+        const auth = credential.auth as { type?: string; mcp_server_url?: string } | null | undefined;
+        if (!auth || !credentialMatchesMcpServerUrl(auth, serverUrl)) continue;
+        (auth.mcp_server_url === serverUrl ? exact : loose).push({ vault_id: group.vault_id, credential });
+      }
+    }
+    ordered.push(...exact, ...loose);
+  }
+  return ordered;
 }
