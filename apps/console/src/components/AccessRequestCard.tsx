@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import { useApi } from "../lib/api";
 import { Button } from "@/components/ui/button";
 import type { Event } from "../lib/events";
-import { openOAuthPopup } from "../lib/oauth-popup";
+import { openOAuthPopup, subscribeOAuthMessages } from "../lib/oauth-popup";
 import { OAuthAppSetupPanel, type OAuthAppRequirement } from "./OAuthAppSetupPanel";
 
 /**
@@ -199,21 +199,7 @@ export function AccessRequestCard({
         setError(err.message ?? "Provider authentication failed");
       }
     };
-    window.addEventListener("message", handle);
-    let bc: BroadcastChannel | null = null;
-    try {
-      bc = new BroadcastChannel("openma-oauth");
-      bc.addEventListener("message", handle);
-    } catch {
-      // BroadcastChannel is best effort for browsers without support.
-    }
-    return () => {
-      window.removeEventListener("message", handle);
-      if (bc) {
-        bc.removeEventListener("message", handle);
-        bc.close();
-      }
-    };
+    return subscribeOAuthMessages(handle);
   }, [status, service, sessionId, api, isMcpOauth]);
 
   const ensureVault = async (): Promise<{ id: string }> => {
