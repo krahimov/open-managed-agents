@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router";
 import type { Event } from "../lib/events";
-import { openOAuthPopup } from "../lib/oauth-popup";
+import { openOAuthPopup, subscribeOAuthMessages } from "../lib/oauth-popup";
 
 /**
  * Setup attached a saved login instead of asking (system.saved_login_attached):
@@ -56,24 +56,13 @@ export function SavedLoginLine({
         setError(data.message ?? "Sign-in failed");
       }
     };
-    window.addEventListener("message", handle);
-    let bc: BroadcastChannel | null = null;
-    try {
-      bc = new BroadcastChannel("openma-oauth");
-      bc.addEventListener("message", handle);
-    } catch {
-      // BroadcastChannel is best effort for browsers without support.
-    }
+    const unsubscribe = subscribeOAuthMessages(handle);
     // Closing the popup without finishing must not leave the line stuck.
     const closedCheck = window.setInterval(() => {
       if (popupRef.current?.closed) setWaiting(false);
     }, 500);
     return () => {
-      window.removeEventListener("message", handle);
-      if (bc) {
-        bc.removeEventListener("message", handle);
-        bc.close();
-      }
+      unsubscribe();
       window.clearInterval(closedCheck);
     };
   }, [waiting, ev.request_id]);

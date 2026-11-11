@@ -1,6 +1,10 @@
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { waitFor } from "@testing-library/react";
-import { openOAuthPopup } from "./oauth-popup";
+import {
+  createOAuthMessageDeduper,
+  createOAuthMessageHub,
+  openOAuthPopup,
+} from "./oauth-popup";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -50,4 +54,106 @@ it("returns null when the popup is blocked and mints nothing", () => {
   vi.stubGlobal("fetch", fetchMock);
   expect(openOAuthPopup(params(), "oauth")).toBeNull();
   expect(fetchMock).not.toHaveBeenCalled();
+});
+
+describe("OAuth popup messages", () => {
+  /** What node-oauth-routes.ts's callback page posts for a vault connect. */
+  const vaultComplete = (service = "linear") => ({
+    type: "oauth_complete",
+    service,
+    server_name: service,
+    vault_id: "vlt-1",
+    request_id: null,
+    session_id: null,
+    grant_recorded: false,
+    probe_ok: true,
+    probe_message: null,
+  });
+
+  function setup() {
+    const channel = new EventTarget() as EventTarget & { close: () => void };
+    channel.close = vi.fn();
+    const hub = createOAuthMessageHub({
+      openChannel: () => channel as unknown as BroadcastChannel,
+    });
+    const handler = vi.fn();
+    const unsubscribe = hub.subscribe(handler);
+    const viaOpener = (data: unknown, origin = window.location.origin) =>
+      window.dispatchEvent(new MessageEvent("message", { data, origin }));
+    const viaBroadcast = (data: unknown, origin = window.location.origin) =>
+      channel.dispatchEvent(new MessageEvent("message", { data, origin }));
+    return { hub, handler, unsubscribe, channel, viaOpener, viaBroadcast };
+  }
+
+  it("delivers a completion once when it arrives via both postMessage and BroadcastChannel", () => {
+    const { handler, unsubscribe, viaOpener, viaBroadcast } = setup();
+    // The callback page posts the same object to both transports.
+    viaOpener(vaultComplete());
+    viaBroadcast(vaultComplete());
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(handler.mock.calls[0][0].data).toEqual(vaultComplete());
+
+    // Either order.
+    viaBroadcast(vaultComplete("sentry"));
+    viaOpener(vaultComplete("sentry"));
+    expect(handler).toHaveBeenCalledTimes(2);
+    unsubscribe();
+  });
+
+  it("still delivers distinct completions, and repeats on the same transport", () => {
+    const { handler, unsubscribe, viaOpener, viaBroadcast } = setup();
+    viaOpener(vaultComplete("linear"));
+    viaBroadcast(vaultComplete("linear"));
+    viaOpener(vaultComplete("github"));
+    viaBroadcast(vaultComplete("github"));
+    expect(handler.mock.calls.map((c) => c[0].data.service)).toEqual(["linear", "github"]);
+
+    // Opener severed by COOP: a second connect of the same service only
+    // arrives on the channel, and must not be taken for an echo.
+    viaBroadcast(vaultComplete("linear"));
+    viaBroadcast(vaultComplete("linear"));
+    expect(handler).toHaveBeenCalledTimes(4);
+    unsubscribe();
+  });
+
+  it("does not let a message from another origin swallow the real one", () => {
+    const { handler, unsubscribe, viaOpener, viaBroadcast } = setup();
+    viaOpener(vaultComplete(), "https://unrelated.example");
+    viaBroadcast(vaultComplete());
+    expect(handler.mock.calls.map((c) => c[0].origin)).toEqual([
+      "https://unrelated.example",
+      window.location.origin,
+    ]);
+    unsubscribe();
+  });
+
+  it("forgets a copy that never got its pair after the window", () => {
+    const deduper = createOAuthMessageDeduper(1000);
+    const event = { data: vaultComplete(), origin: "https://console.example" };
+    expect(deduper.accept(event, "window", 0)).toBe(true);
+    expect(deduper.accept(event, "broadcast", 2000)).toBe(true);
+    expect(deduper.accept(event, "window", 2500)).toBe(false);
+  });
+
+  it("dedupes across re-subscribing and fans out to every subscriber once", () => {
+    const { hub, handler, unsubscribe, channel, viaOpener, viaBroadcast } = setup();
+    const other = vi.fn();
+    const unsubscribeOther = hub.subscribe(other);
+    viaOpener(vaultComplete());
+    // A component re-subscribing between the two copies (re-render from
+    // handling the first) must not get the second.
+    unsubscribe();
+    const again = vi.fn();
+    const unsubscribeAgain = hub.subscribe(again);
+    viaBroadcast(vaultComplete());
+    expect(handler).toHaveBeenCalledTimes(1);
+    expect(other).toHaveBeenCalledTimes(1);
+    expect(again).not.toHaveBeenCalled();
+
+    unsubscribeOther();
+    unsubscribeAgain();
+    expect(channel.close).toHaveBeenCalled();
+    viaOpener(vaultComplete("after"));
+    expect(again).not.toHaveBeenCalled();
+  });
 });

@@ -127,6 +127,8 @@ export function installChunkReloadHandlers({
   const onPreloadError = (event: Event) => {
     // Only swallow the error when we actually reload; otherwise let it
     // reach the route error UI / component so the user sees something.
+    // preventDefault() makes vite resolve the import to undefined instead
+    // of rejecting, so route chunks must load via lazyRoute (lazy-route.tsx).
     if (handle()) event.preventDefault();
   };
   const onRejection = (event: PromiseRejectionEvent) => {

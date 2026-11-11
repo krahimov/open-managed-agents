@@ -6,6 +6,7 @@ import { toast } from "sonner";
 
 import { getActiveTenantId, readApiErrorMessage, useApi } from "../../lib/api";
 import { useApiQuery } from "../../lib/useApiQuery";
+import { subscribeOAuthMessages } from "../../lib/oauth-popup";
 import { Button } from "@/components/ui/button";
 import { Select, SelectGroup, SelectGroupLabel, SelectOption } from "../../components/Select";
 import { Combobox } from "../../components/Combobox";
@@ -681,21 +682,7 @@ export function AgentFormDialog({
       });
       toast.success("Provider account connected.");
     };
-    window.addEventListener("message", handleOAuthMessage);
-    let bc: BroadcastChannel | null = null;
-    try {
-      bc = new BroadcastChannel("openma-oauth");
-      bc.addEventListener("message", handleOAuthMessage);
-    } catch {
-      // BroadcastChannel is best effort for browsers without support.
-    }
-    return () => {
-      window.removeEventListener("message", handleOAuthMessage);
-      if (bc) {
-        bc.removeEventListener("message", handleOAuthMessage);
-        bc.close();
-      }
-    };
+    return subscribeOAuthMessages(handleOAuthMessage);
   }, [notifyComposioAuthComplete, notifyComposioAuthFailed, open]);
 
   // Serialize the form's tool-policy state into the AMA-shape

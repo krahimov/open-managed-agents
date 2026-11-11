@@ -19,6 +19,7 @@ import { AppShell } from "./components/AppShell";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { queryClient } from "./lib/query-client";
 import { installChunkReloadHandlers } from "./lib/chunk-reload";
+import { lazyRoute } from "./lib/lazy-route";
 import { installUpdatePrompt, showUpdateToast } from "./lib/update-prompt";
 import { Login } from "./pages/Login";
 import { Dashboard } from "./pages/Dashboard";
@@ -74,6 +75,8 @@ import { consolePlugins } from "./plugins/registry";
  * `errorElement` etc). Compared to wrapping `<React.lazy />` in a
  * `<Suspense>`, the data router knows to await the chunk before
  * rendering the route, avoiding a flash of fallback during navigation.
+ * Always go through `lazyRoute` (lib/lazy-route.tsx): a stale-chunk reload
+ * makes the import resolve to undefined instead of rejecting.
  *
  * Per-route `handle.crumb` publishes a label for AppBreadcrumb. For
  * fixed labels pass a string; for dynamic labels (resource name from
@@ -97,10 +100,7 @@ const protectedRoutes: RouteObject[] = [
         // ai-elements + Shiki like SessionDetail), so keep it out of the list bundle.
         path: ":id/setup",
         handle: { crumb: "Setup" },
-        lazy: async () => {
-          const { AgentSetup } = await import("./pages/agents/AgentSetup");
-          return { Component: AgentSetup };
-        },
+        lazy: lazyRoute(() => import("./pages/agents/AgentSetup"), "AgentSetup"),
       },
       {
         path: ":id",
@@ -122,10 +122,7 @@ const protectedRoutes: RouteObject[] = [
         // Streamdown + mermaid + dozens of language defs (~500 kB
         // gzipped). Splitting it out keeps the initial bundle for
         // /agents, /sessions list, etc. under 350 kB.
-        lazy: async () => {
-          const { SessionDetail } = await import("./pages/SessionDetail");
-          return { Component: SessionDetail };
-        },
+        lazy: lazyRoute(() => import("./pages/SessionDetail"), "SessionDetail"),
       },
     ],
   },
@@ -150,10 +147,7 @@ const protectedRoutes: RouteObject[] = [
             },
             // Lazy: pulls in TimelineView + trajectory panels, only
             // needed once an operator drills into a trial.
-            lazy: async () => {
-              const { EvalTrialDetail } = await import("./pages/EvalTrialDetail");
-              return { Component: EvalTrialDetail };
-            },
+            lazy: lazyRoute(() => import("./pages/EvalTrialDetail"), "EvalTrialDetail"),
           },
         ],
       },
@@ -280,10 +274,11 @@ const router = createBrowserRouter([
   { path: "login", element: <Login /> },
   { path: "cli/login", element: <CliLogin /> },
   { path: "connect-runtime", element: <ConnectRuntime /> },
-  { path: "telegram/connect/:sessionId/:requestId", lazy: async () => {
-    const { TelegramConnect } = await import("./pages/TelegramConnect");
-    return { Component: TelegramConnect };
-  }, handle: { crumb: "Connect agent app" } },
+  {
+    path: "telegram/connect/:sessionId/:requestId",
+    lazy: lazyRoute(() => import("./pages/TelegramConnect"), "TelegramConnect"),
+    handle: { crumb: "Connect agent app" },
+  },
   { path: "composio/callback", element: <ComposioCallback /> },
   {
     element: <AppShell />,

@@ -3,7 +3,7 @@ import { useNavigate, useParams, useSearchParams } from "react-router";
 import { toast } from "sonner";
 
 import { useApi } from "../lib/api";
-import { openOAuthPopup } from "../lib/oauth-popup";
+import { openOAuthPopup, subscribeOAuthMessages } from "../lib/oauth-popup";
 import { useApiQuery, useQueryClient } from "../lib/useApiQuery";
 
 import { Modal } from "../components/Modal";
@@ -553,7 +553,8 @@ function AddCredentialModal({
   // Cross-Origin-Opener-Policy: same-origin on their authorize page) —
   // postMessage from the popup back to us doesn't work in that case.
   // BroadcastChannel is same-origin and survives COOP, so use it as a
-  // parallel channel; the popup posts to both. Either firing is enough.
+  // parallel channel; the popup posts to both. subscribeOAuthMessages
+  // delivers each result once (it used to toast twice).
   const handleOAuthMessage = useCallback(
     (event: MessageEvent | { data: unknown }) => {
       const data = (
@@ -607,21 +608,7 @@ function AddCredentialModal({
   );
 
   useEffect(() => {
-    window.addEventListener("message", handleOAuthMessage);
-    let bc: BroadcastChannel | null = null;
-    try {
-      bc = new BroadcastChannel("openma-oauth");
-      bc.addEventListener("message", handleOAuthMessage);
-    } catch {
-      // Old browser without BroadcastChannel — fall back to postMessage only.
-    }
-    return () => {
-      window.removeEventListener("message", handleOAuthMessage);
-      if (bc) {
-        bc.removeEventListener("message", handleOAuthMessage);
-        bc.close();
-      }
-    };
+    return subscribeOAuthMessages(handleOAuthMessage);
   }, [handleOAuthMessage]);
 
   const connectMcp = (
