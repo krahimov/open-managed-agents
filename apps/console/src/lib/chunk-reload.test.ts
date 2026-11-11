@@ -106,16 +106,21 @@ describe("chunkReloadTarget", () => {
 });
 
 describe("installChunkReloadHandlers", () => {
-  function fakeWindow() {
+  function fakeWindow(href = "http://x/agents") {
     const target = new EventTarget();
     const storage = memoryStorage();
     const assign = vi.fn();
     const reload = vi.fn();
+    const location = { href, assign, reload };
+    const replaceState = vi.fn((_state: unknown, _unused: string, url: string) => {
+      location.href = url;
+    });
     const win = Object.assign(target, {
       sessionStorage: storage,
-      location: { href: "http://x/agents", assign, reload },
+      location,
+      history: { state: { key: "k1" }, replaceState },
     }) as unknown as Window;
-    return { win, assign, reload };
+    return { win, assign, reload, replaceState, location };
   }
 
   const rejection = (reason: unknown) => {
@@ -167,6 +172,41 @@ describe("installChunkReloadHandlers", () => {
     expect(assign).not.toHaveBeenCalled();
     win.dispatchEvent(rejection(new TypeError("Failed to fetch dynamically imported module: /assets/x.js")));
     expect(assign).toHaveBeenCalledWith("/agents/a1/setup");
+    uninstall();
+  });
+
+  it("reloads (not assigns) a boot-time URL with a #fragment, which assign() would only scroll to", () => {
+    const { win, assign, reload, replaceState } = fakeWindow("http://x/sessions/abc#evt-12");
+    const uninstall = installChunkReloadHandlers({ win, router: fakeRouter({ initialized: false }) });
+    const e = new Event("vite:preloadError", { cancelable: true });
+    win.dispatchEvent(e);
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(assign).not.toHaveBeenCalled();
+    expect(replaceState).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(true);
+    uninstall();
+  });
+
+  it("moves to a pending same-document #fragment target, then reloads", () => {
+    const { win, assign, reload, replaceState, location } = fakeWindow("http://x/sessions/abc");
+    const router = fakeRouter({
+      navigation: { state: "loading", location: { pathname: "/sessions/abc", search: "", hash: "#evt-3" } },
+    });
+    const uninstall = installChunkReloadHandlers({ win, router });
+    win.dispatchEvent(new Event("vite:preloadError", { cancelable: true }));
+    expect(replaceState).toHaveBeenCalledWith({ key: "k1" }, "", "http://x/sessions/abc#evt-3");
+    expect(location.href).toBe("http://x/sessions/abc#evt-3");
+    expect(reload).toHaveBeenCalledTimes(1);
+    expect(assign).not.toHaveBeenCalled();
+    uninstall();
+  });
+
+  it("still assigns a pending target that is another page, even from a URL with a #fragment", () => {
+    const { win, assign, reload } = fakeWindow("http://x/sessions/abc#evt-12");
+    const uninstall = installChunkReloadHandlers({ win, router: fakeRouter({ navigation: navigatingTo("/agents/a1/setup") }) });
+    win.dispatchEvent(new Event("vite:preloadError", { cancelable: true }));
+    expect(assign).toHaveBeenCalledWith("/agents/a1/setup");
+    expect(reload).not.toHaveBeenCalled();
     uninstall();
   });
 

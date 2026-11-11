@@ -98,6 +98,47 @@ export function chunkReloadTarget(
   }
 }
 
+function withoutHash(url: URL): string {
+  const copy = new URL(url.href);
+  copy.hash = "";
+  return copy.href;
+}
+
+/**
+ * Full page load of `target`. `location.assign()` of a URL that matches the
+ * current document apart from its fragment (e.g. booting on
+ * /sessions/abc#evt-12) is only a fragment navigation under the HTML
+ * navigate algorithm, so nothing reloads. handle() returning true means the
+ * preload error was preventDefault()ed and the import resolves to
+ * undefined, which would leave lazyRoute's "Loading the new version…"
+ * placeholder up for good. A same-document target therefore uses
+ * `location.reload()` (after moving the URL to the target if it differs),
+ * which always reloads.
+ */
+function loadFresh(win: Window, target: string): void {
+  let current: URL;
+  let next: URL;
+  try {
+    current = new URL(win.location.href);
+    next = new URL(target, current);
+  } catch {
+    win.location.assign(target);
+    return;
+  }
+  if (withoutHash(next) !== withoutHash(current)) {
+    win.location.assign(target);
+    return;
+  }
+  if (next.href !== current.href) {
+    try {
+      win.history.replaceState(win.history.state, "", next.href);
+    } catch {
+      // Reloading the current URL still beats no reload at all.
+    }
+  }
+  win.location.reload();
+}
+
 export interface ChunkReloadOptions {
   win?: Window;
   router?: ChunkReloadRouter | null;
@@ -120,7 +161,7 @@ export function installChunkReloadHandlers({
       return false;
     }
     if (!claimChunkReload(safeSessionStorage(win))) return false;
-    win.location.assign(target);
+    loadFresh(win, target);
     return true;
   };
 
