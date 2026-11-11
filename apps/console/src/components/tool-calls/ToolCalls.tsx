@@ -34,6 +34,7 @@ import {
   formatElapsed,
   summarizeSteps,
   thinkingPreview,
+  unwrapToolCall,
   type DiffLine,
   type TimelineItem,
   type ToolCall,
@@ -56,6 +57,7 @@ const KIND_ICON: Record<ToolKind, LucideIcon> = {
   search: SearchIcon,
   web_search: GlobeIcon,
   web_fetch: LinkIcon,
+  tool_search: SearchIcon,
   access: KeyRoundIcon,
   skill: SparklesIcon,
   schedule: ClockIcon,
@@ -343,7 +345,8 @@ export function StreamingToolRow({ toolUseId, name, partial }: { toolUseId: stri
   } catch {
     // Partial JSON — label falls back to the bare tool name.
   }
-  const call: ToolCall = { id: toolUseId, name, input, descriptor: describeTool(name, input), status: "running" };
+  const target = unwrapToolCall(name, input);
+  const call: ToolCall = { id: toolUseId, ...target, descriptor: describeTool(target.name, target.input), status: "running" };
   return (
     <div className="flex max-w-2xl flex-col">
       <ToolCallRow call={call} streamingInput={partial} />
@@ -456,7 +459,12 @@ function ToolCallDetail({
     <div className="mb-1 ml-6 flex min-w-0 flex-col gap-2 py-1">
       {body}
       {call.status === "awaiting_approval" && sessionId && (
-        <ToolConfirmationControls sessionId={sessionId} toolUseId={call.id} threadId={threadId} />
+        <ToolConfirmationControls
+          sessionId={sessionId}
+          toolUseId={call.id}
+          threadId={threadId}
+          {...(d.kind === "mcp" && d.server && d.tool ? { server: d.server, tool: d.tool } : {})}
+        />
       )}
       {call.status === "awaiting_client" && (
         <div className="text-[12px] text-fg-subtle" role="status">

@@ -84,6 +84,61 @@ describe("WorkTimeline", () => {
     expect(screen.getByText("Needs approval")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Approve" })).toBeInTheDocument();
   });
+
+  it("presents a deferred call_mcp_tool like a direct MCP call", () => {
+    show([
+      ev({ type: "user.message", id: "u1", content: [] }),
+      ev({ type: "agent.tool_use", id: "d1", name: "call_mcp_tool", input: { name: "mcp__slack__search_channels", arguments: '{"query":"incidents"}' } }),
+      ev({ type: "agent.tool_result", tool_use_id: "d1", content: [{ type: "text", text: "#inc-42" }] }),
+    ]);
+    expect(screen.queryByText(/call_mcp_tool|Call mcp tool/)).toBeNull();
+    expect(screen.getByText("Slack")).toBeInTheDocument();
+    expect(screen.getByText("search channels")).toBeInTheDocument();
+    expect(screen.getByText("incidents")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Slack").closest("button")!);
+    // the input shown is the target's arguments, decoded
+    expect(screen.getByText(/"query": "incidents"/)).toBeInTheDocument();
+    expect(screen.queryByText(/mcp__slack__search_channels/)).toBeNull();
+    expect(screen.getByText("#inc-42")).toBeInTheDocument();
+  });
+
+  it("names the real service and tool on a deferred call's approval card", () => {
+    show([
+      ev({ type: "user.message", id: "u1", content: [] }),
+      ev({
+        type: "agent.tool_use",
+        id: "d1",
+        name: "call_mcp_tool",
+        input: { name: "mcp__linear__create_issue", arguments: { title: "Checkout 500s", teamId: "ENG" } },
+        evaluated_permission: "ask",
+      }),
+      ev({ type: "session.status_idle", id: "i1", stop_reason: { type: "requires_action", event_ids: ["d1"] } }),
+    ]);
+    expect(screen.getByText("Needs approval")).toBeInTheDocument();
+    const prompt = screen.getByText(/needs your approval before it runs/);
+    expect(prompt).toHaveTextContent("Linear · create issue needs your approval before it runs.");
+    expect(screen.getByText(/"title": "Checkout 500s"/)).toBeInTheDocument();
+    expect(screen.queryByText(/call_mcp_tool/)).toBeNull();
+    expect(screen.getByRole("button", { name: "Approve" })).toBeInTheDocument();
+  });
+
+  it("shows search_mcp_tools as a readable search row", () => {
+    show([
+      ev({ type: "user.message", id: "u1", content: [] }),
+      ev({ type: "agent.tool_use", id: "s1", name: "search_mcp_tools", input: { query: "create issue", server: "linear" } }),
+    ]);
+    expect(screen.getByText("Searched Linear tools for")).toBeInTheDocument();
+    expect(screen.getByText('"create issue"')).toBeInTheDocument();
+  });
+
+  it("falls back to the generic row when call_mcp_tool has no valid target", () => {
+    show([
+      ev({ type: "user.message", id: "u1", content: [] }),
+      ev({ type: "agent.tool_use", id: "d1", name: "call_mcp_tool", input: { name: "create_issue", arguments: {} } }),
+      ev({ type: "agent.tool_result", tool_use_id: "d1", content: "Unknown tool", is_error: true }),
+    ]);
+    expect(screen.getByText("Call mcp tool")).toBeInTheDocument();
+  });
 });
 
 describe("Output", () => {

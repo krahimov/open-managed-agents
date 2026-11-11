@@ -52,6 +52,23 @@ describe("timeline tool spans", () => {
     expect(span?.isError).toBe(true);
   });
 
+  it("labels deferred MCP meta tools by their target", () => {
+    const { spans } = deriveSpans([
+      at({ type: "user.message" }),
+      at({ type: "agent.tool_use", id: "d", name: "call_mcp_tool", input: { name: "mcp__github__repos__create_pr", arguments: "{}" } }),
+      at({ type: "agent.tool_result", tool_use_id: "d", content: "ok" }),
+      at({ type: "agent.tool_use", id: "s", name: "search_mcp_tools", input: { query: "pull request" } }),
+      at({ type: "agent.tool_use", id: "x", name: "call_mcp_tool", input: {} }),
+    ]);
+    const tools = spans.filter((s) => s.key.startsWith("tool-"));
+    expect(tools.map((s) => [s.family, s.label])).toEqual([
+      ["mcp", "github:repos__create_pr"],
+      ["tool", 'Searched all tools for "pull request"'],
+      ["tool", "call_mcp_tool"],
+    ]);
+    expect(tools[0].detail).toBe("completed");
+  });
+
   it("pairs custom tool calls with their agent.tool_result", () => {
     const span = toolSpan([
       at({ type: "user.message" }),

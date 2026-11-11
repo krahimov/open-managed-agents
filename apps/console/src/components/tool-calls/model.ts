@@ -1,5 +1,6 @@
 import type { Event } from "../../lib/events";
 import { buildToolCallIndex, isErrorResult, type ToolCallStatus } from "../../lib/tool-status";
+import { parseSearchMcpTools, unwrapCallMcpTool } from "../../lib/deferred-mcp";
 
 /**
  * Pure view-model for the tool-call timeline shared by SessionChat and
@@ -25,6 +26,7 @@ export type ToolKind =
   | "search"
   | "web_search"
   | "web_fetch"
+  | "tool_search"
   | "access"
   | "skill"
   | "schedule"
@@ -191,11 +193,28 @@ function primaryArg(input: Record<string, unknown>): string | undefined {
   return undefined;
 }
 
+/** A call_mcp_tool call as its deferred target (name + arguments), so it
+ *  renders like a direct MCP call; any other call unchanged. */
+export function unwrapToolCall(name: string, input: Record<string, unknown>): { name: string; input: Record<string, unknown> } {
+  const target = unwrapCallMcpTool(name, input);
+  return target ? { name: target.name, input: target.arguments } : { name, input };
+}
+
 export function describeTool(
   name: string,
   input: Record<string, unknown> = {},
   mcpServerName?: string,
 ): ToolDescriptor {
+  // Deferred-server meta tools (an MCP server's own tool may share the name).
+  if (!mcpServerName) {
+    const target = unwrapCallMcpTool(name, input);
+    if (target) return describeTool(target.name, target.arguments);
+    const search = parseSearchMcpTools(name, input);
+    if (search) {
+      const where = search.server ? serverDisplayName(search.server) : "all";
+      return { kind: "tool_search", verb: `Searched ${where} tools for`, target: `"${oneLine(search.query, 80)}"` };
+    }
+  }
   const mcpMatch = /^mcp__(.+?)__(.+)$/.exec(name);
   const server = mcpServerName ?? mcpMatch?.[1];
   if (server) {
@@ -362,8 +381,8 @@ export function thinkingPreview(text: string): string {
 
 // ---------------------------------------------------------------- groups
 
-type Action = "change" | "command" | "code-search" | "read" | "web-search" | "fetch" | "other";
-const ACTION_ORDER: Action[] = ["change", "command", "code-search", "read", "web-search", "fetch", "other"];
+type Action = "change" | "command" | "code-search" | "read" | "web-search" | "fetch" | "tool-search" | "other";
+const ACTION_ORDER: Action[] = ["change", "command", "code-search", "read", "web-search", "fetch", "tool-search", "other"];
 const ACTION_KIND: Record<Action, ToolKind> = {
   change: "edit",
   command: "command",
@@ -371,6 +390,7 @@ const ACTION_KIND: Record<Action, ToolKind> = {
   read: "read",
   "web-search": "web_search",
   fetch: "web_fetch",
+  "tool-search": "tool_search",
   other: "other",
 };
 
@@ -383,6 +403,7 @@ function actionOf(kind: ToolKind): Action {
     case "read": return "read";
     case "web_search": return "web-search";
     case "web_fetch": return "fetch";
+    case "tool_search": return "tool-search";
     default: return "other";
   }
 }
@@ -398,6 +419,7 @@ function actionLabel(action: Action, count: number): string {
     case "read": return `Read ${plural(count, "file", "files")}`;
     case "web-search": return `Searched the web${times(count)}`;
     case "fetch": return `Fetched ${plural(count, "page", "pages")}`;
+    case "tool-search": return `Searched tools${times(count)}`;
     case "other": return `Used ${plural(count, "tool", "tools")}`;
   }
 }
@@ -537,7 +559,12 @@ export function buildTimeline(events: Event[], opts: BuildOptions = {}): Timelin
       const id = typeof ev.id === "string" ? ev.id : key;
       if (hiddenUseIds.has(id)) return;
       const info = index.info(typeof ev.id === "string" ? ev.id : undefined);
-      const input = (ev.input ?? {}) as Record<string, unknown>;
+      // call_mcp_tool presents as its deferred target. An agent.mcp_tool_use
+      // name is the server's own tool name, never a meta tool.
+      const raw = (ev.input ?? {}) as Record<string, unknown>;
+      const { name, input } = ev.type === "agent.mcp_tool_use"
+        ? { name: ev.name ?? "tool", input: raw }
+        : unwrapToolCall(ev.name ?? "tool", raw);
       const resultMs = info.result ? eventTimeMs(info.result) : null;
       const durationMs = resultMs !== null && t !== null && resultMs >= t ? resultMs - t : undefined;
       pushStep({
@@ -545,9 +572,9 @@ export function buildTimeline(events: Event[], opts: BuildOptions = {}): Timelin
         key,
         call: {
           id,
-          name: ev.name ?? "tool",
+          name,
           input,
-          descriptor: describeTool(ev.name ?? "tool", input, ev.type === "agent.mcp_tool_use" ? ev.mcp_server_name : undefined),
+          descriptor: describeTool(name, input, ev.type === "agent.mcp_tool_use" ? ev.mcp_server_name : undefined),
           status: info.status,
           output: info.denyMessage ?? resultText(info.result),
           ...(info.denyMessage ? { denyMessage: info.denyMessage } : {}),
