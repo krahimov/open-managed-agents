@@ -86,14 +86,59 @@ describe("Agent + Session snapshot", () => {
     expect(fetched.vault_ids).toEqual([vault1.id, vault2.id]);
   });
 
-  it("session vault selection infers MCP servers from active vault credentials", async () => {
-    const a = await post("/v1/agents", { name: "VaultMcpAgent", model: "claude-sonnet-4-6", _oma: { harness: "cross-noop" } });
+  it("session vault credentials authenticate declared servers but add none by default", async () => {
+    const a = await post("/v1/agents", {
+      name: "VaultMcpAgent",
+      model: "claude-sonnet-4-6",
+      mcp_servers: [{ name: "github", type: "url", url: "https://api.githubcopilot.com/mcp/" }],
+      _oma: { harness: "cross-noop" },
+    });
     const agent = (await a.json()) as any;
     const e = await post("/v1/environments", { name: "vlt-mcp-env", config: { type: "cloud" } });
     const envObj = (await e.json()) as any;
     const v = await post("/v1/vaults", { name: "mcp-vault" });
     const vault = (await v.json()) as any;
-    const mcpUrl = "https://backend.composio.dev/tool_router/trs_vault_session/mcp";
+    for (const [display_name, auth] of [
+      ["GitHub", { type: "static_bearer", token: "ghp_x", mcp_server_url: "https://api.githubcopilot.com/mcp" }],
+      ["Notion", { type: "static_bearer", token: "ntn_x", mcp_server_url: "https://mcp.notion.com/mcp" }],
+      ["Sentry", { type: "static_bearer", token: "sntrys_x", mcp_server_url: "https://mcp.sentry.dev/mcp" }],
+      ["Composio", {
+        type: "composio_mcp",
+        mcp_server_url: "https://backend.composio.dev/tool_router/trs_vault_session/mcp",
+        api_key_env: "COMPOSIO_API_KEY",
+        composio_toolkits: ["notion"],
+      }],
+    ] as const) {
+      const cred = await post(`/v1/vaults/${vault.id}/credentials`, { display_name, auth });
+      expect(cred.status).toBe(201);
+    }
+
+    const s = await post("/v1/sessions", {
+      agent: agent.id,
+      environment_id: envObj.id,
+      vault_ids: [vault.id],
+    });
+    expect(s.status).toBe(201);
+    const session = (await s.json()) as any;
+    expect(session.vault_ids).toEqual([vault.id]);
+    expect(session.agent.mcp_servers).toEqual([
+      { name: "github", type: "url", url: "https://api.githubcopilot.com/mcp/" },
+    ]);
+  });
+
+  it("vault_mcp_servers: all infers MCP servers from active vault credentials", async () => {
+    const a = await post("/v1/agents", {
+      name: "VaultMcpAllAgent",
+      model: "claude-sonnet-4-6",
+      _oma: { harness: "cross-noop", vault_mcp_servers: "all" },
+    });
+    const agent = (await a.json()) as any;
+    expect(agent._oma.vault_mcp_servers).toBe("all");
+    const e = await post("/v1/environments", { name: "vlt-mcp-all-env", config: { type: "cloud" } });
+    const envObj = (await e.json()) as any;
+    const v = await post("/v1/vaults", { name: "mcp-all-vault" });
+    const vault = (await v.json()) as any;
+    const mcpUrl = "https://backend.composio.dev/tool_router/trs_vault_all_session/mcp";
 
     const cred = await post(`/v1/vaults/${vault.id}/credentials`, {
       display_name: "Notion Composio",
@@ -149,6 +194,7 @@ describe("Agent + Session snapshot", () => {
     const a = await post("/v1/agents", {
       name: "DeployVaultMcpAgent",
       model: "claude-sonnet-4-6",
+      mcp_servers: [{ name: "gmail", type: "url", url: mcpUrl }],
       metadata: {
         default_vault_ids: [vault.id],
         default_environment_id: envObj.id,
@@ -192,8 +238,10 @@ describe("Agent + Session snapshot", () => {
     expect(privateSessionRes.status).toBe(200);
     const privateSession = (await privateSessionRes.json()) as any;
     expect(privateSession.vault_ids).toEqual([vault.id]);
+    // The default vault rides along to authenticate the declared server;
+    // it adds no server of its own.
     expect(privateSession.agent.mcp_servers).toEqual([
-      { name: "composio_gmail", type: "url", url: mcpUrl },
+      { name: "gmail", type: "url", url: mcpUrl },
     ]);
   });
 

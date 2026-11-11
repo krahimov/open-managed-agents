@@ -77,7 +77,9 @@ oma vaults create "Connected Apps"
 oma connect notion --vault <vault-id>
 ```
 
-Then include the vault id in `agent.default_vault_ids`.
+Then include the vault id in `agent.default_vault_ids`. Keep the server in
+`mcp_servers` too: the vault credential only authenticates a declared server,
+it never adds one.
 
 ## Custom Tools
 

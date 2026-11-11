@@ -56,6 +56,11 @@ export interface AgentMemoryConfig {
   store_id?: string;
 }
 
+/** Which MCP servers a session gets from its vaults (rides the `_oma`
+ *  wire envelope). See AgentConfig.vault_mcp_servers. */
+export type VaultMcpServersMode = "declared" | "all";
+export const VAULT_MCP_SERVERS_MODES: readonly VaultMcpServersMode[] = ["declared", "all"];
+
 export interface AgentConfig {
   id: string;
   name: string;
@@ -117,6 +122,19 @@ export interface AgentConfig {
    * session, so memory is the only continuity).
    */
   memory?: AgentMemoryConfig;
+  /**
+   * What the session's vaults contribute to its MCP servers. OMA-only,
+   * rides the `_oma` wire envelope.
+   *   declared — (default) vault credentials only AUTHENTICATE the agent's
+   *              declared `mcp_servers` (plus any server an integration
+   *              injects for the session); a login in an attached vault
+   *              never adds tools on its own.
+   *   all      — legacy: every active mcp_oauth / static_bearer /
+   *              composio_mcp credential in the session's vaults also
+   *              becomes a session MCP server (a Composio credential is
+   *              skipped when a Composio server is already declared).
+   */
+  vault_mcp_servers?: VaultMcpServersMode;
   /**
    * SESSION-SNAPSHOT-ONLY enrichment — never present on live agent rows.
    * The access policy resolved from the agent's permission grants at

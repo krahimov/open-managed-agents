@@ -283,9 +283,46 @@ describe("service-level arming (dormant-rule fix)", () => {
 });
 
 describe("vault MCP injection", () => {
-  it("merges vault-derived servers into the spawned snapshot", async () => {
+  it("merges vault-derived servers into the spawned snapshot for vault_mcp_servers: all", async () => {
     const { service: ambientRules } = createInMemoryAmbientRuleService({ clock: { nowMs: () => T0 } });
     const created: Array<{ agentSnapshot?: { mcp_servers?: unknown } }> = [];
+    const dispatcher = new NodeAmbientDispatcher({
+      ambientRules,
+      agents: {
+        get: async () => ({
+          id: AGENT, name: "a", archived_at: null,
+          metadata: { default_vault_ids: ["vlt-cnb"] },
+          mcp_servers: [{ name: "custom", type: "url", url: "https://example.com/mcp" }],
+          vault_mcp_servers: "all",
+        }),
+      } as never,
+      sessions: {
+        create: async (input: never) => { created.push(input); return { session: { id: "s1" }, resources: [] }; },
+      } as never,
+      appendUserEvent: async () => {},
+      resolveVaultMcpServers: async (_t, vaultIds, declared) => {
+        expect(vaultIds).toEqual(["vlt-cnb"]);
+        expect(declared.map((s) => s.name)).toEqual(["custom"]);
+        return [
+          { name: "composio_gmail_notion", type: "url", url: "https://backend.composio.dev/tool_router/trs_x/mcp" },
+          { name: "dupe", type: "url", url: "https://example.com/mcp/" }, // deduped by normalized url
+        ];
+      },
+      now: () => T0,
+    });
+    await ambientRules.create({
+      tenantId: TENANT, agentId: AGENT,
+      input: { name: "with creds", trigger: { source: "schedule", config: { cron: "0 9 * * *", timezone: "UTC" } }, wake_mode: "act", next_wake_at: new Date(T0).toISOString() },
+    });
+    expect(await dispatcher.dispatchDue()).toBe(1);
+    const snap = created[0].agentSnapshot as { mcp_servers: Array<{ name: string; url: string }> };
+    expect(snap.mcp_servers.map((s) => s.name)).toEqual(["custom", "composio_gmail_notion"]);
+  });
+
+  it("does not consult the vaults for servers by default (vault creds authenticate only)", async () => {
+    const { service: ambientRules } = createInMemoryAmbientRuleService({ clock: { nowMs: () => T0 } });
+    const created: Array<{ agentSnapshot?: { mcp_servers?: unknown }; vaultIds?: string[] }> = [];
+    let asked = 0;
     const dispatcher = new NodeAmbientDispatcher({
       ambientRules,
       agents: {
@@ -299,22 +336,22 @@ describe("vault MCP injection", () => {
         create: async (input: never) => { created.push(input); return { session: { id: "s1" }, resources: [] }; },
       } as never,
       appendUserEvent: async () => {},
-      resolveVaultMcpServers: async (_t, vaultIds) => {
-        expect(vaultIds).toEqual(["vlt-cnb"]);
-        return [
-          { name: "composio_gmail_notion", type: "url", url: "https://backend.composio.dev/tool_router/trs_x/mcp" },
-          { name: "dupe", type: "url", url: "https://example.com/mcp" }, // deduped by url
-        ];
+      resolveVaultMcpServers: async () => {
+        asked++;
+        return [{ name: "composio_gmail", type: "url", url: "https://backend.composio.dev/tool_router/trs_x/mcp" }];
       },
       now: () => T0,
     });
     await ambientRules.create({
       tenantId: TENANT, agentId: AGENT,
-      input: { name: "with creds", trigger: { source: "schedule", config: { cron: "0 9 * * *", timezone: "UTC" } }, wake_mode: "act", next_wake_at: new Date(T0).toISOString() },
+      input: { name: "declared only", trigger: { source: "schedule", config: { cron: "0 9 * * *", timezone: "UTC" } }, wake_mode: "act", next_wake_at: new Date(T0).toISOString() },
     });
     expect(await dispatcher.dispatchDue()).toBe(1);
-    const snap = created[0].agentSnapshot as { mcp_servers: Array<{ name: string; url: string }> };
-    expect(snap.mcp_servers.map((s) => s.name)).toEqual(["custom", "composio_gmail_notion"]);
+    expect(asked).toBe(0);
+    // The vault still rides along (it authenticates "custom").
+    expect(created[0].vaultIds).toEqual(["vlt-cnb"]);
+    const snap = created[0].agentSnapshot as { mcp_servers: Array<{ name: string }> };
+    expect(snap.mcp_servers.map((s) => s.name)).toEqual(["custom"]);
   });
 });
 

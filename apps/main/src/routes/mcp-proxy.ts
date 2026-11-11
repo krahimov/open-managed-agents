@@ -151,9 +151,26 @@ function credentialMatchesServerUrl(
   if (auth.mcp_server_url === serverUrl) return true;
   const authUrl = normalizeMcpUrlForMatch(auth.mcp_server_url);
   const server = normalizeMcpUrlForMatch(serverUrl);
-  if (authUrl && server && authUrl === server) return true;
+  if (authUrl && server && authUrl === server) {
+    // The query isn't cosmetic outside Composio: `…?project_ref=aaa` and
+    // `…?project_ref=bbb` are different accounts (only param order is).
+    if (auth.type === "composio_mcp") return true;
+    if (canonicalMcpQuery(auth.mcp_server_url) === canonicalMcpQuery(serverUrl)) return true;
+  }
   if (auth.type !== "composio_mcp") return false;
   return isGenericComposioMcpUrl(serverUrl) && isComposioMcpUrl(auth.mcp_server_url);
+}
+
+/** Search params sorted by key then value, so only their order is cosmetic. */
+function canonicalMcpQuery(raw: string): string {
+  try {
+    const params = [...new URL(raw).searchParams.entries()];
+    const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+    params.sort(([ak, av], [bk, bv]) => (ak === bk ? cmp(av, bv) : cmp(ak, bk)));
+    return new URLSearchParams(params).toString();
+  } catch {
+    return "";
+  }
 }
 
 async function sha256(input: string): Promise<string> {
@@ -219,50 +236,55 @@ export async function resolveProxyTargetByTenant(
   const grouped = await services.credentials
     .listByVaults({ tenantId, vaultIds })
     .catch(() => []);
-  for (const g of grouped) {
-    for (const c of g.credentials) {
-      const auth = (c as unknown as CredentialConfig).auth as
-        | {
-            type?: string;
-            mcp_server_url?: string;
-            bearer_token?: string;
-            token?: string;
-            access_token?: string;
-            refresh_token?: string;
-            token_endpoint?: string;
-            client_id?: string;
-            client_secret?: string;
-            api_key?: string;
-            api_key_env?: string;
-          }
-        | undefined;
-      if (!auth || !credentialMatchesServerUrl(auth, server.url)) continue;
-      if (auth.type === "composio_mcp") {
-        const apiKey = resolveComposioApiKey(env, auth);
-        if (!apiKey) continue;
-        return {
-          upstreamUrl: auth.mcp_server_url || server.url,
-          upstreamToken: apiKey,
-          upstreamAuthHeader: { name: "x-api-key", value: apiKey },
-        };
-      }
-      const token = auth?.bearer_token ?? auth?.token ?? auth?.access_token;
-      if (!token) continue;
-      const target: ProxyTarget = { upstreamUrl: server.url, upstreamToken: token };
-      // Surface refresh metadata for mcp_oauth so 401 can trigger an
-      // automatic token refresh + retry. static_bearer creds skip this.
-      if (auth.type === "mcp_oauth" && auth.refresh_token && auth.token_endpoint) {
-        target.refresh = {
-          refreshToken: auth.refresh_token,
-          tokenEndpoint: auth.token_endpoint,
-          clientId: auth.client_id,
-          clientSecret: auth.client_secret,
-          credentialId: (c as { id: string }).id,
-          vaultId: g.vault_id,
-        };
-      }
-      return target;
+  // First usable match wins, so a credential stored under exactly this URL
+  // goes before a cosmetic look-alike (`…/mcp/` vs `…/mcp`) — an older
+  // look-alike otherwise shadows it, and 401s for good once its login
+  // lapses. Same order as Node's orderMatchingCredentials.
+  const all = grouped.flatMap((g) => g.credentials.map((c) => ({ g, c })));
+  const isExact = (c: unknown) =>
+    (c as { auth?: { mcp_server_url?: string } }).auth?.mcp_server_url === server.url;
+  for (const { g, c } of [...all.filter((x) => isExact(x.c)), ...all.filter((x) => !isExact(x.c))]) {
+    const auth = (c as unknown as CredentialConfig).auth as
+      | {
+          type?: string;
+          mcp_server_url?: string;
+          bearer_token?: string;
+          token?: string;
+          access_token?: string;
+          refresh_token?: string;
+          token_endpoint?: string;
+          client_id?: string;
+          client_secret?: string;
+          api_key?: string;
+          api_key_env?: string;
+        }
+      | undefined;
+    if (!auth || !credentialMatchesServerUrl(auth, server.url)) continue;
+    if (auth.type === "composio_mcp") {
+      const apiKey = resolveComposioApiKey(env, auth);
+      if (!apiKey) continue;
+      return {
+        upstreamUrl: auth.mcp_server_url || server.url,
+        upstreamToken: apiKey,
+        upstreamAuthHeader: { name: "x-api-key", value: apiKey },
+      };
     }
+    const token = auth?.bearer_token ?? auth?.token ?? auth?.access_token;
+    if (!token) continue;
+    const target: ProxyTarget = { upstreamUrl: server.url, upstreamToken: token };
+    // Surface refresh metadata for mcp_oauth so 401 can trigger an
+    // automatic token refresh + retry. static_bearer creds skip this.
+    if (auth.type === "mcp_oauth" && auth.refresh_token && auth.token_endpoint) {
+      target.refresh = {
+        refreshToken: auth.refresh_token,
+        tokenEndpoint: auth.token_endpoint,
+        clientId: auth.client_id,
+        clientSecret: auth.client_secret,
+        credentialId: (c as { id: string }).id,
+        vaultId: g.vault_id,
+      };
+    }
+    return target;
   }
   return null;
 }

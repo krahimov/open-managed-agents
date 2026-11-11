@@ -23,7 +23,7 @@ import {
   OMA_SETUP_KIND_HARNESS_UPDATED,
 } from "@open-managed-agents/api-types";
 import type { AgentConfig } from "@open-managed-agents/shared";
-import { generateEventId } from "@open-managed-agents/shared";
+import { generateEventId, isComposioMcpUrl, uniqueMcpServerName } from "@open-managed-agents/shared";
 import type { SessionEvent } from "@open-managed-agents/shared";
 import {
   agentMemoryMode,
@@ -249,6 +249,102 @@ export function newlyAddedMcpServers(
     out.push({ name: (s.name ?? new URL(s.url).hostname).trim().toLowerCase(), url: s.url });
   }
   return out;
+}
+
+/**
+ * `agent` with the MCP server at `url` DECLARED: an `mcp_servers` entry plus
+ * a matching `mcp_toolset` in `tools`. Null when a server with that URL is
+ * already declared. Vault credentials only authenticate declared servers,
+ * so an in-product grant (connect card → OAuth callback) has to declare the
+ * server it connected or the agent never sees its tools.
+ *
+ * The toolset carries NO permission policy, on purpose: the server's tools
+ * then resolve exactly as before it was declared — to the built-in
+ * toolset's default (tool-permission.ts) — and an entry without a default
+ * is invisible to the ratchet's legacy first-toolset floor. An
+ * `always_allow` default here would stop asking for this server's tools on
+ * agents whose built-in default is `always_ask`.
+ */
+export function withDeclaredMcpServer(
+  agent: Pick<AgentConfig, "mcp_servers" | "tools">,
+  server: { name: string; url: string },
+): { mcp_servers: NonNullable<AgentConfig["mcp_servers"]>; tools: AgentConfig["tools"] } | null {
+  const servers = agent.mcp_servers ?? [];
+  const target = normalizeMcpUrl(server.url);
+  if (servers.some((s) => typeof s?.url === "string" && normalizeMcpUrl(s.url) === target)) return null;
+  const used = new Set(servers.map((s) => s?.name).filter((n): n is string => typeof n === "string" && n.length > 0));
+  let base = server.name;
+  if (!base.trim()) {
+    try {
+      base = new URL(server.url).hostname.split(".").filter(Boolean)[0] ?? "mcp";
+    } catch {
+      base = "mcp";
+    }
+  }
+  const name = uniqueMcpServerName(base, used);
+  const tools = agent.tools ?? [];
+  const hasToolset = tools.some(
+    (t) => typeof t?.type === "string" && t.type.startsWith("mcp_toolset") &&
+      (t as { mcp_server_name?: unknown }).mcp_server_name === name,
+  );
+  return {
+    mcp_servers: [...servers, { name, type: "url", url: server.url }],
+    tools: hasToolset
+      ? tools
+      : ([...tools, { type: "mcp_toolset", mcp_server_name: name }] as unknown as AgentConfig["tools"]),
+  };
+}
+
+/**
+ * After an in-product grant for `mcpServerUrl` (connect card → OAuth
+ * callback, or the card's API-key path): attach + bind the vault to the
+ * agent (like the setup flow's attachVault) AND declare the server on it,
+ * in one update. Vault credentials only authenticate declared servers, so
+ * without the declaration a grant for a server the agent didn't already
+ * list would connect an account the agent never sees. Composio routers
+ * are declared by the graft route instead
+ * (POST /v1/sessions/:id/composio/graft).
+ */
+export async function attachGrantToAgent(
+  agents: {
+    get(opts: { tenantId: string; agentId: string }): Promise<AgentConfig | null>;
+    update(opts: {
+      tenantId: string;
+      agentId: string;
+      input: { metadata?: Record<string, unknown>; mcp_servers?: AgentConfig["mcp_servers"]; tools?: AgentConfig["tools"] };
+    }): Promise<unknown>;
+  },
+  tenantId: string,
+  agentId: string,
+  grant: { vaultId: string; mcpServerUrl: string; service: string },
+): Promise<void> {
+  const agent = await agents.get({ tenantId, agentId });
+  if (!agent) return;
+  const current = (agent.metadata as { default_vault_ids?: unknown } | undefined)?.default_vault_ids;
+  const ids = Array.isArray(current)
+    ? current.filter((id): id is string => typeof id === "string" && id.length > 0)
+    : [];
+  const attached = ids.includes(grant.vaultId);
+  const bound = boundVaultId(agent.metadata, grant.mcpServerUrl) === grant.vaultId;
+  const declared = isComposioMcpUrl(grant.mcpServerUrl)
+    ? null
+    : withDeclaredMcpServer(agent, { name: grant.service, url: grant.mcpServerUrl });
+  if (attached && bound && !declared) return;
+  await agents.update({
+    tenantId,
+    agentId,
+    input: {
+      ...(attached && bound
+        ? {}
+        : {
+            metadata: {
+              default_vault_ids: attached ? ids : [...ids, grant.vaultId],
+              mcp_vault_bindings: withVaultBinding(agent.metadata, grant.mcpServerUrl, grant.vaultId),
+            },
+          }),
+      ...(declared ? { mcp_servers: declared.mcp_servers, tools: declared.tools } : {}),
+    },
+  });
 }
 
 export interface AutoAccessResult {

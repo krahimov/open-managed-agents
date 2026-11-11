@@ -85,8 +85,8 @@ import { toFileRecord } from "@open-managed-agents/files-store";
 import { SqlEventLog } from "@open-managed-agents/event-log/sql";
 import { sessionErrorAlreadyEmitted } from "@open-managed-agents/session-runtime";
 import type { AgentConfig, CredentialConfig, EnvironmentConfig, SessionEvent, Trajectory } from "@open-managed-agents/shared";
-import { generateEventId, extractTextFromContent, extractTraceFacts } from "@open-managed-agents/shared";
-import type { TraceFacts } from "@open-managed-agents/shared";
+import { generateEventId, extractTextFromContent, extractTraceFacts, inferVaultMcpServers, isComposioMcpUrl, normalizeMcpServerUrl } from "@open-managed-agents/shared";
+import type { TraceFacts, VaultMcpCredentialGroups } from "@open-managed-agents/shared";
 import { DefaultHarness } from "@open-managed-agents/agent/harness/default-loop";
 import { CodexSdkHarness } from "./lib/codex-sdk-harness.js";
 import { createSdkMemoryPort } from "./lib/sdk-harness-memory.js";
@@ -110,6 +110,7 @@ import {
   boundVaultId,
   preferVaults,
   withVaultBinding,
+  attachGrantToAgent,
   describeSetupAccessStatus,
 } from "./lib/setup-harness.js";
 import { ALL_TOOLS, buildTools, getEnabledTools } from "@open-managed-agents/agent/harness/tools";
@@ -201,6 +202,8 @@ import {
   type GrantNotification,
 } from "./lib/node-oauth-routes.js";
 import {
+  credentialMatchesMcpServerUrl,
+  orderMatchingCredentials,
   forwardNodeMcpRequestWithRefresh,
   verifyMcpCredential,
   type NodeMcpProxyRefresh,
@@ -2042,6 +2045,38 @@ composioGraftRoutes.post("/:id/composio/graft", async (c) => {
   });
 });
 
+// POST /v1/sessions/:id/access/attach { service, vault_id, mcp_server_url }
+// — the connect card's API-key path saved a static_bearer credential into
+// a vault; attach that vault to the session's agent and declare the server
+// (the OAuth callback does the same via recordAccessGrant). Vault
+// credentials only authenticate declared servers, so without this a key
+// saved for a server the agent doesn't list would never be used.
+composioGraftRoutes.post("/:id/access/attach", async (c) => {
+  const tenantId = c.var.tenant_id;
+  const body = await c.req
+    .json<{ service?: string; vault_id?: string; mcp_server_url?: string }>()
+    .catch(() => ({}) as { service?: string; vault_id?: string; mcp_server_url?: string });
+  const vaultId = (body.vault_id ?? "").trim();
+  const mcpServerUrl = (body.mcp_server_url ?? "").trim();
+  const service = (body.service ?? "").trim().toLowerCase();
+  if (!vaultId || !mcpServerUrl) {
+    return c.json({ error: "vault_id and mcp_server_url are required" }, 400);
+  }
+  const session = await sessionsService.get({ tenantId, sessionId: c.req.param("id") });
+  if (!session?.agent_id) return c.json({ error: "Session has no agent" }, 404);
+  // Only a vault of this tenant that really holds a live credential for
+  // the server — this route must not become a way to graft arbitrary URLs.
+  const creds = await credentialService.list({ tenantId, vaultId }).catch(() => []);
+  const holds = creds.some((cred) => {
+    if ((cred as { archived_at?: string | null }).archived_at) return false;
+    const auth = (cred as unknown as { auth?: { type?: string; mcp_server_url?: string } }).auth;
+    return !!auth && credentialMatchesMcpServerUrl(auth, mcpServerUrl);
+  });
+  if (!holds) return c.json({ error: "No credential for this server in that vault" }, 404);
+  await attachGrantToAgent(agentsService, tenantId, session.agent_id, { vaultId, mcpServerUrl, service });
+  return c.json({ ok: true });
+});
+
 v1.route("/sessions", composioGraftRoutes);
 
 // GET /v1/agents/:id/evidence/approvals — grant version lineage with
@@ -2891,7 +2926,8 @@ async function findCredentialVaultForUrl(
  * browser, and (3) graft the vault onto the session's agent so its future
  * sessions (scheduled ones included) actually carry the credential —
  * setup-created agents otherwise ended up with NO default vault and every
- * OAuth MCP server 401'd despite valid credentials in "Connected Apps".
+ * OAuth MCP server 401'd despite valid credentials in "Connected Apps" —
+ * and declare the granted server on that agent (attachGrantToAgent).
  */
 async function recordAccessGrant(grant: GrantNotification): Promise<void> {
   const session = await sessionsService.get({
@@ -2911,11 +2947,11 @@ async function recordAccessGrant(grant: GrantNotification): Promise<void> {
 
   if (session.agent_id) {
     try {
-      await attachVaultToAgent(grant.tenantId, session.agent_id, grant.vaultId, grant.mcpServerUrl);
+      await attachGrantToAgent(agentsService, grant.tenantId, session.agent_id, grant);
     } catch (err) {
       logger.warn(
         { err, op: "oauth.grant_vault_graft_failed", session_id: grant.sessionId },
-        "credential stored but could not attach the vault to the agent",
+        "credential stored but could not attach the vault / declare the server on the agent",
       );
     }
   }
@@ -3838,41 +3874,18 @@ const ambientDispatcher = new NodeAmbientDispatcher({
   appendUserEvent: async (sessionId, _tenantId, _agentId, event) => {
     await sessionRouter.appendEvent(sessionId, event);
   },
-  // Vault credentials → MCP servers for the spawned snapshot. Console
-  // sessions get the Composio tool-router entry injected client-side at
-  // create time; ambient sessions derive the same entry from the vault's
-  // composio_mcp credential (its mcp_server_url IS the persistent
-  // tool-router session URL). Name mirrors the console's convention:
-  // composio_<toolkits-joined>, so resolveNodeMcpProxyTarget's URL match
-  // finds the credential and injects the api key at call time.
-  resolveVaultMcpServers: async (tenantId, vaultIds) => {
+  // Vault credentials → extra MCP servers for the spawned snapshot. The
+  // dispatcher only asks for agents with `_oma.vault_mcp_servers: "all"`;
+  // same inference as the sessions route (one server per active MCP
+  // credential, no second Composio router next to a declared one).
+  resolveVaultMcpServers: async (tenantId, vaultIds, declared) => {
     const grouped = await credentialService
       .listByVaults({ tenantId, vaultIds })
       .catch(() => []);
-    const servers: Array<{ name: string; type: "url"; url: string }> = [];
-    const seenUrls = new Set<string>();
-    for (const group of grouped) {
-      for (const cred of group.credentials) {
-        const c = cred as {
-          archived_at?: string | null;
-          auth?: { type?: string; mcp_server_url?: string; composio_toolkits?: string[] };
-        };
-        if (c.archived_at) continue;
-        const auth = c.auth;
-        if (auth?.type !== "composio_mcp") continue;
-        const url = auth.mcp_server_url?.trim();
-        if (!url || seenUrls.has(url)) continue;
-        seenUrls.add(url);
-        const toolkits = Array.isArray(auth.composio_toolkits)
-          ? auth.composio_toolkits.filter((t): t is string => typeof t === "string" && !!t)
-          : [];
-        const base = toolkits.length > 0 ? `composio_${toolkits.join("_")}` : "composio";
-        let name = base;
-        for (let i = 2; servers.some((s) => s.name === name); i++) name = `${base}_${i}`;
-        servers.push({ name, type: "url", url });
-      }
-    }
-    return servers;
+    return inferVaultMcpServers(
+      declared,
+      grouped as unknown as VaultMcpCredentialGroups,
+    ).filter((s): s is { name: string; type: "url"; url: string } => typeof s.url === "string");
   },
 });
 
@@ -4064,73 +4077,69 @@ async function resolveNodeMcpProxyTarget(
   const listed = await credentialService
     .listByVaults({ tenantId, vaultIds })
     .catch(() => []);
-  // First match wins below, so the vault this agent is bound to for this
-  // server (Switch account, the saved-login line) has to come first.
+  // First usable match wins below: the vault this agent is bound to for
+  // this server (Switch account, the saved-login line) comes first, and an
+  // exact-URL credential beats a cosmetic look-alike (orderMatchingCredentials).
   const bound = boundVaultId(agent?.metadata, server.url);
-  const grouped = bound ? preferVaults(listed, [bound]) : listed;
   const composioCandidates: NodeMcpProxyTarget[] = [];
-  for (const group of grouped) {
-    for (const credential of group.credentials) {
-      if ((credential as { archived_at?: string | null }).archived_at) continue;
-      const auth = (credential as unknown as CredentialConfig).auth as
-        | {
-            type?: string;
-            mcp_server_url?: string;
-            bearer_token?: string;
-            token?: string;
-            access_token?: string;
-            api_key?: string;
-            api_key_env?: string;
-            refresh_token?: string;
-            token_endpoint?: string;
-            client_id?: string;
-            client_secret?: string;
-            expires_at?: string;
-          }
-        | undefined;
-      if (!auth || !credentialMatchesMcpServerUrl(auth, server.url)) continue;
+  for (const { vault_id: vaultId, credential } of orderMatchingCredentials(listed, server.url, bound)) {
+    const auth = (credential as unknown as CredentialConfig).auth as
+      | {
+          type?: string;
+          mcp_server_url?: string;
+          bearer_token?: string;
+          token?: string;
+          access_token?: string;
+          api_key?: string;
+          api_key_env?: string;
+          refresh_token?: string;
+          token_endpoint?: string;
+          client_id?: string;
+          client_secret?: string;
+          expires_at?: string;
+        }
+      | undefined;
+    if (!auth) continue;
 
-      if (auth.type === "composio_mcp") {
-        const apiKey = resolveNodeComposioApiKey(auth);
-        if (!apiKey) continue;
-        composioCandidates.push({
-          upstreamUrl: auth.mcp_server_url || server.url,
-          upstreamToken: apiKey,
-          upstreamAuthHeader: { name: "x-api-key", value: apiKey },
-        });
-        continue;
-      }
-
-      const token = auth.bearer_token ?? auth.token ?? auth.access_token;
-      if (!token) continue;
-      const credentialId = (credential as { id: string }).id;
-      const vaultId = group.vault_id;
-      const refresh: NodeMcpProxyRefresh | undefined =
-        auth.type === "mcp_oauth" && auth.refresh_token && auth.token_endpoint
-          ? {
-              refreshToken: auth.refresh_token,
-              tokenEndpoint: auth.token_endpoint,
-              clientId: auth.client_id,
-              clientSecret: auth.client_secret,
-              expiresAtMs: auth.expires_at ? Date.parse(auth.expires_at) || undefined : undefined,
-              persist: async (t) => {
-                await credentialService.refreshAuth({
-                  tenantId,
-                  vaultId,
-                  credentialId,
-                  auth: {
-                    access_token: t.access_token,
-                    refresh_token: t.refresh_token,
-                    expires_at: t.expires_in
-                      ? new Date(Date.now() + t.expires_in * 1000).toISOString()
-                      : undefined,
-                  },
-                });
-              },
-            }
-          : undefined;
-      return { upstreamUrl: server.url, upstreamToken: token, ...(refresh ? { refresh } : {}) };
+    if (auth.type === "composio_mcp") {
+      const apiKey = resolveNodeComposioApiKey(auth);
+      if (!apiKey) continue;
+      composioCandidates.push({
+        upstreamUrl: auth.mcp_server_url || server.url,
+        upstreamToken: apiKey,
+        upstreamAuthHeader: { name: "x-api-key", value: apiKey },
+      });
+      continue;
     }
+
+    const token = auth.bearer_token ?? auth.token ?? auth.access_token;
+    if (!token) continue;
+    const credentialId = (credential as { id: string }).id;
+    const refresh: NodeMcpProxyRefresh | undefined =
+      auth.type === "mcp_oauth" && auth.refresh_token && auth.token_endpoint
+        ? {
+            refreshToken: auth.refresh_token,
+            tokenEndpoint: auth.token_endpoint,
+            clientId: auth.client_id,
+            clientSecret: auth.client_secret,
+            expiresAtMs: auth.expires_at ? Date.parse(auth.expires_at) || undefined : undefined,
+            persist: async (t) => {
+              await credentialService.refreshAuth({
+                tenantId,
+                vaultId,
+                credentialId,
+                auth: {
+                  access_token: t.access_token,
+                  refresh_token: t.refresh_token,
+                  expires_at: t.expires_in
+                    ? new Date(Date.now() + t.expires_in * 1000).toISOString()
+                    : undefined,
+                },
+              });
+            },
+          }
+        : undefined;
+    return { upstreamUrl: server.url, upstreamToken: token, ...(refresh ? { refresh } : {}) };
   }
   // Composio credential selection: any tool-router URL matches any other
   // (credentialMatchesMcpServerUrl), so the vault can yield several
@@ -4170,40 +4179,8 @@ function resolveNodeComposioApiKey(auth: { api_key?: string; api_key_env?: strin
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
-function credentialMatchesMcpServerUrl(
-  auth: { type?: string; mcp_server_url?: string },
-  serverUrl: string,
-): boolean {
-  if (!auth.mcp_server_url) return false;
-  if (auth.mcp_server_url === serverUrl) return true;
-  if (auth.type !== "composio_mcp") return false;
-  if (isComposioMcpUrl(auth.mcp_server_url) && isComposioMcpUrl(serverUrl)) return true;
-  return normalizeMcpUrlForMatch(auth.mcp_server_url) === normalizeMcpUrlForMatch(serverUrl);
-}
-
 function normalizeMcpUrlForMatch(raw: string): string | null {
-  try {
-    const url = new URL(raw);
-    const path = url.pathname.replace(/\/+$/, "") || "/";
-    return `${url.origin}${path}`;
-  } catch {
-    return null;
-  }
-}
-
-function isComposioMcpUrl(raw: string): boolean {
-  try {
-    const url = new URL(raw);
-    const path = url.pathname.replace(/\/+$/, "");
-    if (url.hostname === "connect.composio.dev" && path === "/mcp") return true;
-    return (
-      (url.hostname === "app.composio.dev" || url.hostname === "backend.composio.dev") &&
-      path.includes("/tool_router/") &&
-      path.endsWith("/mcp")
-    );
-  } catch {
-    return false;
-  }
+  return normalizeMcpServerUrl(raw);
 }
 
 async function forwardNodeMcpRequest(

@@ -964,6 +964,10 @@ function AddCredentialModal({
           <div className="text-sm text-fg-muted">
             Authorize an MCP server for delegated user authentication.
           </div>
+          <div className="text-xs text-fg-subtle">
+            Connecting a login doesn&apos;t give it to an agent — add the server on the
+            agent&apos;s MCP Servers or Integrations tab.
+          </div>
 
           <div>
             <label

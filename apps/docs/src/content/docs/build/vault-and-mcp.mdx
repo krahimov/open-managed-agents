@@ -36,6 +36,14 @@ Mirrors the [Claude Managed Agents](https://www.anthropic.com/engineering/manage
 | Cloud agent DO | `(tenantId, sid, server)` | `env.MAIN_MCP.mcpForward(...)` via service-binding RPC (binding scope = auth) |
 | Sandbox container | full upstream URL | `env.MAIN_MCP.outboundForward(...)` via the agent worker's outbound interceptor |
 
+## Credentials authenticate, they don't add servers
+
+A session's MCP servers are the agent's declared `mcp_servers`, plus any server an integration injects for that session (Slack, Linear). Vault credentials are used for **auth only**: when a declared server is called, the proxy finds the credential in the session's vaults whose `mcp_server_url` matches the server URL (ignoring cosmetic differences such as a trailing slash) and injects it. A login sitting in an attached vault never gives the agent that server's tools — declare the server on the agent (console: the agent's **MCP Servers** or **Integrations** tab).
+
+In-product connect flows do this for you: when an agent's connect card completes (OAuth or API key), the platform attaches the vault and declares the server on that agent. The declared server gets an `mcp_toolset` entry with no permission policy of its own, so its tools keep following the agent's built-in toolset policy until you set one.
+
+Agents that relied on the old behavior — every active `mcp_oauth` / `static_bearer` / `composio_mcp` credential in a session's vaults becoming a session server — can opt back in per agent with `_oma.vault_mcp_servers: "all"` (default `"declared"`). With `"all"`, a Composio credential is skipped when the agent already declares a Composio server, so it never gets two tool routers.
+
 ## OAuth refresh
 
 For credentials of type `mcp_oauth`, the proxy automatically handles 401:

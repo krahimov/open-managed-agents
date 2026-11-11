@@ -19,8 +19,13 @@ import type {
   AgentConfig,
   AgentMemoryConfig,
   ReasoningLevel,
+  VaultMcpServersMode,
 } from "@open-managed-agents/shared";
-import { AGENT_MEMORY_MODES, REASONING_LEVELS } from "@open-managed-agents/shared";
+import {
+  AGENT_MEMORY_MODES,
+  REASONING_LEVELS,
+  VAULT_MCP_SERVERS_MODES,
+} from "@open-managed-agents/shared";
 import {
   AgentNotFoundError,
   AgentVersionMismatchError,
@@ -51,6 +56,7 @@ function formatAgent(agent: AgentConfig) {
   if (agent.harness) oma.harness = agent.harness;
   if (agent.reasoning_level) oma.reasoning_level = agent.reasoning_level;
   if (agent.memory) oma.memory = agent.memory;
+  if (agent.vault_mcp_servers) oma.vault_mcp_servers = agent.vault_mcp_servers;
   if (agent.runtime_binding) oma.runtime_binding = agent.runtime_binding;
   if (agent.appendable_prompts && agent.appendable_prompts.length > 0) {
     oma.appendable_prompts = agent.appendable_prompts;
@@ -84,6 +90,7 @@ function formatAgent(agent: AgentConfig) {
     harness: _harness,
     reasoning_level: _rl,
     memory: _mem,
+    vault_mcp_servers: _vms,
     runtime_binding: _rb,
     appendable_prompts: _ap,
     callable_agents: _ca,
@@ -193,6 +200,16 @@ function invalidMemoryConfig(value: unknown): string | null {
   return null;
 }
 
+/** Validate an _oma.vault_mcp_servers value. `undefined`/`null` are fine
+ *  (unset / clear → "declared"). */
+function invalidVaultMcpServers(value: unknown): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value === "string" && (VAULT_MCP_SERVERS_MODES as readonly string[]).includes(value)) {
+    return null;
+  }
+  return `vault_mcp_servers must be one of ${VAULT_MCP_SERVERS_MODES.join("|")}`;
+}
+
 /** Validate an _oma.reasoning_level value. `undefined`/`null` are fine
  *  (unset / clear); anything else must be one of the enum values. */
 function invalidReasoningLevel(value: unknown): string | null {
@@ -280,6 +297,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
         harness?: string;
         reasoning_level?: ReasoningLevel;
         memory?: AgentMemoryConfig;
+        vault_mcp_servers?: VaultMcpServersMode;
         runtime_binding?: AgentConfig["runtime_binding"];
         appendable_prompts?: string[];
       };
@@ -292,6 +310,8 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
     if (rlError) return c.json({ error: rlError }, 400);
     const memError = invalidMemoryConfig(raw._oma?.memory);
     if (memError) return c.json({ error: memError }, 400);
+    const vmsError = invalidVaultMcpServers(raw._oma?.vault_mcp_servers);
+    if (vmsError) return c.json({ error: vmsError }, 400);
 
     const body = {
       ...raw,
@@ -300,6 +320,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
       harness: raw._oma?.harness,
       reasoning_level: raw._oma?.reasoning_level,
       memory: raw._oma?.memory,
+      vault_mcp_servers: raw._oma?.vault_mcp_servers,
       runtime_binding: raw._oma?.runtime_binding,
       appendable_prompts: raw._oma?.appendable_prompts,
     };
@@ -378,6 +399,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
         aux_model: body.aux_model,
         reasoning_level: body.reasoning_level,
         memory: body.memory,
+        vault_mcp_servers: body.vault_mcp_servers,
         appendable_prompts: body.appendable_prompts,
         runtime_binding: body.runtime_binding,
         enable_general_subagent: (body as { enable_general_subagent?: boolean })
@@ -700,6 +722,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
         harness?: string;
         reasoning_level?: ReasoningLevel | null;
         memory?: AgentMemoryConfig | null;
+        vault_mcp_servers?: VaultMcpServersMode | null;
         runtime_binding?: AgentConfig["runtime_binding"] | null;
         appendable_prompts?: string[] | null;
       };
@@ -718,6 +741,8 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
     if (rlError) return c.json({ error: rlError }, 400);
     const memError = invalidMemoryConfig(raw._oma?.memory);
     if (memError) return c.json({ error: memError }, 400);
+    const vmsError = invalidVaultMcpServers(raw._oma?.vault_mcp_servers);
+    if (vmsError) return c.json({ error: vmsError }, 400);
 
     const body = {
       ...raw,
@@ -726,6 +751,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
       harness: raw._oma?.harness,
       reasoning_level: raw._oma?.reasoning_level,
       memory: raw._oma?.memory,
+      vault_mcp_servers: raw._oma?.vault_mcp_servers,
       runtime_binding: raw._oma?.runtime_binding,
       appendable_prompts: raw._oma?.appendable_prompts,
     };
@@ -774,6 +800,7 @@ export function buildAgentRoutes(deps: AgentRoutesDeps) {
           aux_model: body.aux_model,
           reasoning_level: body.reasoning_level,
           memory: body.memory,
+          vault_mcp_servers: body.vault_mcp_servers,
           appendable_prompts: body.appendable_prompts,
           runtime_binding: body.runtime_binding,
           enable_general_subagent: (body as { enable_general_subagent?: boolean })
