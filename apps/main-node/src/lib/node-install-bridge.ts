@@ -103,6 +103,10 @@ export interface NodeInstallBridgeOpts {
   /** Attach the agent's own memory store (per its memory mode) to a session
    *  this bridge creates. Must not throw. */
   attachAgentMemory?: (input: import("./agent-memory-mode.js").AttachAgentMemoryInput) => Promise<void>;
+  /** Before the snapshot is pinned: the sessions route's vault steps
+   *  (Composio router repair, vault-contributed MCP servers). Should not
+   *  throw; a failure leaves the snapshot as is. */
+  prepareAgentSnapshot?: <A extends Record<string, unknown>>(tenantId: string, vaultIds: string[], agent: A) => Promise<A>;
 }
 
 export class NodeInstallBridge implements InstallBridge {
@@ -578,13 +582,16 @@ class InProcessSessionCreator implements SessionCreator {
     // don't 404.
     const envSnapshot = { id: input.environmentId, runtime: "local", sandbox_template: null };
     const meta = Object.keys(input.metadata ?? {}).length === 0 ? undefined : input.metadata;
+    const agentSnapshot = this.opts.prepareAgentSnapshot && input.vaultIds.length > 0
+      ? await this.opts.prepareAgentSnapshot(tenantId, [...input.vaultIds], agentBase).catch(() => agentBase)
+      : agentBase;
     const { session } = await this.opts.sessions.create({
       tenantId,
       agentId: input.agentId,
       environmentId: input.environmentId,
       title: "",
       vaultIds: [...input.vaultIds],
-      agentSnapshot: agentBase as never,
+      agentSnapshot: agentSnapshot as never,
       environmentSnapshot: envSnapshot as never,
       metadata: meta as never,
       resources: (input.resources ?? []).map((resource) => {

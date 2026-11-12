@@ -126,8 +126,9 @@ describe("sessions route — vault credentials authenticate, they don't add serv
     // GitHub's credential URL differs only by the trailing slash → not re-added.
     expect(servers).toEqual([
       { name: "github", type: "url", url: GITHUB },
-      { name: "mcp", type: "url", url: NOTION },
-      { name: "mcp_2", type: "url", url: SENTRY },
+      // Brand label, not the first DNS label ("mcp", "mcp_2" before).
+      { name: "notion", type: "url", url: NOTION },
+      { name: "sentry", type: "url", url: SENTRY },
       { name: "composio_gmail_linear", type: "url", url: COMPOSIO },
     ]);
   });
@@ -182,7 +183,7 @@ describe("sessions route — vault credentials authenticate, they don't add serv
 });
 
 describe("inferVaultMcpServers (the opt-in rule)", () => {
-  it("keeps at most one Composio router, preferring a concrete per-session URL", () => {
+  it("drops a sentinel-only Composio credential next to a concrete router", () => {
     const servers = inferVaultMcpServers([], [
       {
         vault_id: "v1",
@@ -256,7 +257,7 @@ describe("ambient dispatch is gated on the same opt-in", () => {
   it('"all": vault-derived servers are appended after the declared ones', async () => {
     const { servers, asked } = await fire({ vault_mcp_servers: "all" });
     expect(asked).toHaveLength(1);
-    expect(servers.map((s) => s.name)).toEqual(["github", "mcp", "mcp_2", "composio_gmail_linear"]);
+    expect(servers.map((s) => s.name)).toEqual(["github", "notion", "sentry", "composio_gmail_linear"]);
   });
 });
 

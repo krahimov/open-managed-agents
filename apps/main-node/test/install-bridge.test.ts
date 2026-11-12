@@ -578,3 +578,37 @@ TSZ9zdvD3TPAKj3/4HJYPDh4fLULtHtX2+L9UeUF8EcL3Kqgz+hC0CRPRLELYM07
 e43nXM4G2QegVrL1c4u7fVzUhFGXqoY+xiAYa//JDyFxNR9jWavmAiIIGIJ9/+/h
 FF9ZEbS8ihFcZAtGzVS/PVo4tg==
 -----END PRIVATE KEY-----`;
+
+describe("InProcessSessionCreator runs the session-prep hook (Composio repair + vault servers)", () => {
+  it("passes the session's vaults and pins the prepared snapshot", async () => {
+    const { sql, db, agents, vaults, credentials, sessions } = await bootstrap();
+    const seen: Array<{ tenantId: string; vaultIds: string[] }> = [];
+    const bridge = new NodeInstallBridge({
+      sql,
+      db,
+      platformRootSecret: SECRET,
+      gatewayOrigin: "https://gateway.test",
+      vaults,
+      credentials,
+      sessions,
+      agents,
+      resolveTenantId: async (uid) => (uid === USER ? TENANT : null),
+      prepareAgentSnapshot: async (tenantId, vaultIds, agent) => {
+        seen.push({ tenantId, vaultIds });
+        return { ...agent, mcp_servers: [{ name: "prepared", type: "url", url: "https://x.example/mcp" }] };
+      },
+    });
+    const agentRow = await agents.create({ tenantId: TENANT, input: { name: "Bot", model: "claude-haiku-4-5-20251001" } });
+    const { sessionId } = await bridge.buildContainers().slack.sessions.create({
+      userId: USER,
+      agentId: agentRow.id,
+      environmentId: "env-local-runtime",
+      vaultIds: ["vlt_slack"],
+      mcpServers: [],
+      metadata: {},
+    } as never);
+    expect(seen).toEqual([{ tenantId: TENANT, vaultIds: ["vlt_slack"] }]);
+    const row = await sessions.get({ tenantId: TENANT, sessionId });
+    expect((row?.agent_snapshot as { mcp_servers?: Array<{ name: string }> }).mcp_servers?.map((s) => s.name)).toEqual(["prepared"]);
+  });
+});

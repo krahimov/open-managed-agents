@@ -1351,8 +1351,23 @@ export interface CredentialAuth {
   composio_user_id?: string;
   composio_session_id?: string;
   composio_toolkits?: string[];
+  /** toolkits.disable the router was created with (unlocked routers). */
+  composio_disabled_toolkits?: string[];
+  /** Values of composio_connected_accounts (kept for older readers). */
   composio_connected_account_ids?: string[];
+  /** toolkit → connected account id the router session was created with
+   *  (`connected_accounts`). Written only by provisioning code that really
+   *  bound them, so its absence marks a router of unknown binding. */
+  composio_connected_accounts?: Record<string, string>;
   composio_auth_config_ids?: string[];
+  /** toolkit → auth config the router session was created with
+   *  (`auth_configs`) — passed back on every re-provision so custom auth
+   *  configs (e.g. X/twitter) survive. */
+  composio_auth_configs?: Record<string, string>;
+  /** Router URLs this credential replaced on re-provision (newest first,
+   *  bounded) — lets the MCP proxy route a session snapshot still holding
+   *  an old router URL to its successor rather than any router. */
+  composio_previous_mcp_server_urls?: string[];
   // Provider tag: when set, the outbound proxy can request a token refresh
   // via the integrations gateway (which holds the secrets needed to mint a
   // fresh token — e.g. GitHub App private key). Used to support short-lived

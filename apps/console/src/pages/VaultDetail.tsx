@@ -415,6 +415,7 @@ export function VaultDetail() {
             closeAddCred();
             reloadCredentials();
           }}
+          onCredentialsChanged={reloadCredentials}
         />
       )}
     </Page>
@@ -432,6 +433,7 @@ function AddCredentialModal({
   hasComposioCredential,
   onClose,
   onCreated,
+  onCredentialsChanged,
 }: {
   vault: Vault;
   initialType?: "oauth" | "bearer" | "composio";
@@ -439,6 +441,9 @@ function AddCredentialModal({
   hasComposioCredential: boolean;
   onClose: () => void;
   onCreated: () => void;
+  /** The vault's credential list changed without this modal finishing
+   *  (a router re-provisioned in the background) — reload, don't close. */
+  onCredentialsChanged?: () => void;
 }) {
   const { api } = useApi();
   const { data: composioStatus, isLoading: composioStatusLoading } =
@@ -602,9 +607,24 @@ function AddCredentialModal({
           return next;
         });
         toast.success("Provider account connected through Composio.");
+        // The account just turned ACTIVE: re-provision this vault's EXISTING
+        // tool routers so they bind it — a router doesn't see an unbound
+        // account (best-effort; sessions also repair on start). Only a
+        // credential-list reload: the modal stays open — its own submit
+        // still creates the router for the toolkits being connected.
+        if (hasComposioCredential) {
+          void api<{ refreshed?: number }>(
+            `/v1/vaults/${vault.id}/credentials/composio_tool_router_session/refresh`,
+            { method: "POST", body: JSON.stringify({}), silentErrors: true },
+          )
+            .then((res) => {
+              if ((res?.refreshed ?? 0) > 0) onCredentialsChanged?.();
+            })
+            .catch(() => {});
+        }
       }
     },
-    [onCreated],
+    [api, hasComposioCredential, onCreated, onCredentialsChanged, vault.id],
   );
 
   useEffect(() => {
