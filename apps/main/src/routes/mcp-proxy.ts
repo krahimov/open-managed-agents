@@ -48,7 +48,7 @@
 
 import { Hono } from "hono";
 import type { Env, AgentConfig, CredentialConfig } from "@open-managed-agents/shared";
-import { log, logWarn } from "@open-managed-agents/shared";
+import { composioPlatformKeyEnvFor, log, logWarn } from "@open-managed-agents/shared";
 import type { Services } from "@open-managed-agents/services";
 import type { KvStore } from "@open-managed-agents/kv-store";
 import { builtinSpecs, createSpecRegistry } from "@open-managed-agents/cap";
@@ -95,12 +95,18 @@ function exactBearerHeader(token: string): NonNullable<ProxyTarget["upstreamAuth
   return { name: "authorization", value: `Bearer ${token}` };
 }
 
+/** A composio_mcp credential's own raw key, else the platform key — and
+ *  that only for a real Composio upstream and the platform key's variable
+ *  (composioPlatformKeyEnvFor): `api_key_env` and `mcp_server_url` are
+ *  tenant-writable, and this value goes out as `x-api-key`. */
 function resolveComposioApiKey(
   env: Env,
   auth: { api_key?: string; api_key_env?: string },
+  upstreamUrl: string,
 ): string | null {
   if (typeof auth.api_key === "string" && auth.api_key.length > 0) return auth.api_key;
-  const envName = auth.api_key_env || "COMPOSIO_API_KEY";
+  const envName = composioPlatformKeyEnvFor(auth, upstreamUrl);
+  if (!envName) return null;
   const raw = (env as unknown as Record<string, unknown>)[envName];
   return typeof raw === "string" && raw.length > 0 ? raw : null;
 }
@@ -144,7 +150,7 @@ function isGenericComposioMcpUrl(raw: string): boolean {
 }
 
 function credentialMatchesServerUrl(
-  auth: { type?: string; mcp_server_url?: string },
+  auth: { type?: string; mcp_server_url?: string; composio_previous_mcp_server_urls?: string[] },
   serverUrl: string,
 ): boolean {
   if (!auth.mcp_server_url) return false;
@@ -158,6 +164,11 @@ function credentialMatchesServerUrl(
     if (canonicalMcpQuery(auth.mcp_server_url) === canonicalMcpQuery(serverUrl)) return true;
   }
   if (auth.type !== "composio_mcp") return false;
+  // A re-provisioned router (account binding, toolkit add) serves the
+  // sessions whose snapshot still pins the URL it replaced.
+  if (server && (auth.composio_previous_mcp_server_urls ?? []).some((prev) => normalizeMcpUrlForMatch(prev) === server)) {
+    return true;
+  }
   return isGenericComposioMcpUrl(serverUrl) && isComposioMcpUrl(auth.mcp_server_url);
 }
 
@@ -261,10 +272,11 @@ export async function resolveProxyTargetByTenant(
       | undefined;
     if (!auth || !credentialMatchesServerUrl(auth, server.url)) continue;
     if (auth.type === "composio_mcp") {
-      const apiKey = resolveComposioApiKey(env, auth);
+      const upstreamUrl = auth.mcp_server_url || server.url;
+      const apiKey = resolveComposioApiKey(env, auth, upstreamUrl);
       if (!apiKey) continue;
       return {
-        upstreamUrl: auth.mcp_server_url || server.url,
+        upstreamUrl,
         upstreamToken: apiKey,
         upstreamAuthHeader: { name: "x-api-key", value: apiKey },
       };

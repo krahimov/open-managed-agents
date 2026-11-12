@@ -85,7 +85,7 @@ import { toFileRecord } from "@open-managed-agents/files-store";
 import { SqlEventLog } from "@open-managed-agents/event-log/sql";
 import { sessionErrorAlreadyEmitted } from "@open-managed-agents/session-runtime";
 import type { AgentConfig, CredentialConfig, EnvironmentConfig, SessionEvent, Trajectory } from "@open-managed-agents/shared";
-import { generateEventId, extractTextFromContent, extractTraceFacts, inferVaultMcpServers, isComposioMcpUrl, normalizeMcpServerUrl } from "@open-managed-agents/shared";
+import { generateEventId, extractTextFromContent, extractTraceFacts, composioPlatformKeyEnvFor, isComposioMcpUrl, normalizeMcpServerUrl, vaultMcpServersMayAdd, withVaultMcpServers } from "@open-managed-agents/shared";
 import type { TraceFacts, VaultMcpCredentialGroups } from "@open-managed-agents/shared";
 import { DefaultHarness } from "@open-managed-agents/agent/harness/default-loop";
 import { CodexSdkHarness } from "./lib/codex-sdk-harness.js";
@@ -124,8 +124,14 @@ import {
   buildAgentRoutes,
   buildVaultRoutes,
   listComposioToolkits,
-  createComposioToolRouterSession,
-  listComposioConnectedAccounts,
+  listAllComposioConnectedAccounts,
+  provisionComposioToolRouter,
+  composioRouterAuth,
+  selectComposioAccountBindings,
+  isTenantScopedComposioUserId,
+  rotateRouterCredential,
+  routerCarryOver,
+  ComposioRouterRefresher,
   buildSessionRoutes,
   buildDeploymentRoutes,
   buildPublicGatewayRoutes,
@@ -204,6 +210,7 @@ import {
 import {
   credentialMatchesMcpServerUrl,
   orderMatchingCredentials,
+  pickComposioCandidate,
   forwardNodeMcpRequestWithRefresh,
   verifyMcpCredential,
   type NodeMcpProxyRefresh,
@@ -1918,7 +1925,8 @@ composioGraftRoutes.post("/:id/composio/graft", async (c) => {
   const body = await c.req
     .json<{ toolkit?: string; vault_id?: string }>()
     .catch(() => ({}) as { toolkit?: string; vault_id?: string });
-  const toolkit = (body.toolkit ?? "").trim().toLowerCase();
+  // Composio slugs are bare alphanumerics ("google-drive" → googledrive).
+  const toolkit = (body.toolkit ?? "").trim().toLowerCase().replace(/[-_.\s]+/g, "");
   const vaultId = (body.vault_id ?? "").trim();
   if (!toolkit || !vaultId) {
     return c.json({ error: "toolkit and vault_id are required" }, 400);
@@ -1944,78 +1952,114 @@ composioGraftRoutes.post("/:id/composio/graft", async (c) => {
   if (!key) {
     return c.json({ error: "No Composio API key configured for this workspace" }, 503);
   }
-  const creds = await credentialService.list({ tenantId, vaultId });
-  const active = creds.find(
-    (cr) =>
-      !cr.archived_at &&
-      (cr as unknown as { auth?: { type?: string } }).auth?.type === "composio_mcp",
-  );
-  const activeAuth = active
-    ? (active as unknown as {
-        auth: { composio_user_id?: string; composio_toolkits?: string[] };
-      }).auth
-    : null;
-  const composioUserId = activeAuth?.composio_user_id || `oma:${tenantId}:${vaultId}`;
-  const allToolkits = [
-    ...new Set([
-      ...(activeAuth?.composio_toolkits ?? []).map((t) => t.toLowerCase()),
-      ...toolkits,
-    ]),
-  ];
-  const accountList = await listComposioConnectedAccounts(
-    { apiKey: key.apiKey },
-    { userId: composioUserId },
-  ).catch(() => ({ items: [] as Array<never> }));
-  const connectedAccounts: Record<string, string> = {};
-  for (const acct of accountList.items as Array<{
-    id: string;
-    status?: string;
-    toolkit?: { slug?: string };
-  }>) {
-    const slug = (acct.toolkit?.slug ?? "").toLowerCase();
-    // Newest-first listing: keep the first ACTIVE account per toolkit.
-    if (slug && acct.status === "ACTIVE" && allToolkits.includes(slug) && !connectedAccounts[slug]) {
-      connectedAccounts[slug] = acct.id;
+  type RouterAuth = {
+    type?: string;
+    mcp_server_url?: string;
+    api_key?: string;
+    api_key_env?: string;
+    composio_user_id?: string;
+    composio_session_id?: string;
+    composio_toolkits?: string[];
+    composio_connected_accounts?: Record<string, string>;
+    composio_connected_account_ids?: string[];
+    composio_auth_configs?: Record<string, string>;
+    composio_auth_config_ids?: string[];
+    composio_previous_mcp_server_urls?: string[];
+  };
+  const authOf = (cr: unknown) => (cr as { auth?: RouterAuth }).auth;
+  // Every router rotation in a vault runs under the refresher's vault lock
+  // (session-start repair, refresh endpoint, toolkit add): read and rotate
+  // inside it, so a repair racing this graft can't leave two active
+  // routers claiming the same lineage.
+  type GraftOutcome =
+    | { ok: true; allToolkits: string[]; connectedAccounts: Record<string, string> }
+    | { ok: false; status: 403 | 409 | 502; error: string };
+  const outcome = await composioRouterRefresher.withVaultLock(tenantId, vaultId, async (): Promise<GraftOutcome> => {
+    const creds = await credentialService.list({ tenantId, vaultId });
+    // The vault's tool-router credential — never the bare API-key credential
+    // (composio_mcp + generic URL, no session) the console's Apps page
+    // stores: re-provisioning "from" that one used to archive the tenant's
+    // pasted key.
+    const active = creds.find(
+      (cr) => !cr.archived_at && authOf(cr)?.type === "composio_mcp" && !!authOf(cr)?.composio_session_id,
+    );
+    const activeAuth = active ? authOf(active)! : null;
+    const composioUserId = activeAuth?.composio_user_id || `oma:${tenantId}:${vaultId}`;
+    if (key.source === "platform" && !isTenantScopedComposioUserId(composioUserId, tenantId)) {
+      return { ok: false, status: 403, error: "This vault's Composio user belongs to another workspace" };
     }
-  }
-  if (!connectedAccounts[toolkit]) {
-    return c.json({ error: `No active ${toolkit} account was found in this vault. Complete provider authorization and retry.` }, 409);
-  }
-  const routerSession = await createComposioToolRouterSession(
-    { apiKey: key.apiKey },
-    {
-      user_id: composioUserId,
-      toolkits: { enable: allToolkits },
-      ...(Object.keys(connectedAccounts).length > 0
-        ? { connected_accounts: connectedAccounts }
-        : {}),
-    },
-  );
-  await credentialService.create({
-    tenantId,
-    vaultId,
-    displayName: active?.display_name ?? `Composio Tool Router (${agent.name})`,
-    auth: {
-      type: "composio_mcp",
-      mcp_server_url: routerSession.mcp.url,
-      // Same shape the composio_tool_router_session route stores: env
-      // pointer for the platform key, raw key for a tenant-level one.
-      ...(key.source === "platform"
-        ? { api_key_env: "COMPOSIO_API_KEY" }
-        : { api_key: key.apiKey }),
-      composio_user_id: composioUserId,
-      composio_session_id: routerSession.session_id,
-      composio_toolkits: allToolkits,
-      ...(Object.keys(connectedAccounts).length > 0
-        ? { composio_connected_account_ids: Object.values(connectedAccounts) }
-        : {}),
-    },
+    const allToolkits = [
+      ...new Set([
+        ...(activeAuth?.composio_toolkits ?? []).map((t) => t.toLowerCase()),
+        ...toolkits,
+      ]),
+    ];
+    const accounts = await listAllComposioConnectedAccounts({ apiKey: key.apiKey }, composioUserId)
+      .catch(() => null);
+    if (!accounts) {
+      return { ok: false, status: 502, error: "Could not list Composio connected accounts — retry in a moment." };
+    }
+    // Keep the router's other bindings while they are bindable; the
+    // just-granted toolkit takes its NEWEST ACTIVE account (the one this
+    // grant's OAuth produced), not an older one the router held.
+    const carry = activeAuth ? routerCarryOver(activeAuth) : {};
+    const keep: Record<string, string | string[]> = { ...(carry.preferredAccounts ?? {}) };
+    for (const id of carry.preferredAccountIds ?? []) {
+      const acct = accounts.find((a) => a.id === id);
+      const slug = (acct?.toolkit?.slug ?? "").toLowerCase();
+      if (slug && !keep[slug]) keep[slug] = id;
+    }
+    delete keep[toolkit];
+    const connectedAccounts = selectComposioAccountBindings({
+      accounts,
+      userId: composioUserId,
+      enabled: allToolkits,
+      preferred: keep,
+    });
+    if (!connectedAccounts[toolkit]) {
+      return {
+        ok: false,
+        status: 409,
+        error: `No active ${toolkit} account was found in this vault. Complete provider authorization and retry.`,
+      };
+    }
+    const router = await provisionComposioToolRouter(
+      { apiKey: key.apiKey },
+      {
+        userId: composioUserId,
+        enabled: allToolkits,
+        accounts,
+        preferredAccounts: connectedAccounts,
+        authConfigs: carry.authConfigs,
+        authConfigIds: carry.authConfigIds,
+      },
+    );
+    // Same shape the composio_tool_router_session route stores: env
+    // pointer for the platform key, raw key for a tenant-level one.
+    const rotated = await rotateRouterCredential(credentialService as never, {
+      tenantId,
+      vaultId,
+      replaced: active ?? null,
+      displayName: active?.display_name ?? `Composio Tool Router (${agent.name})`,
+      auth: composioRouterAuth({
+        key: key.source === "platform" ? { api_key_env: "COMPOSIO_API_KEY" } : { api_key: key.apiKey },
+        userId: composioUserId,
+        router,
+        enabled: allToolkits,
+        authConfigIds: activeAuth?.composio_auth_config_ids,
+        replacedUrls: activeAuth
+          ? [activeAuth.mcp_server_url, ...(activeAuth.composio_previous_mcp_server_urls ?? [])]
+          : [],
+      }),
+    });
+    if (active) composioRouterRefresher.markReplaced(tenantId, active.id);
+    if (rotated.conflict) {
+      return { ok: false, status: 409, error: "The vault's Composio router changed meanwhile — retry." };
+    }
+    return { ok: true, allToolkits, connectedAccounts: router.connectedAccounts };
   });
-  if (active) {
-    await credentialService
-      .archive({ tenantId, vaultId, credentialId: active.id })
-      .catch(() => {});
-  }
+  if (!outcome.ok) return c.json({ error: outcome.error }, outcome.status);
+  const { allToolkits, connectedAccounts } = outcome;
   const credentialCreated = true;
 
   // Agent: tool-router mcp_server + vault link + toolkit list.
@@ -2178,6 +2222,7 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_USERNAME && proce
   telegram = new TelegramOnboarding({
     sql, agents: agentsService, sessions: sessionsService, router: sessionRouter,
     attachAgentMemory: attachAgentMemoryQuietly,
+    prepareAgentSnapshot: prepareVaultSessionSnapshot,
     token: process.env.TELEGRAM_BOT_TOKEN,
     username: process.env.TELEGRAM_BOT_USERNAME.replace(/^@/, ""),
     webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET,
@@ -2618,6 +2663,64 @@ v1.post("/skills/acquire", async (c) => {
   }
 });
 
+// Composio tool-router repair (packages/http-routes/src/vaults/composio-router.ts):
+// routers provisioned before account binding existed — or before a
+// toolkit's OAuth finished — don't see ACTIVE accounts (prod 2026-11:
+// HubSpot/Airtable "No Active connection" while ACTIVE). Before a session
+// starts, a router with an enabled toolkit that has no recorded binding is
+// re-checked against Composio (at most once per TTL per credential; no
+// Composio call at all once every toolkit is bound) and re-provisioned
+// when that toolkit now has an ACTIVE account. Shared with the vault
+// routes' refresh endpoint so both dedupe in-flight re-provisions.
+const composioRouterRefresher = new ComposioRouterRefresher({
+  platformApiKey: () => process.env.COMPOSIO_API_KEY,
+  onError: (err, ctx) =>
+    logger.warn({ err, op: "composio.router_refresh_failed", ...ctx }, "composio router refresh failed"),
+});
+/** Session creation waits at most this long for a repair; a slower one
+ *  finishes in the background (the proxy reads credentials per request and
+ *  routes the pinned URL to its successor). */
+const COMPOSIO_REPAIR_BUDGET_MS = 3_000;
+
+/** For session creators outside the sessions route (Slack/Linear/GitHub
+ *  install bridge, Telegram): the same pre-snapshot steps — Composio router
+ *  repair, then the vault-contributed servers (withVaultMcpServers). */
+async function prepareVaultSessionSnapshot<A extends Record<string, unknown>>(
+  tenantId: string,
+  vaultIds: string[],
+  agent: A,
+): Promise<A> {
+  if (vaultIds.length === 0) return agent;
+  await repairComposioRoutersBeforeSession(tenantId, vaultIds);
+  if (!vaultMcpServersMayAdd(agent as never)) return agent;
+  const grouped = await credentialService.listByVaults({ tenantId, vaultIds }).catch(() => []);
+  return withVaultMcpServers(agent as never, grouped as unknown as VaultMcpCredentialGroups) as A;
+}
+
+async function repairComposioRoutersBeforeSession(tenantId: string, vaultIds: string[]): Promise<void> {
+  if (vaultIds.length === 0) return;
+  const run = composioRouterRefresher
+    .refreshVaults({ credentials: credentialService as never, tenantId, vaultIds, mode: "lazy" })
+    .then((results) => {
+      for (const result of results) {
+        if (result.status !== "refreshed") continue;
+        logger.info(
+          { op: "composio.router_refreshed", tenant_id: tenantId, ...result },
+          "composio router re-provisioned with ACTIVE accounts bound",
+        );
+      }
+    })
+    .catch((err) => logger.warn({ err, op: "composio.router_repair_failed" }, "composio router repair failed"));
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    run,
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, COMPOSIO_REPAIR_BUDGET_MS);
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+}
+
 const sessionRoutesApp = buildSessionRoutes({
   services,
   router: sessionRouter,
@@ -2650,6 +2753,12 @@ const sessionRoutesApp = buildSessionRoutes({
   }),
   lifecycle: {
     ...nodeSessionLifecycle({ files: filesService, filesBlob }),
+    // Composio routers with an unbound toolkit that now has an ACTIVE
+    // account are re-provisioned before the snapshot pins their URL.
+    refreshSessionCredentials: async ({ tenantId, vaultIds }) => {
+      await repairComposioRoutersBeforeSession(tenantId, vaultIds);
+      return [];
+    },
     // Agent memory mode: attach the agent's own store before the runtime
     // inits, so it is mounted and described on turn 1.
     attachAgentMemory,
@@ -2697,6 +2806,7 @@ v1.route("/vaults", buildVaultRoutes({
     // operator env fallback. Hoisted function declaration defined below.
     resolveApiKey: async (tenantId) =>
       (await resolveTenantComposioKey(tenantId))?.apiKey ?? null,
+    refresher: composioRouterRefresher,
   },
 }));
 v1.route(
@@ -3512,6 +3622,7 @@ if (platformRootSecret) {
     sessions: sessionsService,
     agents: agentsService,
     attachAgentMemory: attachAgentMemoryQuietly,
+    prepareAgentSnapshot: prepareVaultSessionSnapshot,
     resolveTenantId: async (userId) => {
       const row = await sql
         .prepare(
@@ -3874,19 +3985,16 @@ const ambientDispatcher = new NodeAmbientDispatcher({
   appendUserEvent: async (sessionId, _tenantId, _agentId, event) => {
     await sessionRouter.appendEvent(sessionId, event);
   },
-  // Vault credentials → extra MCP servers for the spawned snapshot. The
-  // dispatcher only asks for agents with `_oma.vault_mcp_servers: "all"`;
-  // same inference as the sessions route (one server per active MCP
-  // credential, no second Composio router next to a declared one).
-  resolveVaultMcpServers: async (tenantId, vaultIds, declared) => {
-    const grouped = await credentialService
+  // Vault credentials → the spawned snapshot's vault servers: the
+  // dispatcher applies the sessions route's withVaultMcpServers ("all"
+  // inference; a declared generic Composio server expanded to every
+  // uncovered router, with its permissions inherited).
+  listVaultCredentials: async (tenantId, vaultIds) =>
+    (await credentialService
       .listByVaults({ tenantId, vaultIds })
-      .catch(() => []);
-    return inferVaultMcpServers(
-      declared,
-      grouped as unknown as VaultMcpCredentialGroups,
-    ).filter((s): s is { name: string; type: "url"; url: string } => typeof s.url === "string");
-  },
+      .catch(() => [])) as unknown as VaultMcpCredentialGroups,
+  // Same Composio router repair the sessions route runs before a snapshot.
+  refreshVaultCredentials: (tenantId, vaultIds) => repairComposioRoutersBeforeSession(tenantId, vaultIds),
 });
 
 // Orphan-sandbox sweep: only when this install can reach a Daytona account,
@@ -4081,7 +4189,7 @@ async function resolveNodeMcpProxyTarget(
   // this server (Switch account, the saved-login line) comes first, and an
   // exact-URL credential beats a cosmetic look-alike (orderMatchingCredentials).
   const bound = boundVaultId(agent?.metadata, server.url);
-  const composioCandidates: NodeMcpProxyTarget[] = [];
+  const composioCandidates: Array<NodeMcpProxyTarget & { previousUrls?: string[] }> = [];
   for (const { vault_id: vaultId, credential } of orderMatchingCredentials(listed, server.url, bound)) {
     const auth = (credential as unknown as CredentialConfig).auth as
       | {
@@ -4097,17 +4205,22 @@ async function resolveNodeMcpProxyTarget(
           client_id?: string;
           client_secret?: string;
           expires_at?: string;
+          composio_previous_mcp_server_urls?: string[];
         }
       | undefined;
     if (!auth) continue;
 
     if (auth.type === "composio_mcp") {
-      const apiKey = resolveNodeComposioApiKey(auth);
+      const upstreamUrl = auth.mcp_server_url || server.url;
+      const apiKey = resolveNodeComposioApiKey(auth, upstreamUrl);
       if (!apiKey) continue;
       composioCandidates.push({
-        upstreamUrl: auth.mcp_server_url || server.url,
+        upstreamUrl,
         upstreamToken: apiKey,
         upstreamAuthHeader: { name: "x-api-key", value: apiKey },
+        previousUrls: Array.isArray(auth.composio_previous_mcp_server_urls)
+          ? auth.composio_previous_mcp_server_urls
+          : undefined,
       });
       continue;
     }
@@ -4141,40 +4254,25 @@ async function resolveNodeMcpProxyTarget(
         : undefined;
     return { upstreamUrl: server.url, upstreamToken: token, ...(refresh ? { refresh } : {}) };
   }
-  // Composio credential selection: any tool-router URL matches any other
-  // (credentialMatchesMcpServerUrl), so the vault can yield several
-  // candidates. Prefer a CONCRETE per-session URL (…/tool_router/trs_*/mcp)
-  // over the generic sentinel (…/tool_router/v3/session/mcp) — the sentinel
-  // is not a servable endpoint (301s), and after a credential rotation a
-  // leftover sentinel credential silently won first-match, killing every
-  // Composio tool in the session (observed 2026-07-20 on the GC agent).
-  if (composioCandidates.length > 0) {
-    const concrete = composioCandidates.find(
-      (c) => !isGenericComposioSentinelUrl(c.upstreamUrl),
-    );
-    return concrete ?? composioCandidates[0];
+  // Composio: several routers can match — pickComposioCandidate decides
+  // which one serves THIS server (exact URL, then its successor, then the
+  // first concrete router; never the sentinel while a concrete one exists).
+  const composio = pickComposioCandidate(composioCandidates, server.url);
+  if (composio) {
+    const { previousUrls: _previousUrls, ...target } = composio;
+    return target;
   }
   return null;
 }
 
-/** The session-less tool-router base URL the console historically baked
- *  into agent configs and credentials. It only works as a *server name*
- *  target for the proxy to swap — as an upstream it 301s. */
-function isGenericComposioSentinelUrl(raw: string): boolean {
-  try {
-    const url = new URL(raw);
-    return (
-      url.hostname === "app.composio.dev" &&
-      url.pathname.replace(/\/+$/, "") === "/tool_router/v3/session/mcp"
-    );
-  } catch {
-    return false;
-  }
-}
-
-function resolveNodeComposioApiKey(auth: { api_key?: string; api_key_env?: string }): string | null {
+/** A composio_mcp credential's own raw key, else the platform key — and
+ *  that only for a real Composio upstream and the platform key's variable
+ *  (composioPlatformKeyEnvFor): `api_key_env` and `mcp_server_url` are
+ *  tenant-writable, and this value goes out as `x-api-key`. */
+function resolveNodeComposioApiKey(auth: { api_key?: string; api_key_env?: string }, upstreamUrl: string): string | null {
   if (typeof auth.api_key === "string" && auth.api_key.length > 0) return auth.api_key;
-  const envName = auth.api_key_env || "COMPOSIO_API_KEY";
+  const envName = composioPlatformKeyEnvFor(auth, upstreamUrl);
+  if (!envName) return null;
   const value = process.env[envName];
   return typeof value === "string" && value.length > 0 ? value : null;
 }

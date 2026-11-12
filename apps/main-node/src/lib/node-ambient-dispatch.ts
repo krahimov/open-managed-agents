@@ -26,7 +26,13 @@ import type {
 } from "@open-managed-agents/agents-store";
 import type { SessionService } from "@open-managed-agents/sessions-store";
 import type { UserMessageEvent } from "@open-managed-agents/shared";
-import { normalizeMcpServerUrl, vaultMcpServersMode } from "@open-managed-agents/shared";
+import {
+  normalizeMcpServerUrl,
+  vaultMcpServersMayAdd,
+  vaultMcpServersMode,
+  withVaultMcpServers,
+  type VaultMcpCredentialGroups,
+} from "@open-managed-agents/shared";
 import { getLogger } from "@open-managed-agents/observability";
 
 const log = getLogger("ambient-dispatch");
@@ -51,7 +57,21 @@ export interface AmbientDispatcherDeps {
     tenantId: string,
     vaultIds: string[],
     declared: Array<{ name: string; type: string; url?: string }>,
+    /** The agent's tools + metadata (toolset names keep legacy inferred
+     *  names; vault bindings pick the router a declared one resolves to). */
+    agent?: { tools?: unknown; metadata?: unknown },
   ): Promise<Array<{ name: string; type: "url"; url: string }>>;
+  /** The session's vault credentials, grouped per vault. When set, the
+   *  snapshot gets exactly the sessions route's vault servers
+   *  (withVaultMcpServers: "all" inference, a declared generic Composio
+   *  server expanded to every uncovered router, inherited Composio
+   *  permissions) and resolveVaultMcpServers is not used. */
+  listVaultCredentials?(tenantId: string, vaultIds: string[]): Promise<VaultMcpCredentialGroups>;
+  /** Before the session row (and its snapshot) exists: repair vault
+   *  credentials the session will use — the sessions route's
+   *  refreshSessionCredentials step (Composio router account binding).
+   *  Must not throw. */
+  refreshVaultCredentials?(tenantId: string, vaultIds: string[]): Promise<void>;
   resolveEnvironment?(tenantId: string, environmentId: string): Promise<import("@open-managed-agents/shared").EnvironmentConfig | null>;
   /** Attach the agent's own memory store (per its memory mode) to the
    *  spawned session. Each firing is a fresh session, so this is the only
@@ -141,16 +161,37 @@ export class NodeAmbientDispatcher {
     const vaultIds = Array.isArray(metaVaults)
       ? metaVaults.filter((id): id is string => typeof id === "string" && id.length > 0)
       : [];
+    if (vaultIds.length > 0 && this.deps.refreshVaultCredentials) {
+      await this.deps.refreshVaultCredentials(rule.tenant_id, vaultIds).catch((err) => {
+        log.warn({ err, op: "ambient.vault_refresh_failed", rule_id: rule.id }, "vault credential refresh failed");
+      });
+    }
     // Vault credentials authenticate the declared servers. Only an agent
     // that opted into `vault_mcp_servers: "all"` also gets a server per
     // vault credential — parity with the sessions route. Declared servers
     // keep priority; vault-derived ones are appended (deduped by url).
-    if (vaultIds.length > 0 && this.deps.resolveVaultMcpServers && vaultMcpServersMode(agent) === "all") {
+    if (vaultIds.length > 0 && this.deps.listVaultCredentials && vaultMcpServersMayAdd(agent as never)) {
+      try {
+        const grouped = await this.deps.listVaultCredentials(rule.tenant_id, vaultIds);
+        const withVault = withVaultMcpServers(agentBase as never, grouped) as Record<string, unknown>;
+        for (const key of ["mcp_servers", "tools", "effective_policy"] as const) {
+          if (withVault[key] !== undefined) agentBase[key] = withVault[key];
+        }
+      } catch (err) {
+        log.warn(
+          { err, op: "ambient.vault_mcp_resolve_failed", rule_id: rule.id },
+          "vault MCP resolution failed — session starts without integration tools",
+        );
+      }
+    } else if (vaultIds.length > 0 && !this.deps.listVaultCredentials && this.deps.resolveVaultMcpServers && vaultMcpServersMode(agent) === "all") {
       try {
         const existing = Array.isArray(agentBase.mcp_servers)
           ? (agentBase.mcp_servers as Array<{ name: string; type: string; url?: string }>)
           : [];
-        const derived = await this.deps.resolveVaultMcpServers(rule.tenant_id, vaultIds, existing);
+        const derived = await this.deps.resolveVaultMcpServers(rule.tenant_id, vaultIds, existing, {
+          tools: agentBase.tools,
+          metadata: agentBase.metadata,
+        });
         const key = (url?: string) => (url ? (normalizeMcpServerUrl(url) ?? url) : undefined);
         const known = new Set(existing.map((s) => key(s.url)));
         const merged = [...existing, ...derived.filter((s) => !known.has(key(s.url)))];

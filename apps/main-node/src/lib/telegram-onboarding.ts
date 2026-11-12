@@ -51,6 +51,9 @@ export interface TelegramDeps {
   hasVault?: (tenantId: string, vaultId: string) => Promise<boolean>;
   /** Attach the agent's own memory store to a new working conversation. Must not throw. */
   attachAgentMemory?: (input: import("./agent-memory-mode.js").AttachAgentMemoryInput) => Promise<void>;
+  /** Before the snapshot is pinned: the sessions route's vault steps
+   *  (Composio router repair, vault-contributed MCP servers). */
+  prepareAgentSnapshot?: <A extends Record<string, unknown>>(tenantId: string, vaultIds: string[], agent: A) => Promise<A>;
   fetch?: typeof fetch;
 }
 const hash = (s: string) => createHash("sha256").update(s).digest("hex");
@@ -325,14 +328,18 @@ export class TelegramOnboarding {
     const envId = String(agent.metadata?.default_environment_id ?? "");
     const env = envId ? await this.d.environment(a.tenant_id, envId) : null;
     if (envId && !env) throw new Error("Agent environment unavailable");
+    const vaultIds = Array.isArray(agent.metadata?.default_vault_ids) ? agent.metadata.default_vault_ids as string[] : [];
+    const agentSnapshot = this.d.prepareAgentSnapshot && vaultIds.length > 0
+      ? await this.d.prepareAgentSnapshot(a.tenant_id, vaultIds, agent as unknown as Record<string, unknown>).catch(() => agent)
+      : agent;
     const { session } = await this.d.sessions.create({
       tenantId: a.tenant_id,
       agentId,
       environmentId: envId,
       title: `Telegram · ${agent.name}`,
-      agentSnapshot: agent,
+      agentSnapshot: agentSnapshot as typeof agent,
       ...(env ? { environmentSnapshot: env } : {}),
-      vaultIds: Array.isArray(agent.metadata?.default_vault_ids) ? agent.metadata.default_vault_ids as string[] : [],
+      vaultIds,
       metadata: { telegram_user: a.user_id, ...(mode === "setup" ? { oma_setup: true } : {}) },
     });
     if (mode === "work") {

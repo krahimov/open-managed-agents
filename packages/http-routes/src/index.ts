@@ -21,8 +21,24 @@ export {
   listComposioToolkits,
   createComposioToolRouterSession,
   listComposioConnectedAccounts,
+  listAllComposioConnectedAccounts,
+  provisionComposioToolRouter,
+  composioRouterAuth,
+  selectComposioAccountBindings,
+  isTenantScopedComposioUserId,
+  resolveRouterApiKey,
+  rotateRouterCredential,
+  routerCarryOver,
+  ComposioRouterRefresher,
 } from "./vaults";
-export type { VaultRoutesDeps } from "./vaults";
+export type {
+  VaultRoutesDeps,
+  ComposioConnectedAccount,
+  ComposioRouterCredentialStore,
+  ComposioRouterRefreshMode,
+  ComposioRouterRefreshResult,
+  ProvisionedComposioRouter,
+} from "./vaults";
 
 export { buildSessionRoutes } from "./sessions";
 export type {

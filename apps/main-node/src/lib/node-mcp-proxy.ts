@@ -1,4 +1,4 @@
-import { isComposioMcpUrl, normalizeMcpServerUrl } from "@open-managed-agents/shared";
+import { isComposioMcpUrl, isGenericComposioMcpUrl, normalizeMcpServerUrl } from "@open-managed-agents/shared";
 
 export const SENSITIVE_UPSTREAM_AUTH_HEADERS = ["authorization", "x-api-key"] as const;
 
@@ -348,4 +348,37 @@ export function orderMatchingCredentials<C extends { auth?: unknown; archived_at
     ordered.push(...exact, ...loose);
   }
   return ordered;
+}
+
+/**
+ * Which Composio credential serves a session's Composio server. Any
+ * tool-router URL matches any other (credentialMatchesMcpServerUrl), so the
+ * session's vaults can yield several candidates — and with several routers
+ * mounted at once (one per toolkit set, see inferVaultMcpServers) the pick
+ * decides WHICH router a server talks to:
+ *   1. the credential stored under exactly this URL;
+ *   2. the one that replaced it (`composio_previous_mcp_server_urls`) — a
+ *      session snapshot pins the router URL it started with, and a
+ *      re-provision (account binding, toolkit add) rotates the credential;
+ *   3. the first concrete per-session router (…/tool_router/trs_<id>/mcp) in
+ *      proxy order — the generic sentinel (…/tool_router/v3/session/mcp)
+ *      is not servable (301s), and after a rotation a leftover sentinel
+ *      credential once silently won first-match, killing every Composio
+ *      tool in the session (observed 2026-07-20 on the GC agent);
+ *   4. whatever is left.
+ */
+export function pickComposioCandidate<T extends { upstreamUrl: string; previousUrls?: ReadonlyArray<string> }>(
+  candidates: ReadonlyArray<T>,
+  serverUrl: string,
+): T | null {
+  if (candidates.length === 0) return null;
+  const target = normalizeMcpServerUrl(serverUrl) ?? serverUrl;
+  const norm = (url: string) => normalizeMcpServerUrl(url) ?? url;
+  if (!isGenericComposioMcpUrl(serverUrl)) {
+    const exact = candidates.find((c) => norm(c.upstreamUrl) === target);
+    if (exact) return exact;
+    const successor = candidates.find((c) => (c.previousUrls ?? []).some((prev) => norm(prev) === target));
+    if (successor) return successor;
+  }
+  return candidates.find((c) => !isGenericComposioMcpUrl(c.upstreamUrl)) ?? candidates[0];
 }

@@ -8,6 +8,7 @@ import {
   CredentialImmutableFieldError,
   CredentialMaxExceededError,
   CredentialNotFoundError,
+  MAX_CREDENTIALS_PER_VAULT,
   stripSecrets,
 } from "@open-managed-agents/credentials-store";
 import { VaultNotFoundError } from "@open-managed-agents/vaults-store";
@@ -20,31 +21,47 @@ import type {
   CredentialAuth,
   CredentialConfig,
 } from "@open-managed-agents/shared";
+import { composioCredentialAuthError } from "@open-managed-agents/shared";
 import type { RouteServicesArg } from "../types";
 import { resolveServices } from "../types";
+import {
+  ComposioRouterRefresher,
+  composioRequest,
+  composioRouterAuth,
+  isTenantScopedComposioUserId,
+  listComposioConnectedAccounts,
+  normalizeComposioToolkitSlug,
+  provisionComposioToolRouter,
+  resolveRouterApiKey,
+  rotateRouterCredential,
+  routerCarryOver,
+  type ComposioRouterCredentialStore,
+  type ComposioRouterRefreshMode,
+} from "./composio-router";
+
+export {
+  ComposioRouterRefresher,
+  composioRouterAuth,
+  createComposioToolRouterSession,
+  isTenantScopedComposioUserId,
+  listAllComposioConnectedAccounts,
+  listComposioConnectedAccounts,
+  provisionComposioToolRouter,
+  resolveRouterApiKey,
+  rotateRouterCredential,
+  routerCarryOver,
+  selectComposioAccountBindings,
+} from "./composio-router";
+export type {
+  ComposioConnectedAccount,
+  ComposioRouterCredentialStore,
+  ComposioRouterRefreshMode,
+  ComposioRouterRefreshResult,
+  ProvisionedComposioRouter,
+} from "./composio-router";
 
 interface Vars {
   Variables: { tenant_id: string };
-}
-
-interface ComposioToolRouterSessionInput {
-  user_id: string;
-  toolkits?: {
-    enable?: string[];
-    disable?: string[];
-  };
-  auth_configs?: Record<string, string>;
-  connected_accounts?: Record<string, string | string[]>;
-}
-
-interface ComposioToolRouterSession {
-  session_id: string;
-  mcp: {
-    type?: string;
-    url: string;
-    headers?: Record<string, string>;
-  };
-  config?: unknown;
 }
 
 interface ComposioToolkit {
@@ -68,16 +85,6 @@ interface ComposioAuthConfig {
   status?: string;
   is_composio_managed?: boolean;
   toolkit?: { slug?: string };
-}
-
-interface ComposioConnectedAccount {
-  id: string;
-  status?: string;
-  user_id?: string;
-  toolkit?: { slug?: string; name?: string; logo?: string };
-  auth_config?: { id?: string };
-  created_at?: string;
-  updated_at?: string;
 }
 
 interface ComposioAuthLink {
@@ -165,6 +172,10 @@ export interface VaultRoutesDeps {
     /** Per-tenant key override (managed-first: tenants paste their own key
      *  in the console). When it returns a key, it wins over `apiKey`. */
     resolveApiKey?: (tenantId: string) => Promise<string | null>;
+    /** Shared with the session-start repair hook so both paths dedupe
+     *  in-flight re-provisions of the same router. Built on demand when
+     *  absent. */
+    refresher?: ComposioRouterRefresher;
   };
 }
 
@@ -179,32 +190,22 @@ interface ResolvedComposioDeps {
 
 const COMPOSIO_NOT_CONNECTED =
   "Composio is not connected — configure COMPOSIO_API_KEY on the API server.";
+const COMPOSIO_FOREIGN_USER =
+  "user_id must belong to this workspace (oma:<tenant>:…) when using the platform Composio key.";
 
-function normalizeComposioToolkitSlug(slug: string): string {
-  // Composio toolkit slugs are bare alphanumerics ("googledrive",
-  // "googlecalendar"). Agents and users write human variants
-  // ("google-drive", "Google Drive", "google_drive") — strip separators so
-  // those resolve instead of flowing through as unknown slugs. An unknown
-  // slug is DANGEROUS, not just broken: Composio's auth_configs list
-  // silently ignores an unrecognized toolkit_slug filter and returns every
-  // config, which once routed a google-drive connect card to a LinkedIn
-  // OAuth page (first config in the unfiltered list).
-  return slug.trim().toLowerCase().replace(/[-_.\s]+/g, "");
+/** Under the shared platform key a caller-chosen user_id must stay inside
+ *  the caller's tenant (see isTenantScopedComposioUserId). */
+function composioUserIdAllowed(
+  userId: string,
+  tenantId: string,
+  composio: ResolvedComposioDeps,
+): boolean {
+  return composio.source !== "platform" || isTenantScopedComposioUserId(userId, tenantId);
 }
 
 function normalizeComposioApiKey(apiKey: string | null | undefined): string | undefined {
   const trimmed = apiKey?.trim();
   return trimmed ? trimmed : undefined;
-}
-
-function collectComposioMapValues(input: Record<string, string | string[]> | undefined): string[] {
-  if (!input) return [];
-  const values: string[] = [];
-  for (const value of Object.values(input)) {
-    if (Array.isArray(value)) values.push(...value);
-    else if (value) values.push(value);
-  }
-  return Array.from(new Set(values.filter(Boolean)));
 }
 
 async function resolveComposioForVault(input: {
@@ -251,41 +252,6 @@ async function resolveComposioForVault(input: {
   }
 
   return null;
-}
-
-async function composioRequest<T>(
-  deps: ComposioDeps,
-  path: string,
-  init?: RequestInit,
-): Promise<T> {
-  if (!deps.apiKey) {
-    throw new Error("COMPOSIO_API_KEY is not configured");
-  }
-  const baseUrl = deps.baseUrl || "https://backend.composio.dev";
-  const fetcher = deps.fetcher ?? fetch;
-  const res = await fetcher(`${baseUrl}${path}`, {
-    ...init,
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": deps.apiKey,
-      ...init?.headers,
-    },
-  });
-  const text = await res.text();
-  let data: unknown = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = { error: text };
-  }
-  if (!res.ok) {
-    const detail =
-      typeof data === "object" && data && "error" in data
-        ? JSON.stringify((data as { error?: unknown }).error)
-        : text || `HTTP ${res.status}`;
-    throw new Error(`Composio API ${res.status}: ${detail}`);
-  }
-  return data as T;
 }
 
 export async function listComposioToolkits(
@@ -389,44 +355,16 @@ export async function createComposioConnectedAccountLink(
   };
 }
 
-export async function listComposioConnectedAccounts(
-  deps: NonNullable<VaultRoutesDeps["composio"]>,
-  opts: { userId: string; toolkit?: string; limit?: number },
-): Promise<{ items: ComposioConnectedAccount[]; next_cursor?: string }> {
-  const params = new URLSearchParams({
-    user_ids: opts.userId,
-  });
-  const limit = Number.isFinite(opts.limit) ? opts.limit! : 100;
-  params.set("limit", String(Math.min(Math.max(limit, 1), 1000)));
-  if (opts.toolkit) params.set("toolkit_slugs", normalizeComposioToolkitSlug(opts.toolkit));
-  return composioRequest(deps, `/api/v3.1/connected_accounts?${params.toString()}`);
-}
-
-export async function createComposioToolRouterSession(
-  deps: NonNullable<VaultRoutesDeps["composio"]>,
-  input: ComposioToolRouterSessionInput,
-): Promise<ComposioToolRouterSession> {
-  const session = await composioRequest<Partial<ComposioToolRouterSession>>(
-    deps,
-    "/api/v3.1/tool_router/session",
-    {
-      method: "POST",
-      body: JSON.stringify(input),
-    },
-  ).catch((err) => {
-    if (err instanceof Error && err.message.startsWith("Composio API")) {
-      throw new Error(`Composio session create failed: ${err.message}`);
-    }
-    throw err;
-  });
-  if (!session.session_id || !session.mcp?.url) {
-    throw new Error("Composio session response did not include session_id and mcp.url");
-  }
-  return session as ComposioToolRouterSession;
-}
-
 export function buildVaultRoutes(deps: VaultRoutesDeps) {
   const app = new Hono<Vars>();
+  let localRefresher: ComposioRouterRefresher | null = null;
+  const composioRefresher = () =>
+    deps.composio?.refresher ??
+    (localRefresher ??= new ComposioRouterRefresher({
+      platformApiKey: deps.composio?.apiKey,
+      baseUrl: deps.composio?.baseUrl,
+      fetcher: deps.composio?.fetcher,
+    }));
 
   // ── Vaults ────────────────────────────────────────────────────────────
   app.post("/", async (c) => {
@@ -598,6 +536,10 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
     if (!body.display_name || !body.auth) {
       return c.json({ error: "display_name and auth are required" }, 400);
     }
+    // The MCP proxies send process.env[api_key_env] to mcp_server_url —
+    // never let a tenant point that at its own host or another secret.
+    const authError = composioCredentialAuthError(body.auth);
+    if (authError) return c.json({ error: authError }, 400);
     try {
       const cred = await services.credentials.create({
         tenantId: t,
@@ -638,16 +580,6 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
     }
 
     const composioUserId = body.user_id || `oma:${tenantId}:${vaultId}`;
-    const sessionPayload: ComposioToolRouterSessionInput = {
-      user_id: composioUserId,
-    };
-    if (enabledToolkits.length > 0) {
-      sessionPayload.toolkits = { enable: enabledToolkits };
-    } else if (disabledToolkits.length > 0) {
-      sessionPayload.toolkits = { disable: disabledToolkits };
-    }
-    if (body.auth_configs) sessionPayload.auth_configs = body.auth_configs;
-    if (body.connected_accounts) sessionPayload.connected_accounts = body.connected_accounts;
 
     try {
       const composio = await resolveComposioForVault({
@@ -660,43 +592,57 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
       if (!composio) {
         return c.json({ error: COMPOSIO_NOT_CONNECTED }, 503);
       }
-      const session = await createComposioToolRouterSession(composio.creds, sessionPayload);
-      const auth: CredentialAuth = {
-        type: "composio_mcp",
-        mcp_server_url: session.mcp.url,
-        ...(composio.source === "platform"
-          ? { api_key_env: "COMPOSIO_API_KEY" }
-          : { api_key: composio.apiKey }),
-        composio_user_id: composioUserId,
-        composio_session_id: session.session_id,
-        composio_toolkits: enabledToolkits.length > 0 ? enabledToolkits : undefined,
-        composio_connected_account_ids: collectComposioMapValues(body.connected_accounts),
-        composio_auth_config_ids: body.auth_configs
-          ? Array.from(new Set(Object.values(body.auth_configs).filter(Boolean)))
-          : undefined,
-      };
-      if (body.replace_existing === true) {
-        const current = await services.credentials.list({ tenantId, vaultId });
-        await Promise.all(
-          current
-            .filter((cred) => {
+      if (!composioUserIdAllowed(composioUserId, tenantId, composio)) {
+        return c.json({ error: COMPOSIO_FOREIGN_USER }, 403);
+      }
+      // Bind the toolkits' ACTIVE accounts (see composio-router.ts): the
+      // caller's connected_accounts win when they are this user's and
+      // ACTIVE; a pending id from a connect popup that hasn't finished is
+      // replaced by the newest ACTIVE account or left unbound.
+      const cred = await composioRefresher().withVaultLock(tenantId, vaultId, async () => {
+        const router = await provisionComposioToolRouter(composio.creds, {
+          userId: composioUserId,
+          enabled: enabledToolkits,
+          disabled: disabledToolkits,
+          authConfigs: body.auth_configs,
+          preferredAccounts: body.connected_accounts,
+        });
+        const current = body.replace_existing === true
+          ? (await services.credentials.list({ tenantId, vaultId })).filter((cred) => {
               const existingAuth = (cred as unknown as CredentialConfig).auth;
               return !cred.archived_at && existingAuth.type === "composio_mcp";
             })
-            .map((cred) =>
-              services.credentials.archive({
-                tenantId,
-                vaultId,
-                credentialId: cred.id,
-              }),
-            ),
-        );
-      }
-      const cred = await services.credentials.create({
-        tenantId,
-        vaultId,
-        displayName: body.display_name || "Composio Tool Router",
-        auth,
+          : [];
+        const auth = composioRouterAuth({
+          key: composio.source === "platform"
+            ? { api_key_env: "COMPOSIO_API_KEY" }
+            : { api_key: composio.apiKey },
+          userId: composioUserId,
+          router,
+          enabled: enabledToolkits,
+          disabled: disabledToolkits,
+          authConfigIds: body.auth_configs ? Object.values(body.auth_configs) : [],
+          // replace_existing: sessions still holding a replaced router's URL
+          // are routed to this one by the MCP proxy.
+          replacedUrls: current.flatMap((cred) => {
+            const existingAuth = (cred as unknown as CredentialConfig).auth;
+            return [existingAuth.mcp_server_url, ...(existingAuth.composio_previous_mcp_server_urls ?? [])];
+          }),
+        });
+        // Create BEFORE archiving the replaced routers: no window in which
+        // a starting session sees no router, and a failed create leaves
+        // the old ones in place.
+        const created = await services.credentials.create({
+          tenantId,
+          vaultId,
+          displayName: body.display_name || "Composio Tool Router",
+          auth,
+        });
+        for (const old of current) {
+          await services.credentials.archive({ tenantId, vaultId, credentialId: old.id });
+          composioRefresher().markReplaced(tenantId, old.id);
+        }
+        return created;
       });
       return c.json(toApiCred(stripSecrets(cred) as unknown as CredRowSliced), 201);
     } catch (err) {
@@ -708,6 +654,39 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
       }
       return handleError(err);
     }
+  });
+
+  // POST /v1/vaults/:id/credentials/composio_tool_router_session/refresh
+  // { mode?: "check" | "force" } — re-provision this vault's tool-router
+  // credentials whose account binding is stale or unknown (routers created
+  // before binding existed, before a toolkit's OAuth finished, or bound to
+  // an account that has since expired). Bindable accounts stay bound; a
+  // toolkit without one gets its newest ACTIVE account. The console calls
+  // it when a connect popup completes; sessions also repair lazily on start.
+  app.post("/:id/credentials/composio_tool_router_session/refresh", async (c) => {
+    const services = resolveServices(deps.services, c);
+    const tenantId = c.var.tenant_id;
+    const vaultId = c.req.param("id");
+    if (!(await services.vaults.exists({ tenantId, vaultId }))) {
+      return c.json({ error: "Vault not found" }, 404);
+    }
+    const body = await c.req
+      .json<{ mode?: string }>()
+      .catch(() => ({}) as { mode?: string });
+    const mode: ComposioRouterRefreshMode = body.mode === "force" ? "force" : "check";
+    if (!deps.composio) return c.json({ error: COMPOSIO_NOT_CONNECTED }, 503);
+    const refresher = composioRefresher();
+    const results = await refresher.refreshVaults({
+      credentials: services.credentials as never,
+      tenantId,
+      vaultIds: [vaultId],
+      mode,
+    });
+    return c.json({
+      type: "composio_router_refresh",
+      refreshed: results.filter((r) => r.status === "refreshed").length,
+      data: results,
+    });
   });
 
   app.get("/:id/credentials/composio_toolkits", async (c) => {
@@ -757,6 +736,9 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
       if (!composio) {
         return c.json({ error: COMPOSIO_NOT_CONNECTED }, 503);
       }
+      if (!composioUserIdAllowed(userId, tenantId, composio)) {
+        return c.json({ error: COMPOSIO_FOREIGN_USER }, 403);
+      }
       const accounts = await listComposioConnectedAccounts(composio.creds, {
         userId,
         toolkit: c.req.query("toolkit") || undefined,
@@ -796,6 +778,9 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
       if (!composio) {
         return c.json({ error: COMPOSIO_NOT_CONNECTED }, 503);
       }
+      if (!composioUserIdAllowed(userId, tenantId, composio)) {
+        return c.json({ error: COMPOSIO_FOREIGN_USER }, 403);
+      }
       const link = await createComposioConnectedAccountLink(composio.creds, {
         userId,
         toolkitSlug: body.toolkit,
@@ -808,42 +793,67 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
       // new toolkit's tools even after the OAuth completes — the agent then
       // reports "authorization succeeded but no tools found" (observed with
       // a gmail+github-locked session and a google-drive grant). Re-provision
-      // any such credential with the union list; credential rotation is
-      // transparent to agents (the MCP proxy matches any Composio tool-router
-      // URL and always uses the ACTIVE credential's URL). Best-effort: a
+      // any such credential with the union list, its other toolkits' ACTIVE
+      // accounts bound (the new toolkit's account is still INITIATED here —
+      // it gets bound when the popup completes: the console's refresh call,
+      // the graft route, or the session-start repair). Credential rotation
+      // is transparent to agents: the MCP proxy routes a router URL to its
+      // successor (composio_previous_mcp_server_urls). Best-effort: a
       // failure here must not break the link handoff.
       let toolkitsExpanded = false;
       try {
         const requested = normalizeComposioToolkitSlug(body.toolkit);
-        const creds = await services.credentials.list({ tenantId, vaultId });
-        for (const cred of creds) {
-          if (cred.archived_at) continue;
-          const auth = (cred as unknown as CredentialConfig).auth as CredentialAuth & {
-            composio_toolkits?: string[];
-            composio_user_id?: string;
-          };
-          if (auth.type !== "composio_mcp") continue;
-          const locked = (auth.composio_toolkits ?? []).map(normalizeComposioToolkitSlug);
-          if (locked.length === 0 || locked.includes(requested)) continue;
-          const union = [...locked, requested];
-          const session = await createComposioToolRouterSession(composio.creds, {
-            user_id: auth.composio_user_id || userId,
-            toolkits: { enable: union },
-          });
-          await services.credentials.create({
-            tenantId,
-            vaultId,
-            displayName: cred.display_name,
-            auth: {
-              ...auth,
-              mcp_server_url: session.mcp.url,
-              composio_session_id: session.session_id,
-              composio_toolkits: union,
-            },
-          });
-          await services.credentials.archive({ tenantId, vaultId, credentialId: cred.id });
-          toolkitsExpanded = true;
-        }
+        const refresher = composioRefresher();
+        await refresher.withVaultLock(tenantId, vaultId, async () => {
+          // Read inside the lock: a rotation that ran meanwhile (repair,
+          // graft) must be extended, not raced into a second active router.
+          const creds = await services.credentials.list({ tenantId, vaultId });
+          const active = creds.filter((cred) => !cred.archived_at).length;
+          for (const cred of creds) {
+            if (cred.archived_at) continue;
+            const auth = (cred as unknown as CredentialConfig).auth;
+            if (auth.type !== "composio_mcp" || !auth.composio_session_id) continue;
+            const locked = (auth.composio_toolkits ?? []).map(normalizeComposioToolkitSlug);
+            if (locked.length === 0 || locked.includes(requested)) continue;
+            const routerUserId = auth.composio_user_id || userId;
+            if (!composioUserIdAllowed(routerUserId, tenantId, composio)) continue;
+            const key = resolveRouterApiKey(auth, composio.apiKey);
+            if (!key) continue;
+            if (active >= MAX_CREDENTIALS_PER_VAULT) break;
+            const union = [...locked, requested];
+            const carry = routerCarryOver(auth);
+            const router = await provisionComposioToolRouter(
+              { ...composio.creds, apiKey: key.apiKey },
+              {
+                userId: routerUserId,
+                enabled: union,
+                ...carry,
+                // The auth config this connect link uses governs the new
+                // toolkit in the router too (custom configs, e.g. X).
+                authConfigs: {
+                  ...(carry.authConfigs ?? {}),
+                  ...(link.auth_config_id ? { [requested]: link.auth_config_id } : {}),
+                },
+              },
+            );
+            const rotated = await rotateRouterCredential(services.credentials as unknown as ComposioRouterCredentialStore, {
+              tenantId,
+              vaultId,
+              replaced: cred,
+              displayName: cred.display_name,
+              auth: composioRouterAuth({
+                key: key.own ? { api_key: key.apiKey } : { api_key_env: "COMPOSIO_API_KEY" },
+                userId: routerUserId,
+                router,
+                enabled: union,
+                authConfigIds: auth.composio_auth_config_ids,
+                replacedUrls: [auth.mcp_server_url, ...(auth.composio_previous_mcp_server_urls ?? [])],
+              }),
+            });
+            refresher.markReplaced(tenantId, cred.id);
+            if (!rotated.conflict) toolkitsExpanded = true;
+          }
+        });
       } catch {
         // Expansion is an enhancement to the grant, not a precondition for
         // the OAuth link — swallow and let the card proceed.
@@ -893,6 +903,8 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
       display_name?: string;
       auth?: Partial<CredentialAuth>;
     }>();
+    const authError = composioCredentialAuthError(body.auth);
+    if (authError) return c.json({ error: authError }, 400);
     try {
       const cred = await services.credentials.update({
         tenantId: c.var.tenant_id,
