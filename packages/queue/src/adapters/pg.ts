@@ -162,7 +162,7 @@ export function createPgDlq<T>(opts: PgQueueOptions): DeadLetterQueue<T> {
           for (const row of claimed) {
             const msg: QueueMessage<T> = {
               id: row.id,
-              body: row.payload as T,
+              body: decodePayload<T>(row.payload),
               attempts: row.attempts,
               enqueuedAt: row.enqueued_at_ms,
             };
@@ -206,12 +206,32 @@ export function createPgDlq<T>(opts: PgQueueOptions): DeadLetterQueue<T> {
 
 // ---------- internals ----------
 
+/**
+ * Rows written before the ?::text::jsonb fix hold a double-encoded JSON
+ * string (jsonb_typeof = 'string'); decode those so already-queued messages
+ * still reach consumers as objects.
+ */
+function decodePayload<T>(payload: unknown): T {
+  if (typeof payload === "string") {
+    try {
+      return JSON.parse(payload) as T;
+    } catch {
+      return payload as T;
+    }
+  }
+  return payload as T;
+}
+
 async function insertOne<T>(
   sql: SqlClient,
   name: string,
   body: T,
   opts: EnqueueOptions | undefined,
 ): Promise<void> {
+  // `?::text::jsonb`, not `?::jsonb`: with a jsonb-typed parameter
+  // postgres.js JSON-encodes the bound value again, so the already
+  // stringified body was stored as a JSON *string* and every consumer got a
+  // string instead of an object. Binding as text lets Postgres parse it once.
   const id = `qm_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
   const now = Date.now();
   const visibleAt = now + (opts?.delaySec ?? 0) * 1000;
@@ -219,7 +239,7 @@ async function insertOne<T>(
     .prepare(
       `INSERT INTO queue_messages
          (id, queue_name, payload, attempts, next_visible_at, status, enqueued_at)
-        VALUES (?, ?, ?::jsonb, 0, ?, 'pending', ?)`,
+        VALUES (?, ?, ?::text::jsonb, 0, ?, 'pending', ?)`,
     )
     .bind(id, name, JSON.stringify(body), visibleAt, now)
     .run();
@@ -303,7 +323,7 @@ async function runOne<T>(
 ): Promise<void> {
   const msg: QueueMessage<T> = {
     id: row.id,
-    body: row.payload as T,
+    body: decodePayload<T>(row.payload),
     attempts: row.attempts,
     enqueuedAt: row.enqueued_at_ms,
   };

@@ -165,14 +165,19 @@ export async function applyBetterAuthSchema(opts: {
  * Self-host runs these directly against the main SqlClient; CF declares
  * `tenant` + `membership` in apps/main/migrations/0001_schema.sql with the
  * legacy `createdAt`/`updatedAt` casing better-auth dropped on us.
+ *
+ * Production self-host no longer calls this (Drizzle baseline migrations,
+ * apps/main-node/migrations*); it backs test setup only. The tenant columns
+ * must match that baseline and ensureTenantSqlite ("createdAt"/"updatedAt")
+ * — they had drifted to created_at/updated_at, failing pg-better-auth.
  */
 export async function applyTenantSchema(sql: SqlClient): Promise<void> {
   await sql.exec(`
     CREATE TABLE IF NOT EXISTS "tenant" (
-      "id"         TEXT PRIMARY KEY NOT NULL,
-      "name"       TEXT NOT NULL,
-      "created_at" BIGINT NOT NULL,
-      "updated_at" BIGINT NOT NULL
+      "id"        TEXT PRIMARY KEY NOT NULL,
+      "name"      TEXT NOT NULL,
+      "createdAt" BIGINT NOT NULL,
+      "updatedAt" BIGINT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS "membership" (
       "user_id"    TEXT NOT NULL,
