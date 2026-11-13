@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, useMemo } from "react";
+import posthog from "posthog-js";
 import {
   OMA_SETUP_HARNESS,
   OMA_SETUP_KIND_HARNESS_UPDATED,
@@ -31,6 +32,10 @@ import {
 } from "../../components/ai-elements/prompt-input";
 import { SessionModelPicker } from "../../components/SessionModelPicker";
 import { useComposerDraft } from "../../lib/composer-draft";
+
+const posthogConfigured = Boolean(
+  import.meta.env.VITE_PUBLIC_POSTHOG_PROJECT_TOKEN && import.meta.env.VITE_PUBLIC_POSTHOG_HOST,
+);
 
 /**
  * Lightweight, session-id-driven chat surface. Reuses the same ai-elements
@@ -261,6 +266,13 @@ export function SessionChat({
             events: [{ type: "user.message", content: [{ type: "text", text: trimmed }] }],
           }),
         });
+        if (posthogConfigured) {
+          posthog.capture("session_message_sent");
+          posthog.logger.info("session message accepted", {
+            operation: "session_message_send",
+            status: "accepted",
+          });
+        }
       } catch {
         // api() surfaces the error toast; drop the optimistic bubble.
         setPending(null);

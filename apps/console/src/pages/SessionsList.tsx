@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
+import posthog from "posthog-js";
 import { Controller, useFieldArray, useForm, type Resolver } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -22,6 +23,10 @@ import {
   pickDefaultEnvironmentId,
   type EnvironmentChoice,
 } from "../lib/default-environment";
+
+const posthogConfigured = Boolean(
+  import.meta.env.VITE_PUBLIC_POSTHOG_PROJECT_TOKEN && import.meta.env.VITE_PUBLIC_POSTHOG_HOST,
+);
 
 interface Vault { id: string; name: string; }
 interface FilePick { id: string; filename: string; size_bytes: number; }
@@ -647,6 +652,20 @@ export function SessionsList() {
         method: "POST",
         body: JSON.stringify(body),
       });
+      if (posthogConfigured) {
+        const sessionAttributes = {
+          has_title: Boolean(data.title.trim()),
+          resource_count: resources.length,
+          vault_count: data.vault_ids.length,
+          runtime_type: isLocalRuntime ? "local" : "cloud",
+        };
+        posthog.capture("session_created", sessionAttributes);
+        posthog.logger.info("session created", {
+          operation: "session_create",
+          status: "succeeded",
+          ...sessionAttributes,
+        });
+      }
       closeModal();
       nav(`/sessions/${session.id}`);
     } catch (err) {

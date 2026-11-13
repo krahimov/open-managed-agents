@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import posthog from "posthog-js";
 import { XCircleIcon } from "lucide-react";
 import { useApi } from "../lib/api";
 import { useAsyncAction } from "../hooks/useAsyncAction";
@@ -6,6 +7,10 @@ import { Modal } from "../components/Modal";
 import { Button } from "@/components/ui/button";
 import { DataTable, type ColumnDef } from "../components/DataTable";
 import { RowActionsMenu } from "../components/RowActionsMenu";
+
+const posthogConfigured = Boolean(
+  import.meta.env.VITE_PUBLIC_POSTHOG_PROJECT_TOKEN && import.meta.env.VITE_PUBLIC_POSTHOG_HOST,
+);
 
 interface ApiKey {
   id: string;
@@ -46,6 +51,7 @@ export function ApiKeysList() {
         body: JSON.stringify({ name: name || "Untitled key" }),
       });
       setCreatedKey(result.key);
+      if (posthogConfigured) posthog.capture("api_key_created");
       setName("");
       load();
     } catch (e: any) {
@@ -57,6 +63,7 @@ export function ApiKeysList() {
     if (!confirm("Revoke this API key? This cannot be undone.")) return;
     try {
       await api(`/v1/api_keys/${id}`, { method: "DELETE" });
+      if (posthogConfigured) posthog.capture("api_key_revoked");
       load();
     } catch {}
   };

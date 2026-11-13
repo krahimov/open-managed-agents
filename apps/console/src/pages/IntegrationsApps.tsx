@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import posthog from "posthog-js";
 import { useNavigate } from "react-router";
 import { toast } from "sonner";
 
@@ -16,6 +17,10 @@ import {
   type ComposioIntegrationEntry,
   type ComposioStatusResponse,
 } from "../lib/composio-integrations";
+
+const posthogConfigured = Boolean(
+  import.meta.env.VITE_PUBLIC_POSTHOG_PROJECT_TOKEN && import.meta.env.VITE_PUBLIC_POSTHOG_HOST,
+);
 
 interface Vault {
   id: string;
@@ -51,6 +56,7 @@ export function IntegrationsApps() {
       });
       setKeyInput("");
       setShowKeyForm(false);
+      if (posthogConfigured) posthog.capture("composio_connected");
       toast.success("Composio connected — loading your app catalog");
       await refetchComposioStatus();
     } catch (err) {

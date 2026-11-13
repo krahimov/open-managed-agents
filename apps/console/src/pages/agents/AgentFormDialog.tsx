@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import posthog from "posthog-js";
 import { useNavigate } from "react-router";
 import yaml from "js-yaml";
 import { CheckIcon, ExternalLinkIcon, RefreshCwIcon, XCircleIcon } from "lucide-react";
@@ -55,6 +56,10 @@ import {
   type AmbientDecisionPreset,
   type AmbientWakeMode,
 } from "../../lib/ambient-controls";
+
+const posthogConfigured = Boolean(
+  import.meta.env.VITE_PUBLIC_POSTHOG_PROJECT_TOKEN && import.meta.env.VITE_PUBLIC_POSTHOG_HOST,
+);
 
 interface McpEntry {
   name: string;
@@ -1186,6 +1191,15 @@ export function AgentFormDialog({
           });
         }
       }
+      if (posthogConfigured) {
+        posthog.capture("agent_created", {
+          has_ambient_rule: form.ambientEnabled,
+          mcp_server_count: mcpServers.length,
+          skill_count: form.skills.length,
+          integration_count: form.composioToolkits.length,
+          runtime_type: form.runtimeId ? "local" : "cloud",
+        });
+      }
       closeCreate();
       onCreated?.();
       await goToSetup(agent);
@@ -1299,6 +1313,15 @@ export function AgentFormDialog({
             description: ambientErr instanceof Error ? ambientErr.message : undefined,
           });
         }
+      }
+      if (posthogConfigured) {
+        posthog.capture("agent_updated", {
+          has_ambient_rule: form.ambientEnabled,
+          mcp_server_count: mcpServers.length,
+          skill_count: form.skills.length,
+          integration_count: form.composioToolkits.length,
+          runtime_type: form.runtimeId ? "local" : "cloud",
+        });
       }
       toast.success(`Saved — version ${agent.version}`);
       onSaved?.(agent);

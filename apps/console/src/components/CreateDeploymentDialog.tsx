@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import posthog from "posthog-js";
 import { toast } from "sonner";
 import { useApi } from "../lib/api";
 import { useApiQuery, useQueryClient } from "../lib/useApiQuery";
@@ -7,6 +8,10 @@ import { Modal } from "./Modal";
 import { Select, SelectOption } from "./Select";
 import { Button } from "@/components/ui/button";
 import type { AgentRecord } from "../types/agent";
+
+const posthogConfigured = Boolean(
+  import.meta.env.VITE_PUBLIC_POSTHOG_PROJECT_TOKEN && import.meta.env.VITE_PUBLIC_POSTHOG_HOST,
+);
 
 /**
  * Deployment wire shape — `DeploymentRecord` from the management API minus
@@ -217,6 +222,13 @@ export function CreateDeploymentDialog({
         body: JSON.stringify(body),
       });
       setCreatedKey(result.key);
+      if (posthogConfigured) {
+        posthog.capture("deployment_created", {
+          has_environment_override: environmentId !== AGENT_DEFAULT_ENV,
+          has_version_pin: version !== LATEST_VERSION,
+          allowed_origin_count: originList.length,
+        });
+      }
       void queryClient.invalidateQueries({ queryKey: ["/v1/deployments"] });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to create deployment");

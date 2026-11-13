@@ -1,4 +1,9 @@
 import { Component, type ErrorInfo, type ReactNode } from "react";
+import posthog from "posthog-js";
+
+const posthogConfigured = Boolean(
+  import.meta.env.VITE_PUBLIC_POSTHOG_PROJECT_TOKEN && import.meta.env.VITE_PUBLIC_POSTHOG_HOST,
+);
 
 interface Props {
   children: ReactNode;
@@ -27,9 +32,13 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
+    if (posthogConfigured) {
+      posthog.captureException(error, {
+        $exception_component_stack: info.componentStack,
+      });
+    }
     // Surface to console — production source maps make this useful in
-    // browser devtools. No remote sink yet (no Sentry); when one lands
-    // this is the hook point.
+    // browser devtools.
     console.error("[ErrorBoundary]", error, info.componentStack);
   }
 
