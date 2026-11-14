@@ -179,6 +179,8 @@ export function ContextPanel({
   const cached = Math.max(trajCached, usage.cacheReadTokens);
   const cacheWrite = Math.max(trajWrite, usage.cacheWriteTokens);
   const input = Math.max(tokens ? Math.max(0, (tokens.input_tokens ?? 0) - trajCached - trajWrite) : 0, usage.inputTokens);
+  const toolCalls = Math.max(ready?.summary?.num_tool_calls ?? 0, usage.toolCalls);
+  const toolErrors = Math.max(ready?.summary?.num_tool_errors ?? 0, usage.toolErrors);
   const totalTokens = input + output + cached + cacheWrite;
   const cost = ready?.trace_facts?.est_cost_usd;
   const localRuntime = environmentId === "env_local_runtime";
@@ -286,10 +288,8 @@ export function ContextPanel({
                 )}
                 {usage.modelCalls > 0 && <Fact label="Model calls">{usage.modelCalls.toLocaleString()}</Fact>}
                 <Fact label="Tool calls">
-                  {(ready?.summary?.num_tool_calls ?? usage.toolCalls).toLocaleString()}
-                  {(ready?.summary?.num_tool_errors ?? usage.toolErrors) > 0 && (
-                    <span className="text-danger"> · {ready?.summary?.num_tool_errors ?? usage.toolErrors} failed</span>
-                  )}
+                  {toolCalls.toLocaleString()}
+                  {toolErrors > 0 && <span className="text-danger"> · {toolErrors} failed</span>}
                 </Fact>
               </dl>
             </>
