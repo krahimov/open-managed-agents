@@ -1272,9 +1272,13 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
       // harnesses record through their own recordUsage dep instead.
       // model_usage.input_tokens is the TOTAL input (AI SDK semantics, which
       // Pi mirrors); the tracker stores the uncached part separately.
+      // The spans name the agent's model handle (a model card's model_id,
+      // which can be any name); record the model string the card actually
+      // sends instead, so the call is priced and matches the card's model.
       onModelUsage: ({ model, usage }) => {
         const agentModel =
           typeof input.agent.model === "string" ? input.agent.model : input.agent.model?.id;
+        const sentModel = !model || model === agentModel ? creds.model || agentModel : model;
         const cacheRead = usage.cache_read_input_tokens ?? 0;
         const cacheWrite = usage.cache_creation_input_tokens ?? 0;
         void usageTracker
@@ -1283,7 +1287,7 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
             sessionId: input.sessionId,
             agentId: input.agent.id,
             harness: harness ?? "default",
-            model: model ?? agentModel ?? "unknown",
+            model: sentModel || "unknown",
             usage: {
               input_tokens: Math.max(0, (usage.input_tokens ?? 0) - cacheRead - cacheWrite),
               cached_input_tokens: cacheRead,
