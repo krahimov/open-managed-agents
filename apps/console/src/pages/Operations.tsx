@@ -17,6 +17,11 @@
  * One read, GET /v1/operations, refreshed every 15 seconds and shared with the
  * sidebar count and Home's attention strip. Sessions and agents are shown by
  * name; the page never prints an id.
+ *
+ * Only some servers keep this report (`useServerFeature("operations")`). On
+ * one that does not, the page is never asked for it: it says the view is not
+ * on this server and points to where the same things are (each session, and
+ * the Sessions list's "Waiting on you").
  */
 
 import { useCallback, useMemo, useState, type ReactNode } from "react";
@@ -64,6 +69,7 @@ import { ApiError, useApi } from "@/lib/api";
 import { useAgents, useRecentSessions } from "@/lib/directory";
 import { formatCompact, formatCost, plural } from "@/lib/format";
 import type { OperationsReport, WorkspaceAccess } from "@/lib/operations";
+import { useServerFeatures } from "@/lib/server-features";
 import { useApiQuery } from "@/lib/useApiQuery";
 import { cn } from "@/lib/utils";
 import { inlineLink } from "@/lib/links";
@@ -77,10 +83,14 @@ const FAILED_NOTE = "Later messages in the same session wait until a failed turn
 export function Operations() {
   const { api } = useApi();
   const [tab, setTab] = useTabParam<TabKey>("attention", TAB_KEYS);
-  const access = useApiQuery<WorkspaceAccess>("/v1/workspace/access");
+  const features = useServerFeatures();
+  const available = features.data?.features.has("operations") ?? false;
+  const accessOn = features.data?.features.has("workspace_access") ?? false;
+  const access = useApiQuery<WorkspaceAccess>(accessOn ? "/v1/workspace/access" : null);
   const query = useQuery({
     queryKey: ["/v1/operations"],
     queryFn: ({ signal }) => api<OperationsReport>("/v1/operations", { signal, silentErrors: true }),
+    enabled: available,
     refetchInterval: 15_000,
     retry: false,
   });
@@ -88,14 +98,17 @@ export function Operations() {
   const { sessions: recent } = useRecentSessions();
 
   const report = query.data;
-  const unsupported = query.error instanceof ApiError && query.error.status === 501;
-  const canOperate = !!access.data?.authorization && access.data.authorization.role !== "viewer";
+  const unsupported =
+    (!features.isLoading && !available) || (query.error instanceof ApiError && query.error.status === 501);
+  // A server without roles lets everyone who is signed in act (as its own
+  // session page does); one with them says who may.
+  const canOperate = features.data && !accessOn ? true : !!access.data?.authorization && access.data.authorization.role !== "viewer";
 
   const { refetch } = query;
   const refresh = useCallback(() => refetch(), [refetch]);
   const actions = useOperationActions({
     canOperate,
-    accessKnown: !!access.data || !!access.error,
+    accessKnown: (!!features.data && !accessOn) || !!access.data || !!access.error,
     stale: !!query.error,
     refresh,
   });
@@ -144,11 +157,11 @@ export function Operations() {
       <Page header={header} width="wide">
         <EmptyState
           size="lg"
-          title="This runtime does not report operations"
-          body="This runtime does not provide the operations view. Approvals and failures still appear inside each session."
+          title="Operations is not available on this server"
+          body="Approvals and requests for access still appear in each session, and the Sessions list shows the ones waiting on you."
           action={
             <Button asChild>
-              <Link to="/sessions">Open sessions to review activity</Link>
+              <Link to="/sessions?status=approval">Show sessions waiting on you</Link>
             </Button>
           }
         />

@@ -10,6 +10,9 @@ import { FirstRunGuide, SAMPLE_TASK } from "../components/FirstRunGuide";
 import { AccessPolicyEditor } from "./agents/AccessPolicyEditor";
 import { ApiError } from "../lib/api";
 import type { OperationsReport } from "../lib/operations";
+import { http, HttpResponse } from "msw";
+import { SERVER_FEATURE_KEYS } from "../lib/server-features";
+import { server } from "../mocks/server";
 
 const { api } = vi.hoisted(() => ({ api: vi.fn() }));
 vi.mock("../lib/api", async (original) => ({ ...await original<typeof import("../lib/api")>(), useApi: () => ({ api }) }));
@@ -27,11 +30,23 @@ function show(element: ReactElement) {
   return render(<MemoryRouter><QueryClientProvider client={client}>{element}</QueryClientProvider></MemoryRouter>);
 }
 
+type Answer = (path: string, init?: RequestInit) => Promise<unknown>;
+/**
+ * Answer the page's reads; the server lists every feature unless told
+ * otherwise. (lib/server-features is loaded by the msw handlers before this
+ * file's mock of lib/api, so its read goes over msw: both are answered.)
+ */
+function respond(answer: Answer, features: readonly string[] = SERVER_FEATURE_KEYS) {
+  server.use(http.get("*/v1/server_features", () => HttpResponse.json({ features })));
+  api.mockImplementation(async (path: string, init?: RequestInit) =>
+    path === "/v1/server_features" ? { features } : answer(path, init));
+}
+
 beforeEach(() => { api.mockReset(); });
 
 describe("Workspace operations", () => {
   it("shows failed reads as errors with a retry instead of an empty workspace", async () => {
-    api.mockImplementation(async (path: string) => {
+    respond(async (path: string) => {
       if (path === "/v1/workspace/access") return { authorization: { role: "operator", kind: "session" } };
       throw new Error("Database unavailable");
     });
@@ -44,18 +59,31 @@ describe("Workspace operations", () => {
   });
 
   it("explains unsupported runtimes and links to sessions", async () => {
-    api.mockImplementation(async (path: string) => {
+    respond(async (path: string) => {
       if (path === "/v1/workspace/access") return { authorization: { role: "operator", kind: "session" } };
       throw new ApiError({ status: 501, code: "unsupported", message: "Node runtime required" });
     });
     show(<Operations />);
-    expect(await screen.findByRole("link", { name: "Open sessions to review activity" })).toHaveAttribute("href", "/sessions");
+    expect(await screen.findByRole("link", { name: "Show sessions waiting on you" })).toHaveAttribute("href", "/sessions?status=approval");
     expect(screen.queryByRole("tablist")).not.toBeInTheDocument();
+  });
+
+  it("on a server without the report, says so and never asks for it", async () => {
+    respond(async (path: string) => {
+      if (path === "/v1/workspace/access") return { authorization: { role: "owner", kind: "session" }, budgets_supported: false };
+      if (path.startsWith("/v1/agents") || path.startsWith("/v1/sessions")) return { data: [] };
+      throw new Error(`Unexpected request ${path}`);
+    }, ["usage", "workspace_access"]);
+    show(<Operations />);
+    expect(await screen.findByText("Operations is not available on this server")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Show sessions waiting on you" })).toHaveAttribute("href", "/sessions?status=approval");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(api.mock.calls.some(([path]) => path === "/v1/operations")).toBe(false);
   });
 
   it("shows exact approval arguments and sends only the selected call's decision", async () => {
     let approved = false;
-    api.mockImplementation(async (path: string, init?: RequestInit) => {
+    respond(async (path: string, init?: RequestInit) => {
       if (path === "/v1/workspace/access") return { authorization: { role: "operator", kind: "session" } };
       if (init?.method === "POST") { approved = true; return {}; }
       return approved ? { ...report, sessions: [] } : report;
@@ -76,7 +104,7 @@ describe("Workspace operations", () => {
   });
 
   it("keeps approval controls disabled for viewers", async () => {
-    api.mockImplementation(async (path: string) => path === "/v1/workspace/access" ? { authorization: { role: "viewer", kind: "session" } } : report);
+    respond(async (path: string) => path === "/v1/workspace/access" ? { authorization: { role: "viewer", kind: "session" } } : report);
     show(<Operations />);
     await userEvent.click(await screen.findByRole("tab", { name: "Approvals (1)" }));
     expect(screen.getByRole("button", { name: "Allow this call" })).toBeDisabled();
@@ -84,7 +112,7 @@ describe("Workspace operations", () => {
   });
 
   it("distinguishes pausing future mission iterations from stopping active work", async () => {
-    api.mockImplementation(async (path: string) => path === "/v1/workspace/access"
+    respond(async (path: string) => path === "/v1/workspace/access"
       ? { authorization: { role: "operator", kind: "session" } }
       : { ...report, missions: [{ id: "mission_1", goal: "Test mission", status: "running", iteration: 1, updated_at: 1, active_session_id: "session_1" }] });
     show(<Operations />);
@@ -97,7 +125,7 @@ describe("Workspace operations", () => {
   });
 
   it("validates budgets, preserves owner role, and sends explicit limit removal", async () => {
-    api.mockImplementation(async (path: string) => {
+    respond(async (path: string) => {
       if (path === "/v1/workspace/access") return { authorization: { role: "owner", kind: "session" }, budgets_supported: true };
       if (path === "/v1/workspace/members") return { data: [{ user_id: "user_owner", role: "owner", created_at: 1 }] };
       if (path === "/v1/workspace/budgets") return { data: [{ scope_id: "workspace", daily_tokens: 100, daily_cost_usd: 10, max_concurrent_sessions: 2 }] };
@@ -117,7 +145,7 @@ describe("Workspace operations", () => {
 
   it("runs a safe sample only on request and reuses the session after send failure", async () => {
     let sends = 0;
-    api.mockImplementation(async (path: string, init?: RequestInit) => {
+    respond(async (path: string, init?: RequestInit) => {
       if (path.startsWith("/v1/agents")) return { data: [{ id: "agent_1", name: "Researcher", model: "test", _oma: { default_environment_id: "env_1" } }] };
       if (path === "/v1/sessions" && init?.method === "POST") return { id: "session_sample" };
       if (path.endsWith("/events")) { sends++; throw new Error("Message could not be sent"); }
@@ -136,7 +164,7 @@ describe("Workspace operations", () => {
   });
 
   it("requires deliberate policy saving and preserves the new-session scope", async () => {
-    api.mockResolvedValue({ authorization: { role: "admin", kind: "session" } });
+    respond(async () => ({ authorization: { role: "admin", kind: "session" } }));
     const saved = vi.fn();
     show(<AccessPolicyEditor agentId="agent_1" baseline={null} onSaved={saved} />);
     await userEvent.click(await screen.findByRole("button", { name: "Add access policy" }));
