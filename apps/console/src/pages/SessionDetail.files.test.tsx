@@ -286,8 +286,9 @@ describe("SessionDetail output links", () => {
     rig.history = turn("[Open the report](/v1/oauth/authorize?mcp_server_url=https://evil.example)");
     mountSession();
     await screen.findByText("Open the report");
-    const anchor = screen.getByText("Open the report").closest("a");
-    expect(anchor?.getAttribute("href") ?? "").not.toContain("/v1/oauth");
+    // Its words stay; nothing about them is a link.
+    expect(screen.getByText("Open the report").closest("a")).toBeNull();
+    expect(screen.queryByRole("link", { name: "Open the report" })).toBeNull();
   });
 
   it("lists the turn's outputs in a Files row under the agent message, with Download", async () => {

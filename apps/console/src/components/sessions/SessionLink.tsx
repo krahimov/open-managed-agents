@@ -30,6 +30,8 @@ export function SessionLink({ sessionId, href, children }: { sessionId: string; 
   const { outputs } = useSessionOutputs(sessionId);
   const target = resolveOutputLink(href, outputs);
 
+  // A link whose address was dropped (a sign-in route) is just its words.
+  if (!href) return <span>{children}</span>;
   if (!target) {
     return (
       <a href={href} target="_blank" rel="noopener noreferrer" className={LINK}>

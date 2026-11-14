@@ -96,12 +96,16 @@ const LINK = "rounded-sm py-1 text-plum underline decoration-plum/40 underline-o
  * detach a link in the middle of a click.
  */
 const BASE: Components = {
-  a: ({ children, href }) => (
-    // `py-1` grows the target without moving a line (see lib/links.ts).
-    <a href={href} target="_blank" rel="noopener noreferrer" className={LINK}>
-      {children}
-    </a>
-  ),
+  a: ({ children, href }) =>
+    // A link whose address was dropped (a sign-in route) is just its words.
+    href ? (
+      // `py-1` grows the target without moving a line (see lib/links.ts).
+      <a href={href} target="_blank" rel="noopener noreferrer" className={LINK}>
+        {children}
+      </a>
+    ) : (
+      <span>{children}</span>
+    ),
   pre: ({ children }) => <pre className={`my-3 ${PRE}`}>{children}</pre>,
   hr: () => <hr className="my-5 border-border" />,
   code: ({ className, children, ...props }) => {
