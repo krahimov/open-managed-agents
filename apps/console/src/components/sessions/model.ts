@@ -1,7 +1,10 @@
 import { OMA_SETUP_HARNESS } from "@open-managed-agents/api-types";
 
+import { attachmentsOf, type MessageAttachment } from "@/lib/attachments";
+import { unwrapCallMcpTool } from "@/lib/deferred-mcp";
 import type { Event } from "@/lib/events";
 import type { OpenRequest } from "@/lib/session-state";
+import { isErrorResult } from "@/lib/tool-status";
 
 import { readGrant, readRequests, requestKey, type Grant } from "./requests";
 
@@ -83,8 +86,12 @@ export interface ToolCall {
   /** Result content as text (JSON is pretty-printed). */
   output?: string;
   isError: boolean;
-  /** `undefined`: no result and nothing is running (an interrupted call). */
-  status?: "running" | "completed" | "errored" | "denied";
+  /**
+   * `undefined`: no result and nothing is running (an interrupted call).
+   * `waiting`: a custom tool the session is parked on. The app that runs
+   * the session executes it and posts its result; nobody here can.
+   */
+  status?: "running" | "completed" | "errored" | "denied" | "waiting";
   startedAt: number | null;
   durationMs: number | null;
   /** Set when the call needed a person: still waiting, or how it was decided. */
@@ -138,13 +145,21 @@ export type Block =
   | {
       kind: "card";
       key: string;
-      card: "access_request" | "ambient_rule" | "mission_verdict" | "skill_request";
+      card: "access_request" | "ambient_rule" | "mission_verdict" | "skill_request" | "memory_enabled" | "saved_login";
       event: Event;
       /**
        * For the two request cards: whether anyone has answered, read from
        * the log (see requests.ts). `open` is waiting on a person.
        */
       request?: "open" | "answered" | "passed";
+      /**
+       * Access request and saved login: the log holds a
+       * `system.access_granted` for this request_id, so the server recorded
+       * the grant (a reload keeps it connected, and the card must not nudge
+       * the agent a second time). For a saved login it means the person
+       * switched account.
+       */
+      granted?: boolean;
     }
   | {
       kind: "note";
@@ -162,6 +177,8 @@ export type Item =
       text: string;
       /** file ids of attached images */
       images: string[];
+      /** Files sent with the message (`metadata.attachments`), images included. */
+      attachments: MessageAttachment[];
       at: number | null;
       cancelled: boolean;
       queued: boolean;
@@ -215,6 +232,17 @@ export function eventText(e: Event): string {
     .filter((b) => !b.type || b.type === "text")
     .map((b) => b.text ?? "")
     .join("");
+}
+
+/**
+ * What a person typed. A message sent with files carries a second text
+ * block for the agent only (where in the sandbox each file was saved), so
+ * only the first block is theirs.
+ */
+function personText(e: Event, attachments: MessageAttachment[]): string {
+  if (attachments.length === 0 || !Array.isArray(e.content)) return eventText(e);
+  const first = e.content.find((b) => (!b.type || b.type === "text") && typeof b.text === "string");
+  return first?.text ?? "";
 }
 
 function eventImages(e: Event): string[] {
@@ -279,6 +307,66 @@ const stableKey = (e: Event, i: number): string =>
 
 const TOOL_USE = new Set(["agent.tool_use", "agent.custom_tool_use", "agent.mcp_tool_use"]);
 
+/**
+ * What a tool-use event calls, as a person should read it. A deferred MCP
+ * server (apps/agent tool-budget) is reached through the `call_mcp_tool`
+ * meta tool: `{ name: "mcp__linear__create_issue", arguments: "{…}" }`.
+ * That call is shown as the Linear call it is, with the arguments it
+ * carries, decoded. A malformed one stays the plain tool call it was.
+ */
+export function readToolUse(e: Event): Pick<ToolCall, "flavor" | "name" | "server" | "input"> {
+  const deferred = e.type === "agent.tool_use" ? unwrapCallMcpTool(e.name, e.input) : null;
+  if (deferred) return { flavor: "mcp", name: deferred.tool, server: deferred.server, input: deferred.arguments };
+  return {
+    flavor: e.type === "agent.mcp_tool_use" ? "mcp" : e.type === "agent.custom_tool_use" ? "custom" : "tool",
+    name: str(e.name) ?? "tool",
+    server: e.type === "agent.mcp_tool_use" ? str(e.mcp_server_name) : undefined,
+    input: (e.input && typeof e.input === "object" ? e.input : {}) as Record<string, unknown>,
+  };
+}
+
+/**
+ * Tool calls the session is parked on, by id, from its last status: an
+ * idle with `requires_action`. A built-in or MCP call waits on a person's
+ * decision (`confirmation`); a custom tool waits on the app that runs the
+ * session to post its result (`client`). A status after that idle (the
+ * session ran again, ended) means nothing is owed any more.
+ */
+function owedCalls(events: Event[]): Map<string, "confirmation" | "client"> {
+  const owed = new Map<string, "confirmation" | "client">();
+  const uses = new Map<string, Event>();
+  let last: Event | undefined;
+  for (const e of events) {
+    if (TOOL_USE.has(e.type) && typeof e.id === "string") uses.set(e.id, e);
+    else if (
+      e.type === "session.status_idle" ||
+      e.type === "session.status_running" ||
+      e.type === "session.status_rescheduled" ||
+      e.type === "session.status_terminated"
+    ) {
+      last = e;
+    }
+  }
+  if (last?.type !== "session.status_idle") return owed;
+  const stop = last.stop_reason as { type?: string; action_type?: string; event_ids?: unknown } | undefined;
+  const parked =
+    stop?.type === "requires_action" || stop?.action_type === "tool_confirmation" || stop?.action_type === "custom_tool_result";
+  if (!parked) return owed;
+  let ids = Array.isArray(stop?.event_ids) ? stop.event_ids.filter((x): x is string => typeof x === "string") : [];
+  // Some runtimes leave event_ids out: the calls that wait by their nature.
+  if (ids.length === 0) {
+    ids = [...uses.values()]
+      .filter((u) => u.type === "agent.custom_tool_use" || (u as { evaluated_permission?: string }).evaluated_permission === "ask")
+      .map((u) => u.id as string);
+  }
+  for (const id of ids) {
+    const use = uses.get(id);
+    const client = use ? use.type === "agent.custom_tool_use" : stop?.action_type === "custom_tool_result";
+    owed.set(id, client ? "client" : "confirmation");
+  }
+  return owed;
+}
+
 // ── the fold ────────────────────────────────────────────────────────────
 
 /**
@@ -290,6 +378,8 @@ export function buildConversation(events: Event[], opts: { running?: boolean } =
   // Pass 1: indexes that need look-ahead.
   const results = new Map<string, Event>();
   const confirmations = new Map<string, { result: "allow" | "deny"; message?: string }>();
+  /** Custom tool calls the app has answered (`user.custom_tool_result`). */
+  const clientAnswered = new Set<string>();
   let lastIdle: Event | undefined;
   let lastTriggerIdx = -1;
   events.forEach((e, i) => {
@@ -300,16 +390,21 @@ export function buildConversation(events: Event[], opts: { running?: boolean } =
         result: (e as { result?: string }).result === "deny" ? "deny" : "allow",
         message: str((e as { deny_message?: unknown }).deny_message),
       });
+    } else if (e.type === "user.custom_tool_result") {
+      const cid = str((e as { custom_tool_use_id?: unknown }).custom_tool_use_id);
+      if (cid) clientAnswered.add(cid);
     } else if (e.type === "session.status_idle") lastIdle = e;
-    if (e.type === "user.message" || e.type === "user.tool_confirmation") lastTriggerIdx = i;
+    if (e.type === "user.message" || e.type === "user.tool_confirmation" || e.type === "user.custom_tool_result") lastTriggerIdx = i;
   });
-  const stop = lastIdle?.stop_reason as { action_type?: string; event_ids?: string[] } | undefined;
-  const awaiting = new Set<string>(stop?.action_type === "tool_confirmation" ? (stop.event_ids ?? []) : []);
+  const owed = owedCalls(events);
   // Anything after the idle that asked for confirmation means the session moved on.
   const idleIdx = lastIdle ? events.lastIndexOf(lastIdle) : -1;
   const movedOn = events.slice(idleIdx + 1).some((e) => e.type === "session.status_running" || e.type === "user.message");
 
   const requests = readRequests(events);
+  /** Requests the server recorded as granted (`system.access_granted`). */
+  const granted = grantedRequestIds(events);
+  const requestId = (e: Event): string => str((e as { request_id?: unknown }).request_id) ?? "";
 
   const items: Item[] = [];
   const pendingApprovals: ToolCall[] = [];
@@ -383,12 +478,14 @@ export function buildConversation(events: Event[], opts: { running?: boolean } =
           });
         } else {
           const meta = e as { cancelled_at_ms?: number | null };
+          const attachments = attachmentsOf(e);
           items.push({
             kind: "user",
             key,
             event: e,
-            text: eventText(e),
+            text: personText(e, attachments),
             images: eventImages(e),
+            attachments,
             at,
             cancelled: meta.cancelled_at_ms != null,
             queued: false,
@@ -456,17 +553,22 @@ export function buildConversation(events: Event[], opts: { running?: boolean } =
         const result = id ? results.get(id) : undefined;
         if (id && result) pairedResults.add(id);
         const endAt = eventTime(result);
-        const isError = !!result && Boolean((result as { is_error?: boolean }).is_error);
+        // A bash result that reports a non-zero exit (`exit=1\n…`) failed,
+        // whatever its is_error says.
+        const isError = isErrorResult(result);
         const confirmation = id ? confirmations.get(id) : undefined;
         const asks = (e as { evaluated_permission?: string }).evaluated_permission === "ask";
-        const waiting = !!id && !result && !confirmation && awaiting.has(id) && !movedOn;
+        const answered = !!id && clientAnswered.has(id);
+        const owes = id && !result && !confirmation && !answered && !movedOn ? owed.get(id) : undefined;
+        const waiting = owes === "confirmation";
+        const waitingOnClient = owes === "client";
+        // Answered (allowed, or the app posted the result) and still without
+        // a result: it is running now, whenever it was asked.
+        const resumed = confirmation?.result === "allow" || answered;
         const call: ToolCall = {
           key,
           id,
-          flavor: e.type === "agent.mcp_tool_use" ? "mcp" : e.type === "agent.custom_tool_use" ? "custom" : "tool",
-          name: str(e.name) ?? "tool",
-          server: e.type === "agent.mcp_tool_use" ? str(e.mcp_server_name) : undefined,
-          input: (e.input && typeof e.input === "object" ? e.input : {}) as Record<string, unknown>,
+          ...readToolUse(e),
           use: e,
           result,
           output: resultText(result),
@@ -479,9 +581,11 @@ export function buildConversation(events: Event[], opts: { running?: boolean } =
               : "completed"
             : confirmation?.result === "deny"
               ? "denied"
-              : opts.running && i > lastTriggerIdx && !waiting
-                ? "running"
-                : undefined,
+              : waitingOnClient
+                ? "waiting"
+                : opts.running && !waiting && (i > lastTriggerIdx || resumed)
+                  ? "running"
+                  : undefined,
           approval: waiting
             ? "pending"
             : confirmation
@@ -544,8 +648,8 @@ export function buildConversation(events: Event[], opts: { running?: boolean } =
           use: e,
           result: e,
           output: resultText(e),
-          isError: Boolean((e as { is_error?: boolean }).is_error),
-          status: (e as { is_error?: boolean }).is_error ? "errored" : "completed",
+          isError: isErrorResult(e),
+          status: isErrorResult(e) ? "errored" : "completed",
           startedAt: at,
           durationMs: null,
         };
@@ -589,9 +693,28 @@ export function buildConversation(events: Event[], opts: { running?: boolean } =
         push({ kind: "warning", key, source: str(e.source), message: String(e.message ?? "") }, at);
         break;
 
-      case "system.access_request":
-        push({ kind: "card", key, card: "access_request", event: e, request: requests.states.get(requestKey(e)) ?? "open" }, at);
+      case "system.access_request": {
+        const isGranted = granted.has(requestId(e));
+        push(
+          {
+            kind: "card",
+            key,
+            card: "access_request",
+            event: e,
+            request: isGranted ? "answered" : (requests.states.get(requestKey(e)) ?? "open"),
+            granted: isGranted,
+          },
+          at,
+        );
         break;
+      }
+      case "system.saved_login_attached":
+        push({ kind: "card", key, card: "saved_login", event: e, granted: granted.has(requestId(e)) }, at);
+        break;
+      case "system.memory_enabled":
+        push({ kind: "card", key, card: "memory_enabled", event: e }, at);
+        break;
+      // system.access_granted is state for the request cards above, never a row.
       case "system.ambient_rule_created":
         push({ kind: "card", key, card: "ambient_rule", event: e }, at);
         break;
@@ -625,7 +748,10 @@ export function buildConversation(events: Event[], opts: { running?: boolean } =
   });
   closeTurn();
 
-  return { items, pendingApprovals, openRequests: requests.open, failed, failure: failed ? failure : null };
+  // A grant the server recorded answers its request, even when the note to
+  // the agent is missing or names the service differently.
+  const openRequests = granted.size ? requests.open.filter((r) => !granted.has(r.key)) : requests.open;
+  return { items, pendingApprovals, openRequests, failed, failure: failed ? failure : null };
 }
 
 // ── usage ───────────────────────────────────────────────────────────────
@@ -679,7 +805,7 @@ export function summarizeUsage(events: Event[]): SessionUsage {
       }
     } else if (TOOL_USE.has(e.type)) {
       u.toolCalls += 1;
-    } else if ((e.type === "agent.tool_result" || e.type === "agent.mcp_tool_result") && e.is_error) {
+    } else if ((e.type === "agent.tool_result" || e.type === "agent.mcp_tool_result") && isErrorResult(e)) {
       u.toolErrors += 1;
     } else if (e.type === "user.message") {
       u.turns += 1;

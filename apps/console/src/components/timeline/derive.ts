@@ -1,6 +1,8 @@
+import { parseSearchMcpTools } from "../../lib/deferred-mcp";
 import { formatCompact } from "../../lib/format";
 import type { Event } from "../../lib/events";
-import { eventTime, formatElapsed, handoffKey, handoffKeyOf } from "../sessions/model";
+import { buildToolCallIndex, isErrorResult } from "../../lib/tool-status";
+import { eventTime, formatElapsed, handoffKey, handoffKeyOf, readToolUse } from "../sessions/model";
 import { serverInfo } from "../sessions/tools";
 import type { Span, Turn, TurnTriggerKind } from "./types";
 
@@ -18,7 +20,16 @@ import type { Span, Turn, TurnTriggerKind } from "./types";
  * collapses sub-second events together — only used as a fallback for
  * very old sessions that predate processed_at.
  */
-export function deriveSpans(events: Event[]): { spans: Span[]; totalMs: number } {
+export function deriveSpans(
+  events: Event[],
+  /**
+   * The wider log (the whole thread) a call's fate is read from. A call
+   * asked in one turn is answered in the next (the decision, a custom
+   * tool's result), so one turn's own events cannot tell "still waiting"
+   * from "denied". Bars and times always come from `events` alone.
+   */
+  statusContext: Event[] = events,
+): { spans: Span[]; totalMs: number } {
   // One clock for the whole session view: `processed_at` (ms ISO) first,
   // then the numeric `ts` (ms on Node, seconds on Cloudflare).
   const tsMs = eventTime;
@@ -59,11 +70,21 @@ export function deriveSpans(events: Event[]): { spans: Span[]; totalMs: number }
   const childByParent = new Map<string, { t: number; e: Event }>();
   // tool_use_id → the person's decision, for calls that had to ask first.
   const confirmations = new Map<string, { t: number; e: Event }>();
+  // The same, from the wider log: a decision made after this turn ended.
+  const laterDecisions = new Map<string, Event>();
+  for (const e of statusContext) {
+    if (e.type === "user.tool_confirmation" && e.tool_use_id) laterDecisions.set(e.tool_use_id, e);
+  }
+  const fate = buildToolCallIndex(statusContext);
   for (const { e, t } of timed) {
     if (e.type === "user.tool_confirmation" && e.tool_use_id) confirmations.set(e.tool_use_id, { t, e });
     if (e.type === "agent.tool_result" && e.tool_use_id) toolResults.set(e.tool_use_id, { t, e });
     else if (e.type === "agent.mcp_tool_result" && e.mcp_tool_use_id) mcpResults.set(e.mcp_tool_use_id, { t, e });
-    else if (e.type === "user.custom_tool_result" && (e as Event).id) customResults.set(String(e.id), { t, e });
+    else if (e.type === "user.custom_tool_result") {
+      // Keyed by the call it answers, not by its own id.
+      const cid = (e as { custom_tool_use_id?: unknown }).custom_tool_use_id;
+      if (typeof cid === "string") customResults.set(cid, { t, e });
+    }
     else if (e.type === "span.model_request_end") {
       const data = (e.data as { model_request_start_id?: string; model_usage?: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }; finish_reason?: string } | undefined);
       const sid = (e as { model_request_start_id?: string }).model_request_start_id ?? data?.model_request_start_id;
@@ -124,57 +145,70 @@ export function deriveSpans(events: Event[]): { spans: Span[]; totalMs: number }
     const sourceEvents: Event[] = [e];
     const pushSpan = (span: Omit<Span, "events">) => spans.push({ ...span, events: sourceEvents });
 
-    if (e.type === "agent.tool_use" || e.type === "agent.custom_tool_use") {
-      const result = e.type === "agent.tool_use"
-        ? toolResults.get(String(e.id))
-        : customResults.get(String(e.id));
+    if (e.type === "agent.tool_use" || e.type === "agent.custom_tool_use" || e.type === "agent.mcp_tool_use") {
+      const id = String(e.id ?? "");
+      // A custom tool is closed by the runtime's agent.tool_result too; the
+      // app's own user.custom_tool_result is the fallback.
+      const result =
+        e.type === "agent.mcp_tool_use"
+          ? mcpResults.get(id)
+          : (toolResults.get(id) ?? (e.type === "agent.custom_tool_use" ? customResults.get(id) : undefined));
+      const status = fate.info(id || undefined).status;
       // A call that had to ask first: the wait for a person is its own
       // span, and the tool only starts running once they answered.
-      const asked = (e as { evaluated_permission?: string }).evaluated_permission === "ask";
-      const decision = confirmations.get(String(e.id));
+      const decision = confirmations.get(id);
+      const later = decision ? undefined : laterDecisions.get(id);
+      const asked =
+        (e as { evaluated_permission?: string }).evaluated_permission === "ask" || !!decision || !!later || status === "awaiting_approval";
       let runStartMs = startMs;
-      if (asked && (decision || !result)) {
-        const decidedMs = decision ? decision.t - t0 : startMs;
-        const denied = (decision?.e as { result?: string } | undefined)?.result === "deny";
+      if (asked && (decision || later || !result)) {
+        // Decided in a later turn: this turn waited on it until it closed.
+        const decidedMs = decision ? decision.t - t0 : later ? tEnd - t0 : startMs;
+        const verdict = (decision?.e ?? later) as { result?: string } | undefined;
         spans.push({
           key: `approval-${e.id ?? i}`,
           family: "approval",
           label: "Waiting for approval",
-          detail: decision ? (denied ? "denied" : "allowed") : "still waiting",
+          detail: verdict ? (verdict.result === "deny" ? "denied" : "allowed") : status === "awaiting_approval" ? "still waiting" : "never answered",
           startMs,
           durationMs: Math.max(0, decidedMs - startMs),
-          events: decision ? [e, decision.e] : [e],
+          events: decision ? [e, decision.e] : later ? [e, later] : [e],
         });
         runStartMs = decidedMs;
       }
       const endMs = result ? result.t - t0 : runStartMs;
       if (result) sourceEvents.push(result.e);
-      const failed = !!result && Boolean((result.e as { is_error?: boolean }).is_error);
-      const handoff = handoffKey(String(e.name ?? ""));
+      // A bash result that reports a non-zero exit failed, whatever its is_error says.
+      const failed = !!result && isErrorResult(result.e);
+      const call = readToolUse(e);
+      const handoff = handoffKey(call.name);
+      const search = call.flavor === "tool" ? parseSearchMcpTools(call.name, call.input) : null;
+      const where = search?.server ? serverInfo(search.server).label : null;
       pushSpan({
-        key: `tool-${e.id ?? i}`,
-        family: e.type === "agent.tool_use" ? "tool" : "custom_tool",
-        label: handoff ? `Asked ${handoffNames.get(handoff) ?? "another agent"}` : String(e.name ?? "tool"),
-        plain: !!handoff || undefined,
-        detail: result ? (failed ? "failed" : undefined) : asked && !decision ? "not run yet" : "no result",
+        key: `${e.type === "agent.mcp_tool_use" ? "mcp" : "tool"}-${e.id ?? i}`,
+        // A deferred MCP call (call_mcp_tool) reads as the app call it is.
+        family: call.flavor === "mcp" ? "mcp" : call.flavor === "custom" ? "custom_tool" : "tool",
+        source: call.flavor === "mcp" ? serverInfo(call.server).label : undefined,
+        label: handoff
+          ? `Asked ${handoffNames.get(handoff) ?? "another agent"}`
+          : search
+            ? `Searched ${where ?? "all"} tools for “${search.query}”`
+            : call.name,
+        plain: !!handoff || !!search || undefined,
+        detail: result
+          ? failed
+            ? "failed"
+            : undefined
+          : status === "denied" || (later as { result?: string } | undefined)?.result === "deny" || (decision?.e as { result?: string } | undefined)?.result === "deny"
+            ? "denied"
+            : status === "awaiting_client"
+              ? "waiting for the app's result"
+              : asked && !decision && !later
+                ? "not run yet"
+                : "no result",
         failed,
         startMs: runStartMs,
         durationMs: Math.max(0, endMs - runStartMs),
-      });
-    } else if (e.type === "agent.mcp_tool_use") {
-      const result = mcpResults.get(String(e.id));
-      const endMs = result ? result.t - t0 : startMs;
-      if (result) sourceEvents.push(result.e);
-      const failed = !!result && Boolean((result.e as { is_error?: boolean }).is_error);
-      pushSpan({
-        key: `mcp-${e.id ?? i}`,
-        family: "mcp",
-        source: serverInfo(typeof e.mcp_server_name === "string" ? e.mcp_server_name : undefined).label,
-        label: String(e.name ?? "tool"),
-        detail: result ? (failed ? "failed" : undefined) : "no result",
-        failed,
-        startMs,
-        durationMs: Math.max(0, endMs - startMs),
       });
     } else if (
       e.type === "agent.tool_result" ||
@@ -393,7 +427,7 @@ export function bucketIntoTurns(events: Event[]): Turn[] {
     const k = triggerKindOf(e);
     if (k) {
       // Someone answered (or moved on): the turn that asked is settled.
-      if (current?.status === "approval") current.status = "completed";
+      if (current?.status === "approval" || current?.status === "awaiting_client") current.status = "completed";
       current = {
         id: `turn-${turns.length}`,
         triggerKind: k,
@@ -421,8 +455,20 @@ export function bucketIntoTurns(events: Event[]): Turn[] {
     }
     current.events.push(e);
     if (e.type === "session.status_idle") {
-      const stop = (e as { stop_reason?: { action_type?: string } }).stop_reason;
-      current.status = stop?.action_type === "tool_confirmation" ? "approval" : "completed";
+      // Parked on requires_action: the turn waits on a person's decision,
+      // or on the app for a custom tool's result. Either way it has not
+      // completed; the next turn starts with the answer.
+      const stop = (e as { stop_reason?: { type?: string; action_type?: string; event_ids?: unknown } }).stop_reason;
+      const parked = stop?.type === "requires_action" || stop?.action_type === "tool_confirmation" || stop?.action_type === "custom_tool_result";
+      if (!parked) current.status = "completed";
+      else if (stop?.action_type === "custom_tool_result") current.status = "awaiting_client";
+      else if (stop?.action_type === "tool_confirmation") current.status = "approval";
+      else {
+        // No action type: what the named calls are says what is owed.
+        const ids = new Set(Array.isArray(stop?.event_ids) ? stop.event_ids : []);
+        const custom = current.events.some((x) => x.type === "agent.custom_tool_use" && ids.has(x.id));
+        current.status = custom ? "awaiting_client" : "approval";
+      }
       current.endedAt = parseEventTs(e);
     } else if (e.type === "session.status_terminated") {
       current.status = "terminated";

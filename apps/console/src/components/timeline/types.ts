@@ -142,8 +142,13 @@ export type TurnTriggerKind =
   | "custom_tool_result"
   | "init";
 
-/** `approval`: the turn stopped to ask a person, and nobody has answered yet. */
-export type TurnStatus = "completed" | "running" | "errored" | "terminated" | "approval";
+/**
+ * `approval`: the turn stopped to ask a person, and nobody has answered yet.
+ * `awaiting_client`: the turn stopped for a custom tool's result, which the
+ * app that runs the session sends back. Neither has completed: the next
+ * turn starts with the answer.
+ */
+export type TurnStatus = "completed" | "running" | "errored" | "terminated" | "approval" | "awaiting_client";
 
 export interface Turn {
   id: string;

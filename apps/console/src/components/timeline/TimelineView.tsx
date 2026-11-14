@@ -21,6 +21,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { formatCompact, pickTickStep } from "@/lib/format";
 import type { Event } from "@/lib/events";
+import { isErrorResult } from "@/lib/tool-status";
 import { cn } from "@/lib/utils";
 
 import { StatusBadge } from "../Badge";
@@ -33,7 +34,7 @@ import { CopyButton } from "../IdChip";
 import { Markdown } from "../Markdown";
 import { ModelBadge } from "../ModelBadge";
 import { Skeleton } from "../Skeleton";
-import { eventText, eventTime, formatElapsed, resultText, type ToolCall } from "../sessions/model";
+import { eventText, eventTime, formatElapsed, readToolUse, resultText, type ToolCall } from "../sessions/model";
 import { presentTool, ToolBody } from "../sessions/tools";
 import { Tip } from "../Tip";
 import { bucketIntoTurns, deriveSpans } from "./derive";
@@ -92,12 +93,14 @@ export function TimelineView({
   const derived = useMemo(
     () =>
       turns.map((t) => {
-        const d = deriveSpans(t.events);
+        // A call's fate (denied, still waiting) is read from the whole log:
+        // it is often decided in the turn after the one that asked.
+        const d = deriveSpans(t.events, events);
         if (!sender) return { turn: t, ...d };
         // deriveSpans writes "Message from you"; say who actually sent it.
         return { turn: t, ...d, spans: d.spans.map((sp) => (sp.label === "Message from you" ? { ...sp, label: sender.message } : sp)) };
       }),
-    [turns, sender],
+    [turns, sender, events],
   );
   const containerRef = useRef<HTMLDivElement | null>(null);
   const [selection, setSelection] = useState<TimelineSelection | null>(null);
@@ -510,7 +513,11 @@ function TurnCard({
             </Tip>
           )}
           <span className="font-medium text-fg">{formatElapsed(turnDurationMs) || "0s"}</span>
-          <StatusBadge status={turn.status} className="text-xs" />
+          {turn.status === "awaiting_client" ? (
+            <StatusBadge status="idle" label="Waiting for the app" className="text-xs" />
+          ) : (
+            <StatusBadge status={turn.status} className="text-xs" />
+          )}
         </div>
         {!collapsed && steps > 0 && totalMs > 1 && (
           <ZoomControls
@@ -730,19 +737,24 @@ function toolCallOf(span: Span): ToolCall | null {
   const result = span.events.find(
     (e) => e.type === "agent.tool_result" || e.type === "agent.mcp_tool_result" || e.type === "user.custom_tool_result",
   );
-  const isError = !!result && Boolean((result as { is_error?: boolean }).is_error);
+  const isError = isErrorResult(result);
   return {
     key: span.key,
     id: typeof use.id === "string" ? use.id : undefined,
-    flavor: use.type === "agent.mcp_tool_use" ? "mcp" : use.type === "agent.custom_tool_use" ? "custom" : "tool",
-    name: String(use.name ?? "tool"),
-    server: typeof use.mcp_server_name === "string" ? use.mcp_server_name : undefined,
-    input: (use.input && typeof use.input === "object" ? use.input : {}) as Record<string, unknown>,
+    ...readToolUse(use),
     use,
     result,
     output: resultText(result),
     isError,
-    status: result ? (isError ? "errored" : "completed") : undefined,
+    status: result
+      ? isError
+        ? "errored"
+        : "completed"
+      : span.detail === "denied"
+        ? "denied"
+        : span.detail === "waiting for the app's result"
+          ? "waiting"
+          : undefined,
     startedAt: eventTime(use),
     durationMs: span.durationMs,
   };

@@ -6,6 +6,7 @@ import {
   CircleCheckIcon,
   CircleStopIcon,
   CopyIcon,
+  FileIcon,
   FlagIcon,
   GoalIcon,
   HourglassIcon,
@@ -19,6 +20,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { getActiveTenantId } from "@/lib/api";
 import type { Event } from "@/lib/events";
+import type { SessionOutputFile } from "@/lib/session-outputs";
 import { useCopy } from "@/lib/clipboard";
 import { readFailure } from "@/lib/failures";
 import { formatAbsolute, toDate, type DateInput } from "@/lib/format";
@@ -33,16 +35,21 @@ import { Callout } from "../Callout";
 import { ConfirmDialog } from "../ConfirmDialog";
 import { CodeWell, EventCard, EventSection } from "../EventCard";
 import { Markdown } from "../Markdown";
+import { MemoryEnabledCard } from "../MemoryEnabledCard";
 import { MissionVerdictCard } from "../MissionVerdictCard";
 import { ModelBadge } from "../ModelBadge";
 import { RelativeTime } from "../RelativeTime";
 import { humanSkillName } from "../resources/skills";
+import { SavedLoginLine } from "../SavedLoginLine";
 import { SkillRequestCard } from "../SkillRequestCard";
 import { Tip } from "../Tip";
+import { AccessNote, ApprovalControls } from "./ApprovalControls";
+import { MessageAttachmentChips } from "./AttachmentChips";
 import type { SessionOperations } from "./hooks";
 import { formatElapsed, type Block, type Item, type ToolCall } from "./model";
 import { NEEDS_YOU_CARD } from "./RequestParts";
 import { presentTool, ProviderResponse, serverInfo, ThreadNav, ToolInputPreview, ToolRun } from "./tools";
+import { TurnFiles } from "./TurnFiles";
 
 /**
  * The conversation: a 720px reading column of turns.
@@ -69,6 +76,8 @@ export interface QueuedMessage {
   key: string;
   text: string;
   images: number;
+  /** Other files sent with it (not images). */
+  files?: number;
   /** Still on its way to the server (uploading, posting); otherwise the server holds it in its queue. */
   sending?: boolean;
 }
@@ -87,6 +96,7 @@ export function ConversationView({
   findEnvironmentYaml,
   onSelectThread,
   asker,
+  turnFiles,
 }: {
   items: Item[];
   agent: { id?: string; name?: string };
@@ -101,6 +111,10 @@ export function ConversationView({
   /** In a sub-agent's thread: the agent that handed it the work. What reads
    *  as "you said" in a main thread was said by that agent here. */
   asker?: { id?: string; name?: string };
+  /** Files the agent wrote, by the agent message that closes the turn they
+   *  were written in (`outputsByTurn` in lib/session-outputs). Each turn
+   *  shows its own under its prose. */
+  turnFiles?: ReadonlyMap<Event, SessionOutputFile[]>;
 }) {
   const last = items[items.length - 1];
   const streaming = streams.thinking.length + streams.toolInputs.length + streams.messages.length > 0;
@@ -195,6 +209,7 @@ export function ConversationView({
                 onApproveEnvironmentYaml={onApproveEnvironmentYaml}
                 findEnvironmentYaml={findEnvironmentYaml}
                 onSelectThread={onSelectThread}
+                files={turnFiles}
               />
             );
             break;
@@ -302,6 +317,8 @@ function UserTurn({ item }: { item: Extract<Item, { kind: "user" }> }) {
           )}
         </div>
       )}
+      {/* Images are shown above; every other file sent with the message is a chip. */}
+      <MessageAttachmentChips attachments={item.attachments.filter((a) => a.kind !== "image")} />
       {item.cancelled ? (
         <span className="flex items-center gap-1 pr-1 text-xs text-fg-subtle">
           <Undo2Icon className="size-3" /> Retracted before the agent read it
@@ -318,7 +335,16 @@ function UserTurn({ item }: { item: Extract<Item, { kind: "user" }> }) {
   );
 }
 
+const countOf = (n: number, one: string, many: string): string => (n === 1 ? `1 ${one}` : `${n} ${many}`);
+
 function QueuedTurn({ message }: { message: QueuedMessage }) {
+  const files = message.files ?? 0;
+  const sent = [
+    message.images > 0 ? countOf(message.images, "image", "images") : null,
+    files > 0 ? countOf(files, "file", "files") : null,
+  ]
+    .filter(Boolean)
+    .join(" and ");
   return (
     <div className="flex flex-col items-end gap-1.5">
       <div className={cn(BUBBLE, "opacity-60")}>
@@ -326,14 +352,14 @@ function QueuedTurn({ message }: { message: QueuedMessage }) {
           <p className="break-words whitespace-pre-wrap">{message.text}</p>
         ) : (
           <p className="flex items-center gap-2 text-fg-muted">
-            <ImageIcon className="size-4" />
-            {message.images === 1 ? "1 image" : `${message.images} images`}
+            {message.images > 0 ? <ImageIcon className="size-4" /> : <FileIcon className="size-4" />}
+            {sent || "Nothing to send"}
           </p>
         )}
       </div>
       <span className="flex items-center gap-1 pr-1 text-xs text-fg-subtle">
         {message.sending ? (
-          <>Sending{message.images > 0 && message.text ? ` with ${message.images === 1 ? "1 image" : `${message.images} images`}` : ""}…</>
+          <>Sending{sent && message.text ? ` with ${sent}` : ""}…</>
         ) : (
           <>
             <HourglassIcon className="size-3" /> Queued
@@ -600,6 +626,7 @@ function AgentTurn({
   onApproveEnvironmentYaml,
   findEnvironmentYaml,
   onSelectThread,
+  files,
 }: {
   item: Extract<Item, { kind: "agent" }>;
   agent: { id?: string; name?: string };
@@ -610,9 +637,13 @@ function AgentTurn({
   onApproveEnvironmentYaml?: (source: string) => void;
   findEnvironmentYaml?: (message: string) => string | null;
   onSelectThread?: (threadId: string) => void;
+  files?: ReadonlyMap<Event, SessionOutputFile[]>;
 }) {
   const waiting = item.blocks.some((b) => b.kind === "approval");
   const showFooter = !live && !waiting && !!item.text;
+  const written = files?.size
+    ? item.blocks.flatMap((b) => (b.kind === "text" ? (files.get(b.event) ?? []) : []))
+    : [];
   return (
     <div className="space-y-3">
       <TurnHeader agent={agent} at={item.at} />
@@ -628,6 +659,7 @@ function AgentTurn({
           onSelectThread={onSelectThread}
         />
       ))}
+      {written.length > 0 && <TurnFiles sessionId={sessionId} files={written} />}
       {tail}
       {showFooter && <TurnFooter text={item.text} durationMs={item.durationMs} />}
     </div>
@@ -687,7 +719,7 @@ function BlockView({
       return <ToolRun calls={block.calls} />;
 
     case "approval":
-      return <ApprovalCard call={block.call} agentName={agent.name} ops={ops} />;
+      return <ApprovalCard call={block.call} agentName={agent.name} sessionId={sessionId} />;
 
     case "error":
       return <ErrorCard block={block} ops={ops} />;
@@ -700,7 +732,10 @@ function BlockView({
       );
 
     case "card":
-      if (block.card === "access_request") return <AccessRequestCard event={block.event} sessionId={sessionId} state={block.request} />;
+      if (block.card === "access_request")
+        return <AccessRequestCard event={block.event} sessionId={sessionId} state={block.request} granted={block.granted} />;
+      if (block.card === "saved_login") return <SavedLoginLine event={block.event} sessionId={sessionId} switched={block.granted} />;
+      if (block.card === "memory_enabled") return <MemoryEnabledCard event={block.event} />;
       if (block.card === "ambient_rule") return <AmbientRuleCard event={block.event} />;
       if (block.card === "mission_verdict") return <MissionVerdictCard event={block.event} />;
       return <SkillRequestCard event={block.event} sessionId={sessionId} state={block.request} />;
@@ -772,32 +807,6 @@ function InlineNote({
   );
 }
 
-/**
- * Why the buttons beside it are off. "You do not have access" is said only
- * when the server said so; a permissions read that failed says it could
- * not be checked, and checks again on request.
- */
-function AccessNote({ ops, action }: { ops: SessionOperations; action: string }) {
-  if (ops.accessFailed) {
-    return (
-      <span role="alert" className="text-xs text-fg-muted">
-        Your access could not be checked.{" "}
-        <button
-          type="button"
-          onClick={ops.recheckAccess}
-          className={cn(quietLink, "text-fg")}
-        >
-          Try again
-        </button>
-      </span>
-    );
-  }
-  if (ops.accessKnown && !ops.canOperate) {
-    return <span className="text-xs text-fg-muted">Operator access is required to {action}.</span>;
-  }
-  return null;
-}
-
 // ── approval ────────────────────────────────────────────────────────────
 
 /**
@@ -805,17 +814,14 @@ function AccessNote({ ops, action }: { ops: SessionOperations; action: string })
  * exact input and two decisions. It scrolls itself into view when it
  * appears: the session cannot continue until someone answers.
  */
-function ApprovalCard({ call, agentName, ops }: { call: ToolCall; agentName?: string; ops: SessionOperations }) {
+function ApprovalCard({ call, agentName, sessionId }: { call: ToolCall; agentName?: string; sessionId: string }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     ref.current?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, []);
   const p = presentTool(call);
-  const id = call.id ?? "";
-  const allowing = ops.busy === `allow:${id}`;
-  const denying = ops.busy === `deny:${id}`;
-  const locked = !ops.canOperate || !!ops.busy || !id;
   const toolLabel = p.source ? `${p.source} · ${p.title}` : p.title;
+  const threadId = typeof call.use.session_thread_id === "string" ? call.use.session_thread_id : undefined;
   return (
     <div ref={ref} data-needs-you="approval" className="scroll-my-24">
       <EventCard
@@ -830,23 +836,15 @@ function ApprovalCard({ call, agentName, ops }: { call: ToolCall; agentName?: st
         }
         meta={call.startedAt != null ? <RelativeTime value={call.startedAt} prefix="Asked" /> : undefined}
         actions={
-          <>
-            <Button size="sm" disabled={locked && !allowing} loading={allowing} onClick={() => void ops.decide(id, "allow")}>
-              Allow this call
-            </Button>
-            <Button size="sm" variant="outline" disabled={locked && !denying} loading={denying} onClick={() => void ops.decide(id, "deny")}>
-              Deny
-            </Button>
-            <AccessNote ops={ops} action="approve tools" />
-          </>
+          <ApprovalControls
+            sessionId={sessionId}
+            toolUseId={call.id ?? ""}
+            threadId={threadId}
+            {...(p.kind === "mcp" && p.source ? { server: p.source, tool: p.title.replace(/_/g, " ") } : {})}
+          />
         }
       >
         <ToolInputPreview call={call} />
-        {ops.error && (
-          <p role="alert" className="text-small text-danger">
-            {ops.error}
-          </p>
-        )}
       </EventCard>
     </div>
   );

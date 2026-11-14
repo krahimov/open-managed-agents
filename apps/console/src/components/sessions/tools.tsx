@@ -18,6 +18,7 @@ import {
   WrenchIcon,
 } from "lucide-react";
 
+import { parseSearchMcpTools } from "@/lib/deferred-mcp";
 import { useAgents } from "@/lib/directory";
 import { cn } from "@/lib/utils";
 import { inlineLink, standaloneLink } from "@/lib/links";
@@ -28,6 +29,7 @@ import { CodeWell, EventCard } from "../EventCard";
 import { GitHubIcon, LinearIcon, SlackIcon } from "../icons";
 import { CopyButton } from "../IdChip";
 import { Markdown } from "../Markdown";
+import type { EventStatus } from "../EventCard";
 import { formatElapsed, handoffKey, handoffKeyOf, type ToolCall } from "./model";
 
 /**
@@ -157,6 +159,8 @@ export interface ToolPresentation {
   /** "run a command" — completes "<Agent> wants to …". */
   verb: string;
   kind: "tool" | "mcp";
+  /** The title is words ("Searched Linear tools"), not a tool's name: set it in the text face. */
+  plain?: boolean;
 }
 
 /** SDK harnesses name MCP tools `mcp__<server>__<tool>`. */
@@ -205,6 +209,20 @@ export function presentTool(call: Pick<ToolCall, "name" | "server" | "flavor" | 
       preview: previewOf(tool, call.input),
       verb: `use ${server.label} (${tool.replace(/_/g, " ")})`,
       kind: "mcp",
+    };
+  }
+  // A deferred MCP server's tools are found by search first
+  // (`search_mcp_tools`): say what was looked for, and where.
+  const search = call.flavor === "tool" ? parseSearchMcpTools(call.name, call.input) : null;
+  if (search) {
+    const where = search.server ? serverInfo(search.server).label : null;
+    return {
+      icon: SearchIcon,
+      title: where ? `Searched ${where} tools` : "Searched all tools",
+      preview: `“${oneLine(search.query, 120)}”`,
+      verb: where ? `search ${where}'s tools` : "search its tools",
+      kind: "tool",
+      plain: true,
     };
   }
   // One agent asking another. The name is resolved where the directory is
@@ -412,7 +430,9 @@ export function ToolBody({ call }: { call: ToolCall }) {
     !call.result &&
     (call.status === "running"
       ? "Still running…"
-      : call.approval === "denied"
+      : call.status === "waiting"
+        ? "This is a custom tool: the app that started the session runs it and sends back the result. The agent carries on once it does."
+        : call.approval === "denied"
         ? call.denyMessage
           ? `Denied, so the call did not run. The agent was told: “${call.denyMessage}”`
           : "Denied, so the call did not run."
@@ -616,7 +636,7 @@ function HandoffCard({ call, defaultOpen }: { call: ToolCall; defaultOpen?: bool
       icon={Face}
       title={<span className="font-sans">Asked {agent.name}</span>}
       subtitle={message ? <span className="font-sans text-small">{oneLineText(message, 160)}</span> : undefined}
-      status={call.status}
+      status={glyphOf(call.status)}
       meta={call.durationMs != null ? formatElapsed(call.durationMs) : undefined}
       defaultOpen={defaultOpen}
     >
@@ -651,24 +671,29 @@ function HandoffCard({ call, defaultOpen }: { call: ToolCall; defaultOpen?: bool
   );
 }
 
+/** The row's state glyph: a custom tool the app still owes has none (its meta says so). */
+const glyphOf = (status: ToolCall["status"]): EventStatus | undefined => (status === "waiting" ? "pending" : status);
+
 /** One tool or MCP call as a 40px row that opens to its body. */
 export function ToolCallCard({ call, defaultOpen }: { call: ToolCall; defaultOpen?: boolean }) {
   if (call.handoff) return <HandoffCard call={call} defaultOpen={defaultOpen} />;
   const p = presentTool(call);
   const meta =
-    call.approval === "denied"
-      ? "Denied"
-      : [call.approval === "allowed" ? "Approved" : null, call.durationMs != null ? formatElapsed(call.durationMs) : null]
-          .filter(Boolean)
-          .join(" · ") || undefined;
+    call.status === "waiting"
+      ? "Waiting for the app's result"
+      : call.approval === "denied"
+        ? "Denied"
+        : [call.approval === "allowed" ? "Approved" : null, call.durationMs != null ? formatElapsed(call.durationMs) : null]
+            .filter(Boolean)
+            .join(" · ") || undefined;
   return (
     <EventCard
       kind={p.kind}
       icon={p.icon}
       source={p.source}
-      title={p.title}
+      title={p.plain ? <span className="font-sans">{p.title}</span> : p.title}
       subtitle={p.preview}
-      status={call.status}
+      status={glyphOf(call.status)}
       meta={meta}
       defaultOpen={defaultOpen}
     >
@@ -685,7 +710,7 @@ const RUN_LIMIT = 4;
  * to the full stack; it stays open while a call is running or has failed.
  */
 export function ToolRun({ calls }: { calls: ToolCall[] }) {
-  const needsEyes = calls.some((c) => c.status === "running" || c.status === "errored");
+  const needsEyes = calls.some((c) => c.status === "running" || c.status === "errored" || c.status === "waiting");
   const [open, setOpen] = useState(needsEyes);
   const expanded = open || needsEyes;
 
