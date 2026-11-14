@@ -2,6 +2,7 @@ import { useState } from "react";
 import { FileTextIcon, HistoryIcon, PencilIcon, Trash2Icon } from "lucide-react";
 
 import { useApi } from "@/lib/api";
+import { useServerFeature } from "@/lib/server-features";
 import { useQueryClient } from "@/lib/useApiQuery";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -213,6 +214,9 @@ function EntryBody({
   const { api } = useApi();
   const queryClient = useQueryClient();
   const base = `/v1/memory_stores/${storeId}`;
+  // Editing, deleting, version history, rolling back and redacting need a
+  // server that keeps memory versions; elsewhere an entry is read-only here.
+  const writable = useServerFeature("memory_writes");
 
   const entry = useQuietQuery<Memory>(`${base}/memories/${item.id}`);
   const memory = entry.data;
@@ -358,7 +362,7 @@ function EntryBody({
           </section>
         )}
 
-        {!editing && (
+        {!editing && writable && (
           <section>
             <div className="mb-2 flex h-8 items-center justify-between gap-3">
               <h3 className="text-xs font-medium text-fg-subtle">Versions</h3>
@@ -434,6 +438,8 @@ function EntryBody({
           </>
         ) : archived ? (
           <p className="text-xs text-fg-subtle">This store is archived, so its entries are read-only.</p>
+        ) : !writable ? (
+          <p className="text-xs text-fg-subtle">Entries are read-only here: this server does not edit or delete them from the console.</p>
         ) : (
           <>
             <Button variant="ghost" size="sm" onClick={() => setConfirm({ kind: "delete" })} disabled={!memory}>

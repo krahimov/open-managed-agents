@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 
 import { ApiError, useApi } from "../lib/api";
+import { useServerFeature } from "../lib/server-features";
 import { copyText } from "../lib/clipboard";
 import { plural } from "../lib/format";
 import { useApiQuery, useQueryClient } from "../lib/useApiQuery";
@@ -65,6 +66,10 @@ const ROW = "grid grid-cols-[minmax(0,1fr)_72px_96px] items-center gap-x-4";
  * a small file browser: entries grouped by their top folder, opened in a
  * side panel to read, edit or roll back. History is the store-wide audit
  * trail, where the runtime keeps one.
+ *
+ * Archiving, deleting and the History tab need a server that keeps memory
+ * versions (`useServerFeature("memory_writes")`); elsewhere they are left
+ * out, and entries can be read and added but not changed here.
  */
 export function MemoryStoreDetail() {
   const { id: storeId } = useParams<{ id: string }>();
@@ -72,7 +77,10 @@ export function MemoryStoreDetail() {
   const { api } = useApi();
   const queryClient = useQueryClient();
   const usage = useResourceUsage();
-  const [tab, setTab] = useTabParam<TabKey>("entries", ["entries", "history"]);
+  const writable = useServerFeature("memory_writes");
+  const [tabParam, setTab] = useTabParam<TabKey>("entries", ["entries", "history"]);
+  // A link to History on a server that keeps none opens the entries.
+  const tab: TabKey = writable ? tabParam : "entries";
 
   const { data: store, error, isLoading, refetch } = useApiQuery<MemoryStore>(
     storeId ? `/v1/memory_stores/${storeId}` : null,
@@ -157,21 +165,27 @@ export function MemoryStoreDetail() {
             actions={[
               { label: "Copy store id", icon: <CopyIcon />, onSelect: () => void copyText(store.id) },
               { label: "Copy mount path", icon: <CopyIcon />, onSelect: () => void copyText(path) },
-              { label: "Archive", icon: <ArchiveIcon />, disabled: archived, onSelect: () => setConfirm("archive") },
-              { label: "Delete", icon: <Trash2Icon />, destructive: true, onSelect: () => setConfirm("delete") },
+              ...(writable
+                ? [
+                    { label: "Archive", icon: <ArchiveIcon />, disabled: archived, onSelect: () => setConfirm("archive" as const) },
+                    { label: "Delete", icon: <Trash2Icon />, destructive: true, onSelect: () => setConfirm("delete" as const) },
+                  ]
+                : []),
             ]}
           />
         }
       >
-        <TabBar<TabKey>
-          label="Memory store sections"
-          value={tab}
-          onChange={setTab}
-          tabs={[
-            { value: "entries", label: "Entries", count: totals.stats?.count },
-            { value: "history", label: "History" },
-          ]}
-        />
+        {writable && (
+          <TabBar<TabKey>
+            label="Memory store sections"
+            value={tab}
+            onChange={setTab}
+            tabs={[
+              { value: "entries", label: "Entries", count: totals.stats?.count },
+              { value: "history", label: "History" },
+            ]}
+          />
+        )}
       </DetailHeader>
 
       {archived && (

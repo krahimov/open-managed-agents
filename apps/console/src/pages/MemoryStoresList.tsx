@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { ArchiveIcon, CopyIcon, Trash2Icon } from "lucide-react";
 
 import { useApi } from "../lib/api";
+import { useServerFeature } from "../lib/server-features";
 import { copyText } from "../lib/clipboard";
 import { plural } from "../lib/format";
 import { useApiQuery } from "../lib/useApiQuery";
@@ -132,15 +133,21 @@ export function MemoryStoresList() {
 
   const [confirm, setConfirm] = useState<{ kind: "archive" | "delete"; store: MemoryStore } | null>(null);
 
+  // Archiving and deleting a store need a server that has those writes.
+  const writable = useServerFeature("memory_writes");
   const actionsFor = (s: MemoryStore): RowAction[] => [
     { label: "Copy store id", icon: <CopyIcon />, onSelect: () => void copyText(s.id) },
-    {
-      label: "Archive",
-      icon: <ArchiveIcon />,
-      disabled: !!s.archived_at,
-      onSelect: () => setConfirm({ kind: "archive", store: s }),
-    },
-    { label: "Delete", icon: <Trash2Icon />, destructive: true, onSelect: () => setConfirm({ kind: "delete", store: s }) },
+    ...(writable
+      ? [
+          {
+            label: "Archive",
+            icon: <ArchiveIcon />,
+            disabled: !!s.archived_at,
+            onSelect: () => setConfirm({ kind: "archive", store: s }),
+          },
+          { label: "Delete", icon: <Trash2Icon />, destructive: true, onSelect: () => setConfirm({ kind: "delete", store: s }) },
+        ]
+      : []),
   ];
 
   const columns = useMemo<ColumnDef<MemoryStore>[]>(
@@ -192,7 +199,7 @@ export function MemoryStoresList() {
       },
     ],
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [usage],
+    [usage, writable],
   );
 
   const dated = created.after !== undefined || created.before !== undefined;
