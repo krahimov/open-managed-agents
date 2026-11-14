@@ -1,10 +1,26 @@
 import { useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router";
+import { ArrowRightIcon, CheckIcon, RotateCwIcon } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+
 import { IntegrationsApi } from "../api/client";
 import type { GitHubA1FormStep, GitHubA1InstallLink } from "../api/types";
-import { Combobox } from "../../components/Combobox";
-import { Field } from "../../components/Field";
+import {
+  AgentPersonaFields,
+  CancelLink,
+  ExternalButton,
+  PersonaPreview,
+  WizardCard,
+  WizardFooter,
+  WizardPage,
+  wizardCode,
+} from "../components/Wizard";
+import { BrandLoader } from "../../components/BrandLoader";
+import { Callout } from "../../components/Callout";
+import { IdChip } from "../../components/IdChip";
 import { BRAND_NAME } from "../../lib/brand";
+import { failureSentence } from "../../lib/failure-text";
 
 const api = new IntegrationsApi();
 
@@ -18,13 +34,23 @@ interface Props {
 
 type Phase = "config" | "registering" | "installing" | "done" | "error";
 
+const STEPS: Array<{ key: Phase; label: string }> = [
+  { key: "config", label: "Choose agent" },
+  { key: "registering", label: "Register the app" },
+  { key: "installing", label: "Install" },
+  { key: "done", label: "Live" },
+];
+
+/** GitHub derives the bot login and the trigger label from the name like this. */
+const botSlug = (name: string) => name.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9._-]/g, "");
+
 /**
- * Three-screen wizard with the manifest flow as default. Cuts the manual
- * 5-min "register App, download .pem, paste back 4 secrets" path down to
- * one button + one install click.
+ * Four-screen wizard with the manifest flow as default. Cuts the manual
+ * "register App, download .pem, paste back 4 secrets" path down to one
+ * button + one install click.
  *
  * Phases:
- *   config       → user picks agent + env + persona + clicks "Bind"
+ *   config       → user picks agent + env + bot name and presses "Bind".
  *                  We POST start-a1 → backend INSERTs a github_publications
  *                  shell row (status='pending_setup', app_oma_id minted)
  *                  and returns formToken + manifestStartUrl + publicationId.
@@ -32,29 +58,20 @@ type Phase = "config" | "registering" | "installing" | "done" | "error";
  *                  GitHub. GitHub redirects through our gateway which
  *                  exchanges the manifest code and PATCH'es credentials onto
  *                  the publication row.
- *                  Meanwhile we poll listInstallations() until we see the
- *                  publication go to 'live' (after install callback runs).
- *   installing   → we open the install URL (returned from manifest
- *                  callback) in a popup. User picks org and confirms
- *                  install. Gateway calls /github/oauth/pub/<pubId>/callback
- *                  which mints the installation token, creates the vault,
- *                  and binds installation_id back onto the publication. We
- *                  poll until publication.status === "live".
- *   done         → success. Show confetti-equivalent and a link to the
- *                  workspace page.
+ *   installing   → GitHub takes the user straight on to the install screen.
+ *                  The gateway callback mints the installation token, creates
+ *                  the vault and binds installation_id onto the publication.
+ *                  We poll until publication.status === "live".
+ *   done         → success, with a link to the installation.
  *
- * The publication-first flow means even mid-flow failure (network blip on
- * manifest exchange, OAuth callback timeout) leaves at most a publication
- * row in 'pending_setup' or 'credentials_filled' — never a ghost
- * installation/app pair. User can re-run the wizard to start a fresh shell
- * or hand off the same formToken via /github-setup/<token> for an admin to
- * complete.
+ * The publication-first flow means even a mid-flow failure leaves at most a
+ * publication row in 'pending_setup' or 'credentials_filled' — never a ghost
+ * installation/app pair. The user can resume it from the list page.
  */
 export function IntegrationsGitHubBindWizard({ loadAgents, loadEnvironments }: Props) {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [agents, setAgents] = useState<Agent[]>([]);
-  const [environments, setEnvironments] = useState<Environment[]>([]);
   const [agentId, setAgentId] = useState<string>("");
   const [envId, setEnvId] = useState<string>("");
   const [persona, setPersona] = useState<string>("");
@@ -64,13 +81,14 @@ export function IntegrationsGitHubBindWizard({ loadAgents, loadEnvironments }: P
   const [form, setForm] = useState<GitHubA1FormStep | null>(null);
   const [installLink] = useState<GitHubA1InstallLink | null>(null);
   const [livePubId, setLivePubId] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
 
   // Background poll handle. Single source of truth so cleanup-on-unmount and
   // cleanup-on-success can both reach in and stop it without leaking.
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // If GitHub completed install and bounced back to /integrations/github with
-  // ?install=ok&publication_id=…, surface a "done" state directly.
+  // If GitHub completed install and bounced back with
+  // ?install=ok&publication_id=…, surface the "done" state directly.
   useEffect(() => {
     const installFlag = searchParams.get("install");
     const pubId = searchParams.get("publication_id");
@@ -81,8 +99,8 @@ export function IntegrationsGitHubBindWizard({ loadAgents, loadEnvironments }: P
   }, [searchParams]);
 
   useEffect(() => {
-    void loadAgents().then(setAgents);
-    void loadEnvironments().then(setEnvironments);
+    void loadAgents().then(setAgents).catch(() => undefined);
+    void loadEnvironments().catch(() => undefined);
   }, [loadAgents, loadEnvironments]);
 
   // Refresh-resume hydration. When the wizard renders with `?pub=<id>` (set
@@ -114,12 +132,13 @@ export function IntegrationsGitHubBindWizard({ loadAgents, loadEnvironments }: P
         setForm(r);
         setAgentId(pub.agent_id);
         setEnvId(pub.environment_id);
+        // The saved bot name wins over the "default to the agent's name" effect.
+        personaEditedRef.current = true;
         setPersona(pub.persona.name);
-        // Pick the visible phase off the publication's current status.
-        // pending_setup → user closed the manifest tab before submitting →
-        //   re-render registering with the manifest URL ready.
-        // credentials_filled / awaiting_install → manifest finished, user
-        //   hasn't completed install → resume the install poll.
+        // pending_setup → the manifest tab was closed before submitting, so
+        //   show "registering" with the manifest URL ready.
+        // credentials_filled / awaiting_install → the manifest finished and
+        //   the install has not: resume the install poll.
         if (pub.status === "pending_setup") {
           setPhase("registering");
         } else {
@@ -130,7 +149,7 @@ export function IntegrationsGitHubBindWizard({ loadAgents, loadEnvironments }: P
         if (!cancelled) {
           searchParams.delete("pub");
           setSearchParams(searchParams, { replace: true });
-          setError(err instanceof Error ? err.message : String(err));
+          setError(failureSentence(err));
         }
       }
     })();
@@ -142,9 +161,8 @@ export function IntegrationsGitHubBindWizard({ loadAgents, loadEnvironments }: P
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Default persona name to the chosen agent's name. Skip once the user has
-  // edited the field — otherwise clearing the input would refill it from the
-  // effect's persona dep, making the field feel un-clearable.
+  // Default the bot name to the chosen agent's name. Skip once the user has
+  // edited the field — otherwise clearing the input would refill it.
   const personaEditedRef = useRef(false);
   useEffect(() => {
     if (personaEditedRef.current) return;
@@ -174,7 +192,7 @@ export function IntegrationsGitHubBindWizard({ loadAgents, loadEnvironments }: P
 
   async function startBind() {
     if (!agentId || !envId || !persona) {
-      setError("Pick an agent, environment, and persona name.");
+      setError("Choose an agent, an environment and a bot name.");
       return;
     }
     setError(null);
@@ -190,27 +208,24 @@ export function IntegrationsGitHubBindWizard({ loadAgents, loadEnvironments }: P
       // Pin publication id to URL so refresh resumes here without losing
       // wizard state. Server is source of truth — we just stash the id.
       pinPublicationToUrl(r.publicationId);
-      // Open manifest flow in a popup. The popup will eventually navigate
-      // to our gateway callback, which auto-redirects to GitHub install.
+      // Open the manifest flow in a popup. The popup eventually navigates
+      // to our gateway callback, which redirects on to the GitHub install.
       if (r.manifestStartUrl) {
         window.open(r.manifestStartUrl, "github-bind", "width=820,height=720");
       }
-      // Optimistically advance to "installing" — once the user's clicked
+      // Optimistically advance to "installing": once the user has clicked
       // through the manifest flow, GitHub takes them straight into the
       // install screen. The poll below covers both phases until the
       // publication flips to live.
       setPhase("installing");
-      // Track the publication id directly. We have it from start-a1 — no
-      // need to scan listInstallations until the install callback runs.
       startInstallPoll(r.publicationId);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      setError(failureSentence(e));
       setPhase("error");
     }
   }
 
-  /** Stamp the active publication id into ?pub= so refresh resumes here.
-   *  Pure URL state — no storage. */
+  /** Stamp the active publication id into ?pub= so refresh resumes here. */
   function pinPublicationToUrl(publicationId: string) {
     const url = new URL(window.location.href);
     if (url.searchParams.get("pub") === publicationId) return;
@@ -219,9 +234,7 @@ export function IntegrationsGitHubBindWizard({ loadAgents, loadEnvironments }: P
   }
 
   // Poll every 5 seconds for the publication's status to flip to 'live'.
-  // We have the publicationId up-front (publication-first flow), so we
-  // can poll it directly instead of scanning all installations. Hard cap
-  // at ~5 minutes (60 ticks) so abandoned tabs don't poll forever.
+  // Hard cap at ~5 minutes (60 ticks) so abandoned tabs don't poll forever.
   function startInstallPoll(pubId: string) {
     stopPolling();
     let ticks = 0;
@@ -247,9 +260,10 @@ export function IntegrationsGitHubBindWizard({ loadAgents, loadEnvironments }: P
     }, TICK_MS);
   }
 
-  // Manual refresh button — same lookup as the poll, runs once.
+  // Manual check: the same lookup as the poll, run once.
   async function refresh() {
     if (!form) return;
+    setChecking(true);
     try {
       const pub = await api.github.getPublication(form.publicationId);
       if (pub.status === "live") {
@@ -259,309 +273,181 @@ export function IntegrationsGitHubBindWizard({ loadAgents, loadEnvironments }: P
         return;
       }
     } catch {
-      // ignore — user can keep waiting
+      // ignore — the user can keep waiting
+    } finally {
+      setChecking(false);
     }
   }
 
-  // ───────────────────────────────────────────────────────────────────
+  const slug = botSlug(persona) || "your-bot";
+  // An error keeps the indicator on the step that failed.
+  const stepIndex = phase === "error" ? 0 : STEPS.findIndex((s) => s.key === phase);
+  const waiting = phase === "registering" || phase === "installing";
+  const reopenUrl = phase === "installing" && installLink?.url ? installLink.url : (form?.manifestStartUrl ?? null);
 
   return (
-    <div className="flex-1 overflow-y-auto">
-      <div className="max-w-[680px] mx-auto px-4 sm:px-8 lg:px-10 py-10 lg:py-12">
-        <h1 className="font-display text-[28px] leading-tight font-semibold text-fg mb-2">
-          Bind agent to GitHub
-        </h1>
-        <p className="text-[14px] text-fg-muted mb-8">
-          Make this agent a GitHub teammate — assignable, mentionable, request-as-reviewer.
-          The agent gets its own bot identity (a GitHub App) and its own audit trail.
-        </p>
-
-        <Stepper phase={phase} />
-
-        {phase === "config" && (
-          <ConfigForm
-            agents={agents}
-            environments={environments}
-            agentId={agentId}
-            envId={envId}
-            persona={persona}
-            onAgent={setAgentId}
-            onEnv={setEnvId}
-            onPersona={(v) => { personaEditedRef.current = true; setPersona(v); }}
-            onSubmit={startBind}
-            error={error}
-          />
-        )}
-
-        {(phase === "registering" || phase === "installing") && form && (
-          <InProgress
-            phase={phase}
-            personaName={form.suggestedAppName}
-            manifestUrl={form.manifestStartUrl ?? null}
-            installUrl={installLink?.url ?? null}
-            onRefresh={refresh}
-          />
-        )}
-
-        {phase === "done" && (
-          <Done
-            livePubId={livePubId}
-            onView={() => navigate("/integrations/github")}
-          />
-        )}
-
-        {phase === "error" && (
-          <div className="rounded-md border border-danger/30 bg-danger-subtle px-4 py-3 text-sm text-danger">
+    <WizardPage
+      provider="github"
+      title="Bind an agent to GitHub"
+      subtitle="Give an agent its own GitHub App: assign it, mention it, request its review."
+      steps={STEPS.map((s) => s.label)}
+      current={stepIndex}
+      banner={
+        phase === "error" ? (
+          <Callout
+            tone="danger"
+            title="The GitHub App could not be registered"
+            action={
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => {
+                  setPhase("config");
+                  setError(null);
+                }}
+              >
+                Try again
+              </Button>
+            }
+          >
             {error}
-            <button
-              onClick={() => { setPhase("config"); setError(null); }}
-              className="ml-3 underline"
-            >
-              Try again
-            </button>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-interface Step {
-  key: Phase;
-  label: string;
-  /** One-line subtitle explaining what happens during this step. */
-  hint: string;
-}
-
-function Stepper({ phase }: { phase: Phase }) {
-  // Plain operational labels; subtitles do the explaining. Tried "Saddle
-  // up / Mint App / Install / Riding" as a brand wink — landed too cute
-  // for an enterprise install flow, so kept the verbs functional and
-  // saved the warmth for the subtitle copy.
-  const steps: Step[] = [
-    { key: "config", label: "Configure", hint: "Pick agent, env, bot name" },
-    { key: "registering", label: "Register", hint: "GitHub mints a new App" },
-    { key: "installing", label: "Install", hint: "Grant access to your org" },
-    { key: "done", label: "Live", hint: "Bot is responding to events" },
-  ];
-  const idx = steps.findIndex((s) => s.key === phase);
-  return (
-    <ol className="flex items-stretch gap-1 mb-8 text-[12px]">
-      {steps.map((s, i) => {
-        const state = i < idx ? "done" : i === idx ? "active" : "pending";
-        return (
-          <li key={s.key} className="flex-1 min-w-0">
-            <div className="flex items-center gap-2">
-              <span
-                className={`w-5 h-5 shrink-0 rounded-full inline-flex items-center justify-center text-[11px] font-medium ${
-                  state === "done"
-                    ? "bg-success text-bg"
-                    : state === "active"
-                    ? "bg-brand text-brand-fg"
-                    : "bg-bg-surface text-fg-muted"
-                }`}
+          </Callout>
+        ) : error ? (
+          <Callout tone="danger" title="That did not go through">
+            {error}
+          </Callout>
+        ) : null
+      }
+    >
+      {phase === "config" && (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            void startBind();
+          }}
+        >
+          <WizardCard
+            title="Choose the agent"
+            description="Which agent to bind, where its sessions run, and what its bot is called on GitHub."
+            footer={
+              <WizardFooter
+                hint="Opens GitHub in a new window: create the app there, then install it."
+                back={<CancelLink provider="github" />}
               >
-                {state === "done" ? "✓" : i + 1}
-              </span>
-              <span
-                className={`text-[12px] truncate ${
-                  state === "active"
-                    ? "text-fg font-medium"
-                    : state === "done"
-                    ? "text-fg-muted"
-                    : "text-fg-subtle"
-                }`}
-              >
-                {s.label}
-              </span>
+                <Button type="submit" disabled={!agentId || !envId || !persona.trim()}>
+                  Bind on GitHub
+                  <ArrowRightIcon data-icon="inline-end" />
+                </Button>
+              </WizardFooter>
+            }
+          >
+            <div className="space-y-5">
+              <AgentPersonaFields
+                provider="github"
+                agentId={agentId}
+                onAgent={setAgentId}
+                envId={envId}
+                onEnv={setEnvId}
+                personaName={persona}
+                onPersonaName={(v) => {
+                  personaEditedRef.current = true;
+                  setPersona(v);
+                }}
+                personaLabel="Bot name"
+                personaHint="GitHub creates the bot user from this name. Defaults to the agent's name."
+              />
+              <PersonaPreview
+                provider="github"
+                name={persona}
+                agentId={agentId || undefined}
+                caption={
+                  <span className="font-mono">
+                    @{slug}[bot]
+                  </span>
+                }
+              />
+              <div>
+                <p className="mb-2 text-xs font-medium text-fg-subtle">How people will reach this bot</p>
+                <dl className="divide-y divide-border overflow-hidden rounded-lg border border-border text-small">
+                  <Reach term="Label">
+                    Add the <code className={wizardCode}>{slug}</code> label to an issue or pull request. The bot follows what
+                    happens on labelled items: edits, new comments, new commits and reviews.
+                  </Reach>
+                  <Reach term="Mention">
+                    Write <code className={wizardCode}>@{slug}[bot]</code> in an issue, pull request or comment. GitHub does not
+                    autocomplete bot accounts, so type it in full.
+                  </Reach>
+                  <Reach term="Stop">
+                    Remove the label to stop it following that thread. {BRAND_NAME} creates the label on install and does not
+                    recreate it if you delete it.
+                  </Reach>
+                </dl>
+              </div>
             </div>
-            <p
-              className={`mt-1 ml-7 text-[11px] truncate ${
-                state === "active" ? "text-fg-muted" : "text-fg-subtle"
-              }`}
-            >
-              {s.hint}
+          </WizardCard>
+        </form>
+      )}
+
+      {waiting && (
+        <WizardCard>
+          <div className="flex flex-col items-center px-4 py-8 text-center" role="status" aria-live="polite">
+            <BrandLoader size="lg" label="Waiting for GitHub" />
+            <h2 className="mt-5 text-h2 text-fg">
+              {phase === "registering"
+                ? form
+                  ? `Create ${form.suggestedAppName} on GitHub`
+                  : "Preparing the GitHub App"
+                : "Install it on your organization"}
+            </h2>
+            <p className="mt-1.5 max-w-[46ch] text-small text-fg-muted">
+              {form
+                ? "Switch to the GitHub window to confirm. This page checks every few seconds and moves on by itself when GitHub is done."
+                : "Reserving the app's name and preparing its manifest."}
             </p>
-          </li>
-        );
-      })}
-    </ol>
-  );
-}
-
-function ConfigForm({
-  agents, environments, agentId, envId, persona,
-  onAgent, onEnv, onPersona, onSubmit, error,
-}: {
-  agents: Agent[];
-  environments: Environment[];
-  agentId: string;
-  envId: string;
-  persona: string;
-  onAgent: (v: string) => void;
-  onEnv: (v: string) => void;
-  onPersona: (v: string) => void;
-  onSubmit: () => void;
-  error: string | null;
-}) {
-  return (
-    <form onSubmit={(e) => { e.preventDefault(); onSubmit(); }} className="space-y-5">
-      <Field label="Agent">
-        <Combobox<{ id: string; name: string }>
-          value={agentId}
-          onValueChange={(v) => onAgent(v)}
-          endpoint="/v1/agents"
-          getValue={(a) => a.id}
-          getLabel={(a) => a.name}
-          getTextLabel={(a) => a.name}
-          placeholder="Pick an agent…"
-        />
-      </Field>
-      <Field label="Environment">
-        <Combobox<{ id: string; name: string }>
-          value={envId}
-          onValueChange={(v) => onEnv(v)}
-          endpoint="/v1/environments"
-          getValue={(e) => e.id}
-          getLabel={(e) => e.name}
-          getTextLabel={(e) => e.name}
-          placeholder="Pick an environment…"
-        />
-      </Field>
-      <Field
-        label="Bot name (visible in GitHub)"
-        hint="GitHub will create a bot user @<slug>[bot] from this name. Defaults to the agent's name."
-      >
-        <input
-          type="text"
-          value={persona}
-          onChange={(e) => onPersona(e.target.value)}
-          placeholder="e.g. Coder"
-          className="w-full px-3 py-2 border border-border rounded-md bg-bg text-[14px]"
-          required
-        />
-      </Field>
-
-      <div className="rounded-md border border-border bg-bg-surface/30 p-3 text-[12px] leading-relaxed text-fg-muted">
-        <p className="font-medium text-fg mb-1">How users will engage this bot</p>
-        <ul className="list-disc pl-5 space-y-1">
-          <li>
-            <strong className="text-fg">Primary:</strong> add the{" "}
-            <code className="px-1 py-0.5 bg-bg rounded text-[11px]">{(persona || "<bot>").toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9._\-]/g, "")}</code>{" "}
-            label to any issue or PR. The bot reacts to whitelisted activity on
-            labeled items (open / edit / new comment / new commits / review).
-          </li>
-          <li>
-            <strong className="text-fg">Fallback:</strong>{" "}
-            <code className="px-1 py-0.5 bg-bg rounded text-[11px]">@{(persona || "&lt;bot&gt;").toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9._\-]/g, "")}[bot]</code>{" "}
-            in any issue / PR / comment body. (GitHub doesn't autocomplete bot
-            accounts — type the full string. Functionally equivalent to the
-            label trigger.)
-          </li>
-          <li>
-            On install, {BRAND_NAME} auto-creates the label in your selected repos. If
-            you delete it, {BRAND_NAME} won't recreate it.
-          </li>
-          <li>
-            Removing the label from an issue stops further auto-wakeups on
-            that thread.
-          </li>
-        </ul>
-      </div>
-
-      {error && (
-        <p className="text-[13px] text-danger">{error}</p>
+            {form && (
+              <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
+                {reopenUrl && (
+                  <ExternalButton href={reopenUrl} target="github-bind">
+                    Reopen the GitHub window
+                  </ExternalButton>
+                )}
+                <Button variant="ghost" onClick={() => void refresh()} loading={checking}>
+                  {!checking && <RotateCwIcon data-icon="inline-start" />}
+                  Check now
+                </Button>
+              </div>
+            )}
+          </div>
+        </WizardCard>
       )}
 
-      <div className="flex items-center justify-between gap-4 pt-1">
-        <p className="text-[12px] text-fg-muted leading-snug">
-          Opens a popup to GitHub. You'll click <strong>Create GitHub App</strong>
-          {" "}and then <strong>Install</strong> on the org you want this bot to
-          work in.
-        </p>
-        <button
-          type="submit"
-          className="shrink-0 px-5 py-2 bg-brand text-brand-fg rounded-md text-[13px] font-medium hover:bg-brand-hover transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-        >
-          Bind on GitHub
-        </button>
-      </div>
-    </form>
-  );
-}
-
-function InProgress({
-  phase,
-  personaName,
-  manifestUrl,
-  installUrl,
-  onRefresh,
-}: {
-  phase: Phase;
-  personaName: string;
-  manifestUrl: string | null;
-  installUrl: string | null;
-  onRefresh: () => void;
-}) {
-  return (
-    <div className="border border-border rounded-lg p-6 bg-bg-surface/30 text-center">
-      <div className="text-[15px] font-medium text-fg mb-2">
-        {phase === "registering"
-          ? `Creating "${personaName}" on GitHub…`
-          : `Installing on your org…`}
-      </div>
-      <p className="text-[13px] text-fg-muted mb-5">
-        Switch to the GitHub popup to confirm. We'll check every few seconds
-        and pick up the new install automatically — no need to refresh.
-      </p>
-
-      <div className="flex flex-col gap-2 items-center">
-        {phase === "registering" && manifestUrl && (
-          <a
-            href={manifestUrl}
-            target="github-bind"
-            className="text-[13px] text-brand hover:underline"
-          >
-            Re-open GitHub registration popup →
-          </a>
-        )}
-        {phase === "installing" && installUrl && (
-          <a
-            href={installUrl}
-            target="github-bind"
-            className="text-[13px] text-brand hover:underline"
-          >
-            Re-open GitHub install popup →
-          </a>
-        )}
-        <button
-          onClick={onRefresh}
-          className="text-[12px] text-fg-muted hover:text-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] mt-3"
-        >
-          Check now
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function Done({ livePubId, onView }: { livePubId: string | null; onView: () => void }) {
-  return (
-    <div className="border border-success/30 bg-success-subtle rounded-lg p-6 text-center">
-      <div className="text-success text-[15px] font-medium mb-2">✓ Bot is live on GitHub</div>
-      <p className="text-[13px] text-fg-muted mb-4">
-        Try assigning a GitHub issue to the bot or @-mentioning it in a comment — should respond in seconds.
-        First response after binding may take ~5 seconds (cold start).
-      </p>
-      <button
-        onClick={onView}
-        className="px-4 py-2 bg-brand text-brand-fg rounded-md text-[13px] font-medium hover:bg-brand-hover"
-      >
-        View installation
-      </button>
-      {livePubId && (
-        <p className="mt-3 text-[11px] font-mono text-fg-subtle">publication: {livePubId}</p>
+      {phase === "done" && (
+        <WizardCard>
+          <div className="flex flex-col items-center px-4 py-8 text-center">
+            <span className="flex size-12 items-center justify-center rounded-full bg-success-subtle text-success">
+              <CheckIcon className="size-6 stroke-[2.25]" />
+            </span>
+            <h2 className="mt-5 text-h2 text-fg">The bot is live on GitHub</h2>
+            <p className="mt-1.5 max-w-[46ch] text-small text-fg-muted">
+              Assign it an issue or mention it in a comment. The first reply after binding can take a few seconds longer while
+              its environment starts.
+            </p>
+            <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
+              <Button onClick={() => navigate("/integrations/github")}>View installation</Button>
+              {livePubId && <IdChip id={livePubId} label="Copy publication id" />}
+            </div>
+          </div>
+        </WizardCard>
       )}
+    </WizardPage>
+  );
+}
+
+function Reach({ term, children }: { term: string; children: React.ReactNode }) {
+  return (
+    <div className="flex gap-3 px-3.5 py-2.5">
+      <dt className="w-20 shrink-0 font-medium text-fg">{term}</dt>
+      <dd className="min-w-0 flex-1 text-fg-muted">{children}</dd>
     </div>
   );
 }

@@ -1,52 +1,45 @@
-import {
-  BookOpenIcon,
-  CheckIcon,
-  LogOutIcon,
-  MonitorIcon,
-  MoonIcon,
-  SunIcon,
-} from "lucide-react";
+import { BookOpenIcon, CommandIcon, LogOutIcon, MonitorIcon, MoonIcon, SunIcon } from "lucide-react";
 
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuGroup,
   DropdownMenuItem,
-  DropdownMenuLabel,
   DropdownMenuSeparator,
+  DropdownMenuShortcut,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 
 import { useAuth } from "../lib/auth";
 import { useTheme } from "../lib/theme";
+import { useApiQuery } from "../lib/useApiQuery";
 import { authClient } from "../lib/auth-client";
-import { Avatar } from "./Avatar";
 import { BRAND_DOCS_URL } from "../lib/brand";
+import { MOD_KEY, openCommandPalette } from "../lib/shell-events";
+import { Avatar } from "./Avatar";
+import { Kbd } from "./Kbd";
+import { SegmentedControl } from "./SegmentedControl";
+import { Tip } from "./Tip";
 
 /**
- * Bottom-of-sidebar user profile menu. Single click target opens a
- * dropdown grouping the three account-scoped chrome items:
+ * Account menu — the round avatar at the foot of the sidebar. Holds what
+ * belongs to the person rather than the workspace:
  *
- *   - Documentation (opens docs site in a new tab)
- *   - Theme picker (light / dark / system)
- *   - Sign out
- *
- * The trigger row uses the SAME custom recipe the brand row in
- * SidebarHeader uses — `h-11 px-3 flex items-center gap-2` with the
- * avatar fixed at x=12 and the text collapsing via
- * `group-data-[collapsible=icon]:hidden`. When the sidebar narrows to
- * icon mode the avatar stays put and the compact row visually
- * mirrors the brand row at the top.
+ *   identity (name, email) · theme (Light / Dark / System) ·
+ *   command palette · documentation · sign out
  */
 const THEME_OPTIONS = [
-  { value: "light" as const, label: "Light", Icon: SunIcon },
-  { value: "dark" as const, label: "Dark", Icon: MoonIcon },
-  { value: "system" as const, label: "System", Icon: MonitorIcon },
+  { value: "light" as const, label: "Light", icon: SunIcon },
+  { value: "dark" as const, label: "Dark", icon: MoonIcon },
+  { value: "system" as const, label: "System", icon: MonitorIcon },
 ];
 
-export function UserProfile() {
+export function UserProfile({ side = "top" }: { /** Where the menu opens: above the avatar, or beside it on the rail. */ side?: "top" | "right" }) {
   const { user } = useAuth();
   const { theme, setTheme } = useTheme();
+  const me = useApiQuery<{ user: { name: string | null; email: string } | null }>("/v1/me", undefined, {
+    staleTime: 5 * 60_000,
+  });
 
   if (!user) return null;
 
@@ -55,59 +48,60 @@ export function UserProfile() {
     window.location.href = "/login";
   };
 
-  const label = user.name || user.email || "Account";
+  // The server's record of who this is wins over the session's copy, so the
+  // person has one name here and on the Workspace page (in a local setup
+  // without sign-in the session only holds a placeholder).
+  const name = me.data?.user?.name?.trim() || user.name;
+  const email = me.data?.user?.email || user.email;
+  const label = name || email || "Account";
 
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          aria-label="Account menu"
-          className="mx-2 mb-2 w-[calc(100%-1rem)] h-9 rounded-md px-2 flex items-center gap-2 text-left text-fg-muted hover:bg-bg-surface hover:text-fg transition-colors"
-        >
-          <Avatar name={label} size="sm" />
-          <div className="flex-1 min-w-0 text-left leading-tight group-data-[collapsible=icon]:hidden">
-            <div className="text-sm text-sidebar-foreground truncate">
-              {user.name || user.email}
-            </div>
-            {user.email && user.name && (
-              <div className="text-[11px] text-fg-subtle truncate">
-                {user.email}
-              </div>
-            )}
-          </div>
-        </button>
-      </DropdownMenuTrigger>
+      <Tip label={label} side={side}>
+        <DropdownMenuTrigger asChild>
+          <button
+            type="button"
+            aria-label="Account menu"
+            className="flex size-9 shrink-0 items-center justify-center rounded-full transition-quick hover:bg-bg-hover aria-expanded:bg-bg-hover"
+          >
+            <Avatar name={label} size="md" />
+          </button>
+        </DropdownMenuTrigger>
+      </Tip>
 
-      <DropdownMenuContent
-        side="top"
-        align="start"
-        className="w-56"
-        collisionPadding={8}
-      >
-        <DropdownMenuLabel className="font-normal">
-          <div className="leading-tight">
-            <div className="text-sm font-medium text-fg truncate">
-              {user.name || user.email}
-            </div>
-            {user.email && user.name && (
-              <div className="text-[11px] text-fg-subtle truncate">
-                {user.email}
-              </div>
-            )}
+      <DropdownMenuContent side={side} align="end" sideOffset={side === "right" ? 10 : 4} className="w-64" collisionPadding={8}>
+        <div className="flex items-center gap-3 px-2 pt-2 pb-2.5">
+          <Avatar name={label} size="lg" />
+          <div className="min-w-0 leading-tight">
+            <div className="truncate text-sm font-medium text-fg">{name || email}</div>
+            {email && name && <div className="mt-0.5 truncate text-xs text-fg-subtle">{email}</div>}
           </div>
-        </DropdownMenuLabel>
+        </div>
+
+        <div className="px-1 pb-1.5">
+          <SegmentedControl
+            label="Theme"
+            size="sm"
+            stretch
+            value={theme}
+            onChange={setTheme}
+            options={THEME_OPTIONS.map((o) => ({ ...o, label: o.label }))}
+          />
+        </div>
 
         <DropdownMenuSeparator />
 
         <DropdownMenuGroup>
+          <DropdownMenuItem onSelect={() => openCommandPalette()}>
+            <CommandIcon />
+            Command palette
+            <DropdownMenuShortcut>
+              <Kbd keys={[MOD_KEY, "K"]} />
+            </DropdownMenuShortcut>
+          </DropdownMenuItem>
           <DropdownMenuItem asChild>
-            <a
-              href={BRAND_DOCS_URL}
-              target="_blank"
-              rel="noopener noreferrer"
-            >
-              <BookOpenIcon className="size-4 opacity-80" />
+            <a href={BRAND_DOCS_URL} target="_blank" rel="noopener noreferrer">
+              <BookOpenIcon />
               Documentation
             </a>
           </DropdownMenuItem>
@@ -115,33 +109,8 @@ export function UserProfile() {
 
         <DropdownMenuSeparator />
 
-        <DropdownMenuLabel className="text-[11px] uppercase text-fg-subtle font-medium">
-          Theme
-        </DropdownMenuLabel>
-        <DropdownMenuGroup>
-          {THEME_OPTIONS.map(({ value, label: optLabel, Icon }) => {
-            const active = theme === value;
-            return (
-              <DropdownMenuItem
-                key={value}
-                onClick={() => setTheme(value)}
-                onSelect={(e) => e.preventDefault()}
-              >
-                <Icon className="size-4 opacity-80" />
-                {optLabel}
-                {active && <CheckIcon className="ml-auto size-4 text-brand" />}
-              </DropdownMenuItem>
-            );
-          })}
-        </DropdownMenuGroup>
-
-        <DropdownMenuSeparator />
-
-        <DropdownMenuItem
-          onClick={handleSignOut}
-          className="text-danger focus:text-danger focus:bg-danger/10"
-        >
-          <LogOutIcon className="size-4" />
+        <DropdownMenuItem onClick={handleSignOut}>
+          <LogOutIcon />
           Sign out
         </DropdownMenuItem>
       </DropdownMenuContent>

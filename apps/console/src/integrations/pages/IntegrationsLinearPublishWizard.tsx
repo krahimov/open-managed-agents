@@ -1,14 +1,31 @@
 import { useEffect, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router";
+import { useSearchParams } from "react-router";
+import { ArrowRightIcon } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+
 import { IntegrationsApi } from "../api/client";
-import type {
-  LinearPublicationShell,
-  LinearPublicationInstallLink,
-} from "../api/types";
-import { SecretInput, TextInput } from "../../components/Input";
-import { Combobox } from "../../components/Combobox";
+import type { LinearPublicationInstallLink, LinearPublicationShell } from "../api/types";
+import {
+  AgentPersonaFields,
+  CancelLink,
+  ExternalButton,
+  InstallResult,
+  PersonaPreview,
+  PublishingSummary,
+  ResumingCard,
+  WizardCard,
+  WizardFooter,
+  WizardPage,
+  wizardCode,
+} from "../components/Wizard";
+import { Callout } from "../../components/Callout";
+import { Disclosure } from "../../components/Disclosure";
 import { Field } from "../../components/Field";
+import { SecretInput, TextInput } from "../../components/Input";
+import { CopyList, CopyRow } from "../../components/settings/CopyField";
 import { BRAND_NAME } from "../../lib/brand";
+import { failureSentence } from "../../lib/failure-text";
 
 const api = new IntegrationsApi();
 
@@ -30,8 +47,8 @@ interface PublishWizardProps {
 type Step = "pick" | "credentials" | "install";
 
 const STEPS: Array<{ id: Step; label: string }> = [
-  { id: "pick", label: "Configure" },
-  { id: "credentials", label: "Credentials" },
+  { id: "pick", label: "Choose agent" },
+  { id: "credentials", label: "Create the app" },
   { id: "install", label: "Install" },
 ];
 
@@ -46,13 +63,10 @@ const STEPS: Array<{ id: Step; label: string }> = [
  *                                                         binds installation
  *
  * If the user closes the tab mid-flow, the pub stays in pending_setup /
- * awaiting_install and the wizard can resume from `?publication_id=...`
- * (re-using the same callback URL they already pasted into Linear).
+ * awaiting_install and the wizard can resume from `?pub=...` (re-using the
+ * same callback URL they already pasted into Linear).
  */
-export function IntegrationsLinearPublishWizard({
-  loadAgents,
-  loadEnvironments,
-}: PublishWizardProps) {
+export function IntegrationsLinearPublishWizard({ loadAgents, loadEnvironments }: PublishWizardProps) {
   const [search, setSearch] = useSearchParams();
   const preselectedAgent = search.get("agent_id") ?? "";
   const resumePubId = search.get("pub");
@@ -83,7 +97,7 @@ export function IntegrationsLinearPublishWizard({
         setAgents(a);
         setEnvs(e);
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        setError(failureSentence(err));
       }
     })();
   }, [loadAgents, loadEnvironments]);
@@ -115,6 +129,8 @@ export function IntegrationsLinearPublishWizard({
         setShell(re);
         setAgentId(pub.agent_id);
         setEnvId(pub.environment_id);
+        // The saved persona wins over the "default to the agent's name" effect.
+        personaEditedRef.current = true;
         setPersonaName(pub.persona.name);
         if (pub.persona.avatarUrl) setPersonaAvatar(pub.persona.avatarUrl);
         // Always render the credentials step on resume so the user can
@@ -124,7 +140,7 @@ export function IntegrationsLinearPublishWizard({
         if (!cancelled) {
           search.delete("pub");
           setSearch(search, { replace: true });
-          setError(err instanceof Error ? err.message : String(err));
+          setError(failureSentence(err));
         }
       } finally {
         if (!cancelled) setHydrating(false);
@@ -161,7 +177,7 @@ export function IntegrationsLinearPublishWizard({
 
   async function startPublish() {
     if (!agentId || !envId || !personaName) {
-      setError("Pick agent, environment, and persona name first");
+      setError("Choose an agent, an environment and a persona name first.");
       return;
     }
     setError(null);
@@ -178,7 +194,7 @@ export function IntegrationsLinearPublishWizard({
       setStep("credentials");
       pinPublicationToUrl(s.publication_id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(failureSentence(err));
     } finally {
       setWorking(false);
     }
@@ -189,415 +205,205 @@ export function IntegrationsLinearPublishWizard({
     setError(null);
     setWorking(true);
     try {
-      const link = await api.linear.submitCredentialsForPublication(
-        shell.publication_id,
-        {
-          clientId,
-          clientSecret,
-          webhookSecret,
-          returnUrl,
-        },
-      );
+      const link = await api.linear.submitCredentialsForPublication(shell.publication_id, {
+        clientId,
+        clientSecret,
+        webhookSecret,
+        returnUrl,
+      });
       setInstallLink(link);
       setStep("install");
       pinPublicationToUrl(link.publication_id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(failureSentence(err));
     } finally {
       setWorking(false);
     }
   }
 
+  const stepIndex = STEPS.findIndex((s) => s.id === step);
+  const agentName = agents.find((a) => a.id === agentId)?.name ?? "";
+  const envName = envs.find((e) => e.id === envId)?.name ?? "";
+
   return (
-    <div className="flex-1 overflow-y-auto">
-      <div className="max-w-[760px] mx-auto px-4 sm:px-8 lg:px-10 py-8 lg:py-10">
-        <Link
-          to="/integrations/linear"
-          className="inline-flex items-center gap-1 text-[13px] text-fg-muted hover:text-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+    <WizardPage
+      provider="linear"
+      title="Publish an agent to Linear"
+      subtitle="Make an agent a teammate in Linear: in the assignee menu and in @mentions."
+      steps={STEPS.map((s) => s.label)}
+      current={stepIndex}
+      banner={
+        <>
+          <InstallResult provider="linear" params={search} />
+          {error && (
+            <Callout tone="danger" title="That did not go through">
+              {error}
+            </Callout>
+          )}
+        </>
+      }
+    >
+      {hydrating && <ResumingCard />}
+
+      {!hydrating && step === "pick" && (
+        <WizardCard
+          title="Choose the agent"
+          description="Which agent to publish, where its sessions run, and how it appears in Linear."
+          footer={
+            <WizardFooter
+              hint="About three minutes. You need to be a Linear admin."
+              back={<CancelLink provider="linear" disabled={working} />}
+            >
+              <Button onClick={() => void startPublish()} loading={working} disabled={!agentId || !envId || !personaName.trim()}>
+                Continue
+                <ArrowRightIcon data-icon="inline-end" />
+              </Button>
+            </WizardFooter>
+          }
         >
-          ← Linear integrations
-        </Link>
-
-        <header className="mt-3 mb-6">
-          <h1 className="font-display text-[28px] leading-tight font-semibold text-fg">
-            Publish agent to Linear
-          </h1>
-          <p className="mt-1.5 text-[14px] text-fg-muted">
-            Make this agent a teammate in your Linear workspace.
-          </p>
-        </header>
-
-        <StepIndicator current={step} />
-
-        {error && (
-          <div className="mb-4 rounded-md border border-danger/30 bg-danger-subtle px-3 py-2 text-[13px] text-danger">
-            {error}
+          <div className="space-y-5">
+            <AgentPersonaFields
+              provider="linear"
+              agentId={agentId}
+              onAgent={setAgentId}
+              envId={envId}
+              onEnv={setEnvId}
+              personaName={personaName}
+              onPersonaName={(v) => {
+                personaEditedRef.current = true;
+                setPersonaName(v);
+              }}
+              personaAvatar={personaAvatar}
+              onPersonaAvatar={setPersonaAvatar}
+              disabled={working}
+            />
+            <PersonaPreview
+              provider="linear"
+              name={personaName}
+              avatarUrl={personaAvatar}
+              agentId={agentId || undefined}
+              caption="Shows in the assignee menu, autocompletes in @mentions, posts its progress on the issue."
+            />
           </div>
-        )}
+        </WizardCard>
+      )}
 
-        {hydrating && (
-          <div className="rounded-md border border-border bg-bg-surface/30 px-3.5 py-3 text-[13px] text-fg-muted">
-            Resuming in-progress install…
-          </div>
-        )}
+      {!hydrating && step === "credentials" && shell && (
+        <>
+          <PublishingSummary personaName={personaName} avatarUrl={personaAvatar} agentId={agentId} agentName={agentName} envName={envName} />
 
-        {!hydrating && step === "pick" && (
-          <PickStep
-            agents={agents}
-            envs={envs}
-            agentId={agentId}
-            setAgentId={setAgentId}
-            envId={envId}
-            setEnvId={setEnvId}
-            personaName={personaName}
-            setPersonaName={(v) => { personaEditedRef.current = true; setPersonaName(v); }}
-            personaAvatar={personaAvatar}
-            setPersonaAvatar={setPersonaAvatar}
-            working={working}
-            onContinue={startPublish}
-          />
-        )}
-
-        {!hydrating && step === "credentials" && shell && (
-          <CredentialsStep
-            shell={shell}
-            clientId={clientId}
-            setClientId={setClientId}
-            clientSecret={clientSecret}
-            setClientSecret={setClientSecret}
-            webhookSecret={webhookSecret}
-            setWebhookSecret={setWebhookSecret}
-            working={working}
-            onSubmit={submitCredentials}
-          />
-        )}
-
-        {!hydrating && step === "install" && installLink && <InstallStep link={installLink} />}
-      </div>
-    </div>
-  );
-}
-
-function StepIndicator({ current }: { current: Step }) {
-  const currentIdx = STEPS.findIndex((s) => s.id === current);
-  return (
-    <ol className="flex items-center gap-2 mb-7" aria-label="Wizard progress">
-      {STEPS.map((s, i) => {
-        const state =
-          i < currentIdx ? "done" : i === currentIdx ? "current" : "todo";
-        return (
-          <li key={s.id} className="flex items-center gap-2 flex-1 last:flex-none">
-            <div className="flex items-center gap-2 min-w-0">
-              <div
-                className={`w-6 h-6 rounded-full flex items-center justify-center text-[11px] font-mono font-medium shrink-0 ${
-                  state === "done"
-                    ? "bg-brand text-brand-fg"
-                    : state === "current"
-                      ? "bg-brand-subtle text-brand border border-brand"
-                      : "bg-bg-surface text-fg-subtle border border-border"
-                }`}
-              >
-                {state === "done" ? (
-                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3"><path d="M20 6 9 17l-5-5" /></svg>
-                ) : (
-                  String(i + 1).padStart(2, "0")
-                )}
+          <WizardCard
+            title="Create a Linear OAuth app"
+            description="In Linear, register a new application and copy these values into its form."
+          >
+            <div className="space-y-4">
+              <ExternalButton href="https://linear.app/settings/api/applications/new">Open Linear's new application form</ExternalButton>
+              <CopyList>
+                <CopyRow label="Application name" value={shell.suggested_app_name} />
+                <CopyRow label="Developer name" value={shell.suggested_app_name} />
+                <CopyRow label="Developer URL" value={window.location.origin} />
+                <CopyRow label="Description" value={`${BRAND_NAME}-managed agent: ${shell.suggested_app_name}.`} />
+                <CopyRow label="Callback URLs" value={shell.callback_url} />
+                <CopyRow label="Webhook URL" value={shell.webhook_url} />
+              </CopyList>
+              <div>
+                <p className="mb-2 text-xs font-medium text-fg-subtle">Set the rest of the form like this</p>
+                <dl className="divide-y divide-border overflow-hidden rounded-lg border border-border text-small">
+                  <FormSetting name="Webhooks" value="On">
+                    Paste the webhook URL and subscribe to <code className={wizardCode}>App user notifications</code> and{" "}
+                    <code className={wizardCode}>Agent session events</code>. Linear shows the signing secret once you save.
+                  </FormSetting>
+                  <FormSetting name="Public" value="Off">
+                    Public is for marketplace listings. This app is private to your workspace.
+                  </FormSetting>
+                  <FormSetting name="Client credentials" value="Off">
+                    {BRAND_NAME} uses the standard authorization-code flow.
+                  </FormSetting>
+                  <FormSetting name="GitHub username" value="Empty">
+                    Only used when the app is also bound to a GitHub App.
+                  </FormSetting>
+                </dl>
               </div>
-              <span
-                className={`text-[12px] font-medium uppercase truncate ${
-                  state === "current"
-                    ? "text-fg"
-                    : state === "done"
-                      ? "text-fg-muted"
-                      : "text-fg-subtle"
-                }`}
-              >
-                {s.label}
-              </span>
             </div>
-            {i < STEPS.length - 1 && (
-              <div
-                className={`flex-1 h-px ${
-                  i < currentIdx ? "bg-brand/40" : "bg-border"
-                }`}
-              />
-            )}
-          </li>
-        );
-      })}
-    </ol>
-  );
-}
+          </WizardCard>
 
-function PickStep(props: {
-  agents: AgentOption[];
-  envs: EnvironmentOption[];
-  agentId: string;
-  setAgentId: (v: string) => void;
-  envId: string;
-  setEnvId: (v: string) => void;
-  personaName: string;
-  setPersonaName: (v: string) => void;
-  personaAvatar: string;
-  setPersonaAvatar: (v: string) => void;
-  working: boolean;
-  onContinue: () => void;
-}) {
-  return (
-    <div className="space-y-5">
-      <div className="grid md:grid-cols-2 gap-4">
-        <Field label="Agent">
-          <Combobox<{ id: string; name: string }>
-            value={props.agentId}
-            onValueChange={(v) => props.setAgentId(v)}
-            endpoint="/v1/agents"
-            getValue={(a) => a.id}
-            getLabel={(a) => a.name}
-            getTextLabel={(a) => a.name}
-            placeholder="Pick an agent…"
-          />
-        </Field>
+          <WizardCard
+            title="Paste its credentials"
+            description="From the application you just created. The webhook signing secret is on the same page, under Webhooks."
+            footer={
+              <WizardFooter hint="Secrets are stored encrypted and never shown again.">
+                <Button
+                  onClick={() => void submitCredentials()}
+                  loading={working}
+                  disabled={!clientId || !clientSecret || !webhookSecret}
+                >
+                  Continue
+                  <ArrowRightIcon data-icon="inline-end" />
+                </Button>
+              </WizardFooter>
+            }
+          >
+            <div className="space-y-5">
+              <Field label="Client ID">
+                <TextInput value={clientId} onChange={(e) => setClientId(e.target.value)} className="font-mono" disabled={working} />
+              </Field>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <Field label="Client secret">
+                  <SecretInput value={clientSecret} onChange={(e) => setClientSecret(e.target.value)} disabled={working} />
+                </Field>
+                <Field label="Webhook signing secret" hint="Starts with lin_wh_">
+                  <SecretInput
+                    value={webhookSecret}
+                    onChange={(e) => setWebhookSecret(e.target.value)}
+                    placeholder="lin_wh_"
+                    disabled={working}
+                  />
+                </Field>
+              </div>
+            </div>
+          </WizardCard>
+        </>
+      )}
 
-        <Field label="Environment">
-          <Combobox<{ id: string; name: string }>
-            value={props.envId}
-            onValueChange={(v) => props.setEnvId(v)}
-            endpoint="/v1/environments"
-            getValue={(e) => e.id}
-            getLabel={(e) => e.name}
-            getTextLabel={(e) => e.name}
-            placeholder="Pick an environment…"
-          />
-        </Field>
-      </div>
-
-      <div className="grid md:grid-cols-2 gap-4">
-        <Field label="Persona name (shown in Linear)">
-          <TextInput
-            value={props.personaName}
-            onChange={(e) => props.setPersonaName(e.target.value)}
-            placeholder="e.g. Coder, Designer, Triage"
-            className={inputCls}
-          />
-        </Field>
-
-        <Field label="Avatar URL (optional)">
-          <TextInput
-            value={props.personaAvatar}
-            onChange={(e) => props.setPersonaAvatar(e.target.value)}
-            placeholder="https://…"
-            className={inputCls}
-          />
-        </Field>
-      </div>
-
-      <div className="rounded-md border border-border bg-bg-surface/30 px-3.5 py-3 text-[12px] text-fg-muted">
-        Your agent becomes a real Linear teammate with @autocomplete and a slot in the
-        assignee dropdown. Setup ~3 min, requires Linear admin (or send a setup link).
-      </div>
-
-      <div className="pt-1">
-        <button
-          onClick={props.onContinue}
-          disabled={props.working}
-          className="inline-flex items-center gap-1.5 px-3.5 py-2 text-[13px] bg-brand text-brand-fg rounded-md font-medium hover:bg-brand-hover disabled:opacity-50 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
+      {!hydrating && step === "install" && installLink && (
+        <WizardCard
+          title="Install the app in your workspace"
+          description="Your credentials are stored. Approve the install in Linear and you are brought straight back here."
+          footer={
+            <WizardFooter hint="Installing needs a Linear admin.">
+              <Button asChild>
+                <a href={installLink.install_url}>
+                  Install in Linear
+                  <ArrowRightIcon data-icon="inline-end" />
+                </a>
+              </Button>
+            </WizardFooter>
+          }
         >
-          {props.working ? "Working…" : "Continue"}
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M13 6l6 6-6 6" /></svg>
-        </button>
-      </div>
-    </div>
+          <div className="space-y-4">
+            <PublishingSummary personaName={personaName} avatarUrl={personaAvatar} agentId={agentId} agentName={agentName} envName={envName} />
+            <Disclosure title="Check the URLs Linear should now show">
+              <CopyList>
+                <CopyRow label="Callback URL" value={installLink.callback_url} />
+                <CopyRow label="Webhook URL" value={installLink.webhook_url} />
+              </CopyList>
+            </Disclosure>
+          </div>
+        </WizardCard>
+      )}
+    </WizardPage>
   );
 }
 
-function CredentialsStep(props: {
-  shell: LinearPublicationShell;
-  clientId: string;
-  setClientId: (v: string) => void;
-  clientSecret: string;
-  setClientSecret: (v: string) => void;
-  webhookSecret: string;
-  setWebhookSecret: (v: string) => void;
-  working: boolean;
-  onSubmit: () => void;
-}) {
+/** One switch on Linear's form: what to set it to, and why. */
+function FormSetting({ name, value, children }: { name: string; value: string; children: React.ReactNode }) {
   return (
-    <div className="space-y-7">
-      <section>
-        <h2 className="text-[15px] font-medium text-fg mb-1.5">
-          Create a Linear OAuth app
-        </h2>
-        <p className="text-[13px] text-fg-muted mb-3">
-          Open{" "}
-          <a
-            href="https://linear.app/settings/api/applications/new"
-            target="_blank"
-            rel="noreferrer"
-            className="text-brand hover:underline"
-          >
-            Linear → Settings → API → New application
-          </a>{" "}
-          and register a new OAuth application with these values:
-        </p>
-        <div className="rounded-md border border-border bg-bg-surface/30 divide-y divide-border">
-          <CopyRow label="Application name" value={props.shell.suggested_app_name} />
-          <CopyRow label="Developer name" value={props.shell.suggested_app_name} />
-          <CopyRow label="Developer URL" value={window.location.origin} />
-          <CopyRow
-            label="Description"
-            value={`${BRAND_NAME}-managed agent — ${props.shell.suggested_app_name}.`}
-          />
-          <CopyRow label="Callback URLs" value={props.shell.callback_url} />
-          <CopyRow label="Webhook URL" value={props.shell.webhook_url} />
-        </div>
-        <ul className="text-[12px] text-fg-muted mt-3 space-y-1.5 list-disc pl-5">
-          <li>
-            <strong className="text-fg">GitHub username</strong> — leave empty.
-            Only relevant if you also bind this OAuth app to a GitHub App with
-            <code className="mx-0.5">actor=app</code>; not used by {BRAND_NAME}'s
-            Linear-only flow.
-          </li>
-          <li>
-            <strong className="text-fg">Public</strong> — leave OFF. Public is
-            for app marketplace listings; this app is private to your workspace.
-          </li>
-          <li>
-            <strong className="text-fg">Client credentials</strong> — leave OFF.
-            {BRAND_NAME} uses the standard authorization-code OAuth flow.
-          </li>
-          <li>
-            <strong className="text-fg">Webhooks</strong> — toggle ON, paste the
-            Webhook URL above, and subscribe to{" "}
-            <code>App user notifications</code> +{" "}
-            <code>Agent session events</code>. Linear shows the signing secret
-            (<code>lin_wh_…</code>) once you save — copy it back below.
-          </li>
-        </ul>
-      </section>
-
-      <section>
-        <h2 className="text-[15px] font-medium text-fg mb-1.5">
-          Paste credentials Linear gave you
-        </h2>
-        <p className="text-[13px] text-fg-muted mb-3">
-          From the OAuth app you just created. The webhook signing secret is on
-          the same page (Webhooks → Signing secret).
-        </p>
-        <div className="grid md:grid-cols-2 gap-4">
-          <Field label="Client ID">
-            <TextInput
-              value={props.clientId}
-              onChange={(e) => props.setClientId(e.target.value)}
-              className={inputCls}
-            />
-          </Field>
-          <Field label="Client Secret">
-            <SecretInput
-              value={props.clientSecret}
-              onChange={(e) => props.setClientSecret(e.target.value)}
-              className={inputCls}
-            />
-          </Field>
-          <Field label="Webhook signing secret (lin_wh_…)">
-            <SecretInput
-              value={props.webhookSecret}
-              onChange={(e) => props.setWebhookSecret(e.target.value)}
-              placeholder="lin_wh_…"
-              className={inputCls}
-            />
-          </Field>
-        </div>
-
-        <div className="mt-4 flex items-center gap-3 flex-wrap">
-          <button
-            onClick={props.onSubmit}
-            disabled={props.working || !props.clientId || !props.clientSecret || !props.webhookSecret}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-[13px] bg-brand text-brand-fg rounded-md font-medium hover:bg-brand-hover disabled:opacity-50 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-          >
-            {props.working ? "Validating…" : "Continue"}
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M13 6l6 6-6 6" /></svg>
-          </button>
-        </div>
-      </section>
+    <div className="flex gap-3 px-3.5 py-2.5">
+      <dt className="w-32 shrink-0 sm:w-40">
+        <span className="block font-medium text-fg">{name}</span>
+        <span className="text-xs text-fg-subtle">{value}</span>
+      </dt>
+      <dd className="min-w-0 flex-1 text-fg-muted">{children}</dd>
     </div>
   );
 }
-
-function InstallStep({ link }: { link: LinearPublicationInstallLink }) {
-  return (
-    <div className="space-y-4">
-      <div>
-        <h2 className="text-[15px] font-medium text-fg mb-1.5">
-          Install the app in your workspace
-        </h2>
-        <p className="text-[13px] text-fg-muted">
-          We've stored your credentials. Click below to authorize the install in
-          Linear — you'll be redirected back here automatically.
-        </p>
-      </div>
-
-      <a
-        href={link.install_url}
-        className="inline-flex items-center gap-1.5 px-3.5 py-2 text-[13px] bg-brand text-brand-fg rounded-md font-medium hover:bg-brand-hover transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-      >
-        Install in Linear
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M7 17 17 7M7 7h10v10" /></svg>
-      </a>
-
-      <details className="text-[12px] text-fg-muted mt-3">
-        <summary className="cursor-pointer hover:text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]">
-          Verify the URLs Linear should now show
-        </summary>
-        <div className="mt-2 rounded-md border border-border bg-bg-surface/30 divide-y divide-border">
-          <CopyRow label="Callback URL" value={link.callback_url} />
-          <CopyRow label="Webhook URL" value={link.webhook_url} />
-        </div>
-      </details>
-    </div>
-  );
-}
-
-function CopyRow({ label, value, secret = false }: { label: string; value: string; secret?: boolean }) {
-  const [copied, setCopied] = useState(false);
-  const [reveal, setReveal] = useState(!secret);
-  function copy() {
-    void navigator.clipboard.writeText(value);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  }
-  const display = secret && !reveal ? "•".repeat(Math.min(value.length, 28)) : value;
-  return (
-    <div className="flex items-center gap-3 px-3 py-2">
-      <span className="text-[11px] text-fg-muted font-mono uppercase w-28 shrink-0">
-        {label}
-      </span>
-      <code className="flex-1 text-[12px] font-mono text-fg truncate select-all">
-        {display}
-      </code>
-      <div className="flex items-center gap-1 shrink-0">
-        {secret && (
-          <button
-            onClick={() => setReveal((r) => !r)}
-            className="text-[11px] text-fg-muted hover:text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] px-1.5 py-0.5 rounded"
-            title={reveal ? "Hide" : "Reveal"}
-          >
-            {reveal ? "Hide" : "Show"}
-          </button>
-        )}
-        <button
-          onClick={copy}
-          className={`text-[11px] px-2 py-0.5 rounded transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
-            copied
-              ? "text-success bg-success-subtle"
-              : "text-fg-muted hover:text-fg hover:bg-bg-surface"
-          }`}
-        >
-          {copied ? "Copied" : "Copy"}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-const inputCls =
-  "w-full border border-border rounded-md px-3 py-2 text-[13px] bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";

@@ -4,15 +4,20 @@ import { ChevronsUpDownIcon, PlusIcon, CheckIcon } from "lucide-react";
 import { useApi, getActiveTenantId, setActiveTenantId } from "../lib/api";
 import { useApiQuery } from "../lib/useApiQuery";
 import { Modal } from "./Modal";
+import { Field } from "./Field";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Avatar } from "./Avatar";
+import { Tip } from "./Tip";
+import { failureSentence } from "../lib/failure-text";
 
 // Slot beneath the logo in the sidebar. Opens a dropdown with all
 // memberships + "Create workspace" button. Switching writes
@@ -35,11 +40,27 @@ interface Tenant {
 
 function displayName(t: Tenant): string {
   const trimmed = (t.name ?? "").trim();
-  if (!trimmed || trimmed === "'s workspace" || trimmed.startsWith("'s ")) return t.id;
+  if (!trimmed || trimmed === "'s workspace" || trimmed.startsWith("'s ")) {
+    // No usable name: fall back to the id, title-cased so it reads as one.
+    return t.id ? t.id[0].toUpperCase() + t.id.slice(1) : "Workspace";
+  }
   return trimmed;
 }
 
-export function TenantSwitcher() {
+/**
+ * What a workspace's tile is lettered from. A one-word name gets ONE
+ * letter ("Default" → "D"), the way workspace tiles are drawn everywhere:
+ * its first two letters ("DE") read as an abbreviation of something else.
+ * A name of several words keeps an initial from each of the first two
+ * ("Lumen Analytics" → "LA"), which <Avatar> does by itself.
+ */
+export function workspaceMonogram(name: string): string {
+  const words = name.replace(/[^\p{L}\p{N}\s]/gu, " ").trim().split(/\s+/).filter(Boolean);
+  return words.length === 1 ? words[0][0] : name;
+}
+
+/** `compact` is the rail form: the workspace's avatar alone, named by a tooltip, with the menu beside it. */
+export function TenantSwitcher({ compact = false }: { compact?: boolean }) {
   const [active, setActive] = useState<string>("");
   const [createOpen, setCreateOpen] = useState(false);
 
@@ -93,37 +114,43 @@ export function TenantSwitcher() {
   return (
     <>
       <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <button
-            type="button"
-            aria-label="Switch workspace"
-            disabled={!ready}
-            className="mx-2 w-[calc(100%-1rem)] h-9 rounded-md px-2 flex items-center gap-2 text-left text-fg-muted hover:bg-bg-surface hover:text-fg transition-colors disabled:cursor-default disabled:hover:bg-transparent outline-none focus-visible:bg-bg-surface"
-          >
-            {ready ? (
-              <Avatar name={current.name} size="sm" squared />
-            ) : (
-              <div className="size-6 rounded-md bg-brand-subtle shrink-0" aria-hidden="true" />
-            )}
-            <div className="min-w-0 flex-1 leading-tight group-data-[collapsible=icon]:hidden">
-              <div className="text-sm font-medium truncate text-fg">
-                {ready ? displayName(current) : " "}
-              </div>
-              {ready && tenants.length > 1 && (
-                <div className="text-[10px] text-fg-subtle uppercase">
-                  {current.role}
-                </div>
+        {compact ? (
+          <Tip label={ready ? displayName(current) : null} side="right">
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                aria-label="Switch workspace"
+                disabled={!ready}
+                className="flex size-9 shrink-0 items-center justify-center rounded-md transition-quick hover:bg-bg-hover disabled:cursor-default disabled:hover:bg-transparent aria-expanded:bg-bg-hover"
+              >
+                {ready ? (
+                  <Avatar name={workspaceMonogram(displayName(current))} size="sm" squared />
+                ) : (
+                  <div className="size-6 shrink-0 rounded-[30%] bg-bg-pressed" aria-hidden="true" />
+                )}
+              </button>
+            </DropdownMenuTrigger>
+          </Tip>
+        ) : (
+          <DropdownMenuTrigger asChild>
+            <button
+              type="button"
+              aria-label="Switch workspace"
+              disabled={!ready}
+              className="flex h-9 min-w-0 flex-1 items-center gap-2 rounded-full pr-2 pl-1.5 text-left transition-quick hover:bg-bg-hover disabled:cursor-default disabled:hover:bg-transparent aria-expanded:bg-bg-hover"
+            >
+              {ready ? (
+                <Avatar name={workspaceMonogram(displayName(current))} size="sm" squared />
+              ) : (
+                <div className="size-6 shrink-0 rounded-[30%] bg-bg-pressed" aria-hidden="true" />
               )}
-            </div>
-            {ready && (
-              <ChevronsUpDownIcon
-                className="w-3.5 h-3.5 text-fg-subtle shrink-0 group-data-[collapsible=icon]:hidden"
-                aria-hidden="true"
-              />
-            )}
-          </button>
-        </DropdownMenuTrigger>
-
+              <span className="min-w-0 flex-1 truncate text-small-size font-medium text-fg">
+                {ready ? displayName(current) : "\u00A0"}
+              </span>
+              {ready && <ChevronsUpDownIcon className="size-3.5 shrink-0 text-fg-faint" aria-hidden="true" />}
+            </button>
+          </DropdownMenuTrigger>
+        )}
         {/* `side="bottom"` is the preferred placement; Radix auto-flips
             to top if the dropdown would overflow the viewport. `align`
             anchors the popover's left edge to the trigger; the menu
@@ -131,35 +158,27 @@ export function TenantSwitcher() {
             trigger-width). collisionPadding keeps a small breathing
             margin from viewport edges. */}
         <DropdownMenuContent
-          side="bottom"
-          align="start"
-          sideOffset={4}
+          side={compact ? "right" : "top"}
+          align={compact ? "end" : "start"}
+          sideOffset={compact ? 10 : 6}
           collisionPadding={8}
-          className="w-(--radix-dropdown-menu-trigger-width) min-w-56 max-h-72 overflow-y-auto"
+          className="max-h-80 w-64 overflow-y-auto"
         >
+          <DropdownMenuLabel>Workspaces</DropdownMenuLabel>
           {tenants.map((t) => (
-            <DropdownMenuItem
-              key={t.id}
-              onSelect={() => switchTo(t.id)}
-              className="flex items-center gap-2"
-            >
-              <Avatar name={displayName(t)} size="xs" squared />
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-sm">{displayName(t)}</div>
-                <div className="text-[10px] text-fg-subtle font-mono">{t.id}</div>
+            <DropdownMenuItem key={t.id} onSelect={() => switchTo(t.id)} className="gap-2.5 py-2">
+              <Avatar name={workspaceMonogram(displayName(t))} size="sm" squared />
+              <div className="min-w-0 flex-1 leading-tight">
+                <div className="truncate text-small-size font-medium">{displayName(t)}</div>
+                <div className="mt-0.5 truncate text-xs text-fg-subtle capitalize">{t.role}</div>
               </div>
-              {t.id === active && (
-                <CheckIcon className="size-3.5 text-success shrink-0" />
-              )}
+              {t.id === active && <CheckIcon className="size-4 shrink-0 text-fg!" />}
             </DropdownMenuItem>
           ))}
           <DropdownMenuSeparator />
-          <DropdownMenuItem
-            onSelect={() => setCreateOpen(true)}
-            className="text-fg-muted"
-          >
-            <PlusIcon className="size-4 shrink-0" />
-            Create workspace…
+          <DropdownMenuItem onSelect={() => setCreateOpen(true)}>
+            <PlusIcon />
+            Create workspace
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -204,50 +223,40 @@ function CreateTenantModal({
       });
       onCreated(res);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(failureSentence(err));
       setWorking(false);
     }
   };
 
   return (
-    <Modal open={open} onClose={onClose} title="Create workspace">
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="Create workspace"
+      subtitle="An isolated home for agents, sessions, vaults and integrations. You will be its owner."
+      footer={
+        <>
+          <Button variant="ghost" onClick={onClose} disabled={working}>
+            Cancel
+          </Button>
+          <Button onClick={submit} disabled={!name.trim()} loading={working} loadingLabel="Creating…">
+            Create workspace
+          </Button>
+        </>
+      }
+    >
       <div className="space-y-4">
-        <p className="text-sm text-fg-muted">
-          A workspace is an isolated container for agents, sessions, vaults,
-          and integrations. You'll be the owner of the new one.
-        </p>
-        <div>
-          <label htmlFor="tenant-create-name" className="block text-xs uppercase text-fg-subtle mb-1">
-            Name
-          </label>
-          <input
-            id="tenant-create-name"
+        <Field label="Name" error={error || undefined}>
+          <Input
             value={name}
             onChange={(e) => setName(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && submit()}
             placeholder="e.g. Acme Production"
             autoFocus
             disabled={working}
-            className="w-full bg-bg border border-border rounded-lg px-3 py-2 min-h-11 sm:min-h-0 text-sm outline-none focus:border-border-strong"
+            autoComplete="off"
           />
-        </div>
-        {error && (
-          <div className="bg-danger-subtle border border-danger/30 text-danger text-sm rounded px-3 py-2">
-            {error}
-          </div>
-        )}
-        <div className="flex gap-2 justify-end">
-          <button
-            onClick={onClose}
-            disabled={working}
-            className="inline-flex items-center justify-center px-4 py-2 min-h-11 sm:min-h-0 rounded-lg border border-border text-sm text-fg-muted hover:bg-bg-surface disabled:opacity-40"
-          >
-            Cancel
-          </button>
-          <Button onClick={submit} disabled={working || !name.trim()}>
-            {working ? "Creating…" : "Create workspace"}
-          </Button>
-        </div>
+        </Field>
       </div>
     </Modal>
   );

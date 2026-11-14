@@ -8,7 +8,7 @@ function Input({ className, type, ...props }: React.ComponentProps<"input">) {
       type={type}
       data-slot="input"
       className={cn(
-        "h-8 w-full min-w-0 rounded-md border border-input bg-bg-surface px-2.5 py-1 text-base shadow-[var(--shadow-sm)] transition-colors outline-none file:inline-flex file:h-6 file:border-0 file:bg-transparent file:text-sm file:font-medium file:text-foreground placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/25 disabled:pointer-events-none disabled:cursor-not-allowed disabled:bg-input/50 disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-2 aria-invalid:ring-destructive/20 md:text-sm dark:bg-input/30 dark:disabled:bg-input/80 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40",
+        "h-9 w-full min-w-0 rounded-md border border-border-strong bg-bg-surface px-3 py-1 text-base text-fg shadow-[var(--shadow-xs)] transition-quick outline-none placeholder:text-fg-subtle hover:border-fg-faint focus-visible:border-plum focus-visible:shadow-[var(--shadow-focus)] focus-visible:outline-none disabled:pointer-events-none disabled:cursor-not-allowed disabled:bg-bg-inset disabled:opacity-60 aria-invalid:border-danger md:text-sm dark:bg-bg-soft file:mr-3 file:inline-flex file:h-6 file:rounded-full file:border-0 file:bg-bg-soft file:px-2.5 file:text-xs file:font-medium file:text-fg",
         className
       )}
       {...props}

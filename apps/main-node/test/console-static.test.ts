@@ -26,7 +26,17 @@ beforeAll(() => {
   writeFileSync(join(dir, "assets", "index-NEW.js"), "export {};");
   writeFileSync(join(dir, "logo.svg"), "<svg/>");
   app = new Hono();
-  app.get("/v1/ping", (c) => c.json({ ok: true }));
+  // Mirrors index.ts: an authenticated v1 sub-app with its own middleware,
+  // mounted before the console, plus app-level /v1/oma and /public/v1 mounts.
+  const v1 = new Hono();
+  v1.use("*", async (c, next) => {
+    if (c.req.header("x-test-auth") === "deny") return c.json({ error: "Unauthorized" }, 401);
+    await next();
+  });
+  v1.get("/ping", (c) => c.json({ ok: true }));
+  app.route("/v1", v1);
+  app.get("/v1/oma/me", (c) => c.json({ me: true }));
+  app.get("/public/v1/hello", (c) => c.json({ hello: true }));
   mountConsoleUi(app, dir); // absolute path, like CONSOLE_DIR in prod
   app.notFound((c) => c.json({ error: "not found" }, 404));
 });
@@ -79,6 +89,45 @@ describe("mountConsoleUi", () => {
     expect(logo.headers.get("cache-control")).toBeNull();
     const api = await app.request("/v1/ping");
     expect(await api.json()).toEqual({ ok: true });
+  });
+});
+
+describe("unknown API paths", () => {
+  const unknown = ["/v1/x", "/v1/oma/x", "/public/v1/x", "/v1/operations", "/v1/workspace/members", "/v1/"];
+
+  it("answer GET with a JSON 404, never the console page", async () => {
+    for (const path of unknown) {
+      const res = await app.request(path);
+      expect(res.status, path).toBe(404);
+      expect(res.headers.get("content-type"), path).toMatch(/application\/json/);
+      expect(res.headers.get("cache-control"), path).toBe("no-store");
+      expect(await res.json(), path).toEqual({ error: "not found" });
+    }
+  });
+
+  it("answer other methods with a JSON 404 too", async () => {
+    for (const method of ["POST", "PUT", "DELETE", "HEAD"]) {
+      const res = await app.request("/v1/missions", { method });
+      expect(res.status, method).toBe(404);
+      expect(res.headers.get("content-type") ?? "", method).not.toMatch(/text\/html/);
+    }
+  });
+
+  it("keep the v1 middleware in front, so an unauthenticated request is still a 401", async () => {
+    const res = await app.request("/v1/x", { headers: { "x-test-auth": "deny" } });
+    expect(res.status).toBe(401);
+  });
+
+  it("leave known API routes and look-alike console routes alone", async () => {
+    expect(await (await app.request("/v1/ping")).json()).toEqual({ ok: true });
+    expect(await (await app.request("/v1/oma/me")).json()).toEqual({ me: true });
+    expect(await (await app.request("/public/v1/hello")).json()).toEqual({ hello: true });
+    // Console routes that merely start with "v1" text still get the page.
+    for (const path of ["/v1x", "/public/v1x", "/public"]) {
+      const res = await app.request(path);
+      expect(res.status, path).toBe(200);
+      expect(await res.text(), path).toBe(INDEX);
+    }
   });
 });
 

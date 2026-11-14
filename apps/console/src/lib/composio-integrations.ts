@@ -40,9 +40,6 @@ export interface ComposioStatusResponse {
 export const COMPOSIO_NOT_CONFIGURED_MESSAGE =
   "Composio isn't connected for this workspace yet — add your API key in Apps.";
 
-function favicon(domain: string): string {
-  return `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
-}
 
 function titleCaseSlug(slug: string): string {
   return slug
@@ -235,11 +232,6 @@ export const COMPOSIO_MANAGED_AGENT_INTEGRATIONS: ComposioIntegrationEntry[] = [
   },
 ];
 
-export function composioIntegrationIcon(entry: Pick<ComposioIntegrationEntry, "domain" | "icon">): string {
-  return typeof entry.icon === "string" && entry.icon
-    ? entry.icon
-    : favicon(entry.domain);
-}
 
 export function composioEntriesFromCatalog(
   catalog: ComposioToolkitCatalogResponse | null | undefined,

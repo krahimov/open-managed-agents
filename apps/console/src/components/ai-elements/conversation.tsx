@@ -81,15 +81,18 @@ export const ConversationScrollButton = ({
     scrollToBottom();
   }, [scrollToBottom]);
 
+  // A small raised pill, centred over the composer's fade. It appears the
+  // moment the reader scrolls away from the latest message.
   return (
     !isAtBottom && (
       <Button
+        aria-label="Jump to latest"
         className={cn(
-          "absolute bottom-4 left-[50%] translate-x-[-50%] rounded-full dark:bg-background dark:hover:bg-muted",
+          "absolute bottom-3 left-[50%] translate-x-[-50%] animate-pop-in rounded-full shadow-[var(--shadow-md)]",
           className
         )}
         onClick={handleScrollToBottom}
-        size="icon"
+        size="icon-sm"
         type="button"
         variant="outline"
         {...props}

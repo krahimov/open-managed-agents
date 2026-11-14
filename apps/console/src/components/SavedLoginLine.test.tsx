@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router";
+
 import { SavedLoginLine } from "./SavedLoginLine";
 
 const event = {
@@ -25,7 +26,10 @@ beforeEach(() => {
   vi.stubGlobal("BroadcastChannel", class { addEventListener() {} removeEventListener() {} close() {} });
   vi.stubGlobal("fetch", vi.fn(async () => Response.json({ token: "tok-1" })));
 });
-afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllGlobals();
+});
 
 it("names the vault the agent got and links to it", () => {
   show();
@@ -36,7 +40,6 @@ it("names the vault the agent got and links to it", () => {
 it("switches into a new vault, never the shared one, against this session", async () => {
   const popup = { closed: false, location: { href: "" } };
   vi.spyOn(window, "open").mockReturnValue(popup as any);
-  vi.stubGlobal("fetch", vi.fn(async () => Response.json({ token: "tok-1" })));
   show();
   fireEvent.click(screen.getByRole("button", { name: "Switch account" }));
   await waitFor(() => expect(popup.location.href).not.toBe(""));
@@ -50,17 +53,34 @@ it("switches into a new vault, never the shared one, against this session", asyn
   expect(screen.getByRole("button", { name: "Waiting for sign-in…" })).toBeDisabled();
 });
 
+it("stops waiting when this request's sign-in completes, not another's", async () => {
+  vi.spyOn(window, "open").mockReturnValue({ closed: false, location: { href: "" } } as any);
+  show();
+  fireEvent.click(screen.getByRole("button", { name: "Switch account" }));
+  const send = (data: unknown) =>
+    act(() => {
+      fireEvent(window, new MessageEvent("message", { origin: window.location.origin, data }));
+    });
+  send({ type: "oauth_complete", request_id: "acreq-other" });
+  expect(screen.getByRole("button", { name: "Waiting for sign-in…" })).toBeDisabled();
+  send({ type: "oauth_complete", request_id: "acreq-1" });
+  expect(screen.getByRole("button", { name: "Switch account" })).toBeEnabled();
+});
+
 it("shows the error from the popup and lets the user retry", () => {
   vi.spyOn(window, "open").mockReturnValue({ closed: false, location: { href: "" } } as any);
   show();
   fireEvent.click(screen.getByRole("button", { name: "Switch account" }));
   act(() => {
-    fireEvent(window, new MessageEvent("message", {
-      origin: window.location.origin,
-      data: { type: "oauth_error", message: "Authorization failed" },
-    }));
+    fireEvent(
+      window,
+      new MessageEvent("message", {
+        origin: window.location.origin,
+        data: { type: "oauth_error", message: "Authorization failed" },
+      }),
+    );
   });
-  expect(screen.getByText("Authorization failed")).toBeInTheDocument();
+  expect(screen.getByRole("alert")).toHaveTextContent("Authorization failed");
   expect(screen.getByRole("button", { name: "Switch account" })).toBeEnabled();
 });
 
@@ -72,7 +92,9 @@ it("does not get stuck waiting when the popup is closed", () => {
     show();
     fireEvent.click(screen.getByRole("button", { name: "Switch account" }));
     popup.closed = true;
-    act(() => { vi.advanceTimersByTime(600); });
+    act(() => {
+      vi.advanceTimersByTime(600);
+    });
     expect(screen.getByRole("button", { name: "Switch account" })).toBeEnabled();
   } finally {
     vi.useRealTimers();
@@ -83,7 +105,7 @@ it("tells the user when the sign-in window was blocked", () => {
   vi.spyOn(window, "open").mockReturnValue(null);
   show();
   fireEvent.click(screen.getByRole("button", { name: "Switch account" }));
-  expect(screen.getByText(/blocked the sign-in window/)).toBeInTheDocument();
+  expect(screen.getByRole("alert")).toHaveTextContent(/blocked the sign-in window/);
   expect(screen.getByRole("button", { name: "Switch account" })).toBeEnabled();
 });
 

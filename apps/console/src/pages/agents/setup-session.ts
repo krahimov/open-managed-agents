@@ -1,11 +1,12 @@
 import type { useApi } from "../../lib/api";
+import { pickDefaultEnvironmentId, type EnvironmentChoice } from "../../lib/default-environment";
 
 /**
- * Setup-session plumbing shared by the create flow (AgentFormDialog) and the
- * agent page's "Setup chat" button. A setup session is a normal session
- * flagged `metadata.oma_setup: true`; the server swaps in the config-designer
- * preamble + update_harness toolset and always reads the LIVE agent, so a
- * resumed setup chat sees edits made in the form since it last ran.
+ * Setup-session plumbing for the agent page's "Setup chat" (ported from
+ * main). A setup session is a normal session flagged
+ * `metadata.oma_setup: true`; the server swaps in the config-designer
+ * preamble and the update_harness toolset, and always reads the LIVE agent,
+ * so a resumed setup chat sees edits made in the form since it last ran.
  */
 type Api = ReturnType<typeof useApi>["api"];
 
@@ -20,7 +21,8 @@ export function setupPath(agentId: string, sessionId: string): string {
 }
 
 /** Create a setup session for the agent and send the opening message so the
- *  agent speaks first. Returns the new session id. */
+ *  agent speaks first. Returns the new session id. With no environment given
+ *  it starts in the first ordinary one, never a persistent agent computer. */
 export async function startSetupSession(
   api: Api,
   agentId: string,
@@ -28,7 +30,9 @@ export async function startSetupSession(
 ): Promise<string> {
   const environmentId =
     opts.environmentId ||
-    (await api<{ data?: Array<{ id: string }> }>("/v1/environments?limit=1")).data?.[0]?.id;
+    pickDefaultEnvironmentId(
+      (await api<{ data?: EnvironmentChoice[] }>("/v1/environments?limit=100")).data ?? [],
+    );
   const session = await api<{ id: string }>("/v1/sessions", {
     method: "POST",
     body: JSON.stringify({
@@ -46,17 +50,15 @@ export async function startSetupSession(
   return session.id;
 }
 
-/** Reopen the agent's existing setup conversation, or start a new one (with a
- *  "revise" opener) when it has none — e.g. agents created via API/CLI or
- *  whose setup session was terminated. */
+/** Reopen the agent's existing setup conversation, or start a new one (with
+ *  a "revise" opener) when it has none: agents made through the API or CLI,
+ *  or whose setup session has ended. */
 export async function openSetupSession(
   api: Api,
   agentId: string,
   opts: { environmentId?: string } = {},
 ): Promise<string> {
-  const existing = await api<{ data: { id: string } | null }>(
-    `/v1/agents/${agentId}/setup_session`,
-  );
+  const existing = await api<{ data: { id: string } | null }>(`/v1/agents/${agentId}/setup_session`);
   if (existing.data?.id) return existing.data.id;
   return startSetupSession(api, agentId, {
     environmentId: opts.environmentId,

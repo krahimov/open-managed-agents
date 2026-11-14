@@ -1,13 +1,14 @@
 import type { Event } from "../../lib/events";
 
 /**
- * Layout constants — kept here as the single source of truth so that
- * Tailwind utility classes (`w-56`, `w-20`) and pixel arithmetic
- * (`224 + chartPx + 80`) stay in sync. Change here, change both.
+ * Layout constants, in pixels. The waterfall does its own arithmetic
+ * (label column + chart + duration column), so these are the single source
+ * of truth for both the styles and the maths.
  */
-export const LABEL_COL_W = 224; // === w-56
-export const DURATION_COL_W = 80; // === w-20
+export const LABEL_COL_W = 272;
+export const DURATION_COL_W = 76;
 export const SIDE_PANEL_W = 420;
+export const ROW_H = 34;
 
 /**
  * One row in the timeline waterfall. A span can be an instant marker
@@ -20,9 +21,6 @@ export interface Span {
   family: SpanFamily;
   label: string;
   detail?: string;
-  /** Tool spans whose result is an error (is_error, recovery placeholder,
-   *  denied call). Rendered with danger colors regardless of family. */
-  isError?: boolean;
   /** ms since the first event */
   startMs: number;
   /** 0 for instants */
@@ -30,6 +28,12 @@ export interface Span {
   /** Optional: ms from this span's start to first-token (model spans only).
    *  Used to render a TTFT divider inside the bar. */
   ttftMs?: number;
+  /** App / MCP server name for mcp spans, shown before the label. */
+  source?: string;
+  /** The span failed (tool error, model error). */
+  failed?: boolean;
+  /** The label is words ("Asked PR Reviewer"), not a tool's name: set it in the text face. */
+  plain?: boolean;
   /** Source events that contributed to this span (1 for instants,
    *  2 for paired spans, possibly more for tool calls with streaming
    *  input chunks). Click-to-expand renders the raw JSON of these. */
@@ -53,46 +57,73 @@ export type SpanFamily =
   | "thread"       // sub-agent thread lifecycle / messages
   | "aux"          // aux.model_call (web_fetch summarizer etc.)
   | "thinking"     // agent.thinking marker
+  | "approval"     // a tool call waiting on a person
   | "marker";      // catch-all for unrecognized event types
 
-export const FAMILY_DOT: Record<SpanFamily, string> = {
-  model: "bg-info",
-  tool: "bg-success",
-  mcp: "bg-accent-violet",
-  custom_tool: "bg-warning",
-  user: "bg-brand",
-  agent: "bg-fg-muted",
-  system: "bg-fg-subtle",
-  warn: "bg-warning",
-  error: "bg-danger",
-  schedule: "bg-info",
-  wakeup: "bg-info",
-  compaction: "bg-accent-violet/70",
-  outcome: "bg-success/70",
-  thread: "bg-fg-muted",
-  aux: "bg-fg-subtle",
-  thinking: "bg-fg-subtle",
-  marker: "bg-fg-subtle",
+/**
+ * Colour by KIND of work, fixed across the product (DESIGN.md 9.3). Values
+ * are CSS colours so bars, dots and legend swatches share one source.
+ *
+ * The three kinds of work wear the category family (index.css --kind-*),
+ * which no provider and no status uses: apricot and teal mean Anthropic and
+ * OpenAI on the model badges beside this chart, so they can never also mean
+ * "scheduled wait" or "tools" here. The family is stepped in lightness, so
+ * the kinds stay apart for colour-blind readers too; every row also carries
+ * its icon and name.
+ *
+ *   model      plum     the model is generating
+ *   tool       indigo   a built-in or custom tool is running
+ *   mcp        lilac    a call to a connected app
+ *   schedule   neutral  asleep until a scheduled wake-up (not work: no hue)
+ *   approval   amber    waiting on a person          (status colour)
+ *   error      red      something failed             (status colour)
+ *   everything else is a neutral marker
+ */
+export type SpanKind = "model" | "tool" | "mcp" | "schedule" | "approval" | "error" | "thinking" | "message" | "system";
+
+export const KIND_COLOR: Record<SpanKind, string> = {
+  model: "var(--kind-model)",
+  tool: "var(--kind-tool)",
+  mcp: "var(--kind-app)",
+  schedule: "var(--kind-wait)",
+  approval: "var(--warning-solid)",
+  error: "var(--danger-solid)",
+  thinking: "var(--chart-other)",
+  message: "var(--fg)",
+  system: "var(--fg-faint)",
 };
 
-export const FAMILY_BAR: Record<SpanFamily, string> = {
-  model: "bg-info/70",
-  tool: "bg-success/70",
-  mcp: "bg-accent-violet/70",
-  custom_tool: "bg-warning/70",
-  user: "bg-brand/70",
-  agent: "bg-fg-muted/70",
-  system: "bg-fg-subtle/70",
-  warn: "bg-warning/70",
-  error: "bg-danger/70",
-  schedule: "bg-info/40",
-  wakeup: "bg-info/70",
-  compaction: "bg-accent-violet/50",
-  outcome: "bg-success/50",
-  thread: "bg-fg-muted/50",
-  aux: "bg-fg-subtle/70",
-  thinking: "bg-fg-subtle/40",
-  marker: "bg-fg-subtle/40",
+export const KIND_LABEL: Record<SpanKind, string> = {
+  model: "Model",
+  tool: "Tools",
+  mcp: "Apps",
+  schedule: "Scheduled wait",
+  approval: "Waiting for approval",
+  error: "Error",
+  thinking: "Thinking",
+  message: "Messages",
+  system: "System",
+};
+
+export const FAMILY_KIND: Record<SpanFamily, SpanKind> = {
+  model: "model",
+  tool: "tool",
+  custom_tool: "tool",
+  mcp: "mcp",
+  user: "message",
+  agent: "message",
+  wakeup: "message",
+  system: "system",
+  warn: "approval",
+  error: "error",
+  schedule: "schedule",
+  compaction: "system",
+  outcome: "model",
+  thread: "system",
+  aux: "model",
+  thinking: "thinking",
+  approval: "approval",
+  marker: "system",
 };
 
 /**
@@ -111,7 +142,13 @@ export type TurnTriggerKind =
   | "custom_tool_result"
   | "init";
 
-export type TurnStatus = "completed" | "running" | "awaiting_action" | "errored" | "terminated";
+/**
+ * `approval`: the turn stopped to ask a person, and nobody has answered yet.
+ * `awaiting_client`: the turn stopped for a custom tool's result, which the
+ * app that runs the session sends back. Neither has completed: the next
+ * turn starts with the answer.
+ */
+export type TurnStatus = "completed" | "running" | "errored" | "terminated" | "approval" | "awaiting_client";
 
 export interface Turn {
   id: string;
@@ -127,27 +164,11 @@ export interface Turn {
 }
 
 export const TRIGGER_LABEL: Record<TurnTriggerKind, string> = {
-  user_message: "user message",
-  wakeup: "scheduled wakeup",
-  tool_confirmation: "tool confirmation",
-  custom_tool_result: "custom tool result",
-  init: "session init",
-};
-
-export const TRIGGER_DOT: Record<TurnTriggerKind, string> = {
-  user_message: "bg-brand",
-  wakeup: "bg-info",
-  tool_confirmation: "bg-warning",
-  custom_tool_result: "bg-warning",
-  init: "bg-fg-subtle",
-};
-
-export const STATUS_TEXT: Record<TurnStatus, string> = {
-  completed: "text-fg-subtle",
-  running: "text-info",
-  awaiting_action: "text-warning",
-  errored: "text-danger",
-  terminated: "text-danger",
+  user_message: "You",
+  wakeup: "Scheduled wake-up",
+  tool_confirmation: "Approval decision",
+  custom_tool_result: "Tool result returned",
+  init: "Session start",
 };
 
 /**
@@ -155,7 +176,6 @@ export const STATUS_TEXT: Record<TurnStatus, string> = {
  * TimelineView so a click in any TurnCard updates one shared panel.
  */
 export interface TimelineSelection {
-  spanKey: string;
-  spanLabel: string;
-  events: Event[];
+  turnId: string;
+  span: Span;
 }

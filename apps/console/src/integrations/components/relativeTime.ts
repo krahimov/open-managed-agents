@@ -1,15 +1,32 @@
-// Format a unix timestamp (ms or seconds) or ISO string into a short
-// relative-time string. Used by integrations workspace pages for the
-// "Installed 3d ago" line and the activity timeline.
+// Time helpers for records whose timestamps arrive as unix numbers.
 //
-// Coarse buckets only — exact second precision would just add noise to a UI
-// where "yesterday vs three days ago" is the load-bearing distinction.
+// Integrations and local runtimes report `created_at` / `last_heartbeat` as
+// a number that may be seconds or milliseconds depending on the adapter.
+// `toMillis` normalises either (and ISO strings) so the value can be handed
+// to <RelativeTime>, which is how every time is shown on screen.
 
+/** Normalise seconds, milliseconds, an ISO string or a Date to epoch ms. */
+export function toMillis(input: number | string | Date | null | undefined): number | null {
+  if (input == null || input === "") return null;
+  if (input instanceof Date) return input.getTime();
+  if (typeof input === "number") {
+    if (!Number.isFinite(input) || input <= 0) return null;
+    // A 10-digit value is seconds; promote it.
+    return input < 1e12 ? input * 1000 : input;
+  }
+  const t = Date.parse(input);
+  return Number.isNaN(t) ? null : t;
+}
+
+/**
+ * Coarse relative time as plain text ("3d ago"). Prefer <RelativeTime>
+ * with `toMillis` in components: it adds the absolute time on hover. This
+ * stays for callers that need a string.
+ */
 export function relativeTime(input: number | string | Date): string {
-  const now = Date.now();
-  const t = parseTime(input);
-  if (t == null) return "—";
-  const diff = now - t;
+  const t = toMillis(input);
+  if (t == null) return "unknown";
+  const diff = Date.now() - t;
   if (diff < 0) return "just now"; // clock skew or future timestamps
   const sec = Math.floor(diff / 1000);
   if (sec < 45) return "just now";
@@ -22,17 +39,4 @@ export function relativeTime(input: number | string | Date): string {
   if (day < 30) return `${Math.floor(day / 7)}w ago`;
   if (day < 365) return `${Math.floor(day / 30)}mo ago`;
   return `${Math.floor(day / 365)}y ago`;
-}
-
-function parseTime(input: number | string | Date): number | null {
-  if (input instanceof Date) return input.getTime();
-  if (typeof input === "number") {
-    // Heuristic: if value looks like seconds (10-digit), promote to ms.
-    return input < 1e12 ? input * 1000 : input;
-  }
-  if (typeof input === "string") {
-    const t = Date.parse(input);
-    return isNaN(t) ? null : t;
-  }
-  return null;
 }

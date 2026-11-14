@@ -92,9 +92,18 @@ export function EnvIcon({ className }: IconProps) {
   return <StrokeIcon className={className} d="M5 12h14M5 12a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v4a2 2 0 01-2 2M5 12a2 2 0 00-2 2v4a2 2 0 002 2h14a2 2 0 002-2v-4a2 2 0 00-2-2" />;
 }
 
-export function VaultIcon({ className }: IconProps) {
-  return <StrokeIcon className={className} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />;
-}
+/**
+ * The vault mark: a padlock with a keyhole. It has to read as "secrets kept
+ * safe" at 14 to 16px beside a name, and it must never look like a control.
+ * (lucide's own `Vault`, a safe door seen head-on, is a square with four
+ * spokes: at that size it is a box with an X in it, which reads as "close"
+ * or "blocked".) A key is the API keys' mark, so a vault is the lock.
+ *
+ * Defined once, here. Everything that shows a vault (the navigation, a
+ * reference by name, the session panel, an agent's "Runs with", the session
+ * starter's options, empty states) imports this, never an icon of its own.
+ */
+export { LockKeyholeIcon as VaultIcon } from "lucide-react";
 
 export function AppsIcon({ className }: IconProps) {
   return <StrokeIcon className={className} d="M4 4h6v6H4V4zm10 0h6v6h-6V4zM4 14h6v6H4v-6zm10 0h6v6h-6v-6z" />;
@@ -147,6 +156,11 @@ export function SlackIcon({ className }: IconProps) {
 }
 
 // ─── Generic UI icons ────────────────────────────────────────────────────
+
+// Usage/analytics — ascending line chart over a baseline.
+export function UsageIcon({ className }: IconProps) {
+  return <StrokeIcon className={className} d="M4 4v16h16M7.5 14.5l3.5-4 3 2.5 4.5-6" />;
+}
 
 export function ClockIcon({ className }: IconProps) {
   return <StrokeIcon className={className} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />;

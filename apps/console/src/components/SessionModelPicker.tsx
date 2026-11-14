@@ -6,17 +6,28 @@ import {
   type ModelCard,
   type ReasoningLevel,
 } from "@open-managed-agents/api-types";
+
 import { useApi } from "../lib/api";
 import { useApiQuery } from "../lib/useApiQuery";
 import { ModelReasoningPicker, type ModelReasoningValue } from "./ModelReasoningPicker";
 
 /**
- * Composer chip for a session: switches model + reasoning for the following
- * turns of THIS session only. Persisted server-side as the session override
- * (`metadata.model` / `metadata.reasoning_level`, honored by the harness each
- * turn) so it survives reload; the agent's own config is never touched.
- * Picking the agent's own value clears that override key (null = inherit).
+ * The model and reasoning chip of one session's composer. A change applies
+ * to the next turns of this session only: it is saved on the session
+ * (`metadata.model` / `metadata.reasoning_level`, read by the harness each
+ * turn), so it survives a reload, and the agent itself is never changed.
+ * Choosing the agent's own value clears that override (null = follow the
+ * agent). Unset reasoning follows the agent, and Medium when the agent has
+ * none, never "Instant".
+ *
+ * Renders nothing until the session has loaded.
  */
+
+export interface SessionModelPickerProps {
+  sessionId: string;
+  /** For example while a turn is being sent. */
+  disabled?: boolean;
+}
 
 interface SessionRow {
   id: string;
@@ -27,10 +38,11 @@ interface SessionRow {
 const MODEL_CARD_PARAMS = { limit: "200" };
 
 function handleOf(model: string | { id: string } | undefined): string {
-  return typeof model === "string" ? model : model?.id ?? "";
+  return typeof model === "string" ? model : (model?.id ?? "");
 }
 
-/** Effective session values: override first, then the agent's config. */
+/** What the session runs with (its override, else the agent's config), and
+ *  the agent's own values as the defaults. */
 export function sessionModelValue(session: SessionRow | undefined): {
   value: ModelReasoningValue;
   defaults: ModelReasoningValue;
@@ -46,13 +58,7 @@ export function sessionModelValue(session: SessionRow | undefined): {
   };
 }
 
-export function SessionModelPicker({
-  sessionId,
-  disabled,
-}: {
-  sessionId: string;
-  disabled?: boolean;
-}) {
+export function SessionModelPicker({ sessionId, disabled }: SessionModelPickerProps) {
   const { api } = useApi();
   const qc = useQueryClient();
   const sessionPath = `/v1/sessions/${sessionId}`;
@@ -63,7 +69,6 @@ export function SessionModelPicker({
 
   if (!session) return null;
   const { value, defaults } = sessionModelValue(session);
-  const shown = optimistic ?? value;
 
   const change = async (next: ModelReasoningValue) => {
     setOptimistic(next);
@@ -79,9 +84,9 @@ export function SessionModelPicker({
           },
         }),
       });
-      qc.setQueryData([sessionPath, {}], updated);
+      qc.setQueryData([sessionPath, {}], (prev: SessionRow | undefined) => ({ ...(prev ?? {}), ...updated }));
     } catch {
-      // api() already toasts the error; the chip snaps back.
+      // api() already reports the failure; the chip goes back.
     } finally {
       setOptimistic(null);
       setSaving(false);
@@ -91,7 +96,7 @@ export function SessionModelPicker({
   return (
     <ModelReasoningPicker
       cards={cardsRes?.data ?? []}
-      value={shown}
+      value={optimistic ?? value}
       defaults={defaults}
       onChange={(next) => void change(next)}
       disabled={disabled}

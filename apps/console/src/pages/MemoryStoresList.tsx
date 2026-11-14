@@ -1,322 +1,345 @@
 import { useMemo, useState } from "react";
-import { useNavigate } from "react-router";
-import { ArchiveIcon, TrashIcon } from "lucide-react";
+import { ArchiveIcon, CopyIcon, Trash2Icon } from "lucide-react";
 
 import { useApi } from "../lib/api";
+import { useServerFeature } from "../lib/server-features";
+import { copyText } from "../lib/clipboard";
+import { plural } from "../lib/format";
 import { useApiQuery } from "../lib/useApiQuery";
+import { useLocalSearch } from "../lib/useLocalSearch";
+import { Callout } from "../components/Callout";
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { DataTable, type ColumnDef } from "../components/DataTable";
-import { FacetedFilter } from "../components/FacetedFilter";
-import { FilterChip, CreatedFilterChip } from "../components/FilterChip";
-import { RowActionsMenu } from "../components/RowActionsMenu";
+import { Field } from "../components/Field";
+import { CreatedFilterChip } from "../components/FilterChip";
 import { Modal } from "../components/Modal";
+import { RelativeTime } from "../components/RelativeTime";
+import { RowActionsMenu, type RowAction } from "../components/RowActionsMenu";
+import { Skeleton } from "../components/Skeleton";
+import { Tip } from "../components/Tip";
+import { useMemoryEntries, type MemoryStore } from "../components/resources/memory";
+import {
+  ArchiveStatusFilter,
+  ResourceIdentity,
+  formatBytes,
+  type ArchiveStatus,
+} from "../components/resources/ResourceBits";
+import { lastWriteOf, StoreLastWrite as LastWrite } from "../components/resources/lastWrite";
+import { ResourceListError } from "../components/resources/ResourceListError";
+import { UsedBy, useResourceUsage } from "../components/resources/usage";
 import { Button } from "@/components/ui/button";
-import { PopoverContent } from "@/components/ui/popover";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { withReason } from "../lib/failure-text";
 
-interface MemoryStore {
-  id: string;
-  name: string;
-  description?: string;
-  created_at: string;
-  archived_at?: string;
+const SUBTITLE = "What your agents remember between sessions, kept as folders of notes.";
+
+/** "12 entries" over "2.9 KB in 7 folders". */
+function StoreSize({ store }: { store: MemoryStore }) {
+  const { stats, isLoading } = useMemoryEntries(store.id);
+  if (isLoading || !stats) return <Skeleton className="h-3.5 w-20" rounded="sm" />;
+  if (stats.count === 0) return <span className="text-fg-subtle">Empty</span>;
+  return (
+    <div className="min-w-0 leading-tight">
+      <div className="truncate text-fg">{plural(stats.count, "entry", "entries")}</div>
+      <div className="truncate text-xs text-fg-subtle">
+        {formatBytes(stats.bytes)}
+        {stats.folders > 0 ? ` in ${plural(stats.folders, "folder")}` : ""}
+      </div>
+    </div>
+  );
 }
 
-type StatusValue = "any" | "active" | "archived";
+/**
+ * When an agent or a person last wrote to the store: from its entries, never
+ * from the store's own date. An empty store has no last write: Contents
+ * already says "Empty", so this column shows a quiet dash (its words on
+ * hover and to a screen reader) instead of saying it again, cut short.
+ */
+function StoreLastWrite({ store }: { store: MemoryStore }) {
+  const { stats, isLoading } = useMemoryEntries(store.id);
+  if (!isLoading && lastWriteOf(stats).kind === "never") {
+    return (
+      <Tip label="Nothing written yet">
+        <span className="text-fg-faint">
+          <span aria-hidden="true">—</span>
+          <span className="sr-only">Nothing written yet</span>
+        </span>
+      </Tip>
+    );
+  }
+  return <LastWrite stats={stats} isLoading={isLoading} className="text-fg-muted" />;
+}
 
-const STATUS_OPTIONS: { value: StatusValue; label: string }[] = [
-  { value: "any", label: "All" },
-  { value: "active", label: "Active" },
-  { value: "archived", label: "Archived" },
-];
-
+/**
+ * Memory — the stores agents remember in. One row per store: what it is
+ * for, how much is in it, which agents use it and when it was last
+ * written to.
+ */
 export function MemoryStoresList() {
   const { api } = useApi();
-  const nav = useNavigate();
+  const usage = useResourceUsage();
 
-  // Server-driven filter state. Each piece flows into storesParams below
-  // → useApiQuery refetches on params change → the list reflects exactly
-  // what the server returned (no client-side faking).
-  const [status, setStatus] = useState<StatusValue>("active");
+  // Server-driven filters. /v1/memory_stores has no text search, so the
+  // search field narrows the stores in the browser, by name and description
+  // (the list arrives whole).
+  const [status, setStatus] = useState<ArchiveStatus>("active");
   const [created, setCreated] = useState<{ after?: number; before?: number }>({});
-  // Search box state is wired but not sent to the server: /v1/memory_stores
-  // has no `q` column yet (name lives only in the row itself, no JSON
-  // blob like /v1/agents). The input stays visible so the toolbar shape
-  // matches every other list page; the moment the backend gets a hot
-  // column, drop it into `storesParams` and this comment with it. No
-  // client-side filter() — that would lie about which rows the server
-  // actually returned.
-  const [search, setSearch] = useState("");
-
-  const [showCreate, setShowCreate] = useState(false);
-  const [formName, setFormName] = useState("");
-  const [formDesc, setFormDesc] = useState("");
-  const [formError, setFormError] = useState<string | null>(null);
 
   const storesParams = useMemo(
     () => ({
       status,
-      ...(created.after !== undefined
-        ? { created_after: new Date(created.after).toISOString() }
-        : {}),
-      ...(created.before !== undefined
-        ? { created_before: new Date(created.before).toISOString() }
-        : {}),
+      ...(created.after !== undefined ? { created_after: new Date(created.after).toISOString() } : {}),
+      ...(created.before !== undefined ? { created_before: new Date(created.before).toISOString() } : {}),
     }),
     [status, created.after, created.before],
   );
 
-  const {
-    data: resp,
-    isLoading: loading,
-    refetch,
-  } = useApiQuery<{ data: MemoryStore[] }>("/v1/memory_stores", storesParams);
+  const { data: resp, isLoading: loading, error, refetch } = useApiQuery<{ data: MemoryStore[] }>(
+    "/v1/memory_stores",
+    storesParams,
+  );
   const stores = resp?.data ?? [];
+  const found = useLocalSearch(stores, (s) => [s.name, s.description]);
 
-  const createStore = async () => {
-    setFormError(null);
+  // Create
+  const [showCreate, setShowCreate] = useState(false);
+  const [form, setForm] = useState({ name: "", description: "" });
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const closeCreate = () => {
+    if (creating) return;
+    setShowCreate(false);
+    setCreateError(null);
+  };
+  const create = async () => {
+    setCreating(true);
+    setCreateError(null);
     try {
       await api("/v1/memory_stores", {
         method: "POST",
-        body: JSON.stringify({ name: formName, description: formDesc || undefined }),
+        body: JSON.stringify({ name: form.name.trim(), description: form.description.trim() || undefined }),
+        silentErrors: true,
       });
       setShowCreate(false);
-      setFormName("");
-      setFormDesc("");
+      setForm({ name: "", description: "" });
       void refetch();
     } catch (e) {
-      setFormError(errMsg(e));
+      setCreateError(withReason("The store could not be created", e));
+    } finally {
+      setCreating(false);
     }
   };
 
-  // TanStack column defs. Required columns (name) opt out of the Columns
-  // hide menu so the user can't end up with a table that has nothing
-  // identifying.
+  const [confirm, setConfirm] = useState<{ kind: "archive" | "delete"; store: MemoryStore } | null>(null);
+
+  // Archiving and deleting a store need a server that has those writes.
+  const writable = useServerFeature("memory_writes");
+  const actionsFor = (s: MemoryStore): RowAction[] => [
+    { label: "Copy store id", icon: <CopyIcon />, onSelect: () => void copyText(s.id) },
+    ...(writable
+      ? [
+          {
+            label: "Archive",
+            icon: <ArchiveIcon />,
+            disabled: !!s.archived_at,
+            onSelect: () => setConfirm({ kind: "archive", store: s }),
+          },
+          { label: "Delete", icon: <Trash2Icon />, destructive: true, onSelect: () => setConfirm({ kind: "delete", store: s }) },
+        ]
+      : []),
+  ];
+
   const columns = useMemo<ColumnDef<MemoryStore>[]>(
     () => [
       {
         id: "name",
         accessorKey: "name",
-        header: "Name",
-        cell: ({ row }) => (
-          <span className="font-medium text-fg">{row.original.name}</span>
-        ),
+        header: "Memory store",
+        size: 470,
+        minSize: 240,
         enableHiding: false,
-      },
-      {
-        id: "id",
-        accessorKey: "id",
-        header: "ID",
+        enableSorting: true,
         cell: ({ row }) => (
-          <span title={row.original.id} className="font-mono text-xs text-fg-muted">
-            {row.original.id}
-          </span>
+          <ResourceIdentity
+            name={row.original.name}
+            secondary={row.original.description?.trim() || "No description"}
+            archived={!!row.original.archived_at}
+          />
         ),
       },
       {
-        id: "status",
-        accessorFn: (s) => (s.archived_at ? "archived" : "active"),
-        header: "Status",
-        cell: ({ row }) => (
-          <span
-            className={`inline-flex items-center text-xs px-2 py-0.5 rounded-full ${
-              row.original.archived_at
-                ? "bg-bg-surface text-fg-subtle"
-                : "bg-success-subtle text-success"
-            }`}
-          >
-            {row.original.archived_at ? "archived" : "active"}
-          </span>
-        ),
+        id: "size",
+        header: "Contents",
+        size: 220,
+        cell: ({ row }) => <StoreSize store={row.original} />,
       },
       {
-        id: "created",
-        accessorFn: (s) => s.created_at,
-        header: "Created",
-        cell: ({ row }) => (
-          <span className="text-fg-muted">
-            {new Date(row.original.created_at).toLocaleDateString()}
-          </span>
-        ),
+        id: "used_by",
+        header: "Used by",
+        size: 230,
+        // Also on the store's page: it gives way before the table scrolls sideways.
+        meta: { hideBelow: 720 },
+        cell: ({ row }) => <UsedBy agents={usage.memoryStores.get(row.original.id)} loading={usage.isLoading} />,
+      },
+      {
+        id: "updated",
+        header: "Last write",
+        size: 130,
+        cell: ({ row }) => <StoreLastWrite store={row.original} />,
       },
       {
         id: "actions",
         header: "",
-        cell: ({ row }) => {
-          const s = row.original;
-          const archived = !!s.archived_at;
-          return (
-            <RowActionsMenu
-              label={`Actions for ${s.name}`}
-              actions={[
-                {
-                  label: "Archive",
-                  icon: <ArchiveIcon className="size-4" />,
-                  disabled: archived,
-                  onSelect: async () => {
-                    try {
-                      await api(`/v1/memory_stores/${s.id}/archive`, {
-                        method: "POST",
-                        body: "{}",
-                      });
-                      void refetch();
-                    } catch {}
-                  },
-                },
-                {
-                  label: "Delete",
-                  icon: <TrashIcon className="size-4" />,
-                  destructive: true,
-                  onSelect: async () => {
-                    if (!confirm(`Delete memory store ${s.name}? This can't be undone.`)) return;
-                    try {
-                      await api(`/v1/memory_stores/${s.id}`, { method: "DELETE" });
-                      void refetch();
-                    } catch {}
-                  },
-                },
-              ]}
-            />
-          );
-        },
-        enableHiding: false,
         size: 56,
+        enableHiding: false,
+        cell: ({ row }) => (
+          <RowActionsMenu label={`Actions for ${row.original.name}`} actions={actionsFor(row.original)} />
+        ),
       },
     ],
-    [api, refetch],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [usage, writable],
   );
 
-  // Active-filter chip display — kept undefined when matching the default
-  // so the chip reads "Status ▾" rather than "Status: All ▾".
-  const statusDisplay =
-    status === "any" ? undefined : STATUS_OPTIONS.find((o) => o.value === status)?.label;
+  const dated = created.after !== undefined || created.before !== undefined;
+  const filtered = found.searching || dated;
 
-  const filters = (
-    <>
-      <FilterChip
-        label="Status"
-        active={status !== "any"}
-        display={statusDisplay}
-        onClear={() => setStatus("any")}
-      >
-        <PopoverContent
-          align="start"
-          sideOffset={4}
-          collisionPadding={8}
-          className="w-48 p-0"
-        >
-          <FacetedFilter
-            options={STATUS_OPTIONS}
-            value={status}
-            onValueChange={(v) => setStatus(v as StatusValue)}
-            searchPlaceholder="Status..."
-          />
-        </PopoverContent>
-      </FilterChip>
-
-      <CreatedFilterChip value={created} onChange={setCreated} />
-    </>
-  );
-
-  const inputCls =
-    "w-full border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
+  if (error && stores.length === 0) {
+    return (
+      <ResourceListError
+        title="Memory"
+        subtitle={SUBTITLE}
+        what="Memory stores"
+        error={error}
+        retry={() => void refetch()}
+      />
+    );
+  }
 
   return (
     <DataTable<MemoryStore>
+      title="Memory"
+      subtitle={SUBTITLE}
       createLabel="+ New store"
-      onCreate={() => {
-        setShowCreate(true);
-        setFormError(null);
-      }}
-      searchPlaceholder="Search memory stores..."
-      searchValue={search}
-      onSearchChange={setSearch}
-      filters={filters}
-      data={stores}
+      onCreate={() => setShowCreate(true)}
+      searchPlaceholder="Search memory"
+      searchValue={found.search}
+      onSearchChange={found.setSearch}
+      filters={
+        <>
+          {/* Nothing can be archived on a server without memory writes. */}
+          {writable && <ArchiveStatusFilter value={status} onChange={setStatus} />}
+          <CreatedFilterChip value={created} onChange={setCreated} />
+        </>
+      }
+      summary={loading || found.rows.length === 0 ? undefined : plural(found.rows.length, "store")}
+      data={found.rows}
       loading={loading}
       getRowId={(s) => s.id}
-      onRowClick={(s) => nav(`/memory/${s.id}`)}
-      emptyTitle="No memory stores"
-      emptyKind="memory"
-      emptyAction={
-        <Button
-          onClick={() => {
-            setShowCreate(true);
-            setFormError(null);
-          }}
-        >
-          + New store
-        </Button>
-      }
-      emptySubtitle="Create a memory store to give your agents long-term context across sessions."
+      rowHref={(s) => `/memory/${s.id}`}
       columns={columns}
+      emptyKind="memory"
+      emptyTitle={
+        found.searching
+          ? `No memory stores match “${found.query}”`
+          : filtered
+            ? "No memory stores match"
+            : status === "archived"
+              ? "No archived stores"
+              : "No memory stores yet"
+      }
+      emptySubtitle={
+        found.searching
+          ? `Stores are searched by name and description, not by what is written in them.${dated ? " The date range is narrowing the list too." : ""}`
+          : filtered
+            ? "Widen the date range to see more."
+            : status === "archived"
+              ? "Stores you archive become read-only and are kept here."
+              : "A memory store is a folder of notes that outlives a session. Attach one to an agent and it can pick up where it left off: preferences, decisions, customer context."
+      }
+      filtered={filtered}
+      emptyAction={
+        filtered ? (
+          <Button
+            variant="outline"
+            onClick={() => {
+              found.setSearch("");
+              setCreated({});
+            }}
+          >
+            {found.searching && !dated ? "Clear search" : "Clear filters"}
+          </Button>
+        ) : status !== "archived" ? (
+          <Button onClick={() => setShowCreate(true)}>New store</Button>
+        ) : undefined
+      }
     >
       <Modal
         open={showCreate}
-        onClose={() => {
-          setShowCreate(false);
-          setFormError(null);
-        }}
-        title="New Memory Store"
+        onClose={closeCreate}
+        title="New memory store"
+        subtitle="A place for one kind of knowledge. Agents see the name and description when they decide where to look."
         footer={
           <>
-            <Button
-              variant="ghost"
-              onClick={() => {
-                setShowCreate(false);
-                setFormError(null);
-              }}
-            >
+            <Button variant="ghost" onClick={closeCreate} disabled={creating}>
               Cancel
             </Button>
-            <Button onClick={createStore} disabled={!formName}>
-              Create
+            <Button onClick={() => void create()} disabled={!form.name.trim()} loading={creating}>
+              Create store
             </Button>
           </>
         }
       >
-        <div className="space-y-3">
-          {formError && (
-            <div className="text-sm text-danger bg-danger-subtle border border-danger/30 rounded-lg px-3 py-2">
-              {formError}
-            </div>
-          )}
-          <div>
-            <label
-              htmlFor="memory-store-name"
-              className="text-sm text-fg-muted block mb-1"
-            >
-              Name
-            </label>
-            <input
-              id="memory-store-name"
-              placeholder="e.g. User Preferences"
-              value={formName}
-              onChange={(e) => setFormName(e.target.value)}
-              className={inputCls}
+        <form
+          className="space-y-5"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (form.name.trim() && !creating) void create();
+          }}
+        >
+          {createError && <Callout tone="danger">{createError}</Callout>}
+          <Field label="Name" hint="Also the folder name inside the sandbox: /mnt/memory/<name>/">
+            <Input
+              value={form.name}
+              onChange={(e) => setForm({ ...form, name: e.target.value })}
+              placeholder="Support playbook"
+              autoComplete="off"
+              autoFocus
             />
-          </div>
-          <div>
-            <label
-              htmlFor="memory-store-description"
-              className="text-sm text-fg-muted block mb-1"
-            >
-              Description <span className="text-fg-subtle">(optional)</span>
-            </label>
-            <input
-              id="memory-store-description"
-              placeholder="What's stored here?"
-              value={formDesc}
-              onChange={(e) => setFormDesc(e.target.value)}
-              className={inputCls}
+          </Field>
+          <Field label="Description" hint="Optional. What is stored here, and when an agent should read it.">
+            <Textarea
+              value={form.description}
+              onChange={(e) => setForm({ ...form, description: e.target.value })}
+              rows={3}
+              placeholder="Known issues, policies and escalation contacts for the support team"
             />
-          </div>
-        </div>
+          </Field>
+        </form>
       </Modal>
+
+      <ConfirmDialog
+        open={!!confirm}
+        onClose={() => setConfirm(null)}
+        destructive={confirm?.kind === "delete"}
+        title={confirm?.kind === "delete" ? `Delete ${confirm.store.name}?` : `Archive ${confirm?.store.name ?? "store"}?`}
+        body={
+          confirm?.kind === "delete"
+            ? "The store, every entry in it and its version history are removed. This cannot be undone."
+            : "The store becomes read-only and can no longer be attached to new sessions. Archiving cannot be reversed."
+        }
+        confirmLabel={confirm?.kind === "delete" ? "Delete store" : "Archive store"}
+        onConfirm={async () => {
+          if (!confirm) return;
+          if (confirm.kind === "delete") {
+            await api(`/v1/memory_stores/${confirm.store.id}`, { method: "DELETE" });
+          } else {
+            await api(`/v1/memory_stores/${confirm.store.id}/archive`, { method: "POST", body: "{}" });
+          }
+          void refetch();
+        }}
+      />
     </DataTable>
   );
-}
-
-function errMsg(e: unknown): string {
-  if (e instanceof Error) return e.message;
-  if (typeof e === "string") return e;
-  return "Unknown error";
 }

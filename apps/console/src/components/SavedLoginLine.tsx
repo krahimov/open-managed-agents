@@ -1,27 +1,39 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router";
+
+import { inlineLink, quietLink } from "@/lib/links";
+import { cn } from "@/lib/utils";
+
 import type { Event } from "../lib/events";
 import { openOAuthPopup, subscribeOAuthMessages } from "../lib/oauth-popup";
+import { serverInfo } from "./sessions/tools";
 
 /**
- * Setup attached a saved login instead of asking (system.saved_login_attached):
- * says which vault the agent got and offers Switch account. Switching signs in
- * through the provider and saves the result in a NEW vault, so a login other
- * agents share is never overwritten. The durable system.access_granted (the
- * `switched` prop) is what marks it done; popup messages only clear "waiting".
+ * One line under the turn for a `system.saved_login_attached` event: setup
+ * found a working login for one of the agent's MCP servers and attached its
+ * vault instead of asking. The line says which vault the agent got (by
+ * name, linked) and, when the login can be replaced by an OAuth sign-in,
+ * offers "Switch account".
+ *
+ * Switching signs in through the provider (`openOAuthPopup`, carrying
+ * `session_id` and `request_id`) and saves the result in a NEW vault
+ * (`new_vault_name`, never `vault_id`), so a login other agents share is
+ * never overwritten. The durable `switched` prop (a `system.access_granted`
+ * for this request in the log) is what marks the switch done; popup
+ * messages only clear "waiting", and a closed popup stops waiting too.
  */
-export function SavedLoginLine({
-  event,
-  sessionId: sessionIdProp,
-  switched = false,
-}: {
+export interface SavedLoginLineProps {
+  /** The `system.saved_login_attached` event. */
   event: Event;
   /** Defaults to the :id route param (SessionDetail); SessionChat must pass
-   *  it explicitly — its route param is the AGENT id. */
+   *  it explicitly, since its route param is the AGENT id. */
   sessionId?: string;
-  /** The session's event log holds a system.access_granted for this line. */
+  /** The session's event log holds a `system.access_granted` for this
+   *  event's request_id (C3's access_granted fold). */
   switched?: boolean;
-}) {
+}
+
+export function SavedLoginLine({ event, sessionId: sessionIdProp, switched = false }: SavedLoginLineProps) {
   const { id: routeId } = useParams();
   const sessionId = sessionIdProp ?? routeId;
   const ev = event as unknown as {
@@ -33,8 +45,8 @@ export function SavedLoginLine({
     agent_name?: string;
     can_switch?: boolean;
   };
-  const service = ev.service ?? "service";
-  const label = service.charAt(0).toUpperCase() + service.slice(1);
+  const service = (ev.service ?? "service").toLowerCase();
+  const app = serverInfo(service);
   const [waiting, setWaiting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const popupRef = useRef<Window | null>(null);
@@ -47,13 +59,13 @@ export function SavedLoginLine({
     if (!waiting) return;
     const handle = (e: MessageEvent) => {
       if (e.origin && e.origin !== window.location.origin) return;
-      const data = (e as MessageEvent<{ type?: string; request_id?: string | null; message?: string }>).data;
+      const data = e.data as { type?: string; request_id?: string | null; message?: string } | null | undefined;
       if (data?.type === "oauth_complete") {
         if (data.request_id && data.request_id !== ev.request_id) return;
         setWaiting(false);
       } else if (data?.type === "oauth_error") {
         setWaiting(false);
-        setError(data.message ?? "Sign-in failed");
+        setError(data.message ?? `${app.label} did not complete the sign-in. Try again.`);
       }
     };
     const unsubscribe = subscribeOAuthMessages(handle);
@@ -65,7 +77,7 @@ export function SavedLoginLine({
       unsubscribe();
       window.clearInterval(closedCheck);
     };
-  }, [waiting, ev.request_id]);
+  }, [waiting, ev.request_id, app.label]);
 
   const switchAccount = () => {
     setError(null);
@@ -79,48 +91,63 @@ export function SavedLoginLine({
     if (ev.request_id) params.set("request_id", ev.request_id);
     const popup = openOAuthPopup(params, `oauth-${service}`);
     if (!popup) {
-      setError("Your browser blocked the sign-in window. Allow popups for this site and try again.");
+      setError("Your browser blocked the sign-in window. Allow pop-ups for this site and try again.");
       return;
     }
     popupRef.current = popup;
     setWaiting(true);
   };
 
+  const canSwitch = !!ev.can_switch && !!ev.mcp_server_url;
+  const Icon = app.icon;
+
   return (
-    <div className="max-w-2xl text-xs text-fg-subtle">
-      <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5">
-        {switched ? (
-          <span>
-            <span className="font-medium text-fg">{label}</span>: using the account you just signed in with
-          </span>
-        ) : (
-          <span>
-            <span className="font-medium text-fg">{label}</span>: using the saved login from{" "}
-            <Link to={`/vaults/${ev.vault_id ?? ""}`} className="font-mono underline underline-offset-2">
-              {ev.vault_name ?? ev.vault_id}
-            </Link>
-          </span>
+    <div className="flex min-h-8 items-start gap-2 py-1.5 text-small text-fg-muted" data-testid="saved-login">
+      <Icon className="mt-0.5 size-4 shrink-0 text-fg-subtle" />
+      <div className="min-w-0">
+        <p className="min-w-0">
+          {switched ? (
+            <>
+              <span className="font-medium text-fg">{app.label}</span> is using the account you just signed in with.
+            </>
+          ) : (
+            <>
+              <span className="font-medium text-fg">{app.label}</span> is using the saved login in{" "}
+              {ev.vault_id ? (
+                <Link to={`/vaults/${ev.vault_id}`} className={inlineLink}>
+                  {ev.vault_name?.trim() || "this vault"}
+                </Link>
+              ) : (
+                <span className="font-medium text-fg">{ev.vault_name?.trim() || "a vault"}</span>
+              )}
+              .
+            </>
+          )}
+          {canSwitch && (
+            <>
+              {" "}
+              <button
+                type="button"
+                onClick={switchAccount}
+                disabled={waiting}
+                className={cn(quietLink, "disabled:text-fg-subtle disabled:no-underline")}
+              >
+                {waiting ? "Waiting for sign-in…" : "Switch account"}
+              </button>
+            </>
+          )}
+        </p>
+        {waiting && (
+          <p className="mt-0.5 text-xs text-fg-subtle">
+            Not offered a choice of account? Sign out of {app.label} in that window, then try again.
+          </p>
         )}
-        {ev.can_switch && ev.mcp_server_url && (
-          <>
-            <span aria-hidden>·</span>
-            <button
-              type="button"
-              onClick={switchAccount}
-              disabled={waiting}
-              className="underline underline-offset-2 hover:text-fg disabled:no-underline disabled:opacity-70"
-            >
-              {waiting ? "Waiting for sign-in…" : "Switch account"}
-            </button>
-          </>
+        {error && (
+          <p role="alert" className="mt-0.5 text-xs text-danger">
+            {error}
+          </p>
         )}
       </div>
-      {waiting && (
-        <div className="mt-0.5">
-          Not offered a choice of account? Sign out of {label} in that window, then try again.
-        </div>
-      )}
-      {error && <div className="mt-0.5 text-danger">{error}</div>}
     </div>
   );
 }

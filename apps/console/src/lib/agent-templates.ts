@@ -7,6 +7,13 @@ export interface AgentTemplate {
   mcpServers: Array<{ name: string; type: "url"; url: string }>;
   skills: Array<{ type: "anthropic" | "custom"; skill_id: string; version?: string }>;
   tags: string[];
+  /** The glyph an agent created from this template is born with, as stored
+   *  in `metadata.avatar` (see `lib/agent-face.ts`). The gallery card wears
+   *  it and the agent keeps it, whatever it is renamed to. The tint is left
+   *  to the glyph's family, so a second agent from the same template still
+   *  gets a colour of its own. The blank template has none: its agent's
+   *  face is read from the name the person gives it. */
+  face?: string;
 }
 
 export const AGENT_TEMPLATES: AgentTemplate[] = [
@@ -22,6 +29,7 @@ export const AGENT_TEMPLATES: AgentTemplate[] = [
   },
   {
     id: "deep-research",
+    face: "telescope",
     name: "Deep researcher",
     description: "Conducts multi-step web research with source synthesis and citations.",
     model: "",
@@ -39,6 +47,7 @@ Be skeptical. If sources conflict, say so and explain which you find more credib
   },
   {
     id: "structured-extractor",
+    face: "scan",
     name: "Structured extractor",
     description: "Parses unstructured text into a typed JSON schema.",
     model: "",
@@ -56,6 +65,7 @@ When the input is ambiguous, pick the most conservative interpretation and note 
   },
   {
     id: "field-monitor",
+    face: "radar",
     name: "Field monitor",
     description: "Scans software blogs for a topic and writes a weekly what-changed brief.",
     model: "",
@@ -76,6 +86,7 @@ Be ruthless about signal. A paper that restates a known result with a new benchm
   },
   {
     id: "support-agent",
+    face: "headset",
     name: "Support agent",
     description: "Answers customer questions from your docs and knowledge base, and escalates when needed.",
     model: "",
@@ -95,6 +106,7 @@ Match the customer's tone. Be warm but don't pad. One emoji max.`,
   },
   {
     id: "incident-commander",
+    face: "siren",
     name: "Incident commander",
     description: "Triages a Sentry alert, opens a Linear incident ticket, and runs the Slack war room.",
     model: "",
@@ -118,6 +130,7 @@ Be decisive. If you're >70% confident it's a specific deploy, say so and recomme
   },
   {
     id: "feedback-miner",
+    face: "pickaxe",
     name: "Feedback miner",
     description: "Clusters raw feedback from Slack and Notion into themes and drafts Asana tasks for the top asks.",
     model: "",
@@ -139,6 +152,7 @@ Don't file tasks for clusters with fewer than 3 distinct voices — note them in
   },
   {
     id: "sprint-retro-facilitator",
+    face: "loop",
     name: "Sprint retro facilitator",
     description: "Pulls a closed sprint from Linear, synthesizes themes, and writes the retro doc before the meeting.",
     model: "",
@@ -159,6 +173,7 @@ Be specific. "Communication was bad" is useless; "three tickets were re-assigned
   },
   {
     id: "support-to-eng-escalator",
+    face: "escalate",
     name: "Support-to-eng escalator",
     description: "Reads an Intercom conversation, reproduces the bug, and files a linked Jira issue with repro steps.",
     model: "",
@@ -181,6 +196,7 @@ If you can't repro, say so explicitly and list what you tried — don't file a v
   },
   {
     id: "data-analyst",
+    face: "chart",
     name: "Data analyst",
     description: "Load, explore, and visualize data; build reports and answer questions from datasets.",
     model: "",

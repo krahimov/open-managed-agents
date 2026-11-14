@@ -1,18 +1,21 @@
-<svg width="64" height="64" viewBox="0 0 64 64" fill="none" role="img" aria-label="orrery" xmlns="http://www.w3.org/2000/svg">
-  <style>
-    .ink { stroke: #17171a; }
-    .hub { fill: #17171a; }
-    .dot { fill: #d9564a; }
-    @media (prefers-color-scheme: dark) {
-      .ink { stroke: #f1f1f3; }
-      .hub { fill: #f1f1f3; }
-      .dot { fill: #ff8d7e; }
-    }
-  </style>
-  <g class="ink" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M32 32l12-12"/>
-    <circle cx="32" cy="32" r="17"/>
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" role="img" aria-label="Orrery" xmlns="http://www.w3.org/2000/svg">
+  <!-- The Orrery mark as Muse presents it: a cream ring, hand and hub on an
+       ink tile, with the orbiting body lit by the peach, rose and lilac wash.
+       Same geometry as src/components/Logo.tsx (a 32 grid, doubled). -->
+  <defs>
+    <linearGradient id="body" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#f6b98a"/>
+      <stop offset="0.55" stop-color="#f08fa6"/>
+      <stop offset="1" stop-color="#b9a0f5"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="19" fill="#261925"/>
+  <g transform="translate(32 32) scale(0.72) translate(-32 -32)">
+    <g stroke="#fefbfa" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M32 32l12-12"/>
+      <circle cx="32" cy="32" r="17"/>
+    </g>
+    <circle cx="32" cy="32" r="4.5" fill="#fefbfa"/>
+    <circle cx="44" cy="20" r="8" fill="url(#body)" stroke="#261925" stroke-width="3"/>
   </g>
-  <circle class="hub" cx="32" cy="32" r="4.5"/>
-  <circle class="dot" cx="44" cy="20" r="7"/>
 </svg>

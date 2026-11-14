@@ -81,7 +81,7 @@ describe("AgentComputerPanel", () => {
     renderPanel();
 
     expect(await screen.findByText(/runs each session in a fresh sandbox/)).toBeInTheDocument();
-    expect(screen.getByText(/click Edit, open the Sandbox tab/)).toHaveTextContent(
+    expect(screen.getByText(/edit the agent, open All settings and, under Sandbox/)).toHaveTextContent(
       "choose a default environment marked “persistent agent computer”",
     );
     expect(screen.queryByText(/not enabled/)).not.toBeInTheDocument();
@@ -116,9 +116,30 @@ describe("AgentComputerPanel", () => {
     renderPanel({ defaultEnvironment: undefined });
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
-    expect(await screen.findByText("Loading computer...")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("region", { name: "Computer" })).toHaveAttribute("aria-busy", "true"));
     expect(screen.queryByText(/fresh sandbox/)).not.toBeInTheDocument();
     expect(screen.queryByText(/next session starts/)).not.toBeInTheDocument();
+  });
+
+  it("offers the agent's settings where it says how to get a computer", async () => {
+    fetchMock.mockResolvedValue(Response.json({ machine: null, supported: false }));
+    const onEdit = vi.fn();
+
+    renderPanel({ onEdit });
+
+    fireEvent.click(await screen.findByRole("button", { name: "Edit agent" }));
+    expect(onEdit).toHaveBeenCalledOnce();
+  });
+
+  it("renders nothing on a server without agent computers", async () => {
+    // A server whose console fallback answers unknown paths with the app page.
+    fetchMock.mockResolvedValue(new Response("<!doctype html><html></html>", { headers: { "content-type": "text/html" } }));
+
+    const view = renderPanel();
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    await waitFor(() => expect(view.container).toBeEmptyDOMElement());
+    expect(screen.queryByText(/could not be loaded/)).not.toBeInTheDocument();
   });
 
   it("renders nothing for an agent on a local runtime without a computer", async () => {

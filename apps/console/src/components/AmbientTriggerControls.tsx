@@ -1,235 +1,208 @@
+import { useMemo } from "react";
+
+import { Checkbox } from "@/components/ui/checkbox";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+
 import {
   AMBIENT_SCHEDULE_PRESETS,
   AMBIENT_TRIGGER_SOURCES,
   WEEKDAYS,
+  buildAmbientTrigger,
   eventOptionsForSource,
   withAmbientTriggerSource,
+  type AmbientSchedulePreset,
   type AmbientTriggerDraft,
-  type AmbientTriggerSource,
 } from "../lib/ambient-controls";
-import type { ReactNode } from "react";
+import { ChoicePills, PickSelect } from "./agents/controls";
+import { TRIGGER_SOURCE, describeTrigger } from "./agents/triggers";
+import { Disclosure } from "./Disclosure";
+import { Field } from "./Field";
+import { LocalCombobox } from "./LocalCombobox";
+import { TimeField } from "./TimeField";
 
 interface AmbientTriggerControlsProps {
   value: AmbientTriggerDraft;
   onChange: (value: AmbientTriggerDraft) => void;
-  inputClassName: string;
 }
 
-export function AmbientTriggerControls({
-  value,
-  onChange,
-  inputClassName,
-}: AmbientTriggerControlsProps) {
-  const eventOptions = eventOptionsForSource(value.source);
-  return (
-    <div className="space-y-3">
-      <div className="grid gap-3 sm:grid-cols-2">
-        <AmbientControlField label="Trigger">
-          <select
-            value={value.source}
-            onChange={(e) =>
-              onChange(withAmbientTriggerSource(value, e.target.value as AmbientTriggerSource))
-            }
-            className={inputClassName}
-          >
-            {AMBIENT_TRIGGER_SOURCES.map((source) => (
-              <option key={source} value={source}>
-                {source}
-              </option>
-            ))}
-          </select>
-        </AmbientControlField>
+const PRESET_LABEL: Record<AmbientSchedulePreset, string> = {
+  hourly: "Every hour",
+  daily: "Every day",
+  weekdays: "Every weekday",
+  weekly: "Every week",
+  monthly: "Every month",
+  custom: "Custom (cron)",
+};
 
-        {value.source === "schedule" ? (
-          <AmbientControlField label="Repeat">
-            <select
-              value={value.schedulePreset}
-              onChange={(e) =>
-                onChange({
-                  ...value,
-                  schedulePreset: e.target.value as AmbientTriggerDraft["schedulePreset"],
-                })
-              }
-              className={inputClassName}
-            >
-              {AMBIENT_SCHEDULE_PRESETS.map((preset) => (
-                <option key={preset} value={preset}>
-                  {presetLabel(preset)}
-                </option>
-              ))}
-            </select>
-          </AmbientControlField>
-        ) : (
-          <AmbientControlField label="Event">
-            <select
-              value={value.eventPreset}
-              onChange={(e) => onChange({ ...value, eventPreset: e.target.value })}
-              className={inputClassName}
-            >
-              {eventOptions.map((event) => (
-                <option key={event.value} value={event.value}>
-                  {event.label}
-                </option>
-              ))}
-            </select>
-          </AmbientControlField>
-        )}
+const SOURCE_OPTIONS = AMBIENT_TRIGGER_SOURCES.map((source) => ({
+  value: source,
+  label: TRIGGER_SOURCE[source].label,
+  icon: TRIGGER_SOURCE[source].icon,
+}));
+
+const PRESET_OPTIONS = AMBIENT_SCHEDULE_PRESETS.map((preset) => ({ value: preset, label: PRESET_LABEL[preset] }));
+const MINUTE_OPTIONS = ["00", "15", "30", "45"].map((m) => ({ value: m, label: `:${m} past the hour` }));
+const MONTH_DAY_OPTIONS = Array.from({ length: 31 }, (_, i) => ({ value: String(i + 1), label: `Day ${i + 1}` }));
+
+function timezones(): string[] {
+  try {
+    const supported = (Intl as unknown as { supportedValuesOf?: (key: string) => string[] }).supportedValuesOf?.("timeZone");
+    if (supported?.length) return ["UTC", ...supported.filter((z) => z !== "UTC")];
+  } catch {
+    // older engines: fall through to the short list
+  }
+  return ["UTC", "America/New_York", "America/Chicago", "America/Los_Angeles", "Europe/London", "Europe/Berlin", "Asia/Tokyo"];
+}
+
+/**
+ * What wakes the agent: a source (schedule, webhook, an app), then the
+ * details for that source. Used by the trigger dialog on the agent page
+ * and by the Triggers section of the new-agent dialog.
+ *
+ * The component only edits the draft. `buildAmbientTrigger(draft)` in
+ * `lib/ambient-controls` turns it into the API's trigger object.
+ */
+export function AmbientTriggerControls({ value, onChange }: AmbientTriggerControlsProps) {
+  const eventOptions = eventOptionsForSource(value.source);
+  const zones = useMemo(timezones, []);
+
+  // A sentence that restates the choice, so the result is never a guess.
+  const preview = useMemo(() => {
+    try {
+      return describeTrigger(buildAmbientTrigger(value));
+    } catch {
+      return null; // the advanced override is not valid JSON yet
+    }
+  }, [value]);
+
+  return (
+    <div className="space-y-5">
+      <div>
+        <div className="mb-1.5 text-small leading-5 font-medium text-fg">Wakes on</div>
+        <ChoicePills
+          label="Trigger source"
+          value={value.source}
+          onChange={(source) => onChange(withAmbientTriggerSource(value, source))}
+          options={SOURCE_OPTIONS}
+        />
+        <p className="mt-1.5 text-xs text-fg-subtle">{TRIGGER_SOURCE[value.source].hint}.</p>
       </div>
 
-      {value.source === "schedule" && (
-        <SchedulePresetFields
-          value={value}
-          onChange={onChange}
-          inputClassName={inputClassName}
-        />
-      )}
-
-      <details className="rounded-md border border-border bg-bg-surface px-3 py-2">
-        <summary className="cursor-pointer text-xs font-medium text-fg-muted">
-          Advanced config override
-        </summary>
-        <label className="block mt-3 text-xs text-fg-muted">
-          <span className="block mb-1">Config object</span>
-          <textarea
-            value={value.advancedConfig}
-            onChange={(e) =>
-              onChange({ ...value, advancedConfig: e.target.value, useAdvancedConfig: true })
-            }
-            rows={6}
-            className={`${inputClassName} font-mono text-xs leading-relaxed resize-y`}
-            spellCheck={false}
-          />
-        </label>
-        <label className="mt-2 inline-flex items-center gap-2 text-xs text-fg-muted">
-          <input
-            type="checkbox"
-            checked={value.useAdvancedConfig}
-            onChange={(e) => onChange({ ...value, useAdvancedConfig: e.target.checked })}
-            className="accent-brand"
-          />
-          Use override
-        </label>
-      </details>
-    </div>
-  );
-}
-
-function SchedulePresetFields({
-  value,
-  onChange,
-  inputClassName,
-}: AmbientTriggerControlsProps) {
-  const showTime = value.schedulePreset !== "custom";
-  return (
-    <div className="grid gap-3 sm:grid-cols-3">
-      {showTime && (
-        <AmbientControlField label={value.schedulePreset === "hourly" ? "Minute" : "Time"}>
-          {value.schedulePreset === "hourly" ? (
-            <select
-              value={value.scheduleTime.split(":")[1] ?? "00"}
-              onChange={(e) => onChange({ ...value, scheduleTime: `09:${e.target.value}` })}
-              className={inputClassName}
-            >
-              {["00", "15", "30", "45"].map((minute) => (
-                <option key={minute} value={minute}>
-                  :{minute}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <input
-              type="time"
-              value={value.scheduleTime}
-              onChange={(e) => onChange({ ...value, scheduleTime: e.target.value })}
-              className={inputClassName}
+      {value.source === "schedule" ? (
+        <div className="grid gap-x-3 gap-y-5 sm:grid-cols-2">
+          <Field label="Repeats">
+            <PickSelect
+              value={value.schedulePreset}
+              onValueChange={(schedulePreset) => onChange({ ...value, schedulePreset })}
+              options={PRESET_OPTIONS}
             />
+          </Field>
+
+          {value.schedulePreset === "hourly" && (
+            <Field label="At">
+              <PickSelect
+                value={value.scheduleTime.split(":")[1] ?? "00"}
+                onValueChange={(minute) => onChange({ ...value, scheduleTime: `09:${minute}` })}
+                options={MINUTE_OPTIONS}
+              />
+            </Field>
           )}
-        </AmbientControlField>
-      )}
 
-      {value.schedulePreset === "weekly" && (
-        <AmbientControlField label="Day">
-          <select
-            value={value.scheduleWeekday}
-            onChange={(e) => onChange({ ...value, scheduleWeekday: e.target.value })}
-            className={inputClassName}
-          >
-            {WEEKDAYS.map((day) => (
-              <option key={day.value} value={day.value}>
-                {day.label}
-              </option>
-            ))}
-          </select>
-        </AmbientControlField>
-      )}
+          {value.schedulePreset === "weekly" && (
+            <Field label="On">
+              <PickSelect
+                value={value.scheduleWeekday}
+                onValueChange={(scheduleWeekday) => onChange({ ...value, scheduleWeekday })}
+                options={WEEKDAYS}
+              />
+            </Field>
+          )}
 
-      {value.schedulePreset === "monthly" && (
-        <AmbientControlField label="Day of month">
-          <select
-            value={value.scheduleMonthDay}
-            onChange={(e) => onChange({ ...value, scheduleMonthDay: e.target.value })}
-            className={inputClassName}
-          >
-            {Array.from({ length: 31 }, (_, i) => String(i + 1)).map((day) => (
-              <option key={day} value={day}>
-                {day}
-              </option>
-            ))}
-          </select>
-        </AmbientControlField>
-      )}
+          {value.schedulePreset === "monthly" && (
+            <Field label="On">
+              <PickSelect
+                value={value.scheduleMonthDay}
+                onValueChange={(scheduleMonthDay) => onChange({ ...value, scheduleMonthDay })}
+                options={MONTH_DAY_OPTIONS}
+              />
+            </Field>
+          )}
 
-      {value.schedulePreset === "custom" && (
-        <AmbientControlField label="Cron">
-          <input
-            value={value.scheduleCustomCron}
-            onChange={(e) => onChange({ ...value, scheduleCustomCron: e.target.value })}
-            className={inputClassName}
-            placeholder="0 9 * * *"
+          {value.schedulePreset === "custom" && (
+            <Field label="Cron expression" hint="Five fields: minute, hour, day of month, month, day of week.">
+              <Input
+                value={value.scheduleCustomCron}
+                onChange={(e) => onChange({ ...value, scheduleCustomCron: e.target.value })}
+                placeholder="0 9 * * *"
+                spellCheck={false}
+                className="font-mono"
+              />
+            </Field>
+          )}
+
+          {value.schedulePreset !== "hourly" && value.schedulePreset !== "custom" && (
+            <Field label="Time">
+              <TimeField value={value.scheduleTime} onChange={(scheduleTime) => onChange({ ...value, scheduleTime })} />
+            </Field>
+          )}
+
+          <Field label="Time zone">
+            <LocalCombobox<string>
+              value={value.timezone}
+              onChange={(timezone) => onChange({ ...value, timezone })}
+              onPick={(timezone) => onChange({ ...value, timezone })}
+              options={zones}
+              filter={(zone, q) => zone.toLowerCase().includes(q)}
+              getKey={(zone) => zone}
+              renderItem={(zone) => <span className="block px-2 py-1.5 text-small-size text-fg">{zone.replace(/_/g, " ")}</span>}
+              placeholder="UTC"
+              maxHeight="14rem"
+            />
+          </Field>
+        </div>
+      ) : eventOptions.length > 1 ? (
+        <Field label="Event">
+          <PickSelect
+            value={value.eventPreset}
+            onValueChange={(eventPreset) => onChange({ ...value, eventPreset })}
+            options={eventOptions}
           />
-        </AmbientControlField>
+        </Field>
+      ) : null}
+
+      {preview && !value.useAdvancedConfig && (
+        <p className="rounded-lg bg-bg-soft px-3.5 py-2.5 text-small text-fg-muted">
+          <span className="font-medium text-fg">{preview.summary}</span>
+          {preview.cron && <span className="ml-1.5 font-mono text-xs">{preview.cron}</span>}
+          {preview.timezone && <span> · {preview.timezone.replace(/_/g, " ")}</span>}
+        </p>
       )}
 
-      <AmbientControlField label="Timezone">
-        <input
-          value={value.timezone}
-          onChange={(e) => onChange({ ...value, timezone: e.target.value })}
-          className={inputClassName}
-          placeholder="UTC"
-        />
-      </AmbientControlField>
+      <Disclosure
+        title="Advanced: edit the trigger config"
+        meta={value.useAdvancedConfig ? "In use" : undefined}
+        defaultOpen={value.useAdvancedConfig}
+      >
+        <div className="space-y-3">
+          <Field label="Config (JSON)" hint="Sent as the trigger's config exactly as written.">
+            <Textarea
+              value={value.advancedConfig}
+              onChange={(e) => onChange({ ...value, advancedConfig: e.target.value, useAdvancedConfig: true })}
+              rows={6}
+              spellCheck={false}
+              className="font-mono text-xs leading-relaxed md:text-xs"
+            />
+          </Field>
+          <label className="flex cursor-pointer items-center gap-2.5 text-small text-fg">
+            <Checkbox
+              checked={value.useAdvancedConfig}
+              onCheckedChange={(checked) => onChange({ ...value, useAdvancedConfig: checked === true })}
+            />
+            Use this config instead of the options above
+          </label>
+        </div>
+      </Disclosure>
     </div>
   );
-}
-
-function AmbientControlField({
-  label,
-  children,
-}: {
-  label: string;
-  children: ReactNode;
-}) {
-  return (
-    <label className="block text-sm text-fg-muted">
-      <span className="block mb-1">{label}</span>
-      {children}
-    </label>
-  );
-}
-
-function presetLabel(preset: AmbientTriggerDraft["schedulePreset"]): string {
-  switch (preset) {
-    case "hourly":
-      return "Hourly";
-    case "daily":
-      return "Daily";
-    case "weekdays":
-      return "Every weekday";
-    case "weekly":
-      return "Weekly";
-    case "monthly":
-      return "Monthly";
-    case "custom":
-      return "Custom cron";
-  }
 }

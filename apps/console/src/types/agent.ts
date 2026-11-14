@@ -32,19 +32,28 @@ export interface AgentRecord {
   _oma?: {
     aux_model?: { id: string; speed?: string };
     harness?: string;
+    runtime_binding?: { runtime_id: string; acp_agent_id: string };
+    appendable_prompts?: string[];
+    default_environment_id?: string;
+    default_vault_ids?: string[];
+    /** Reasoning level. Unset means the default (api-types
+     *  DEFAULT_REASONING_LEVEL, "medium"); `instant` is a legacy value
+     *  older agents may still carry. */
     reasoning_level?: import("@open-managed-agents/api-types").ReasoningLevel;
-    /** Cross-session memory. Absent = off (and still eligible for the
-     *  automatic enable that comes with a first ambient rule). */
-    memory?: import("@open-managed-agents/api-types").AgentMemoryConfig;
+    /** Cross-session memory. Absent = never configured: off, and still
+     *  eligible for the automatic enable that comes with a first trigger.
+     *  `{ mode: "off" }` is an explicit off that stays off. `store_id` is
+     *  kept while off so turning it back on finds the same notes. */
+    memory?: import("@open-managed-agents/api-types").AgentMemoryConfig & {
+      /** Base-only knobs some older rows carry; the server ignores them. */
+      extract?: boolean;
+      push?: boolean;
+    };
     /** MCP tool-definition loading. Absent = auto. */
     mcp_tool_loading?: import("@open-managed-agents/api-types").McpToolLoading;
     /** "all" = every MCP credential in the session's vaults also becomes a
      *  session server (legacy). Absent = "declared": vaults only
      *  authenticate the agent's own mcp_servers. */
     vault_mcp_servers?: import("@open-managed-agents/api-types").VaultMcpServersMode;
-    runtime_binding?: { runtime_id: string; acp_agent_id: string };
-    appendable_prompts?: string[];
-    default_environment_id?: string;
-    default_vault_ids?: string[];
   };
 }

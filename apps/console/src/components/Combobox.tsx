@@ -25,6 +25,7 @@ import {
   PopoverTrigger,
 } from "@/components/ui/popover";
 import { cn } from "@/lib/utils";
+import type { FieldControlProps } from "./Field";
 
 /**
  * Generic Combobox for "pick one resource from a possibly large list."
@@ -64,7 +65,7 @@ interface PageResponse<T> {
   next_cursor?: string;
 }
 
-export interface ComboboxProps<T> {
+export interface ComboboxProps<T> extends FieldControlProps {
   value: string;
   onValueChange: (value: string, item: T | null) => void;
   /** API path, e.g. "/v1/agents". Combobox appends `?limit=&cursor=&q=`. */
@@ -86,6 +87,12 @@ export interface ComboboxProps<T> {
   className?: string;
   /** Page size for each fetch. Default 20. */
   pageLimit?: number;
+  /** Name to show for a preset `value` while its record is still being
+   *  fetched, when the caller already knows it. Without it the trigger
+   *  falls back to the raw id for that moment. */
+  fallbackLabel?: string;
+  /** Accessible name when there is no visible label. */
+  "aria-label"?: string;
 }
 
 export function Combobox<T>({
@@ -101,6 +108,12 @@ export function Combobox<T>({
   disabled,
   className,
   pageLimit = 20,
+  fallbackLabel,
+  id,
+  "aria-label": ariaLabel,
+  "aria-labelledby": labelledBy,
+  "aria-describedby": describedBy,
+  "aria-invalid": invalid,
 }: ComboboxProps<T>) {
   const { api } = useApi();
   const [open, setOpen] = useState(false);
@@ -171,7 +184,7 @@ export function Combobox<T>({
   const labelText = (() => {
     if (!value) return placeholder;
     const item = presetItem ?? items.find((it) => getValue(it) === value);
-    if (!item) return value; // fallback to raw id while detail resolves
+    if (!item) return fallbackLabel ?? value; // known name, else the raw id, while detail resolves
     return getTextLabel ? getTextLabel(item) : String(getValue(item));
   })();
   const isPlaceholder = !value;
@@ -197,16 +210,22 @@ export function Combobox<T>({
       <PopoverTrigger asChild>
         <button
           type="button"
+          id={id}
           role="combobox"
           aria-haspopup="listbox"
           aria-expanded={open}
+          aria-label={ariaLabel}
+          aria-labelledby={labelledBy}
+          aria-describedby={describedBy}
+          aria-invalid={invalid || undefined}
           disabled={disabled}
           className={
             className ??
-            "w-full inline-flex items-center justify-between gap-2 border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-[13px] bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] disabled:opacity-50 disabled:cursor-not-allowed"
+            "inline-flex h-9 w-full items-center justify-between gap-2 rounded-md border border-border-strong bg-bg-surface px-3 text-sm text-fg shadow-[var(--shadow-xs)] transition-quick outline-none hover:border-fg-faint focus-visible:border-plum focus-visible:shadow-[var(--shadow-focus)] focus-visible:outline-none aria-expanded:border-plum aria-invalid:border-danger disabled:cursor-not-allowed disabled:opacity-50 dark:bg-bg-soft"
           }
         >
           <span
+            title={typeof labelText === "string" ? labelText : undefined}
             className={cn(
               "truncate text-left flex-1",
               isPlaceholder && "text-fg-subtle",
@@ -214,13 +233,13 @@ export function Combobox<T>({
           >
             {labelText}
           </span>
-          <ChevronDownIcon className="size-3.5 text-fg-subtle shrink-0" />
+          <ChevronDownIcon className="size-4 shrink-0 text-fg-subtle" />
         </button>
       </PopoverTrigger>
       <PopoverContent
         align="start"
         // Match trigger width so the dropdown lines up with the trigger.
-        className="p-0 w-[var(--radix-popover-trigger-width)] min-w-[200px]"
+        className="w-[var(--radix-popover-trigger-width)] min-w-[220px] gap-0 p-0"
       >
         <Command shouldFilter={false} className="max-h-80">
           {!noSearch && (
@@ -250,7 +269,7 @@ export function Combobox<T>({
                 >
                   <span className="truncate flex-1">{getLabel(it)}</span>
                   {value === v && (
-                    <CheckIcon className="size-3.5 text-brand" />
+                    <CheckIcon className="size-4 text-fg" />
                   )}
                 </CommandItem>
               );
@@ -258,12 +277,12 @@ export function Combobox<T>({
             {/* Sentinel for IntersectionObserver — sits inside scroll
                 container so its own visibility tracks scroll position. */}
             {hasMore && (
-              <div ref={listEndRef} className="py-2 text-center text-[12px] text-fg-subtle">
+              <div ref={listEndRef} className="py-2 text-center text-caption-size text-fg-subtle">
                 {infiniteQuery.isFetchingNextPage ? "Loading..." : ""}
               </div>
             )}
             {showInitialLoading && (
-              <div className="px-3 py-6 text-center text-[13px] text-fg-subtle">
+              <div className="px-3 py-6 text-center text-small text-fg-subtle">
                 Loading...
               </div>
             )}

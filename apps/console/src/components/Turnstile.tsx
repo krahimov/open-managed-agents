@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { withReason } from "@/lib/failure-text";
 
 // Cloudflare Turnstile widget — vanilla CF JS, no dependency.
 //
@@ -68,10 +69,24 @@ function loadTurnstileScript(): Promise<void> {
   return scriptLoaded;
 }
 
-export function Turnstile({ siteKey, onToken, onExpire, appearance = "interaction-only" }: TurnstileProps) {
+/**
+ * The host takes no room until Cloudflare actually draws a challenge (in
+ * the default `interaction-only` mode that is only when a person has to
+ * interact), so it can sit right above a form's submit button: it then
+ * appears centred with `className` applied (pass the gap you want, e.g.
+ * "mb-5"). A load failure is said in words in the same place.
+ */
+export function Turnstile({
+  siteKey,
+  onToken,
+  onExpire,
+  appearance = "interaction-only",
+  className,
+}: TurnstileProps & { className?: string }) {
   const ref = useRef<HTMLDivElement>(null);
   const widgetId = useRef<string | null>(null);
   const [error, setError] = useState<string>("");
+  const [visible, setVisible] = useState(false);
 
   useEffect(() => {
     if (!siteKey || !ref.current) return;
@@ -88,7 +103,7 @@ export function Turnstile({ siteKey, onToken, onExpire, appearance = "interactio
           theme: "auto",
         });
       })
-      .catch((err) => setError(err instanceof Error ? err.message : String(err)));
+      .catch((err) => setError(withReason("The bot challenge could not be loaded", err)));
     return () => {
       cancelled = true;
       if (widgetId.current && window.turnstile) {
@@ -98,12 +113,26 @@ export function Turnstile({ siteKey, onToken, onExpire, appearance = "interactio
     };
   }, [siteKey, onToken, onExpire, appearance]);
 
+  // Track whether the widget is drawing anything, so the spacing around it
+  // exists only while there is something to see.
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => setVisible(el.offsetHeight > 0));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [siteKey]);
+
   if (!siteKey) return null;
 
   return (
-    <div className="space-y-1">
-      <div ref={ref} />
-      {error && <div className="text-xs text-danger">{error}</div>}
+    <div className={visible || error ? className : undefined}>
+      <div ref={ref} className="flex justify-center" />
+      {error && (
+        <p role="alert" className="text-center text-xs text-danger">
+          {error}
+        </p>
+      )}
     </div>
   );
 }

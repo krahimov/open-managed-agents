@@ -1,25 +1,42 @@
-// "Save as eval" dialog (evals-design §8 save-as-eval).
+// "Save as eval": turn a session that went well into a task that can be
+// run again.
 //
-// Opened from a session's header. On open we POST
-// /v1/evals/draft_task_from_session: the backend rebuilds the task
-// messages from the session's user.message events and asks the tenant's
-// cross-family judge to author a §4.3 rubric (static-template fallback).
-// Drafting can take up to a minute, so the dialog stays responsive with
-// a Cancel that aborts the in-flight draft. The drafted task is fully
-// editable before saving into a new or existing suite. The draft endpoint
-// is Node-only — the CF eval router 501s it — so on such runtimes the
-// dialog falls back to hand-authoring (suites CRUD still works there).
+// Opened from a session's header. Opening it starts nothing the person did
+// not ask for. The form needs the session's own words, so it asks
+// POST /v1/evals/draft_task_from_session for those alone
+// (`draft_rubric: false`): the server rebuilds the task's messages from
+// what the user said and hands back a rubric template. No model runs, and
+// it answers at once.
+//
+// Having the judge model write the rubric from what the agent actually
+// delivered is the same endpoint without that flag. It costs a model call
+// and can take up to a minute, so it is a button ("Draft the rubric"),
+// next to the rubric it fills in. While it runs the dialog says what is
+// happening and offers a way back to the form; nothing else on the form is
+// overwritten when it lands, only the rubric.
+//
+// Everything is editable before it is saved to a new or existing suite. A
+// server without the endpoint answers 501 (older ones 404): the form then
+// opens empty, to be filled in by hand.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 import { toast } from "sonner";
 
-import { ApiError, useApi } from "../../lib/api";
-import { useApiQuery, useQueryClient } from "../../lib/useApiQuery";
-import { useAsyncAction } from "../../hooks/useAsyncAction";
-import { Modal } from "../../components/Modal";
-import { Select, SelectOption } from "../../components/Select";
 import { Button } from "@/components/ui/button";
+
+import { Callout } from "../../components/Callout";
+import { Modal } from "../../components/Modal";
+import { Tip } from "../../components/Tip";
+import { RUNS_KEY, SUITES_KEY, useEvalSuites } from "../../components/evals/data";
+import { DialogSection, DraftingState, NEW_SUITE, SuiteFields } from "../../components/evals/fields";
+import { clearFor, TaskBasics, TaskGrading } from "../../components/evals/TaskForm";
+import { blankTask, checkTask, draftToTask, hasErrors, taskToDraft, type TaskDraft, type TaskFieldErrors } from "../../components/evals/task-draft";
+import { useAsyncAction } from "../../hooks/useAsyncAction";
+import { ApiError, useApi } from "../../lib/api";
+import { describeModel } from "../../lib/models";
+import { useQueryClient } from "../../lib/useApiQuery";
+import { failureSentence, withReason } from "../../lib/failure-text";
 
 interface DraftedTask {
   id: string;
@@ -36,16 +53,10 @@ interface DraftResponse {
   rubric_drafted_by: string;
 }
 
-interface SuiteSummary {
-  id: string;
-  name: string;
-  agent_id?: string;
-  task_count: number;
-  updated_at: string;
-}
+type FieldErrors = TaskFieldErrors & { suiteName?: string };
 
-// Radix Select items can't carry an empty-string value.
-const NEW_SUITE = "__new__";
+/** The form before the session's words arrive, or when they cannot: empty, to be written by hand. */
+const emptyTask = (): TaskDraft => ({ ...blankTask(), id: "", rubric: "" });
 
 export function SaveAsEvalDialog({
   open,
@@ -65,142 +76,121 @@ export function SaveAsEvalDialog({
   const { api } = useApi();
   const nav = useNavigate();
   const queryClient = useQueryClient();
+  const { suites } = useEvalSuites(open);
 
-  const [drafting, setDrafting] = useState(false);
+  // "reading": the session's messages are on their way (no model).
+  // "drafting": the judge model is writing the rubric, because it was asked to.
+  const [phase, setPhase] = useState<"reading" | "form" | "drafting">("reading");
+  const drafting = phase === "drafting";
   const [rubricDraftedBy, setRubricDraftedBy] = useState("");
   const [draftUnavailable, setDraftUnavailable] = useState(false);
+  const [draftError, setDraftError] = useState("");
+  /** Which request failed: reading the session ("task") or the model's rubric. */
+  const [draftFailedOn, setDraftFailedOn] = useState<"task" | "rubric">("task");
   const [error, setError] = useState("");
+  const [errors, setErrors] = useState<FieldErrors>({});
 
-  const [taskId, setTaskId] = useState("");
-  const [messages, setMessages] = useState<string[]>([""]);
-  const [rubric, setRubric] = useState("");
-  const [trials, setTrials] = useState("1");
-  const [passThreshold, setPassThreshold] = useState("1");
-  const [timeoutSec, setTimeoutSec] = useState("600");
+  // The task, as the shared task form holds it (components/evals/TaskForm).
+  const [task, setTask] = useState<TaskDraft>(emptyTask);
+  const editTask = (patch: Partial<TaskDraft>) => {
+    setTask((prev) => ({ ...prev, ...patch }));
+    setErrors((prev) => clearFor(prev, patch));
+  };
 
   const [suiteChoice, setSuiteChoice] = useState(NEW_SUITE);
   const [newSuiteName, setNewSuiteName] = useState("");
 
-  // Draft on open. The AbortController doubles as the Cancel path — the
-  // effect cleanup fires it too, so navigating away mid-draft is safe.
-  useEffect(() => {
-    if (!open) return;
-    setError("");
-    setDraftUnavailable(false);
-    setRubricDraftedBy("");
-    setTaskId("");
-    setMessages([""]);
-    setRubric("");
-    setTrials("1");
-    setPassThreshold("1");
-    setTimeoutSec("600");
-    setSuiteChoice(NEW_SUITE);
-    setNewSuiteName(`${agentName || "agent"} suite`);
+  // The draft request in flight. Cancel, close and unmount abort it.
+  const acRef = useRef<AbortController | null>(null);
 
-    setDrafting(true);
+  /**
+   * Ask the server about this session. Without `withRubric` it returns the
+   * session's messages and a rubric template at once, with no model call:
+   * that is what opening the dialog does. With it, the judge model writes
+   * the rubric: only ever on the person's click.
+   */
+  function draft(withRubric: boolean) {
+    acRef.current?.abort();
     const ac = new AbortController();
+    acRef.current = ac;
+    setPhase(withRubric ? "drafting" : "reading");
+    setDraftError("");
     api<DraftResponse>("/v1/evals/draft_task_from_session", {
       method: "POST",
-      body: JSON.stringify({ session_id: sessionId }),
+      body: JSON.stringify({ session_id: sessionId, ...(withRubric ? {} : { draft_rubric: false }) }),
       signal: ac.signal,
-      // Draft failures are handled inline below (the form still works
-      // hand-authored), and a runtime without the endpoint would toast on
-      // every open otherwise.
+      // A failure is shown in the form (which still works by hand), and
+      // a server without the endpoint would otherwise toast on every open.
       silentErrors: true,
     })
       .then((res) => {
-        setTaskId(res.task.id);
-        setMessages(res.task.messages.length > 0 ? res.task.messages : [""]);
-        setRubric(res.task.reward?.rubric ?? "");
-        setTrials(String(res.task.trials ?? 1));
-        setTimeoutSec(String(Math.round((res.task.timeout_ms ?? 600_000) / 1000)));
+        if (withRubric) {
+          // The person may have edited the task while they decided: the
+          // model's draft fills in the rubric and touches nothing else.
+          editTask({ rubric: res.task.reward?.rubric ?? "" });
+        } else {
+          setTask(taskToDraft(res.task));
+        }
         setRubricDraftedBy(res.rubric_drafted_by);
-        setDrafting(false);
+        setPhase("form");
       })
       .catch((e) => {
         if (ac.signal.aborted) return;
-        // Drafting lives only in the Node runtime (apps/main-node); the
-        // CF eval router answers 501 (older deploys 404). That's not an
-        // error — show hand-author mode with a note instead.
-        if (e instanceof ApiError && (e.status === 501 || e.status === 404)) {
-          setDraftUnavailable(true);
-        } else {
-          // Keep the dialog open with an inline error so the user can
-          // still hand-author the task.
-          setError(e instanceof Error ? e.message : "Failed to draft task from session");
-        }
-        setDrafting(false);
+        if (e instanceof ApiError && (e.status === 501 || e.status === 404)) setDraftUnavailable(true);
+        else setDraftError(failureSentence(e));
+        setDraftFailedOn(withRubric ? "rubric" : "task");
+        setPhase("form");
       });
-    return () => ac.abort();
-  }, [open, sessionId, agentName, api]);
-
-  const { data: suitesRes } = useApiQuery<{ data: SuiteSummary[] }>(
-    "/v1/evals/suites",
-    undefined,
-    { enabled: open },
-  );
-  const suites = suitesRes?.data ?? [];
-
-  /** Validate the form into an EvalTaskSpec, or null (with inline error). */
-  function buildTask(): (DraftedTask & { pass_threshold: number }) | null {
-    const id = taskId.trim();
-    if (!id) {
-      setError("Task id is required.");
-      return null;
-    }
-    const msgs = messages.filter((m) => m.trim());
-    if (msgs.length === 0) {
-      setError("At least one non-empty message is required.");
-      return null;
-    }
-    if (!rubric.trim()) {
-      setError("Rubric is required.");
-      return null;
-    }
-    const trialsN = Number(trials);
-    if (!Number.isInteger(trialsN) || trialsN < 1) {
-      setError("Trials must be a whole number ≥ 1.");
-      return null;
-    }
-    const thresholdN = Number(passThreshold);
-    if (!Number.isFinite(thresholdN) || thresholdN < 0 || thresholdN > 1) {
-      setError("Pass threshold must be between 0 and 1.");
-      return null;
-    }
-    const timeoutN = Number(timeoutSec);
-    if (!Number.isFinite(timeoutN) || timeoutN < 1) {
-      setError("Timeout must be at least 1 second.");
-      return null;
-    }
-    return {
-      id,
-      messages: msgs,
-      timeout_ms: Math.round(timeoutN * 1000),
-      trials: trialsN,
-      pass_threshold: thresholdN,
-      reward: { type: "llm_judge", rubric: rubric.trim() },
-    };
   }
 
-  /** Create the target suite (or append to the chosen one). Throws on
-   *  API failure — api() has already toasted by then. */
+  /** Stop waiting for the model and go back to the form as it was. */
+  function stopDrafting() {
+    acRef.current?.abort();
+    setPhase("form");
+  }
+
+  useEffect(() => {
+    if (!open) return;
+    setError("");
+    setErrors({});
+    setDraftUnavailable(false);
+    setRubricDraftedBy("");
+    setTask(emptyTask());
+    setSuiteChoice(NEW_SUITE);
+    setNewSuiteName(`${agentName || "Agent"} suite`);
+    // The session's own messages, and a template: no model is asked for anything here.
+    draft(false);
+    return () => acRef.current?.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, sessionId, agentName, api]);
+
+  /** Check the form. Returns the task, or null with each problem on its field. */
+  function buildTask(): DraftedTask | null {
+    const next: FieldErrors = checkTask(task);
+    if (suiteChoice === NEW_SUITE && !newSuiteName.trim()) next.suiteName = "Give the suite a name.";
+    setErrors(next);
+    if (hasErrors(next)) return null;
+    return draftToTask(task) as unknown as DraftedTask;
+  }
+
+  /** Create the suite, or add the task to the chosen one. */
   async function saveToSuite(task: DraftedTask): Promise<{ id: string; name: string }> {
     if (suiteChoice === NEW_SUITE) {
-      const name = newSuiteName.trim();
-      if (!name) throw new Error("Suite name is required.");
-      return api<{ id: string; name: string }>("/v1/evals/suites", {
+      return api<{ id: string; name: string }>(SUITES_KEY, {
         method: "POST",
         body: JSON.stringify({
-          name,
+          name: newSuiteName.trim(),
           ...(agentId ? { agent_id: agentId } : {}),
           tasks: [task],
           source_sessions: [sessionId],
         }),
+        silentErrors: true,
       });
     }
-    return api<{ id: string; name: string }>(`/v1/evals/suites/${suiteChoice}`, {
+    return api<{ id: string; name: string }>(`${SUITES_KEY}/${suiteChoice}`, {
       method: "POST",
       body: JSON.stringify({ append_task: task }),
+      silentErrors: true,
     });
   }
 
@@ -208,17 +198,14 @@ export function SaveAsEvalDialog({
     setError("");
     const task = buildTask();
     if (!task) return;
-    if (suiteChoice === NEW_SUITE && !newSuiteName.trim()) {
-      setError("Suite name is required.");
-      return;
-    }
     try {
       const suite = await saveToSuite(task);
-      void queryClient.invalidateQueries({ queryKey: ["/v1/evals/suites"] });
+      void queryClient.invalidateQueries({ queryKey: [SUITES_KEY] });
       toast.success(`Saved ${task.id} to ${suite.name}`);
       onClose();
-    } catch {
-      // api() toasted; leave the dialog open so nothing typed is lost.
+    } catch (e) {
+      // Stay open so nothing typed is lost.
+      setError(failureSentence(e));
     }
   });
 
@@ -226,238 +213,151 @@ export function SaveAsEvalDialog({
     setError("");
     const task = buildTask();
     if (!task) return;
-    if (suiteChoice === NEW_SUITE && !newSuiteName.trim()) {
-      setError("Suite name is required.");
-      return;
-    }
     if (!environmentId) return;
     try {
       const suite = await saveToSuite(task);
-      void queryClient.invalidateQueries({ queryKey: ["/v1/evals/suites"] });
-      const res = await api<{ run_id: string }>(`/v1/evals/suites/${suite.id}/run`, {
+      void queryClient.invalidateQueries({ queryKey: [SUITES_KEY] });
+      const res = await api<{ run_id: string }>(`${SUITES_KEY}/${suite.id}/run`, {
         method: "POST",
-        // agent_id rides along so appending to a suite without a pinned
-        // agent still runs (the route 400s otherwise).
-        body: JSON.stringify({
-          environment_id: environmentId,
-          ...(agentId ? { agent_id: agentId } : {}),
-        }),
+        // The agent rides along so a suite with none of its own still runs.
+        body: JSON.stringify({ environment_id: environmentId, ...(agentId ? { agent_id: agentId } : {}) }),
+        silentErrors: true,
       });
-      void queryClient.invalidateQueries({ queryKey: ["/v1/evals/runs"] });
-      toast.success(`Saved ${task.id} to ${suite.name} — run started`);
+      void queryClient.invalidateQueries({ queryKey: [RUNS_KEY] });
+      toast.success(`Saved ${task.id} to ${suite.name}. The run has started.`);
       onClose();
       nav(`/evals/${res.run_id}`);
-    } catch {
-      // Save may have landed even when the run failed — the suites cache
-      // was already invalidated above, so the list stays truthful.
+    } catch (e) {
+      // The task may have been saved even though the run did not start;
+      // the suites list was refreshed above, so nothing on screen is stale.
+      setError(withReason("The run could not be started", e));
     }
   });
 
   const busy = save.loading || saveAndRun.loading;
-  const inputCls =
-    "w-full px-3 py-1.5 rounded-md bg-bg border border-border text-sm text-fg placeholder:text-fg-subtle focus:outline-none focus:ring-1 focus:ring-brand";
+  const isTemplate = rubricDraftedBy === "template";
+  const clear = (key: keyof FieldErrors) => setErrors((prev) => (prev[key] ? { ...prev, [key]: undefined } : prev));
 
   return (
     <Modal
       open={open}
-      onClose={onClose}
+      onClose={() => !busy && onClose()}
       title="Save as eval"
-      subtitle="Snapshot this session into a suite task — its user messages become the task input; the rubric grades fresh attempts."
+      subtitle="Keep this session as a task you can run again: what the user asked becomes the task, and a rubric grades each new attempt."
       maxWidth="max-w-2xl"
       footer={
-        drafting ? (
-          <Button variant="ghost" onClick={onClose}>
+        phase === "reading" ? (
+          <Button variant="ghost" onClick={onClose} className="mr-auto">
             Cancel
           </Button>
-        ) : (
+        ) : drafting ? (
           <>
-            <Button variant="ghost" onClick={onClose} disabled={busy}>
+            <Button variant="ghost" onClick={onClose} className="mr-auto">
               Cancel
             </Button>
-            <Button
-              variant="outline"
-              onClick={save.run}
-              disabled={busy}
-              loading={save.loading}
-              loadingLabel="Saving…"
-            >
+            <Tip label="Go back to the form. The template rubric is still there to fill in.">
+              <Button variant="outline" onClick={stopDrafting}>
+                Stop and write it myself
+              </Button>
+            </Tip>
+          </>
+        ) : (
+          <>
+            <Button variant="ghost" onClick={onClose} disabled={busy} className="mr-auto">
+              Cancel
+            </Button>
+            <Button variant="outline" onClick={save.run} disabled={busy} loading={save.loading}>
               Save to suite
             </Button>
-            {/* Disabled shadcn buttons are pointer-events-none, so the
-                "why is this disabled" tooltip rides a wrapping span. */}
-            <span title={environmentId ? undefined : "Session has no environment to run against"}>
-              <Button
-                onClick={saveAndRun.run}
-                disabled={busy || !environmentId}
-                loading={saveAndRun.loading}
-                loadingLabel="Starting…"
-              >
-                Save &amp; run
-              </Button>
-            </span>
+            {/* A disabled button takes no pointer events, so the reason rides a wrapper. */}
+            <Tip label={environmentId ? undefined : "This session has no environment to run in"}>
+              <span className="inline-flex">
+                <Button onClick={saveAndRun.run} disabled={busy || !environmentId} loading={saveAndRun.loading}>
+                  Save and run
+                </Button>
+              </span>
+            </Tip>
           </>
         )
       }
     >
-      {drafting ? (
-        <div className="flex items-center gap-3 py-10 justify-center text-sm text-fg-muted">
-          <svg className="animate-spin h-4 w-4 text-fg-subtle" viewBox="0 0 24 24" fill="none">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-          </svg>
-          <span>
-            Drafting rubric with the cross-family judge… this can take up to a minute.
-          </span>
-        </div>
+      {phase === "reading" ? (
+        <DraftingState title="Reading this session" body="Collecting what the user asked, to use as the task." />
+      ) : drafting ? (
+        <DraftingState
+          title="Drafting the rubric"
+          body="The judge model is reading what the agent did and writing the checks a new attempt should pass. This can take up to a minute."
+        />
       ) : (
-        <div className="space-y-3">
-          {draftUnavailable && (
-            <div className="text-sm text-fg-muted bg-bg-surface border border-border rounded-lg px-3 py-2">
-              Automatic drafting isn&apos;t available on this runtime — author the
-              task by hand. Saving to a suite still works.
-            </div>
-          )}
-          {error && (
-            <div className="text-sm text-danger bg-danger-subtle border border-danger/30 rounded-lg px-3 py-2">
-              {error}
-            </div>
-          )}
-
-          <div>
-            <label htmlFor="sae-task-id" className="text-sm text-fg-muted block mb-1">
-              Task id *
-            </label>
-            <input
-              id="sae-task-id"
-              value={taskId}
-              onChange={(e) => setTaskId(e.target.value)}
-              className={inputCls}
-              placeholder="task-id"
-              spellCheck={false}
-            />
-          </div>
-
-          <div>
-            <span className="text-sm text-fg-muted block mb-1">Messages *</span>
-            <div className="space-y-2">
-              {messages.map((m, i) => (
-                <div key={i} className="flex items-start gap-2">
-                  <textarea
-                    value={m}
-                    onChange={(e) =>
-                      setMessages((prev) => prev.map((p, j) => (j === i ? e.target.value : p)))
-                    }
-                    className={`${inputCls} min-h-16 resize-y`}
-                    placeholder={`User message ${i + 1}`}
-                    aria-label={`Message ${i + 1}`}
-                  />
-                  {messages.length > 1 && (
-                    <button
-                      onClick={() => setMessages((prev) => prev.filter((_, j) => j !== i))}
-                      className="mt-1 text-fg-subtle hover:text-danger text-sm"
-                      title="Remove message"
-                      aria-label={`Remove message ${i + 1}`}
-                    >
-                      ✕
-                    </button>
-                  )}
-                </div>
-              ))}
-            </div>
-            <button
-              onClick={() => setMessages((prev) => [...prev, ""])}
-              className="mt-1.5 text-xs text-fg-muted hover:text-fg"
-            >
-              + Add message
-            </button>
-          </div>
-
-          <div>
-            <label htmlFor="sae-rubric" className="text-sm text-fg-muted block mb-1">
-              Rubric *
-              {rubricDraftedBy && (
-                <span className="text-fg-subtle">
-                  {" "}
-                  — drafted by{" "}
-                  <span className="font-mono">{rubricDraftedBy}</span>
-                </span>
+        <div className="space-y-8">
+          {(error || draftError || draftUnavailable) && (
+            <div className="space-y-3">
+              {error && (
+                <Callout tone="danger" title="That did not save">
+                  {error}
+                </Callout>
               )}
-            </label>
-            <textarea
-              id="sae-rubric"
-              value={rubric}
-              onChange={(e) => setRubric(e.target.value)}
-              className={`${inputCls} min-h-48 font-mono text-xs resize-y`}
-              spellCheck={false}
+              {draftError && (
+                <Callout tone="danger" title={draftFailedOn === "rubric" ? "The rubric could not be drafted" : "This session could not be read"}>
+                  {draftError} You can still write {draftFailedOn === "rubric" ? "it" : "the task"} by hand below.
+                </Callout>
+              )}
+              {draftUnavailable && (
+                <Callout title="This server cannot draft tasks">Write the task by hand below. Saving to a suite works as usual.</Callout>
+              )}
+            </div>
+          )}
+
+          <DialogSection title="The task" description="What a new attempt is given. Taken from what the user said in this session.">
+            <TaskBasics task={task} onChange={editTask} errors={errors} idPrefix="sae" />
+          </DialogSection>
+
+          <DialogSection
+            title="Grading"
+            description={
+              rubricDraftedBy && !isTemplate
+                ? `The rubric was drafted by ${describeModel(rubricDraftedBy).label} from what the agent delivered. Read it before you trust it.`
+                : "The rubric the judge grades each new attempt against."
+            }
+          >
+            <TaskGrading
+              task={task}
+              onChange={editTask}
+              errors={errors}
+              idPrefix="sae"
+              notice={
+                isTemplate && !draftUnavailable ? (
+                  // The one thing here that calls a model, so it is asked for, never assumed.
+                  <Callout
+                    tone="warning"
+                    title="This rubric is a template"
+                    action={
+                      <Button variant="outline" size="sm" onClick={() => draft(true)} disabled={busy}>
+                        Draft the rubric
+                      </Button>
+                    }
+                  >
+                    It still has placeholders. Replace them with what a good answer must contain, or have the judge model draft it from
+                    what the agent delivered in this session (up to a minute).
+                  </Callout>
+                ) : undefined
+              }
             />
-          </div>
+          </DialogSection>
 
-          <div className="grid grid-cols-3 gap-3">
-            <div>
-              <label htmlFor="sae-trials" className="text-sm text-fg-muted block mb-1">
-                Trials
-              </label>
-              <input
-                id="sae-trials"
-                type="number"
-                min={1}
-                step={1}
-                value={trials}
-                onChange={(e) => setTrials(e.target.value)}
-                className={inputCls}
-              />
-            </div>
-            <div>
-              <label htmlFor="sae-threshold" className="text-sm text-fg-muted block mb-1">
-                Pass threshold
-              </label>
-              <input
-                id="sae-threshold"
-                type="number"
-                min={0}
-                max={1}
-                step={0.05}
-                value={passThreshold}
-                onChange={(e) => setPassThreshold(e.target.value)}
-                className={inputCls}
-              />
-            </div>
-            <div>
-              <label htmlFor="sae-timeout" className="text-sm text-fg-muted block mb-1">
-                Timeout (s)
-              </label>
-              <input
-                id="sae-timeout"
-                type="number"
-                min={1}
-                step={30}
-                value={timeoutSec}
-                onChange={(e) => setTimeoutSec(e.target.value)}
-                className={inputCls}
-              />
-            </div>
-          </div>
-
-          <div>
-            <label className="text-sm text-fg-muted block mb-1">Suite</label>
-            <Select value={suiteChoice} onValueChange={setSuiteChoice}>
-              <SelectOption value={NEW_SUITE}>New suite…</SelectOption>
-              {suites.map((s) => (
-                <SelectOption key={s.id} value={s.id}>
-                  {s.name} ({s.task_count} task{s.task_count === 1 ? "" : "s"})
-                </SelectOption>
-              ))}
-            </Select>
-            {suiteChoice === NEW_SUITE && (
-              <input
-                value={newSuiteName}
-                onChange={(e) => setNewSuiteName(e.target.value)}
-                className={`${inputCls} mt-2`}
-                placeholder="Suite name"
-                aria-label="New suite name"
-              />
-            )}
-          </div>
+          <DialogSection title="Save to" description="Put it with the tasks it belongs with.">
+            <SuiteFields
+              suites={suites}
+              choice={suiteChoice}
+              onChoiceChange={setSuiteChoice}
+              name={newSuiteName}
+              onNameChange={(v) => {
+                setNewSuiteName(v);
+                clear("suiteName");
+              }}
+              nameError={errors.suiteName}
+            />
+          </DialogSection>
         </div>
       )}
     </Modal>

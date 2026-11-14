@@ -1,18 +1,20 @@
-// Files in both directions through the real SessionDetail page:
-//   in  — attach a non-image file in the composer → uploaded, attached as a
-//         session resource, and named (with its sandbox path) to the agent;
-//         a failed upload is surfaced and nothing is sent.
-//   out — links in agent messages to output files download the session
-//         output instead of navigating to an app route.
+// Files in both directions through the real SessionDetail page (ported from
+// main's SessionDetail.files test, rewritten for Muse's composer and
+// conversation):
+//   in  — any file can be attached; a non-image is uploaded, attached to the
+//         session as a resource and named (with its sandbox path) to the
+//         agent; a failed upload is said next to the box and nothing is sent;
+//         a sent message shows its files as chips, not the path note.
+//   out — links in agent messages to output files download them instead of
+//         navigating to an app route; each turn lists the files it wrote.
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { toast } from "sonner";
+
 import { server } from "../mocks/server";
 import { resetSessionOutputsStore } from "../lib/session-outputs";
-import { SessionDetail } from "./SessionDetail";
+import { installDomShims, mountSession, newRig, rigApi, type PageRig } from "./session-detail/test-page";
 
 const api = vi.hoisted(() => vi.fn());
 vi.mock("../lib/api", async (importOriginal) => ({
@@ -22,45 +24,30 @@ vi.mock("../lib/api", async (importOriginal) => ({
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() } }));
 
 beforeAll(() => {
-  // StickToBottom (Conversation) needs these in jsdom.
-  globalThis.ResizeObserver ??= class { observe() {} unobserve() {} disconnect() {} } as unknown as typeof ResizeObserver;
-  Element.prototype.scrollTo ??= function () {};
-  // jsdom has no object URLs; the composer makes one per picked file and
-  // downloads save through one.
+  installDomShims();
+  // jsdom has no object URLs; downloads save through one.
   URL.createObjectURL = vi.fn(() => "blob:mock");
   URL.revokeObjectURL = vi.fn();
 });
 
-let history: Array<Record<string, unknown>> = [];
-/** POSTs the page made through api(), in order. */
-let posts: Array<{ path: string; body: unknown }> = [];
-/** Per-test override for POST responses; default succeeds. */
-let onPost: (path: string) => unknown = () => ({});
+let rig: PageRig;
 /** Output listing + download requests that reached the network layer. */
 let outputFetches: string[] = [];
 let outputs: Array<Record<string, unknown>> = [];
 
 beforeEach(() => {
   resetSessionOutputsStore();
-  posts = [];
+  try {
+    sessionStorage.clear();
+  } catch {
+    /* no storage */
+  }
+  rig = newRig();
   outputFetches = [];
   outputs = [];
-  onPost = () => ({});
   vi.mocked(toast.error).mockClear();
-  api.mockReset();
-  api.mockImplementation(async (path: string, init?: RequestInit) => {
-    if (init?.method === "POST") {
-      posts.push({ path, body: init.body instanceof FormData ? init.body : JSON.parse(String(init.body)) });
-      return onPost(path);
-    }
-    if (path.startsWith("/v1/sessions/sess-1/events")) {
-      return { data: history.map((data, i) => ({ seq: i + 1, type: data.type, data })), has_more: false };
-    }
-    if (path === "/v1/sessions/sess-1") return { agent: { id: "agent-1", name: "QA agent" } };
-    if (path.endsWith("/trajectory")) return { outcome: "success" };
-    if (path.endsWith("/threads") || path.endsWith("/pending")) return { data: [] };
-    throw new Error(`unexpected ${path}`);
-  });
+  vi.mocked(toast.info).mockClear();
+  rigApi(api, rig);
   server.use(
     http.get("*/v1/sessions/sess-1/outputs", () => {
       outputFetches.push("list");
@@ -75,74 +62,69 @@ beforeEach(() => {
 
 afterEach(() => vi.restoreAllMocks());
 
-function Where() {
-  return <div data-testid="where">{useLocation().pathname}</div>;
-}
-
-const mount = () =>
-  render(
-    <QueryClientProvider client={new QueryClient()}>
-      <MemoryRouter initialEntries={["/sessions/sess-1"]}>
-        <Where />
-        <Routes>
-          <Route path="/sessions/:id" element={<SessionDetail />} />
-          <Route path="*" element={<div>WRONG ROUTE</div>} />
-        </Routes>
-      </MemoryRouter>
-    </QueryClientProvider>,
-  );
-
 const csv = () => new File(["a,b\n1,2\n"], "sales.csv", { type: "text/csv" });
 
-async function pickAndSend(file: File, text: string) {
+async function pick(file: File) {
+  await screen.findByRole("button", { name: "Attach files" });
   const picker = document.querySelector<HTMLInputElement>('input[type="file"]')!;
   fireEvent.change(picker, { target: { files: [file] } });
   // The pending attachment shows as a chip with its name and size.
   const chips = await screen.findByTestId("composer-attachments");
   expect(within(chips).getByText("sales.csv")).toBeInTheDocument();
   expect(within(chips).getByText("8 B")).toBeInTheDocument();
+}
 
-  const box = screen.getByPlaceholderText(/Send a message/);
+async function pickAndSend(file: File, text: string) {
+  await pick(file);
+  const box = screen.getByRole("textbox", { name: "Message QA agent" }) as HTMLTextAreaElement;
   fireEvent.change(box, { target: { value: text } });
-  fireEvent.click(screen.getByRole("button", { name: "Submit" }));
-  return box as HTMLTextAreaElement;
+  fireEvent.click(screen.getByRole("button", { name: "Send" }));
+  return box;
 }
 
 describe("SessionDetail attach flow", () => {
-  it("offers 'Attach file' for any file type, not images only", async () => {
-    history = [];
-    mount();
-    expect(await screen.findByRole("button", { name: "Attach file" })).toBeInTheDocument();
+  it("offers to attach any kind of file, not images only", async () => {
+    mountSession();
+    expect(await screen.findByRole("button", { name: "Attach files" })).toBeInTheDocument();
     const picker = document.querySelector<HTMLInputElement>('input[type="file"]')!;
     expect(picker.getAttribute("accept")).toBeNull();
     expect(picker.multiple).toBe(true);
   });
 
+  it("takes a CSV without a refusal: no notice, the chip waits to be sent", async () => {
+    mountSession();
+    await pick(csv());
+    expect(screen.queryByText(/was not attached/)).toBeNull();
+    expect(screen.queryByText(/images only/i)).toBeNull();
+  });
+
   it("uploads a non-image file, attaches it as a session resource, then tells the agent its path", async () => {
-    history = [];
-    onPost = (path) => {
+    rig.onPost = (path) => {
       if (path === "/v1/files") return { id: "file-1", filename: "sales.csv", media_type: "text/csv", size_bytes: 8 };
       if (path === "/v1/sessions/sess-1/resources") {
         return { id: "res-1", type: "file", file_id: "file-1", mount_path: "/mnt/session/uploads/sales.csv" };
       }
       return {};
     };
-    mount();
-    await screen.findByRole("button", { name: "Attach file" });
+    mountSession();
     await pickAndSend(csv(), "summarise this");
 
-    await waitFor(() => expect(posts.map((p) => p.path)).toEqual([
-      "/v1/files",
-      // resource attach lands BEFORE the message that starts the turn
-      "/v1/sessions/sess-1/resources",
-      "/v1/sessions/sess-1/events",
-    ]));
-    expect(((posts[0].body as FormData).get("file") as File).name).toBe("sales.csv");
-    expect(posts[1].body).toEqual({ type: "file", file_id: "file-1" });
+    await waitFor(() =>
+      expect(rig.posts.map((p) => p.path)).toEqual([
+        "/v1/files",
+        // The resource is attached BEFORE the message that starts the turn.
+        "/v1/sessions/sess-1/resources",
+        "/v1/sessions/sess-1/events",
+      ]),
+    );
+    const form = rig.posts[0].body as FormData;
+    expect((form.get("file") as File).name).toBe("sales.csv");
+    expect(form.get("scope_id")).toBe("sess-1");
+    expect(rig.posts[1].body).toEqual({ type: "file", file_id: "file-1" });
 
-    const [event] = (posts[2].body as { events: Array<Record<string, any>> }).events;
+    const [event] = (rig.posts[2].body as { events: Array<Record<string, any>> }).events;
     expect(event.type).toBe("user.message");
-    // The user's words stay the first (visible) block…
+    // The person's words stay the first (visible) block…
     expect(event.content[0]).toEqual({ type: "text", text: "summarise this" });
     // …and the model-readable attachment line rides in a later one.
     expect(event.content[1].text).toContain("/mnt/session/uploads/sales.csv");
@@ -150,45 +132,78 @@ describe("SessionDetail attach flow", () => {
     expect(event.metadata.attachments).toEqual([
       expect.objectContaining({ file_id: "file-1", kind: "file", path: "/mnt/session/uploads/sales.csv" }),
     ]);
-    // Sent → the composer's pending attachment is cleared.
+    // Sent: the box no longer holds the attachment.
     await waitFor(() => expect(screen.queryByTestId("composer-attachments")).toBeNull());
-    expect(toast.error).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 
-  it("surfaces a failed upload, sends nothing, and keeps the text + file for a retry", async () => {
-    history = [];
-    onPost = (path) => {
+  it("sends an image inline as a picture, with no resource and no path note", async () => {
+    rig.onPost = (path) =>
+      path === "/v1/files" ? { id: "img-1", filename: "chart.png", media_type: "image/png", size_bytes: 3 } : {};
+    mountSession();
+    await screen.findByRole("button", { name: "Attach files" });
+    const picker = document.querySelector<HTMLInputElement>('input[type="file"]')!;
+    fireEvent.change(picker, { target: { files: [new File(["png"], "chart.png", { type: "image/png" })] } });
+    await screen.findByTestId("composer-attachments");
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(rig.posts.map((p) => p.path)).toEqual(["/v1/files", "/v1/sessions/sess-1/events"]));
+    const [event] = (rig.posts[1].body as { events: Array<Record<string, any>> }).events;
+    expect(event.content).toEqual([
+      { type: "text", text: "Attached 1 file." },
+      { type: "image", source: { type: "file", file_id: "img-1" } },
+    ]);
+  });
+
+  it("says a failed upload next to the box, sends nothing, and keeps the text and the file for a retry", async () => {
+    rig.onPost = (path) => {
       if (path === "/v1/files") throw new Error("Upload too large: limit is 26214400 bytes");
       return {};
     };
-    mount();
-    await screen.findByRole("button", { name: "Attach file" });
+    mountSession();
     const box = await pickAndSend(csv(), "summarise this");
 
-    await waitFor(() => expect(toast.error).toHaveBeenCalled());
-    const message = String(vi.mocked(toast.error).mock.calls[0][0]);
-    expect(message).toContain('Couldn\'t attach "sales.csv"');
-    expect(message).toContain("Upload too large");
-    expect(message).toContain("not sent");
+    const notice = await screen.findByRole("alert");
+    expect(notice).toHaveTextContent("“sales.csv” could not be uploaded, so nothing was sent");
+    expect(notice).toHaveTextContent("Your message is back in the box below.");
+    expect(within(notice).getByRole("button", { name: "Try again" })).toBeInTheDocument();
 
     // No user.message went out, and the file was not silently dropped.
-    expect(posts.map((p) => p.path)).toEqual(["/v1/files"]);
+    expect(rig.posts.map((p) => p.path)).toEqual(["/v1/files"]);
     expect(within(screen.getByTestId("composer-attachments")).getByText("sales.csv")).toBeInTheDocument();
     await waitFor(() => expect(box.value).toBe("summarise this"));
   });
 
-  it("shows attachment chips on a sent message and hides the path note from the bubble", async () => {
-    history = [
+  it("refuses a file over 25 MB by name, and attaches nothing", async () => {
+    mountSession();
+    await screen.findByRole("button", { name: "Attach files" });
+    const big = new File(["x"], "video.mov", { type: "video/quicktime" });
+    Object.defineProperty(big, "size", { value: 26 * 1024 * 1024 });
+    fireEvent.change(document.querySelector<HTMLInputElement>('input[type="file"]')!, { target: { files: [big] } });
+    const notice = await screen.findByRole("alert");
+    expect(notice).toHaveTextContent("“video.mov” was not attached");
+    expect(notice).toHaveTextContent("A file can be up to 25 MB.");
+    expect(screen.queryByTestId("composer-attachments")).toBeNull();
+  });
+
+  it("shows attachment chips on a sent message and keeps the path note out of the bubble", async () => {
+    rig.history = [
       {
-        type: "user.message", id: "u1", ts: "2026-11-10T10:00:00.000Z",
+        type: "user.message",
+        id: "u1",
+        ts: "2026-11-10T10:00:00.000Z",
         content: [
           { type: "text", text: "summarise this" },
           { type: "text", text: "[Attached file — …]\n- /mnt/session/uploads/sales.csv (sales.csv, text/csv, 8 B)" },
         ],
-        metadata: { attachments: [{ file_id: "file-1", filename: "sales.csv", media_type: "text/csv", size_bytes: 8, kind: "file", path: "/mnt/session/uploads/sales.csv" }] },
+        metadata: {
+          attachments: [
+            { file_id: "file-1", filename: "sales.csv", media_type: "text/csv", size_bytes: 8, kind: "file", path: "/mnt/session/uploads/sales.csv" },
+          ],
+        },
       },
     ];
-    mount();
+    mountSession();
     const chips = await screen.findByTestId("message-attachments");
     expect(within(chips).getByText("sales.csv")).toBeInTheDocument();
     expect(screen.getByText("summarise this")).toBeInTheDocument();
@@ -205,16 +220,14 @@ describe("SessionDetail output links", () => {
   ];
 
   beforeEach(() => {
-    outputs = [
-      { filename: "competitors.md", size_bytes: 2048, uploaded_at: "2026-11-10T10:00:20.000Z", media_type: "text/markdown" },
-    ];
+    outputs = [{ filename: "competitors.md", size_bytes: 2048, uploaded_at: "2026-11-10T10:00:20.000Z", media_type: "text/markdown" }];
     // jsdom would try to navigate to the blob: URL the download helper clicks.
     vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
   });
 
   it("downloads a bare relative filename that matches a session output — never an app route", async () => {
-    history = turn("Saved the analysis to [competitors.md](competitors.md).");
-    mount();
+    rig.history = turn("Saved the analysis to [competitors.md](competitors.md).");
+    mountSession();
     const link = await screen.findByRole("link", { name: /competitors\.md/ });
     await waitFor(() => expect(link.getAttribute("href")).toBe("/v1/sessions/sess-1/outputs/competitors.md"));
 
@@ -226,10 +239,8 @@ describe("SessionDetail output links", () => {
   });
 
   it("downloads sandbox:/mnt/session/outputs/… and plain /mnt/session/outputs/… links", async () => {
-    history = turn(
-      "See [the report](sandbox:/mnt/session/outputs/competitors.md) or [same file](/mnt/session/outputs/competitors.md).",
-    );
-    mount();
+    rig.history = turn("See [the report](sandbox:/mnt/session/outputs/competitors.md) or [same file](/mnt/session/outputs/competitors.md).");
+    mountSession();
     const sandbox = await screen.findByRole("link", { name: /the report/ });
     const plain = screen.getByRole("link", { name: /same file/ });
     expect(sandbox.getAttribute("href")).toBe("/v1/sessions/sess-1/outputs/competitors.md");
@@ -238,34 +249,53 @@ describe("SessionDetail output links", () => {
     fireEvent.click(sandbox);
     fireEvent.click(plain);
 
-    await waitFor(() =>
-      expect(outputFetches.filter((f) => f === "download:competitors.md")).toHaveLength(2),
-    );
+    await waitFor(() => expect(outputFetches.filter((f) => f === "download:competitors.md")).toHaveLength(2));
     expect(screen.getByTestId("where")).toHaveTextContent("/sessions/sess-1");
   });
 
   it("does not navigate for a relative link that isn't a session output", async () => {
-    history = turn("Draft is at [notes](drafts.md).");
-    mount();
+    rig.history = turn("Draft is at [notes](drafts.md).");
+    mountSession();
     const link = await screen.findByRole("link", { name: /notes/ });
     expect(link.getAttribute("href")).toBe("#");
 
     fireEvent.click(link);
 
-    await waitFor(() => expect(toast.error).toHaveBeenCalledWith(`"drafts.md" isn't in this session's files.`));
+    await waitFor(() => expect(toast.error).toHaveBeenCalledWith("“drafts.md” is not among this session's files."));
     expect(outputFetches.some((f) => f.startsWith("download:"))).toBe(false);
     expect(screen.getByTestId("where")).toHaveTextContent("/sessions/sess-1");
-    // The click re-listed outputs, which re-renders the transcript. The
-    // link must survive that as the same DOM node — a remounted link is
+    // The click listed the outputs again, which re-renders the transcript.
+    // The link must survive that as the same DOM node: a remounted link is
     // detached mid-click and its default navigation goes through.
     expect(outputFetches.filter((f) => f === "list").length).toBeGreaterThan(1);
     expect(link.isConnected).toBe(true);
   });
 
-  it("lists the turn's outputs in a Files strip under the agent message, with Download", async () => {
-    history = turn("Done.");
-    mount();
+  it("says a path elsewhere in the sandbox cannot be downloaded, and goes nowhere", async () => {
+    rig.history = turn("Scratch work is in [scratch](/workspace/tmp/scratch.txt).");
+    mountSession();
+    const link = await screen.findByRole("link", { name: /scratch/ });
+    fireEvent.click(link);
+    await waitFor(() => expect(toast.info).toHaveBeenCalled());
+    expect(String(vi.mocked(toast.info).mock.calls[0][0])).toContain("in the agent's sandbox");
+    expect(outputFetches.some((f) => f.startsWith("download:"))).toBe(false);
+    expect(screen.getByTestId("where")).toHaveTextContent("/sessions/sess-1");
+  });
+
+  it("never makes a live link to the console's own sign-in routes", async () => {
+    rig.history = turn("[Open the report](/v1/oauth/authorize?mcp_server_url=https://evil.example)");
+    mountSession();
+    await screen.findByText("Open the report");
+    // Its words stay; nothing about them is a link.
+    expect(screen.getByText("Open the report").closest("a")).toBeNull();
+    expect(screen.queryByRole("link", { name: "Open the report" })).toBeNull();
+  });
+
+  it("lists the turn's outputs in a Files row under the agent message, with Download", async () => {
+    rig.history = turn("Done.");
+    mountSession();
     const strip = await screen.findByTestId("turn-files");
+    expect(within(strip).getByText("2.0 KB")).toBeInTheDocument();
     fireEvent.click(within(strip).getByRole("button", { name: "Download competitors.md" }));
     await waitFor(() => expect(outputFetches).toContain("download:competitors.md"));
   });

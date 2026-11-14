@@ -1,1556 +1,439 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router";
-import { toast } from "sonner";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router";
+import { ArchiveIcon, CopyIcon, LockKeyholeIcon, PlusIcon, Trash2Icon } from "lucide-react";
 
-import { useApi } from "../lib/api";
-import { openOAuthPopup, subscribeOAuthMessages } from "../lib/oauth-popup";
+import { VaultIcon } from "@/components/icons";
+
+import { ApiError, useApi } from "../lib/api";
+import { copyText } from "../lib/clipboard";
+import { formatDate, plural, toDate } from "../lib/format";
 import { useApiQuery, useQueryClient } from "../lib/useApiQuery";
-
-import { Modal } from "../components/Modal";
+import { EntityAvatar } from "../components/AgentAvatar";
+import { Chip, StatusBadge } from "../components/Badge";
+import { Callout } from "../components/Callout";
+import { ConfirmDialog } from "../components/ConfirmDialog";
+import { DetailHeader } from "../components/DetailHeader";
+import { EmptyState, RecordNotFound } from "../components/EmptyState";
+import { CopyButton, IdChip } from "../components/IdChip";
 import { Page } from "../components/Page";
-import { PageHeader } from "../components/PageHeader";
-import { Disclosure } from "../components/Disclosure";
-import { LocalCombobox } from "../components/LocalCombobox";
-import { SecretInput, TextInput } from "../components/Input";
-import { FilterChip } from "../components/FilterChip";
-import { FacetedFilter } from "../components/FacetedFilter";
-
-import { Button } from "@/components/ui/button";
-import { PopoverContent } from "@/components/ui/popover";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-
-import { MCP_REGISTRY, type McpRegistryEntry } from "../lib/mcp-registry";
+import { Property, PropertyList } from "../components/PropertyList";
+import { ErrorState } from "../components/QueryProblem";
+import { RelativeTime } from "../components/RelativeTime";
+import { RowActionsMenu, type RowAction } from "../components/RowActionsMenu";
+import { SectionCard } from "../components/SectionCard";
+import { Skeleton, SkeletonDetail } from "../components/Skeleton";
+import { Tip } from "../components/Tip";
+import { AddCredentialDialog } from "../components/resources/AddCredentialDialog";
 import {
-  composioEntriesFromCatalog,
-  composioIntegrationIcon,
-  type ComposioToolkitCatalogResponse,
-  type ComposioIntegrationEntry,
-  type ComposioStatusResponse,
-} from "../lib/composio-integrations";
+  credentialBreakdown,
+  credentialKind,
+  credentialTarget,
+  isConnectedAppsVault,
+  useVaultCredentials,
+  type Credential,
+  type Vault,
+} from "../components/resources/credentials";
+import { ArchiveStatusFilter, MaskedSecret, type ArchiveStatus } from "../components/resources/ResourceBits";
+import { UsedByList, useResourceUsage } from "../components/resources/usage";
+import { cn } from "@/lib/utils";
+import { Button } from "@/components/ui/button";
 
-// =================================================================
-// Types
-// =================================================================
+/** Label column for the narrow aside, so a full id fits beside it. */
+// The aside's label column: the same width as PropertyList labelWidth="narrow".
+const ASIDE_ROW = "grid-cols-[6.5rem_minmax(0,1fr)]";
 
-interface Vault {
-  id: string;
-  name: string;
-  created_at: string;
-  updated_at?: string | null;
-  archived_at?: string | null;
-}
-interface Credential {
-  id: string;
-  display_name: string;
-  vault_id: string;
-  auth: { type: string; mcp_server_url?: string; cli_id?: string };
-  created_at: string;
-  updated_at?: string | null;
-  archived_at?: string | null;
+/** Columns of the credentials list: credential · secret · updated · menu. */
+const COLS = "grid grid-cols-[minmax(0,1fr)_40px] items-center gap-x-4 sm:grid-cols-[minmax(0,1fr)_minmax(0,148px)_76px_40px]";
+
+function joinWords(parts: string[]): string {
+  if (parts.length <= 1) return parts.join("");
+  return `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
 }
 
-// First-wave cap CLI list. Mirrors @open-managed-agents/cap builtinSpecs.
-// Lifted verbatim from VaultsList — kept here because the Add-credential
-// flow now lives on this page.
-const CAP_CLIS: Array<{ cli_id: string; label: string; helper: string; oauth?: boolean }> = [
-  { cli_id: "gh", label: "GitHub CLI (gh)", helper: "Personal access token (ghp_...)", oauth: true },
-  { cli_id: "glab", label: "GitLab CLI (glab)", helper: "Personal access token (glpat-...)", oauth: true },
-  { cli_id: "az", label: "Azure CLI (az)", helper: "ARM access token", oauth: true },
-  { cli_id: "gcloud", label: "Google Cloud SDK", helper: "OAuth access token", oauth: true },
-  { cli_id: "fly", label: "Fly.io (fly / flyctl)", helper: "Fly API token (fo1_...)" },
-  { cli_id: "vercel", label: "Vercel CLI", helper: "Account access token" },
-  { cli_id: "doctl", label: "DigitalOcean (doctl)", helper: "API token (dop_v1_...)" },
-  { cli_id: "heroku", label: "Heroku CLI", helper: "API token (heroku auth:token)" },
-  { cli_id: "cf", label: "Cloudflare (cf / wrangler)", helper: "API token (CLOUDFLARE_API_TOKEN)" },
-  { cli_id: "npm", label: "npm registry", helper: "Granular access token (npm_...)" },
-  { cli_id: "aws", label: "AWS CLI / SDKs", helper: "AWS secret access key" },
-  { cli_id: "kubectl", label: "kubectl", helper: "Bearer token for the API server" },
-  { cli_id: "docker", label: "Docker registry", helper: "Registry password / PAT" },
-  { cli_id: "git", label: "git (HTTPS remotes)", helper: "Personal access token" },
-];
-
-type StatusValue = "any" | "active" | "archived";
-
-const STATUS_OPTIONS: { value: StatusValue; label: string }[] = [
-  { value: "any", label: "All" },
-  { value: "active", label: "Active" },
-  { value: "archived", label: "Archived" },
-];
-
-type ComposioConnectionState = Record<
-  string,
-  {
-    connectedAccountId: string;
-    authConfigId: string;
-    status: "pending" | "connected";
-    redirectUrl?: string;
-  }
->;
-
-function normalizeComposioToolkitSlug(slug: string): string {
-  return slug.trim().toLowerCase();
-}
-
-function parseComposioToolkits(raw: string): string[] {
-  return Array.from(
-    new Set(
-      raw
-        .split(/[,\s]+/)
-        .map(normalizeComposioToolkitSlug)
-        .filter(Boolean),
-    ),
+/** When an OAuth access token runs out, with a tone when that is soon or past. */
+function TokenExpiry({ value }: { value: string | null | undefined }) {
+  const date = toDate(value);
+  if (!date) return null;
+  const days = (date.getTime() - Date.now()) / 86_400_000;
+  const text = days < 0 ? "Token expired" : `Valid until ${formatDate(date)}`;
+  return (
+    <span className={cn("block truncate text-xs", days < 0 ? "text-danger" : days < 7 ? "text-warning" : "text-fg-subtle")} title={text}>
+      {text}
+    </span>
   );
 }
 
-function formatComposioToolkits(toolkits: string[]): string {
-  return toolkits.join(", ");
+function CredentialRow({
+  cred,
+  onDelete,
+}: {
+  cred: Credential;
+  onDelete: () => void;
+}) {
+  const kind = credentialKind(cred);
+  const target = credentialTarget(cred);
+  const archived = !!cred.archived_at;
+  const keyId = typeof cred.auth.extras?.access_key_id === "string" ? cred.auth.extras.access_key_id : null;
+
+  const actions: RowAction[] = [
+    { label: "Copy credential id", icon: <CopyIcon />, onSelect: () => void copyText(cred.id) },
+    ...(cred.auth.mcp_server_url
+      ? [{ label: "Copy server URL", icon: <CopyIcon />, onSelect: () => void copyText(cred.auth.mcp_server_url!) }]
+      : []),
+    { label: "Delete", icon: <Trash2Icon />, destructive: true, onSelect: onDelete },
+  ];
+
+  return (
+    <li className={cn(COLS, "min-h-[60px] border-t border-border px-5 py-2.5 first:border-t-0")}>
+      <div className="flex min-w-0 items-center gap-3">
+        <EntityAvatar icon={kind.icon} size="md" className={cn(archived && "opacity-60")} />
+        <div className="min-w-0">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className={cn("truncate text-small-size font-medium", archived ? "text-fg-muted" : "text-fg")} title={cred.display_name}>
+              {cred.display_name}
+            </span>
+            {archived && <Chip tone="outline">Archived</Chip>}
+          </div>
+          <div className="flex min-w-0 items-center gap-1.5 text-xs text-fg-subtle">
+            <Tip label={kind.about}>
+              <span className="shrink-0 text-fg-muted">{kind.label}</span>
+            </Tip>
+            <span aria-hidden="true">·</span>
+            <span className={cn("truncate", target.mono && "font-mono text-micro-size")} title={target.full ?? target.text}>
+              {target.text}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div className="hidden min-w-0 sm:block">
+        <MaskedSecret />
+        {keyId && (
+          <span className="mt-1 flex min-w-0 items-center gap-0.5 text-xs text-fg-subtle">
+            <span className="truncate" title={`Access key id ${keyId}`}>
+              Key id{" "}
+              <span className="font-mono text-micro-size text-fg-muted">
+                {keyId.length > 12 ? `${keyId.slice(0, 4)}…${keyId.slice(-4)}` : keyId}
+              </span>
+            </span>
+            <CopyButton value={keyId} label="Copy access key id" className="size-5" />
+          </span>
+        )}
+        {cred.auth.type === "mcp_oauth" && <TokenExpiry value={cred.auth.expires_at} />}
+      </div>
+
+      <div className="hidden sm:block">
+        <RelativeTime value={cred.updated_at ?? cred.created_at} className="text-small text-fg-muted" />
+      </div>
+
+      <RowActionsMenu label={`Actions for ${cred.display_name}`} actions={actions} />
+    </li>
+  );
 }
 
-const inputCls =
-  "w-full border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
-
-// =================================================================
-// Page
-// =================================================================
-
+/**
+ * Vault — the record of one vault and everything in it. The credentials
+ * are the page: each row says what the secret is for, how it is held and
+ * when it changed, and never the secret itself. "Add credential" is the
+ * one primary action; it also opens from Integrations
+ * (`?connect=composio&toolkit=…`).
+ */
 export function VaultDetail() {
   const { id } = useParams<{ id: string }>();
   const [searchParams, setSearchParams] = useSearchParams();
   const { api } = useApi();
   const nav = useNavigate();
   const queryClient = useQueryClient();
+  const usage = useResourceUsage();
 
-  const { data: vault, error: vaultError } = useApiQuery<Vault>(
+  const { data: vault, error: vaultError, isLoading, refetch: refetchVault } = useApiQuery<Vault>(
     id ? `/v1/vaults/${id}` : null,
   );
-  const {
-    data: credsRes,
-    isLoading: credsLoading,
-    refetch: refetchCreds,
-  } = useApiQuery<{ data: Credential[] }>(
-    id ? `/v1/vaults/${id}/credentials` : null,
-  );
-  const credentials = useMemo(() => credsRes?.data ?? [], [credsRes]);
+  const { credentials: loaded, isLoading: credsLoading, error: credsError, refetch: refetchCreds } = useVaultCredentials(id);
+  const credentials = useMemo(() => loaded ?? [], [loaded]);
 
-  // Status filter applied client-side — the credentials list endpoint
-  // doesn't accept a status query param and the per-vault credential count
-  // is small enough that paging it server-side would be over-engineering.
-  const [status, setStatus] = useState<StatusValue>("active");
-  const filteredCreds = useMemo(() => {
+  // Filtered here: the credentials endpoint takes no status param and
+  // returns the vault's whole (small) list in one response.
+  const [status, setStatus] = useState<ArchiveStatus>("active");
+  const shown = useMemo(() => {
     if (status === "any") return credentials;
     if (status === "active") return credentials.filter((c) => !c.archived_at);
     return credentials.filter((c) => !!c.archived_at);
   }, [credentials, status]);
+  const active = useMemo(() => credentials.filter((c) => !c.archived_at), [credentials]);
 
-  const [showAddCred, setShowAddCred] = useState(false);
+  const [showAdd, setShowAdd] = useState(false);
   const connectMode = searchParams.get("connect");
   const connectToolkit = searchParams.get("toolkit") ?? "";
-
   useEffect(() => {
-    if (connectMode === "composio" && !vault?.archived_at) {
-      setShowAddCred(true);
-    }
-  }, [connectMode, vault?.archived_at]);
+    if (connectMode === "composio" && vault && !vault.archived_at) setShowAdd(true);
+  }, [connectMode, vault]);
 
-  // Refetch credentials after a successful add/delete. Mirrors the old
-  // `openVault(selectedVault)` reload from VaultsList, but goes through
-  // TQ so any other tab/observer with the same key updates too.
   const reloadCredentials = useCallback(() => {
     if (!id) return;
     void refetchCreds();
-    void queryClient.invalidateQueries({
-      queryKey: [`/v1/vaults/${id}/credentials`],
-    });
+    void queryClient.invalidateQueries({ queryKey: [`/v1/vaults/${id}/credentials`] });
   }, [id, refetchCreds, queryClient]);
 
-  const archive = async () => {
-    if (!id) return;
-    if (
-      !confirm(
-        "Archive this vault? All its credentials will also be archived. Archive is one-way.",
-      )
-    )
-      return;
-    try {
-      await api(`/v1/vaults/${id}/archive`, { method: "POST" });
-      nav("/vaults");
-    } catch {
-      // useApi already toasts the underlying error.
-    }
-  };
-
-  const del = async () => {
-    if (!id) return;
-    if (
-      !confirm(
-        "Delete this vault and ALL its credentials? This cannot be undone.",
-      )
-    )
-      return;
-    try {
-      await api(`/v1/vaults/${id}`, { method: "DELETE" });
-      nav("/vaults");
-    } catch {
-      // useApi already toasts the underlying error.
-    }
-  };
-
-  const deleteCred = async (credId: string) => {
-    if (!id) return;
-    if (!confirm("Delete this credential?")) return;
-    try {
-      await api(`/v1/vaults/${id}/credentials/${credId}`, { method: "DELETE" });
-      reloadCredentials();
-    } catch {
-      // useApi already toasts the underlying error.
-    }
-  };
-
-  const closeAddCred = () => {
-    setShowAddCred(false);
+  const closeAdd = () => {
+    setShowAdd(false);
     if (searchParams.has("connect") || searchParams.has("toolkit")) {
       setSearchParams(new URLSearchParams(), { replace: true });
     }
   };
 
-  const errorMsg =
-    vaultError instanceof Error
-      ? vaultError.message
-      : vaultError
-        ? String(vaultError)
-        : null;
+  const [confirm, setConfirm] = useState<
+    { kind: "archive" } | { kind: "delete" } | { kind: "credential"; cred: Credential } | null
+  >(null);
 
-  if (!id) return <div className="flex-1 p-8">Missing vault id.</div>;
-  if (errorMsg)
-    return <div className="flex-1 p-8 text-danger">Error: {errorMsg}</div>;
-  if (!vault) return <div className="flex-1 p-8 text-fg-muted">Loading...</div>;
+  if (vaultError && !vault) {
+    const missing = vaultError instanceof ApiError && vaultError.status === 404;
+    return (
+      <Page>
+        {missing ? (
+          <RecordNotFound thing="vault" kind="vault" back={{ to: "/vaults", label: "vaults" }} className="mt-4" />
+        ) : (
+          <ErrorState title="This vault could not be loaded" error={vaultError} retry={() => void refetchVault()} className="mt-4" />
+        )}
+      </Page>
+    );
+  }
+  if (isLoading || !vault) {
+    return (
+      <Page>
+        <SkeletonDetail />
+      </Page>
+    );
+  }
 
   const archived = !!vault.archived_at;
-  const updatedAt = vault.updated_at ?? vault.created_at;
+  const managed = isConnectedAppsVault(vault);
+  const agents = usage.vaults.get(vault.id) ?? [];
+  const breakdown = credentialBreakdown(active);
 
-  // Active-filter chip display — null at the default so the chip reads
-  // "Status ▾" rather than "Status: All ▾". Matches the list-page pattern.
-  const statusDisplay =
-    status === "any" ? undefined : STATUS_OPTIONS.find((o) => o.value === status)?.label;
+  const description = managed
+    ? "Created for you to hold the apps you connect from Integrations or while setting up an agent."
+    : credsLoading
+      ? undefined
+      : active.length === 0
+        ? "Nothing is stored here yet."
+        : `Credentials for ${joinWords(breakdown.map((b) => b.label))}.`;
+
+  const addButton = (variant: "default" | "secondary" = "default", size: "default" | "sm" = "default") => (
+    <Button variant={variant} size={size} onClick={() => setShowAdd(true)}>
+      <PlusIcon data-icon="inline-start" className={variant === "default" ? "stroke-[2.25]" : undefined} />
+      Add credential
+    </Button>
+  );
 
   return (
-    <Page
-      header={
-        <PageHeader
-          title={vault.name}
-          subtitle={
-            <span className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-fg-subtle">
-              <span
-                className={`inline-flex items-center text-[11px] px-2 py-0.5 rounded-full ${
-                  archived
-                    ? "bg-bg-surface text-fg-subtle"
-                    : "bg-success-subtle text-success"
-                }`}
-              >
-                {archived ? "archived" : "active"}
+    <Page>
+      <DetailHeader
+        avatar={<EntityAvatar icon={VaultIcon} size="xl" />}
+        title={vault.name}
+        status={<StatusBadge status={archived ? "archived" : "active"} variant="soft" />}
+        description={description}
+        meta={
+          <>
+            {managed && <Chip title="Created and used by the product">Managed</Chip>}
+            {managed && !credsLoading && <Chip icon={LockKeyholeIcon}>{plural(active.length, "credential")}</Chip>}
+            {!usage.isLoading && (
+              <Chip>{agents.length === 0 ? "Not used by an agent" : `Used by ${plural(agents.length, "agent")}`}</Chip>
+            )}
+          </>
+        }
+        actions={!archived ? addButton() : undefined}
+        menu={
+          <RowActionsMenu
+            label={`Actions for ${vault.name}`}
+            actions={[
+              { label: "Copy vault id", icon: <CopyIcon />, onSelect: () => void copyText(vault.id) },
+              { label: "Archive", icon: <ArchiveIcon />, disabled: archived, onSelect: () => setConfirm({ kind: "archive" }) },
+              { label: "Delete", icon: <Trash2Icon />, destructive: true, onSelect: () => setConfirm({ kind: "delete" }) },
+            ]}
+          />
+        }
+      />
+
+      {archived && (
+        <Callout tone="neutral" icon={ArchiveIcon} title="This vault is archived" className="mb-6">
+          Agents can no longer borrow from it, and nothing can be added. Its credentials were archived with it.
+        </Callout>
+      )}
+
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_340px]">
+        <SectionCard
+          title="Credentials"
+          description="What agents can borrow from this vault."
+          actions={<ArchiveStatusFilter value={status} onChange={setStatus} align="end" />}
+          flush
+          footer={
+            <span className="flex items-start gap-2">
+              <LockKeyholeIcon className="mt-0.5 size-3.5 shrink-0 text-fg-subtle" />
+              <span>
+                Secrets are encrypted and write-only. Nothing on this page can reveal one; to change a secret, delete
+                the credential and add it again.
               </span>
-              <span className="font-mono">{vault.id}</span>
-              <span>Created {new Date(vault.created_at).toLocaleString()}</span>
-              <span>Updated {new Date(updatedAt).toLocaleString()}</span>
-              {archived && (
-                <span>
-                  Archived {new Date(vault.archived_at!).toLocaleString()}
-                </span>
-              )}
             </span>
           }
-          actions={
-            <>
-              {!archived && (
-                <Button variant="outline" size="sm" onClick={archive}>
-                  Archive
-                </Button>
-              )}
-              <Button variant="destructive" size="sm" onClick={del}>
-                Delete
-              </Button>
-            </>
-          }
-        />
-      }
-    >
-      <div>
-        <section>
-          <header className="flex items-center gap-3 mb-3 flex-wrap">
-            <h2 className="font-display text-base font-semibold text-fg mr-auto">
-              Credentials
-            </h2>
-            <FilterChip
-              label="Status"
-              active={status !== "any"}
-              display={statusDisplay}
-              onClear={() => setStatus("any")}
-            >
-              <PopoverContent
-                align="end"
-                sideOffset={4}
-                collisionPadding={8}
-                className="w-48 p-0"
-              >
-                <FacetedFilter
-                  options={STATUS_OPTIONS}
-                  value={status}
-                  onValueChange={(v) => setStatus(v as StatusValue)}
-                  searchPlaceholder="Status..."
-                />
-              </PopoverContent>
-            </FilterChip>
-            {!archived && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => setShowAddCred(true)}
-              >
-                + Add credential
-              </Button>
-            )}
-          </header>
-
-          {credsLoading ? (
-            <div className="text-fg-subtle text-sm py-4">Loading...</div>
-          ) : filteredCreds.length === 0 ? (
-            <div className="border border-border rounded-lg px-4 py-8 text-center text-fg-subtle text-sm">
-              {credentials.length === 0
-                ? "No credentials yet. Connect an MCP server or add a CLI token."
-                : "No credentials match the current filter."}
+          className="min-w-0 self-start"
+        >
+          {credsError && credentials.length === 0 ? (
+            <div className="p-5">
+              <ErrorState compact title="Credentials could not be loaded" error={credsError} retry={() => void refetchCreds()} />
             </div>
+          ) : credsLoading ? (
+            <ul aria-hidden="true">
+              {[0, 1, 2].map((i) => (
+                <li key={i} className="flex h-[60px] items-center gap-3 border-t border-border px-5 first:border-t-0">
+                  <Skeleton className="size-8 shrink-0" rounded="lg" />
+                  <div className="flex-1 space-y-1.5">
+                    <Skeleton className="h-3" rounded="sm" style={{ width: `${28 + i * 9}%` }} />
+                    <Skeleton className="h-2.5" rounded="sm" style={{ width: `${18 + i * 5}%` }} />
+                  </div>
+                  <Skeleton className="hidden h-[22px] w-24 sm:block" rounded="full" />
+                </li>
+              ))}
+            </ul>
+          ) : shown.length === 0 ? (
+            credentials.length === 0 ? (
+              <EmptyState
+                kind="vault"
+                size="md"
+                variant="plain"
+                title="No credentials yet"
+                body={
+                  managed
+                    ? "Apps you connect from Integrations land here. You can also add an MCP server or a CLI token directly."
+                    : "Sign in to an MCP server, paste a token, or add a command-line tool. Agents that use this vault can then reach it."
+                }
+                action={
+                  !archived && (
+                    <>
+                      {addButton("secondary", "sm")}
+                      {managed && (
+                        <Button variant="ghost" size="sm" asChild>
+                          <Link to="/integrations/apps">Browse apps</Link>
+                        </Button>
+                      )}
+                    </>
+                  )
+                }
+              />
+            ) : (
+              <EmptyState
+                size="md"
+                variant="plain"
+                icon={<LockKeyholeIcon />}
+                title={status === "archived" ? "No archived credentials" : "No active credentials"}
+                body={
+                  status === "archived"
+                    ? "Nothing in this vault has been archived."
+                    : "Every credential in this vault is archived."
+                }
+                action={
+                  <Button variant="outline" size="sm" onClick={() => setStatus("any")}>
+                    Show all
+                  </Button>
+                }
+              />
+            )
           ) : (
-            <div className="border border-border rounded-lg overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase">
-                    <th className="text-left px-4 py-2.5">Name</th>
-                    <th className="text-left px-4 py-2.5">ID</th>
-                    <th className="text-left px-4 py-2.5">Type</th>
-                    <th className="text-left px-4 py-2.5">MCP server URL</th>
-                    <th className="text-left px-4 py-2.5">Status</th>
-                    <th className="text-left px-4 py-2.5">Updated</th>
-                    <th className="text-right px-4 py-2.5"></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredCreds.map((c) => {
-                    const typeLabel =
-                      c.auth.type === "mcp_oauth"
-                        ? "OAuth"
-                        : c.auth.type === "cap_cli"
-                          ? "CLI"
-                          : c.auth.type === "composio_mcp"
-                            ? "Composio"
-                            : "Bearer";
-                    const typeCls =
-                      c.auth.type === "mcp_oauth"
-                        ? "bg-info-subtle text-info"
-                        : c.auth.type === "cap_cli"
-                          ? "bg-brand-subtle text-brand"
-                          : c.auth.type === "composio_mcp"
-                            ? "bg-warning-subtle text-warning"
-                            : "bg-success-subtle text-success";
-                    return (
-                      <tr key={c.id} className="border-t border-border">
-                        <td className="px-4 py-3 font-medium text-fg">
-                          {c.display_name}
-                        </td>
-                        <td className="px-4 py-3 font-mono text-xs text-fg-muted">
-                          {c.id}
-                        </td>
-                        <td className="px-4 py-3">
-                          <span
-                            className={`text-[10px] px-2 py-0.5 rounded-full ${typeCls}`}
-                          >
-                            {typeLabel}
-                          </span>
-                        </td>
-                        <td className="px-4 py-3 font-mono text-xs text-fg-muted truncate max-w-[260px]">
-                          {c.auth.mcp_server_url || c.auth.cli_id || "—"}
-                        </td>
-                        <td className="px-4 py-3">
-                          <span
-                            className={`inline-flex items-center text-[11px] px-2 py-0.5 rounded-full ${
-                              c.archived_at
-                                ? "bg-bg-surface text-fg-subtle"
-                                : "bg-success-subtle text-success"
-                            }`}
-                          >
-                            {c.archived_at ? "archived" : "active"}
-                          </span>
-                        </td>
-                        <td className="px-4 py-3 text-fg-muted">
-                          {new Date(c.updated_at ?? c.created_at).toLocaleString()}
-                        </td>
-                        <td className="px-4 py-3 text-right">
-                          <button
-                            onClick={() => deleteCred(c.id)}
-                            className="inline-flex items-center justify-center min-w-11 min-h-11 sm:min-w-0 sm:min-h-0 px-2 text-xs text-fg-subtle hover:text-danger transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-                          >
-                            Delete
-                          </button>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+            <>
+              <div className={cn(COLS, "hidden h-9 border-b border-border px-5 text-xs font-medium text-fg-subtle sm:grid")}>
+                <span>Credential</span>
+                <span>Secret</span>
+                <span>Updated</span>
+                <span className="sr-only">Actions</span>
+              </div>
+              <ul>
+                {shown.map((c) => (
+                  <CredentialRow key={c.id} cred={c} onDelete={() => setConfirm({ kind: "credential", cred: c })} />
+                ))}
+              </ul>
+            </>
           )}
-        </section>
+        </SectionCard>
+
+        <aside className="min-w-0 space-y-4">
+          <SectionCard title="Used by" description={agents.length > 0 ? `${plural(agents.length, "agent")} can borrow from this vault.` : undefined}>
+            <UsedByList
+              agents={usage.vaults.get(vault.id)}
+              loading={usage.isLoading}
+              empty="No agent uses this vault yet. Attach it in an agent's settings and its sessions can use these credentials."
+            />
+          </SectionCard>
+          <SectionCard title="Details">
+            <PropertyList>
+              <Property label="Created" className={ASIDE_ROW}>
+                <RelativeTime value={vault.created_at} />
+              </Property>
+              <Property label="Updated" className={ASIDE_ROW}>
+                <RelativeTime value={vault.updated_at ?? vault.created_at} />
+              </Property>
+              {archived && (
+                <Property label="Archived" className={ASIDE_ROW}>
+                  <RelativeTime value={vault.archived_at} />
+                </Property>
+              )}
+              <Property label="Vault id" className={ASIDE_ROW}>
+                <IdChip id={vault.id} full />
+              </Property>
+            </PropertyList>
+          </SectionCard>
+        </aside>
       </div>
 
-      {showAddCred && (
-        <AddCredentialModal
+      {showAdd && !archived && (
+        <AddCredentialDialog
           key={`${connectMode}:${connectToolkit}`}
           vault={vault}
-          initialType={connectMode === "composio" ? "composio" : undefined}
+          initialKind={connectMode === "composio" ? "composio" : undefined}
           initialToolkits={connectToolkit ? [connectToolkit] : undefined}
-          hasComposioCredential={credentials.some(
-            (cred) => !cred.archived_at && cred.auth.type === "composio_mcp",
-          )}
-          onClose={closeAddCred}
+          hasComposioCredential={credentials.some((cred) => !cred.archived_at && cred.auth.type === "composio_mcp")}
+          onClose={closeAdd}
           onCreated={() => {
-            closeAddCred();
+            closeAdd();
             reloadCredentials();
           }}
           onCredentialsChanged={reloadCredentials}
         />
       )}
+
+      <ConfirmDialog
+        open={confirm !== null}
+        onClose={() => setConfirm(null)}
+        destructive={confirm?.kind !== "archive"}
+        title={
+          confirm?.kind === "credential"
+            ? `Delete ${confirm.cred.display_name}?`
+            : confirm?.kind === "delete"
+              ? `Delete ${vault.name}?`
+              : `Archive ${vault.name}?`
+        }
+        body={
+          confirm?.kind === "credential"
+            ? "The stored secret is removed, and agents that borrow from this vault lose this access. This cannot be undone."
+            : confirm?.kind === "delete"
+              ? `The vault and ${active.length === 0 ? "everything in it" : `its ${plural(active.length, "credential")}`} are removed. ${agents.length > 0 ? `${plural(agents.length, "agent")} will lose that access. ` : ""}This cannot be undone.`
+              : "The vault and all of its credentials are archived, and agents can no longer borrow from it. Archiving cannot be reversed."
+        }
+        confirmLabel={
+          confirm?.kind === "credential" ? "Delete credential" : confirm?.kind === "delete" ? "Delete vault" : "Archive vault"
+        }
+        onConfirm={async () => {
+          if (!confirm) return;
+          if (confirm.kind === "credential") {
+            await api(`/v1/vaults/${vault.id}/credentials/${confirm.cred.id}`, { method: "DELETE" });
+            reloadCredentials();
+            return;
+          }
+          if (confirm.kind === "delete") await api(`/v1/vaults/${vault.id}`, { method: "DELETE" });
+          else await api(`/v1/vaults/${vault.id}/archive`, { method: "POST" });
+          void queryClient.invalidateQueries({ queryKey: ["/v1/vaults"] });
+          nav("/vaults");
+        }}
+      />
     </Page>
-  );
-}
-
-// =================================================================
-// Add credential modal — unified MCP / CLI (Anthropic-style)
-// =================================================================
-
-function AddCredentialModal({
-  vault,
-  initialType,
-  initialToolkits,
-  hasComposioCredential,
-  onClose,
-  onCreated,
-  onCredentialsChanged,
-}: {
-  vault: Vault;
-  initialType?: "oauth" | "bearer" | "composio";
-  initialToolkits?: string[];
-  hasComposioCredential: boolean;
-  onClose: () => void;
-  onCreated: () => void;
-  /** The vault's credential list changed without this modal finishing
-   *  (a router re-provisioned in the background) — reload, don't close. */
-  onCredentialsChanged?: () => void;
-}) {
-  const { api } = useApi();
-  const { data: composioStatus, isLoading: composioStatusLoading } =
-    useApiQuery<ComposioStatusResponse>("/v1/composio/status");
-  const composioConfigured = composioStatus?.configured === true;
-
-  // Top-level tab inside the modal: MCP server vs CLI. Folds the two
-  // previously separate entry points into one modal; matches Anthropic.
-  const [addTab, setAddTab] = useState<"mcp" | "cli">("mcp");
-  const [connecting, setConnecting] = useState<string | null>(null);
-
-  // Custom MCP server form — single inline form (Anthropic-style). All
-  // fields in one view; refresh-token block reveals only when an access
-  // token is filled (RFC 6749 §6: refresh_token requires access_token).
-  const [customForm, setCustomForm] = useState({
-    name: "",
-    type: (initialType ?? "oauth") as "oauth" | "bearer" | "composio",
-    url: "",
-    pickedName: "",
-    pickedIcon: "",
-    token: "",
-    refreshToken: "",
-    tokenEndpoint: "",
-    authMethod: "client_secret_post" as
-      | "client_secret_basic"
-      | "client_secret_post"
-      | "none",
-    clientId: "",
-    clientSecret: "",
-    composioToolkits: formatComposioToolkits(initialToolkits ?? []),
-    composioApiKey: "",
-  });
-  const composioToolkits = useMemo(
-    () => parseComposioToolkits(customForm.composioToolkits),
-    [customForm.composioToolkits],
-  );
-  const composioApiKey = composioConfigured ? "" : customForm.composioApiKey.trim();
-  const composioAvailable =
-    composioConfigured || !!composioApiKey || hasComposioCredential;
-  const composioCatalogEnabled = composioConfigured || hasComposioCredential;
-  const shouldShowComposioApiKeyInput =
-    !composioStatusLoading && !composioConfigured;
-  const composioUnavailableMessage =
-    "Configure COMPOSIO_API_KEY on the API server or add a key for this vault.";
-  const { data: composioCatalogRes, isLoading: composioCatalogLoading } =
-    useApiQuery<ComposioToolkitCatalogResponse>(
-      `/v1/vaults/${vault.id}/credentials/composio_toolkits`,
-      { limit: "500" },
-      { enabled: composioCatalogEnabled },
-    );
-  const composioCatalogEntries = useMemo(
-    () => composioEntriesFromCatalog(composioCatalogRes),
-    [composioCatalogRes],
-  );
-  const [composioConnections, setComposioConnections] =
-    useState<ComposioConnectionState>({});
-  const [tokenSectionOpen, setTokenSectionOpen] = useState(false);
-  const [refreshSectionOpen, setRefreshSectionOpen] = useState(false);
-  const [clientCredsSectionOpen, setClientCredsSectionOpen] = useState(false);
-
-  // Add-CLI form (cap_cli credentials). Visible under the "CLI" tab.
-  const [cliForm, setCliForm] = useState({
-    cli_id: "gh",
-    display_name: "",
-    token: "",
-  });
-
-  // OAuth Device Authorization Grant state for cap_cli credentials.
-  // Set when "Sign in via OAuth" is clicked; the poll loop fires until
-  // ready / failure, then writes a cap_cli credential.
-  const [deviceFlow, setDeviceFlow] = useState<{
-    cli_id: string;
-    session_id: string;
-    user_code: string;
-    verification_uri: string;
-    verification_uri_complete?: string;
-    interval_seconds: number;
-    expires_at_ms: number;
-    status: "polling" | "ready" | "expired" | "denied" | "error";
-    error?: string;
-  } | null>(null);
-
-  const writeComposioToolkits = useCallback((toolkits: string[]) => {
-    setCustomForm((prev) => ({
-      ...prev,
-      composioToolkits: formatComposioToolkits(toolkits),
-    }));
-  }, []);
-
-  const toggleComposioToolkit = useCallback(
-    (slug: string) => {
-      const normalized = normalizeComposioToolkitSlug(slug);
-      const next = composioToolkits.includes(normalized)
-        ? composioToolkits.filter((s) => s !== normalized)
-        : [...composioToolkits, normalized];
-      writeComposioToolkits(next);
-    },
-    [composioToolkits, writeComposioToolkits],
-  );
-
-  const addComposioToolkit = useCallback(
-    (slug: string) => {
-      const normalized = normalizeComposioToolkitSlug(slug);
-      if (!normalized || composioToolkits.includes(normalized)) return;
-      writeComposioToolkits([...composioToolkits, normalized]);
-    },
-    [composioToolkits, writeComposioToolkits],
-  );
-
-  // Listen for OAuth popup completion. Two transports because COOP
-  // severs window.opener for providers like Sentry (which set
-  // Cross-Origin-Opener-Policy: same-origin on their authorize page) —
-  // postMessage from the popup back to us doesn't work in that case.
-  // BroadcastChannel is same-origin and survives COOP, so use it as a
-  // parallel channel; the popup posts to both. subscribeOAuthMessages
-  // delivers each result once (it used to toast twice).
-  const handleOAuthMessage = useCallback(
-    (event: MessageEvent | { data: unknown }) => {
-      const data = (
-        event as {
-          data?: {
-            type?: string;
-            toolkit?: string;
-            connected_account_id?: string;
-            service?: string;
-            probe_ok?: boolean;
-            probe_message?: string | null;
-          };
-        }
-      ).data;
-      if (data?.type === "oauth_complete") {
-        setConnecting(null);
-        onCreated();
-        // Surface the MCP probe result so the user knows whether the just-
-        // stored credential will actually work. Same toasts as the legacy
-        // VaultsList modal.
-        const svc = data.service ?? "MCP server";
-        if (data.probe_ok === true) {
-          toast.success(`Connected to ${svc} — token verified.`);
-        } else if (data.probe_ok === false) {
-          toast.warning(
-            data.probe_message
-              ? `Connected to ${svc}, but: ${data.probe_message}`
-              : `Connected to ${svc}, but the server rejected our token.`,
-          );
-        }
-      } else if (data?.type === "composio_auth_complete") {
-        const toolkit = data.toolkit ? normalizeComposioToolkitSlug(data.toolkit) : "";
-        setConnecting(null);
-        setComposioConnections((prev) => {
-          const next = { ...prev };
-          if (toolkit && next[toolkit]) {
-            next[toolkit] = { ...next[toolkit], status: "connected" };
-          } else {
-            for (const slug of Object.keys(next)) {
-              if (next[slug].status === "pending") {
-                next[slug] = { ...next[slug], status: "connected" };
-              }
-            }
-          }
-          return next;
-        });
-        toast.success("Provider account connected through Composio.");
-        // The account just turned ACTIVE: re-provision this vault's EXISTING
-        // tool routers so they bind it — a router doesn't see an unbound
-        // account (best-effort; sessions also repair on start). Only a
-        // credential-list reload: the modal stays open — its own submit
-        // still creates the router for the toolkits being connected.
-        if (hasComposioCredential) {
-          void api<{ refreshed?: number }>(
-            `/v1/vaults/${vault.id}/credentials/composio_tool_router_session/refresh`,
-            { method: "POST", body: JSON.stringify({}), silentErrors: true },
-          )
-            .then((res) => {
-              if ((res?.refreshed ?? 0) > 0) onCredentialsChanged?.();
-            })
-            .catch(() => {});
-        }
-      }
-    },
-    [api, hasComposioCredential, onCreated, onCredentialsChanged, vault.id],
-  );
-
-  useEffect(() => {
-    return subscribeOAuthMessages(handleOAuthMessage);
-  }, [handleOAuthMessage]);
-
-  const connectMcp = (
-    entry: McpRegistryEntry | { name: string; url: string },
-    opts?: { clientId?: string; clientSecret?: string },
-  ) => {
-    setConnecting(entry.name);
-    const params = new URLSearchParams({
-      mcp_server_url: entry.url,
-      vault_id: vault.id,
-      redirect_uri: window.location.href,
-    });
-    if (opts?.clientId) params.set("client_id", opts.clientId);
-    if (opts?.clientSecret) params.set("client_secret", opts.clientSecret);
-    openOAuthPopup(params, "oauth");
-  };
-
-  const createBearerCred = async () => {
-    setConnecting("custom");
-    try {
-      // OAuth-standard credential auth shape:
-      //   - access_token + refresh_token + token_endpoint → mcp_oauth
-      //     (server can refresh on 401 via vault-forward.refreshMcpOAuth).
-      //   - access_token only → static_bearer (no auto-refresh).
-      const hasRefresh = customForm.refreshToken && customForm.tokenEndpoint;
-      const auth: Record<string, unknown> = hasRefresh
-        ? {
-            type: "mcp_oauth",
-            access_token: customForm.token,
-            refresh_token: customForm.refreshToken,
-            token_endpoint: customForm.tokenEndpoint,
-            token_endpoint_auth_method: customForm.authMethod,
-            mcp_server_url: customForm.url,
-          }
-        : {
-            type: "static_bearer",
-            token: customForm.token,
-            mcp_server_url: customForm.url,
-          };
-      await api(`/v1/vaults/${vault.id}/credentials`, {
-        method: "POST",
-        body: JSON.stringify({
-          display_name:
-            customForm.name || customForm.pickedName || "Custom MCP",
-          auth,
-        }),
-      });
-      onCreated();
-    } finally {
-      setConnecting(null);
-    }
-  };
-
-  const createComposioCred = async () => {
-    if (!composioAvailable) {
-      toast.error(composioUnavailableMessage);
-      return;
-    }
-    setConnecting("composio");
-    const linkedEntries = Object.entries(composioConnections).filter(([slug]) =>
-      composioToolkits.includes(slug),
-    );
-    try {
-      await api(`/v1/vaults/${vault.id}/credentials/composio_tool_router_session`, {
-        method: "POST",
-        body: JSON.stringify({
-          display_name:
-            customForm.name || customForm.pickedName || "Composio Tool Router",
-          api_key: composioApiKey || undefined,
-          toolkits: composioToolkits.length > 0 ? { enable: composioToolkits } : undefined,
-          connected_accounts:
-            linkedEntries.length > 0
-              ? Object.fromEntries(
-                  linkedEntries.map(([slug, link]) => [slug, link.connectedAccountId]),
-                )
-              : undefined,
-          auth_configs:
-            linkedEntries.length > 0
-              ? Object.fromEntries(
-                  linkedEntries.map(([slug, link]) => [slug, link.authConfigId]),
-                )
-              : undefined,
-        }),
-      });
-      onCreated();
-    } finally {
-      setConnecting(null);
-    }
-  };
-
-  const connectComposioToolkit = async (
-    entry: Pick<ComposioIntegrationEntry, "slug" | "name">,
-  ) => {
-    if (!composioAvailable) {
-      toast.error(composioUnavailableMessage);
-      return;
-    }
-    const slug = normalizeComposioToolkitSlug(entry.slug);
-    const popup = window.open("", `composio-${slug}`, "width=600,height=720,popup=yes");
-    setConnecting(entry.name);
-    try {
-      addComposioToolkit(slug);
-      const callbackUrl = `${window.location.origin}/composio/callback?toolkit=${encodeURIComponent(slug)}`;
-      const link = await api<{
-        redirect_url: string;
-        connected_account_id: string;
-        auth_config_id: string;
-      }>(`/v1/vaults/${vault.id}/credentials/composio_accounts/link`, {
-        method: "POST",
-        body: JSON.stringify({
-          toolkit: slug,
-          callback_url: callbackUrl,
-          api_key: composioApiKey || undefined,
-        }),
-      });
-      setComposioConnections((prev) => ({
-        ...prev,
-        [slug]: {
-          connectedAccountId: link.connected_account_id,
-          authConfigId: link.auth_config_id,
-          status: "pending",
-          redirectUrl: link.redirect_url,
-        },
-      }));
-      if (popup) {
-        popup.location.href = link.redirect_url;
-      } else {
-        window.open(
-          link.redirect_url,
-          `composio-${slug}`,
-          "width=600,height=720,popup=yes",
-        );
-      }
-    } catch (err) {
-      popup?.close();
-      toast.error(err instanceof Error ? err.message : "Failed to start provider OAuth");
-    } finally {
-      setConnecting(null);
-    }
-  };
-
-  const submitCustom = () => {
-    // Submit rules for the unified Add-credential MCP form:
-    //   - Bearer type or Access token filled → POST a credential
-    //     immediately (mcp_oauth if refresh_token present, else
-    //     static_bearer). Button reads "Add credential".
-    //   - Otherwise → start /v1/oauth/authorize popup. Button reads
-    //     "Connect". Picking a registry row only fills the MCP Server
-    //     field, never auto-connects.
-    if (customForm.type === "composio") {
-      void createComposioCred();
-      return;
-    }
-    if (!customForm.url) return;
-    if (customForm.type === "bearer" || customForm.token) {
-      void createBearerCred();
-    } else {
-      connectMcp(
-        {
-          name:
-            customForm.name || customForm.pickedName || customForm.url,
-          url: customForm.url,
-        },
-        { clientId: customForm.clientId, clientSecret: customForm.clientSecret },
-      );
-    }
-  };
-
-  const createCapCliCred = async () => {
-    const defaultName =
-      CAP_CLIS.find((c) => c.cli_id === cliForm.cli_id)?.label ?? cliForm.cli_id;
-    await api(`/v1/vaults/${vault.id}/credentials`, {
-      method: "POST",
-      body: JSON.stringify({
-        display_name: cliForm.display_name || defaultName,
-        auth: {
-          type: "cap_cli",
-          cli_id: cliForm.cli_id,
-          token: cliForm.token,
-        },
-      }),
-    });
-    onCreated();
-  };
-
-  // Drive cap's OAuth Device Authorization Grant for the selected CLI.
-  // Sequence: POST /initiate → show user_code + URL → poll /poll until
-  // ready / terminal failure → write cap_cli credential and close modal.
-  const startDeviceFlow = async () => {
-    setDeviceFlow(null);
-    try {
-      const init = await api<{
-        session_id: string;
-        user_code: string;
-        verification_uri: string;
-        verification_uri_complete?: string;
-        interval_seconds: number;
-        expires_at_ms: number;
-      }>(`/v1/cap-cli/oauth/initiate`, {
-        method: "POST",
-        body: JSON.stringify({ vault_id: vault.id, cli_id: cliForm.cli_id }),
-      });
-      const flow = { ...init, cli_id: cliForm.cli_id, status: "polling" as const };
-      setDeviceFlow(flow);
-      void pollDeviceFlow(flow);
-    } catch (err) {
-      setDeviceFlow({
-        cli_id: cliForm.cli_id,
-        session_id: "",
-        user_code: "",
-        verification_uri: "",
-        interval_seconds: 0,
-        expires_at_ms: 0,
-        status: "error",
-        error: (err as Error).message,
-      });
-    }
-  };
-
-  const pollDeviceFlow = async (flow: {
-    session_id: string;
-    interval_seconds: number;
-    expires_at_ms: number;
-  }) => {
-    let interval = flow.interval_seconds;
-    while (Date.now() < flow.expires_at_ms) {
-      await new Promise((r) => setTimeout(r, interval * 1000));
-      try {
-        const r = await api<{
-          status:
-            | "pending"
-            | "slow_down"
-            | "ready"
-            | "expired"
-            | "denied"
-            | "error";
-          new_interval_seconds?: number;
-          oauth_error?: string;
-          description?: string;
-          credential_id?: string;
-        }>(`/v1/cap-cli/oauth/poll`, {
-          method: "POST",
-          body: JSON.stringify({ session_id: flow.session_id }),
-        });
-        if (r.status === "pending") continue;
-        if (r.status === "slow_down") {
-          interval = r.new_interval_seconds ?? interval + 5;
-          continue;
-        }
-        if (r.status === "ready") {
-          setDeviceFlow((prev) => (prev ? { ...prev, status: "ready" } : null));
-          // Trigger a refetch so the new credential shows up; close after
-          // a short delay so the user gets visual confirmation first.
-          onCreated();
-          setTimeout(() => {
-            setDeviceFlow(null);
-          }, 1500);
-          return;
-        }
-        // expired / denied / error
-        setDeviceFlow((prev) =>
-          prev
-            ? {
-                ...prev,
-                status: r.status as "expired" | "denied" | "error",
-                error: r.description ?? r.oauth_error,
-              }
-            : null,
-        );
-        return;
-      } catch (err) {
-        setDeviceFlow((prev) =>
-          prev
-            ? { ...prev, status: "error", error: (err as Error).message }
-            : null,
-        );
-        return;
-      }
-    }
-    setDeviceFlow((prev) => (prev ? { ...prev, status: "expired" } : null));
-  };
-
-  return (
-    <Modal
-      open
-      onClose={onClose}
-      title="Add credential"
-      maxWidth="max-w-lg"
-      footer={
-        addTab === "cli" ? (
-          deviceFlow?.status === "polling" ? (
-            <Button variant="ghost" onClick={() => setDeviceFlow(null)}>
-              Cancel
-            </Button>
-          ) : (
-            <>
-              <Button variant="ghost" onClick={onClose}>
-                Cancel
-              </Button>
-              <Button onClick={createCapCliCred} disabled={!cliForm.token}>
-                Create
-              </Button>
-            </>
-          )
-        ) : (
-          <>
-            <Button variant="ghost" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button
-              onClick={submitCustom}
-              disabled={
-                (customForm.type !== "composio" && !customForm.url) ||
-                !!connecting ||
-                (customForm.type === "bearer" && !customForm.token) ||
-                (customForm.type === "composio" && !composioAvailable)
-              }
-            >
-              {customForm.type === "composio"
-                ? "Add credential"
-                : customForm.token || customForm.type === "bearer"
-                  ? "Add credential"
-                  : "Connect"}
-            </Button>
-          </>
-        )
-      }
-    >
-      <Tabs
-        value={addTab}
-        onValueChange={(v) => setAddTab(v as "mcp" | "cli")}
-        aria-label="Add credential"
-      >
-        <TabsList className="mb-3">
-          <TabsTrigger value="mcp">MCP server</TabsTrigger>
-          <TabsTrigger value="cli">CLI</TabsTrigger>
-        </TabsList>
-
-        <TabsContent value="mcp" className="space-y-4">
-          <div className="text-sm text-fg-muted">
-            Authorize an MCP server for delegated user authentication.
-          </div>
-          <div className="text-xs text-fg-subtle">
-            Connecting a login doesn&apos;t give it to an agent — add the server on the
-            agent&apos;s MCP Servers or Integrations tab.
-          </div>
-
-          <div>
-            <label
-              htmlFor="vault-mcp-name"
-              className="text-sm font-medium text-fg block mb-1"
-            >
-              Name{" "}
-              <span className="text-xs text-fg-muted ml-1 px-1.5 py-0.5 rounded bg-bg-surface">
-                Optional
-              </span>
-            </label>
-            <input
-              id="vault-mcp-name"
-              value={customForm.name}
-              onChange={(e) => setCustomForm({ ...customForm, name: e.target.value })}
-              placeholder="Example MCP"
-              className={inputCls}
-            />
-          </div>
-
-          <div>
-            <label className="text-sm font-medium text-fg block mb-1">Type</label>
-            <div className="inline-flex rounded-md border border-border p-0.5">
-              {(["oauth", "bearer", "composio"] as const).map((t) => (
-                <button
-                  key={t}
-                  type="button"
-                  onClick={() =>
-                    setCustomForm({
-                      ...customForm,
-                      type: t,
-                    })
-                  }
-                  className={`inline-flex items-center justify-center px-3 py-1 min-h-11 sm:min-h-0 text-sm rounded ${customForm.type === t ? "bg-bg-surface text-fg font-medium" : "text-fg-muted"}`}
-                >
-                  {t === "oauth"
-                    ? "OAuth"
-                    : t === "composio"
-                      ? "Composio"
-                      : "Bearer token"}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {customForm.type === "composio" ? (
-            <div className="space-y-3">
-              {!composioStatusLoading && !composioAvailable && (
-                <div className="rounded-md border border-warning/30 bg-warning-subtle px-3 py-2 text-sm text-warning">
-                  {composioUnavailableMessage}
-                </div>
-              )}
-              {shouldShowComposioApiKeyInput && (
-                <SecretInput
-                  id="vault-composio-api-key"
-                  label={
-                    <>
-                      Composio API key{" "}
-                      <span className="text-xs text-fg-muted ml-1 px-1.5 py-0.5 rounded bg-bg-surface">
-                        {hasComposioCredential ? "Optional" : "Required"}
-                      </span>
-                    </>
-                  }
-                  hint="Used for this vault when the API server does not provide COMPOSIO_API_KEY."
-                  value={customForm.composioApiKey}
-                  onChange={(e) =>
-                    setCustomForm({ ...customForm, composioApiKey: e.target.value })
-                  }
-                  placeholder="ak_..."
-                  className={inputCls}
-                />
-              )}
-              <div>
-                <label className="text-sm font-medium text-fg block mb-1">
-                  Managed Agent apps
-                  <span className="text-xs text-fg-muted ml-1">
-                    {composioStatusLoading || (composioCatalogEnabled && composioCatalogLoading)
-                      ? "loading..."
-                      : `${composioCatalogEntries.length} available`}
-                  </span>
-                </label>
-                <div className="border border-border rounded-md divide-y divide-border max-h-72 overflow-y-auto">
-                  {composioCatalogEntries.map((entry) => {
-                    const selected = composioToolkits.includes(entry.slug);
-                    const connection = composioConnections[entry.slug];
-                    return (
-                      <div
-                        key={entry.slug}
-                        className="flex items-center gap-3 px-3 py-2.5"
-                      >
-                        <input
-                          type="checkbox"
-                          checked={selected}
-                          onChange={() => toggleComposioToolkit(entry.slug)}
-                          aria-label={`Enable ${entry.name}`}
-                          className="size-4 shrink-0"
-                        />
-                        <img
-                          src={composioIntegrationIcon(entry)}
-                          alt=""
-                          loading="lazy"
-                          decoding="async"
-                          className="w-5 h-5 rounded shrink-0"
-                          onError={(e) => {
-                            (e.target as HTMLImageElement).style.display = "none";
-                          }}
-                        />
-                        <div className="min-w-0 flex-1">
-                          <div className="text-sm font-medium text-fg truncate">
-                            {entry.name}
-                          </div>
-                          <div className="text-xs text-fg-subtle truncate">
-                            {entry.category}
-                          </div>
-                        </div>
-                        {connection && (
-                          <span className="text-[11px] px-2 py-0.5 rounded-full bg-success-subtle text-success shrink-0">
-                            {connection.status === "connected" ? "connected" : "pending"}
-                          </span>
-                        )}
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            if (connection?.status === "pending" && connection.redirectUrl) {
-                              window.open(
-                                connection.redirectUrl,
-                                `composio-${entry.slug}`,
-                                "width=600,height=720,popup=yes",
-                              );
-                            } else {
-                              void connectComposioToolkit(entry);
-                            }
-                          }}
-                          disabled={!composioAvailable || !!connecting}
-                        >
-                          {connection?.status === "pending" ? "Open auth" : "Connect"}
-                        </Button>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-
-              <div>
-                <label className="text-sm font-medium text-fg block mb-1">
-                  Toolkits
-                  <span className="text-xs text-fg-muted ml-1 px-1.5 py-0.5 rounded bg-bg-surface">
-                    Optional
-                  </span>
-                </label>
-                <input
-                  value={customForm.composioToolkits}
-                  onChange={(e) =>
-                    setCustomForm({ ...customForm, composioToolkits: e.target.value })
-                  }
-                  placeholder="github, slack, notion, googledrive"
-                  className={inputCls}
-                />
-                {composioToolkits.length > 0 && (
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    {composioToolkits.map((slug) => {
-                      const known = composioCatalogEntries.find(
-                        (entry) => entry.slug === slug,
-                      );
-                      const connection = composioConnections[slug];
-                      return (
-                        <span
-                          key={slug}
-                          className="inline-flex items-center gap-2 text-xs border border-border rounded-md px-2 py-1"
-                        >
-                          <span className="font-mono">{slug}</span>
-                          {connection && (
-                            <span className="text-success">
-                              {connection.status === "connected" ? "connected" : "pending"}
-                            </span>
-                          )}
-                          <button
-                            type="button"
-                            className="text-brand hover:underline"
-                            disabled={!composioAvailable || !!connecting}
-                            onClick={() => {
-                              if (connection?.status === "pending" && connection.redirectUrl) {
-                                window.open(
-                                  connection.redirectUrl,
-                                  `composio-${slug}`,
-                                  "width=600,height=720,popup=yes",
-                                );
-                              } else {
-                                void connectComposioToolkit({
-                                  slug,
-                                  name: known?.name ?? slug,
-                                });
-                              }
-                            }}
-                          >
-                            {connection?.status === "pending" ? "Open auth" : "Connect"}
-                          </button>
-                        </span>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            </div>
-          ) : (
-            <div>
-              <label className="text-sm font-medium text-fg block mb-1">
-                MCP Server
-              </label>
-              {/* Combobox: input filters the registry as you type. Pick a
-                  row to fill the URL + show the favicon as a left-side
-                  prefix; type a custom URL to ignore the registry. The
-                  dropdown renders into document.body via portal so it
-                  escapes Modal's overflow-y-auto clipping. */}
-              <LocalCombobox
-                value={customForm.url}
-                onChange={(text) =>
-                  setCustomForm({
-                    ...customForm,
-                    url: text,
-                    pickedName: "",
-                    pickedIcon: "",
-                  })
-                }
-                onPick={(entry) =>
-                  setCustomForm({
-                    ...customForm,
-                    url: entry.url,
-                    pickedName: entry.name,
-                    pickedIcon: entry.icon ?? "",
-                    type: entry.id === "composio" ? "composio" : customForm.type,
-                  })
-                }
-                options={MCP_REGISTRY}
-                filter={(entry, q) =>
-                  !q ||
-                  entry.name.toLowerCase().includes(q) ||
-                  entry.url.toLowerCase().includes(q)
-                }
-                getKey={(entry) => entry.id}
-                renderItem={(entry) => (
-                  <div className="flex items-center gap-3 px-3 py-2.5">
-                    {entry.icon ? (
-                      <img
-                        src={entry.icon}
-                        alt=""
-                        loading="lazy"
-                        decoding="async"
-                        className="w-5 h-5 rounded shrink-0"
-                        onError={(e) => {
-                          (e.target as HTMLImageElement).style.display = "none";
-                        }}
-                      />
-                    ) : (
-                      <div className="w-5 h-5 rounded bg-bg-surface shrink-0" />
-                    )}
-                    <div className="min-w-0 flex-1">
-                      <div className="text-sm font-medium text-fg">
-                        {entry.name}
-                      </div>
-                      <div className="text-xs text-fg-muted font-mono truncate">
-                        {entry.url}
-                      </div>
-                    </div>
-                  </div>
-                )}
-                prefix={
-                  customForm.pickedIcon ? (
-                    <img
-                      src={customForm.pickedIcon}
-                      alt=""
-                      loading="lazy"
-                      decoding="async"
-                      className="w-4 h-4 rounded shrink-0"
-                      onError={(e) => {
-                        (e.target as HTMLImageElement).style.display = "none";
-                      }}
-                    />
-                  ) : null
-                }
-                placeholder="Search Anthropic's MCP registry or enter a custom URL"
-                emptyHint="No matches — keep typing for a custom URL"
-              />
-            </div>
-          )}
-
-          {/* Access token — collapsed Optional. Filling this switches the
-              submit path to POST static_bearer + button label changes to
-              "Add credential". Visible regardless of Type so the user can
-              supply a pre-issued OAuth access_token without a handshake. */}
-          {customForm.type !== "composio" && (
-            <Disclosure
-              title="Access token"
-              meta={
-                <span className="px-1.5 py-0.5 rounded bg-bg-surface">
-                  Optional
-                </span>
-              }
-              open={tokenSectionOpen}
-              onOpenChange={setTokenSectionOpen}
-            >
-              <input
-                value={customForm.token}
-                onChange={(e) =>
-                  setCustomForm({ ...customForm, token: e.target.value })
-                }
-                type="password"
-                placeholder="••••••••"
-                aria-label="Access token"
-                className={inputCls}
-              />
-              <div className="text-xs text-fg-subtle mt-1">
-                If filled, the credential is stored as a static bearer token (no
-                OAuth handshake).
-              </div>
-            </Disclosure>
-          )}
-
-          {/* Refresh token block (Optional) — only meaningful when an
-              Access token is also set (RFC 6749 §6 refresh_token grant). */}
-          {customForm.token && (
-            <Disclosure
-              title="Refresh token"
-              meta={
-                <span className="px-1.5 py-0.5 rounded bg-bg-surface">
-                  Optional
-                </span>
-              }
-              open={refreshSectionOpen}
-              onOpenChange={setRefreshSectionOpen}
-              className="space-y-3"
-            >
-              <div className="space-y-3">
-                <div>
-                  <input
-                    value={customForm.refreshToken}
-                    onChange={(e) =>
-                      setCustomForm({
-                        ...customForm,
-                        refreshToken: e.target.value,
-                      })
-                    }
-                    placeholder="OAuth refresh token"
-                    aria-label="Refresh token"
-                    className={inputCls}
-                  />
-                </div>
-                <div>
-                  <label
-                    htmlFor="vault-token-endpoint"
-                    className="text-sm font-medium text-fg block mb-1"
-                  >
-                    Token endpoint
-                  </label>
-                  <input
-                    id="vault-token-endpoint"
-                    value={customForm.tokenEndpoint}
-                    onChange={(e) =>
-                      setCustomForm({
-                        ...customForm,
-                        tokenEndpoint: e.target.value,
-                      })
-                    }
-                    placeholder="https://auth.example.com/oauth/token"
-                    className={inputCls}
-                  />
-                </div>
-                <div>
-                  <label
-                    htmlFor="vault-auth-method"
-                    className="text-sm font-medium text-fg block mb-1"
-                  >
-                    Auth method
-                  </label>
-                  <select
-                    id="vault-auth-method"
-                    value={customForm.authMethod}
-                    onChange={(e) =>
-                      setCustomForm({
-                        ...customForm,
-                        authMethod: e.target
-                          .value as typeof customForm.authMethod,
-                      })
-                    }
-                    className={inputCls}
-                  >
-                    <option value="client_secret_post">client_secret_post</option>
-                    <option value="client_secret_basic">client_secret_basic</option>
-                    <option value="none">none</option>
-                  </select>
-                </div>
-                <div className="text-xs text-fg-subtle">
-                  RFC 8414 token_endpoint_auth_methods_supported. Used when the
-                  server refreshes on 401.
-                </div>
-              </div>
-            </Disclosure>
-          )}
-          {/* OAuth client credentials (Optional) — only shown for the
-              OAuth flow. Lets the user override the server's preset
-              client_id/secret on a per-credential basis (GitHub, Feishu,
-              any provider that doesn't support DCR). */}
-          {customForm.type === "oauth" && !customForm.token && (
-            <Disclosure
-              title="OAuth client credentials"
-              meta={
-                <span className="px-1.5 py-0.5 rounded bg-bg-surface">
-                  Optional
-                </span>
-              }
-              open={clientCredsSectionOpen}
-              onOpenChange={setClientCredsSectionOpen}
-            >
-              <div className="space-y-2">
-                <input
-                  value={customForm.clientId}
-                  onChange={(e) =>
-                    setCustomForm({ ...customForm, clientId: e.target.value })
-                  }
-                  placeholder="Client ID"
-                  aria-label="OAuth client ID"
-                  className={inputCls}
-                />
-                <input
-                  value={customForm.clientSecret}
-                  onChange={(e) =>
-                    setCustomForm({
-                      ...customForm,
-                      clientSecret: e.target.value,
-                    })
-                  }
-                  type="password"
-                  placeholder="Client secret"
-                  aria-label="OAuth client secret"
-                  className={inputCls}
-                />
-                <div className="text-xs text-fg-subtle">
-                  For OAuth providers that don't support Dynamic Client
-                  Registration (GitHub, Feishu) — supply a client_id/secret from
-                  a pre-registered app.
-                </div>
-              </div>
-            </Disclosure>
-          )}
-        </TabsContent>
-
-        <TabsContent value="cli" className="space-y-3">
-          <div>
-            <label
-              htmlFor="vault-cli-id"
-              className="text-sm text-fg-muted block mb-1"
-            >
-              CLI
-            </label>
-            <select
-              id="vault-cli-id"
-              value={cliForm.cli_id}
-              onChange={(e) => {
-                setCliForm({ ...cliForm, cli_id: e.target.value });
-                setDeviceFlow(null);
-              }}
-              className={inputCls}
-              disabled={deviceFlow?.status === "polling"}
-            >
-              {CAP_CLIS.map((c) => (
-                <option key={c.cli_id} value={c.cli_id}>
-                  {c.label}
-                  {c.oauth ? " (OAuth supported)" : ""}
-                </option>
-              ))}
-            </select>
-            <div className="text-xs text-fg-subtle mt-1">
-              {CAP_CLIS.find((c) => c.cli_id === cliForm.cli_id)?.helper}
-            </div>
-          </div>
-
-          {CAP_CLIS.find((c) => c.cli_id === cliForm.cli_id)?.oauth && (
-            <div className="border border-border rounded-md p-3 bg-bg-surface">
-              {!deviceFlow && (
-                <Button variant="outline" size="sm" onClick={startDeviceFlow}>
-                  Sign in via {cliForm.cli_id} OAuth
-                </Button>
-              )}
-              {deviceFlow?.status === "polling" && (
-                <div className="space-y-2 text-sm">
-                  <div className="text-fg-muted">
-                    Open{" "}
-                    <a
-                      href={
-                        deviceFlow.verification_uri_complete ??
-                        deviceFlow.verification_uri
-                      }
-                      target="_blank"
-                      rel="noreferrer"
-                      className="text-brand underline"
-                    >
-                      {deviceFlow.verification_uri_complete ??
-                        deviceFlow.verification_uri}
-                    </a>{" "}
-                    and enter:
-                  </div>
-                  <div className="font-mono text-2xl text-centerst text-fg py-2 select-all">
-                    {deviceFlow.user_code}
-                  </div>
-                  <div className="text-xs text-fg-subtle text-center">
-                    Waiting for confirmation… (polls every{" "}
-                    {deviceFlow.interval_seconds}s)
-                  </div>
-                </div>
-              )}
-              {deviceFlow?.status === "ready" && (
-                <div className="text-sm text-success">
-                  ✓ Token acquired and stored.
-                </div>
-              )}
-              {(deviceFlow?.status === "expired" ||
-                deviceFlow?.status === "denied" ||
-                deviceFlow?.status === "error") && (
-                <div className="text-sm text-danger">
-                  {deviceFlow.status === "denied"
-                    ? "Access denied by user."
-                    : deviceFlow.status === "expired"
-                      ? "Code expired — try again."
-                      : `OAuth error: ${deviceFlow.error ?? "unknown"}`}
-                </div>
-              )}
-            </div>
-          )}
-
-          <div>
-            <label
-              htmlFor="vault-cli-display-name"
-              className="text-sm text-fg-muted block mb-1"
-            >
-              Display Name{" "}
-              <span className="text-fg-subtle">(optional)</span>
-            </label>
-            <TextInput
-              id="vault-cli-display-name"
-              value={cliForm.display_name}
-              onChange={(e) =>
-                setCliForm({ ...cliForm, display_name: e.target.value })
-              }
-              className={inputCls}
-              placeholder={
-                CAP_CLIS.find((c) => c.cli_id === cliForm.cli_id)?.label ??
-                cliForm.cli_id
-              }
-              disabled={deviceFlow?.status === "polling"}
-            />
-          </div>
-          <div>
-            <label
-              htmlFor="vault-cli-token"
-              className="text-sm text-fg-muted block mb-1"
-            >
-              Token{" "}
-              <span className="text-fg-subtle">
-                (write-only — leave blank to use OAuth above)
-              </span>
-            </label>
-            <SecretInput
-              id="vault-cli-token"
-              value={cliForm.token}
-              onChange={(e) =>
-                setCliForm({ ...cliForm, token: e.target.value })
-              }
-              className={inputCls}
-              placeholder="••••••••"
-              disabled={deviceFlow?.status === "polling"}
-            />
-          </div>
-        </TabsContent>
-      </Tabs>
-    </Modal>
   );
 }

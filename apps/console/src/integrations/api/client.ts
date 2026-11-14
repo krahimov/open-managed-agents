@@ -1,12 +1,15 @@
 // Typed wrapper around fetch for /v1/integrations/* endpoints.
 //
-// Credentials are sent via session cookie (better-auth). The base path is
+// Credentials: the session cookie (better-auth) or the Clerk bearer, plus
+// the pinned workspace header, as lib/api sends them. The base path is
 // configurable for tests; defaults to the Console's same-origin "".
 //
 // Each integration provider gets a sub-client (api.linear.*, api.slack.*,
 // api.github.*) with the same method shapes. Provider-specific quirks
 // (e.g. signingSecret vs webhookSecret) live in narrow input types.
 
+import { getActiveTenantId } from "../../lib/api";
+import { getClerkBearerToken } from "../../lib/clerk-auth";
 import type {
   A1FormStep,
   A1InstallLink,
@@ -41,11 +44,17 @@ async function request<T = unknown>(
   path: string,
   init?: RequestInit,
 ): Promise<T> {
+  // Same auth as lib/api: the Clerk bearer (Clerk mode has no cookie on
+  // these calls) and the pinned workspace.
+  const clerkToken = await getClerkBearerToken();
+  const activeTenant = getActiveTenantId();
   const res = await fetch(`${basePath}${path}`, {
     ...init,
     credentials: "include",
     headers: {
       ...(init?.body ? { "content-type": "application/json" } : {}),
+      ...(clerkToken ? { authorization: `Bearer ${clerkToken}` } : {}),
+      ...(activeTenant ? { "x-active-tenant": activeTenant } : {}),
       ...init?.headers,
     },
   });
@@ -64,7 +73,9 @@ async function request<T = unknown>(
     else if (body.error && typeof body.error === "object" && body.error.message)
       msg = body.error.message;
     else msg = `HTTP ${res.status}`;
-    throw new Error(msg);
+    // The status rides along so the console can say what kind of failure it
+    // was when the server sent only a word (lib/failure-text.ts).
+    throw Object.assign(new Error(msg), { status: res.status });
   }
   return (await res.json()) as T;
 }

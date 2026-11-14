@@ -1,13 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router";
-import { AgentFormDialog } from "./AgentFormDialog";
-import type { AgentRecord } from "../../types/agent";
+import { http, HttpResponse } from "msw";
+import type { ModelCard } from "@open-managed-agents/api-types";
 
-vi.mock("../../lib/clerk-auth", () => ({
-  getClerkBearerToken: vi.fn(async () => null),
-}));
+import { server } from "../../mocks/server";
+import type { AgentRecord } from "../../types/agent";
+import { AgentFormDialog } from "./AgentFormDialog";
 
 const customTool = {
   type: "custom",
@@ -44,31 +44,42 @@ const agent: AgentRecord = {
   _oma: { harness: "default", default_environment_id: "env_1" },
 };
 
-const fetchMock = vi.fn<typeof fetch>();
+const modelCard: ModelCard = {
+  id: "mc_1",
+  model_id: "claude-sonnet-4-6",
+  model: "claude-sonnet-4-6",
+  provider: "ant",
+  created_at: "2026-09-01T00:00:00Z",
+};
 
-function json(body: unknown) {
-  return Promise.resolve(Response.json(body));
-}
+let saved: Array<Record<string, unknown>> = [];
 
-beforeEach(() => {
-  fetchMock.mockImplementation((input, init) => {
-    const url = new URL(String(input), "http://localhost");
-    if (url.pathname === "/v1/composio/status") return json({ configured: false });
-    if (url.pathname === "/v1/vaults") return json({ data: [] });
-    if (url.pathname === "/v1/environments") return json({ data: [{ id: "env_1", name: "Default" }, { id: "env_2", name: "Other" }] });
-    if (url.pathname === "/v1/sandbox/config") return json({ provider: "subprocess" });
-    if (url.pathname === "/v1/agents/agent_1" && init?.method === "POST") {
-      return json({ ...agent, ...JSON.parse(String(init.body)), version: 4 });
-    }
-    return json({ data: [] });
-  });
-  vi.stubGlobal("fetch", fetchMock);
+beforeAll(() => {
+  globalThis.ResizeObserver ??= class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  } as unknown as typeof ResizeObserver;
+  Element.prototype.scrollIntoView ??= () => {};
+  Element.prototype.hasPointerCapture ??= () => false;
+  Element.prototype.releasePointerCapture ??= () => {};
 });
 
-afterEach(() => {
-  cleanup();
-  vi.unstubAllGlobals();
-  fetchMock.mockReset();
+beforeEach(() => {
+  saved = [];
+  server.use(
+    http.get("*/v1/composio/status", () => HttpResponse.json({ configured: false })),
+    http.get("*/v1/environments", () =>
+      HttpResponse.json({ data: [{ id: "env_1", name: "Default" }, { id: "env_2", name: "Other" }] }),
+    ),
+    http.get("*/v1/sandbox/config", () => HttpResponse.json({ provider: "subprocess" })),
+    http.post("*/v1/agents/agent_1", async ({ request }) => {
+      const body = (await request.json()) as Record<string, unknown>;
+      saved.push(body);
+      return HttpResponse.json({ ...agent, ...body, version: 4 });
+    }),
+    http.get("*/v1/*", () => HttpResponse.json({ data: [] })),
+  );
 });
 
 function renderEdit(
@@ -86,7 +97,7 @@ function renderEdit(
           onOpenSetup={props.onOpenSetup}
           allAgents={[]}
           customSkills={[]}
-          modelCards={[]}
+          modelCards={[modelCard]}
           runtimes={[]}
         />
       </MemoryRouter>
@@ -94,124 +105,112 @@ function renderEdit(
   );
 }
 
-function savedBody(): Record<string, unknown> {
-  const call = fetchMock.mock.calls.find(
-    ([input, init]) => String(input).endsWith("/v1/agents/agent_1") && init?.method === "POST",
-  );
-  expect(call).toBeDefined();
-  return JSON.parse(String(call![1]!.body));
+/** Let the environment read land, so it cannot overwrite the prefill. */
+const settle = () => new Promise((r) => setTimeout(r, 30));
+
+async function saveAndRead(onSaved: ReturnType<typeof vi.fn>): Promise<Record<string, unknown>> {
+  fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+  await waitFor(() => expect(onSaved).toHaveBeenCalled());
+  expect(saved).toHaveLength(1);
+  return saved[0];
 }
 
 describe("AgentFormDialog edit mode", () => {
-  it("prefills the agent's config and skips the template picker", async () => {
+  it("starts from the agent's configuration, with no template step", async () => {
     renderEdit();
-    expect(screen.getByRole("heading", { name: "Edit Triage Bot" })).toBeInTheDocument();
-    expect(screen.queryByText("← Templates")).toBeNull();
-    expect(screen.getByDisplayValue("Triage Bot")).toBeInTheDocument();
-    expect(screen.getByDisplayValue("You triage issues.")).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /Skills \(1\)/ })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: /MCP Servers \(1\)/ })).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "Edit Triage Bot" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Back to templates" })).toBeNull();
+    expect(screen.getByRole("textbox", { name: "Name" })).toHaveValue("Triage Bot");
+    expect(screen.getByRole("textbox", { name: "Instructions" })).toHaveValue("You triage issues.");
+    expect(screen.getByRole("tab", { name: /Skills\s*1/ })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: /MCP servers\s*1/ })).toBeInTheDocument();
+    expect(screen.getByText(/Saving creates version 4/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Save changes" })).toBeInTheDocument();
   });
 
-  it("saves a new version without dropping config the form can't edit", async () => {
+  it("saves a new version without dropping what the form cannot edit", async () => {
     const onSaved = vi.fn();
     renderEdit({ onSaved });
-    // Let the environments fetch settle so it can't overwrite the prefill.
-    await waitFor(() =>
-      expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/v1/environments"))).toBe(true),
-    );
-    fireEvent.change(screen.getByDisplayValue("Triage Bot"), { target: { value: "Triage Bot 2" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
-    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    await settle();
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Triage Bot 2" } });
+    const body = await saveAndRead(onSaved);
 
-    const body = savedBody();
     expect(body.version).toBe(3);
     expect(body.name).toBe("Triage Bot 2");
-    // Unchanged model keeps its {id, speed} object.
+    // An unchanged model keeps its {id, speed}.
     expect(body.model).toEqual({ id: "claude-sonnet-4-6", speed: "fast" });
     expect(body.skills).toEqual([{ type: "anthropic", skill_id: "xlsx" }]);
     expect(body.mcp_servers).toEqual(agent.mcp_servers);
     const tools = body.tools as Array<Record<string, unknown>>;
     expect(tools).toContainEqual(customTool);
-    // Existing per-server MCP policy survives instead of being reset.
+    // A server's own permissions survive instead of being reset.
     expect(tools).toContainEqual(githubToolset);
-    expect(tools[0]).toMatchObject({
-      type: "agent_toolset_20260401",
-      configs: [{ name: "web_search", enabled: false }],
-    });
-    // Metadata untouched → not sent (server merges per key).
+    expect(tools[0]).toMatchObject({ type: "agent_toolset_20260401", configs: [{ name: "web_search", enabled: false }] });
+    // Metadata untouched: not sent (the server merges per key).
     expect(body.metadata).toBeUndefined();
-    // Harness unchanged → not re-sent.
-    expect((body._oma as Record<string, unknown>).harness).toBeUndefined();
-    // Unset vault_mcp_servers stays unset ("declared").
-    expect((body._oma as Record<string, unknown>).vault_mcp_servers).toBeUndefined();
+    const oma = body._oma as Record<string, unknown>;
+    // Unchanged engine, reasoning, memory and vault servers are not re-sent.
+    expect(oma).not.toHaveProperty("harness");
+    expect(oma).not.toHaveProperty("reasoning_level");
+    expect(oma).not.toHaveProperty("memory");
+    expect(oma).not.toHaveProperty("vault_mcp_servers");
   });
 
-  it("round-trips _oma.vault_mcp_servers: all through an edit", async () => {
+  it("keeps _oma.vault_mcp_servers: all through an edit", async () => {
     const onSaved = vi.fn();
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    render(
-      <QueryClientProvider client={client}>
-        <MemoryRouter>
-          <AgentFormDialog
-            open
-            onClose={() => {}}
-            editAgent={{ ...agent, _oma: { ...agent._oma, vault_mcp_servers: "all" } }}
-            onSaved={onSaved}
-            allAgents={[]}
-            customSkills={[]}
-            modelCards={[]}
-            runtimes={[]}
-          />
-        </MemoryRouter>
-      </QueryClientProvider>,
-    );
-    await waitFor(() =>
-      expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/v1/environments"))).toBe(true),
-    );
-    fireEvent.change(screen.getByDisplayValue("Triage Bot"), { target: { value: "Triage Bot 2" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
-    await waitFor(() => expect(onSaved).toHaveBeenCalled());
-    // Unchanged → not re-sent, and in particular not cleared back to "declared".
-    expect((savedBody()._oma as Record<string, unknown>).vault_mcp_servers).toBeUndefined();
+    renderEdit({ onSaved, editAgent: { ...agent, _oma: { ...agent._oma, vault_mcp_servers: "all" } } });
+    await settle();
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Triage Bot 2" } });
+    const body = await saveAndRead(onSaved);
+    // Unchanged: not re-sent, and in particular not cleared back to "declared".
+    expect(body._oma as Record<string, unknown>).not.toHaveProperty("vault_mcp_servers");
   });
 
-  it("round-trips _oma.mcp_tool_loading through the JSON view and only sends it when it changed", async () => {
+  it("carries _oma.mcp_tool_loading through the JSON view and sends it only when it changed", async () => {
     const onSaved = vi.fn();
     renderEdit({ onSaved, editAgent: { ...agent, _oma: { ...agent._oma, mcp_tool_loading: "deferred" } } });
-    await waitFor(() =>
-      expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/v1/environments"))).toBe(true),
-    );
-    fireEvent.click(screen.getByRole("button", { name: "JSON" }));
-    const editor = await waitFor(() => {
-      const el = document.querySelector("textarea.font-mono") as HTMLTextAreaElement | null;
-      expect(el?.value).toContain("{");
-      return el!;
-    });
+    await settle();
+    fireEvent.click(screen.getByRole("radio", { name: "JSON" }));
+    const editor = (await screen.findByRole("textbox", { name: "Agent config as JSON" })) as HTMLTextAreaElement;
     const config = JSON.parse(editor.value) as { _oma?: Record<string, unknown> };
     expect(config._oma?.mcp_tool_loading).toBe("deferred");
 
-    // Edit it in the raw config, back to the form, save.
-    fireEvent.change(editor, {
-      target: { value: JSON.stringify({ ...config, _oma: { ...config._oma, mcp_tool_loading: "eager" } }) },
-    });
-    fireEvent.click(screen.getByRole("button", { name: "Form" }));
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
-    await waitFor(() => expect(onSaved).toHaveBeenCalled());
-    expect((savedBody()._oma as Record<string, unknown>).mcp_tool_loading).toBe("eager");
+    fireEvent.change(editor, { target: { value: JSON.stringify({ ...config, _oma: { ...config._oma, mcp_tool_loading: "eager" } }) } });
+    fireEvent.click(screen.getByRole("radio", { name: "Form" }));
+    const body = await saveAndRead(onSaved);
+    expect((body._oma as Record<string, unknown>).mcp_tool_loading).toBe("eager");
   });
 
   it("does not re-send an unchanged mcp_tool_loading", async () => {
     const onSaved = vi.fn();
     renderEdit({ onSaved, editAgent: { ...agent, _oma: { ...agent._oma, mcp_tool_loading: "deferred" } } });
-    await waitFor(() =>
-      expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/v1/environments"))).toBe(true),
-    );
-    fireEvent.change(screen.getByDisplayValue("Triage Bot"), { target: { value: "Triage Bot 2" } });
-    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
-    await waitFor(() => expect(onSaved).toHaveBeenCalled());
-    expect(savedBody()._oma as Record<string, unknown>).not.toHaveProperty("mcp_tool_loading");
+    await settle();
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Triage Bot 2" } });
+    const body = await saveAndRead(onSaved);
+    expect(body._oma as Record<string, unknown>).not.toHaveProperty("mcp_tool_loading");
+  });
+
+  it("keeps an agent's Extra High and its legacy Instant until someone changes them", async () => {
+    const onSaved = vi.fn();
+    renderEdit({ onSaved, editAgent: { ...agent, _oma: { ...agent._oma, reasoning_level: "instant" } } });
+    await settle();
+    fireEvent.click(screen.getByRole("tab", { name: /Model and engine/ }));
+    // The legacy value is shown as itself, not mistaken for the default.
+    expect(await screen.findByRole("combobox", { name: "Reasoning" })).toHaveTextContent("Instant");
+    fireEvent.click(screen.getByRole("radio", { name: "JSON" }));
+    const editor = (await screen.findByRole("textbox", { name: "Agent config as JSON" })) as HTMLTextAreaElement;
+    expect((JSON.parse(editor.value) as { _oma: Record<string, unknown> })._oma.reasoning_level).toBe("instant");
+  });
+
+  it("an Off chosen for memory keeps the agent's store", async () => {
+    const onSaved = vi.fn();
+    renderEdit({ onSaved, editAgent: { ...agent, _oma: { ...agent._oma, memory: { mode: "shared", store_id: "memstore_1" } } } });
+    await settle();
+    fireEvent.click(screen.getByRole("tab", { name: /Model and engine/ }));
+    const memory = await screen.findByRole("radiogroup", { name: "Memory" });
+    fireEvent.click(within(memory).getByRole("radio", { name: "Off" }));
+    const body = await saveAndRead(onSaved);
+    expect((body._oma as Record<string, unknown>).memory).toEqual({ mode: "off", store_id: "memstore_1" });
   });
 
   it("hands off to the setup chat", () => {
@@ -221,23 +220,31 @@ describe("AgentFormDialog edit mode", () => {
     expect(onOpenSetup).toHaveBeenCalledOnce();
   });
 
-  it("closes on Escape when nothing changed, and asks once the config was edited", async () => {
-    const confirmMock = vi.fn(() => false);
-    vi.stubGlobal("confirm", confirmMock);
+  it("closes on Escape when nothing changed, and asks once something did", async () => {
     const onClose = vi.fn();
     renderEdit({ onClose });
-    await waitFor(() =>
-      expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/v1/environments"))).toBe(true),
-    );
+    await settle();
 
-    fireEvent.change(screen.getByDisplayValue("Triage Bot"), { target: { value: "Triage Bot 2" } });
-    fireEvent.keyDown(document, { key: "Escape" });
-    expect(confirmMock).toHaveBeenCalledWith("Discard your changes to this agent? They will be lost.");
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Triage Bot 2" } });
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+    expect(screen.getByRole("alert")).toHaveTextContent("Discard your changes to this agent?");
     expect(onClose).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(screen.getByRole("textbox", { name: "Name" })).toHaveValue("Triage Bot 2");
 
-    fireEvent.change(screen.getByDisplayValue("Triage Bot 2"), { target: { value: "Triage Bot" } });
-    fireEvent.keyDown(document, { key: "Escape" });
-    expect(confirmMock).toHaveBeenCalledOnce();
+    // Cancel asks the same way, and Discard changes leaves.
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("closes without asking once the change is undone", async () => {
+    const onClose = vi.fn();
+    renderEdit({ onClose });
+    await settle();
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Triage Bot 2" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Triage Bot" } });
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
     expect(onClose).toHaveBeenCalledOnce();
   });
 });

@@ -1,4 +1,4 @@
-import { type JSX, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type JSX, type ReactNode } from "react";
 
 import {
   Dialog,
@@ -47,6 +47,10 @@ interface ModalProps {
    *  `max-w-2xl`). Modal applies `!important` internally to beat
    *  shadcn's baked-in `sm:max-w-sm` cap. Default: `max-w-lg`. */
   maxWidth?: string;
+  /** `top` pins the dialog near the top of the window instead of centring
+   *  it, for a dialog that opens something beneath itself (the session
+   *  starter's Options) and so needs the room below. Default: `center`. */
+  placement?: "center" | "top";
   children: ReactNode;
   footer?: ReactNode;
 }
@@ -57,12 +61,14 @@ export function Modal({
   title,
   subtitle,
   maxWidth = "max-w-lg",
+  placement = "center",
   children,
   footer,
 }: ModalProps): JSX.Element {
   // Strip a stray `!` prefix from caller for back-compat, then apply
   // our own — guarantees exactly one `!` is present in the final class.
   const widthClass = `!${maxWidth.replace(/^!/, "")}`;
+  const edges = useScrollEdges(open);
 
   return (
     <Dialog
@@ -73,29 +79,72 @@ export function Modal({
     >
       <DialogContent
         className={cn(
-          "max-h-[85vh] flex flex-col gap-0 p-0",
+          "flex flex-col gap-0 overflow-hidden p-0",
+          placement === "top"
+            ? // Pinned near the top, it may grow to a small margin above the window's bottom.
+              "top-[clamp(1.5rem,9vh,6rem)] max-h-[min(calc(100dvh-clamp(1.5rem,9vh,6rem)-1.5rem),880px)] translate-y-0"
+            : "max-h-[min(86vh,880px)]",
           widthClass,
         )}
       >
-        <DialogHeader className="px-6 py-4 border-b border-border gap-1">
-          <DialogTitle className="text-lg font-semibold font-display truncate">
-            {title}
-          </DialogTitle>
-          {subtitle && (
-            <DialogDescription className="text-sm text-fg-muted">
-              {subtitle}
-            </DialogDescription>
-          )}
+        <DialogHeader className="gap-1 px-6 pt-5 pb-4 pr-14">
+          <DialogTitle className="truncate">{title}</DialogTitle>
+          {subtitle && <DialogDescription>{subtitle}</DialogDescription>}
         </DialogHeader>
 
-        <div className="flex-1 overflow-y-auto px-6 py-4">{children}</div>
+        {/* When the body scrolls, its edges say so: a hairline under the
+            header once something has gone up under it, and a soft fade at
+            the bottom while more is below, so a cut line reads as "more",
+            never as text clipped by mistake. */}
+        <div
+          ref={edges.ref}
+          onScroll={edges.update}
+          className={cn(
+            "min-h-0 flex-1 overflow-y-auto border-t border-transparent px-6 pt-1 pb-6 transition-[border-color] duration-[var(--dur-quick)]",
+            edges.above && "border-border",
+            edges.below && "[mask-image:linear-gradient(to_bottom,black_calc(100%-2.5rem),transparent)]",
+          )}
+        >
+          {children}
+        </div>
 
         {footer && (
-          <DialogFooter className="m-0 px-6 py-4 border-t border-border bg-transparent rounded-none sm:justify-end gap-3">
+          <DialogFooter className="m-0 gap-2 rounded-none border-t border-border bg-bg-inset/60 px-6 py-4 sm:justify-end">
             {footer}
           </DialogFooter>
         )}
       </DialogContent>
     </Dialog>
   );
+}
+
+/** Whether a scroll box has content above or below what it shows. */
+function useScrollEdges(open: boolean) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [state, setState] = useState({ above: false, below: false });
+  const update = useCallback(() => {
+    const el = ref.current;
+    if (!el) return;
+    const above = el.scrollTop > 1;
+    const below = el.scrollTop + el.clientHeight < el.scrollHeight - 1;
+    setState((cur) => (cur.above === above && cur.below === below ? cur : { above, below }));
+  }, []);
+  useEffect(() => {
+    if (!open) return;
+    // The dialog's content mounts a frame after `open`; watch the box and what it holds.
+    let ro: ResizeObserver | undefined;
+    const frame = requestAnimationFrame(() => {
+      const el = ref.current;
+      if (!el || typeof ResizeObserver === "undefined") return;
+      ro = new ResizeObserver(update);
+      ro.observe(el);
+      for (const child of Array.from(el.children)) ro.observe(child);
+      update();
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      ro?.disconnect();
+    };
+  }, [open, update]);
+  return { ref, update, ...state };
 }

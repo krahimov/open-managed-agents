@@ -1,36 +1,24 @@
+import { CalendarClockIcon } from "lucide-react";
+
+import { formatAbsolute, toDate } from "@/lib/format";
+
 import type { Event } from "../lib/events";
+import { cronInWords, wakeModeMeta } from "./agents/triggers";
+import { Chip, StatusBadge } from "./Badge";
+import { RelativeTime } from "./RelativeTime";
 
 /**
- * Renders a system.ambient_rule_created event — the agent just wired a
- * standing cron on itself from chat. Same card family as the access-request
- * and harness-diff cards; reuses their entrance choreography
- * (.harness-diff-card / .harness-diff-row in index.css, reduced-motion safe).
+ * The agent set up a trigger for itself from the conversation (a
+ * `system.ambient_rule_created` event): from now on it wakes on a schedule
+ * without being asked. The card says, in words, when it will run, what it
+ * does when it wakes and what each run is told. The same vocabulary as the
+ * Triggers tab on the agent's page (`agents/triggers`), where the trigger
+ * can be paused or deleted.
+ *
+ * Same card family as the configuration diff card, with the same entrance
+ * (`.harness-diff-card` / `.harness-diff-row` in index.css, off under
+ * reduced motion).
  */
-
-/** "0 9 * * 1-5" → "at 09:00, Mon–Fri" for the common shapes; anything
- *  fancier falls back to the raw cron (shown alongside regardless). */
-function humanizeCron(cron: string): string | null {
-  const parts = cron.trim().split(/\s+/);
-  if (parts.length !== 5) return null;
-  const [min, hour, dom, mon, dow] = parts;
-  if (dom !== "*" || mon !== "*") return null;
-  if (!/^\d{1,2}$/.test(min) || !/^\d{1,2}$/.test(hour)) return null;
-  const time = `${hour.padStart(2, "0")}:${min.padStart(2, "0")}`;
-  const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-  if (dow === "*") return `daily at ${time}`;
-  if (dow === "1-5") return `at ${time}, Mon–Fri`;
-  if (dow === "0,6" || dow === "6,0") return `at ${time}, weekends`;
-  if (/^\d$/.test(dow)) return `every ${DAYS[Number(dow)]} at ${time}`;
-  return null;
-}
-
-const WAKE_MODE_HINT: Record<string, string> = {
-  act: "does the task",
-  decide: "assesses, then acts if warranted",
-  observe: "logs only",
-  escalate: "flags a human",
-};
-
 export function AmbientRuleCard({ event }: { event: Event }) {
   const ev = event as unknown as {
     rule_id?: string;
@@ -42,63 +30,60 @@ export function AmbientRuleCard({ event }: { event: Event }) {
     prompt?: string;
     next_wake_at?: string;
   };
-  const human = ev.cron ? humanizeCron(ev.cron) : null;
-  const nextWake = ev.next_wake_at ? new Date(ev.next_wake_at) : null;
+  const schedule = ev.cron ? cronInWords(ev.cron) : null;
+  const wake = ev.wake_mode ? wakeModeMeta(ev.wake_mode) : null;
+  const firstRun = toDate(ev.next_wake_at);
 
-  let rowIndex = 0;
-  const delayFor = () => `${rowIndex++ * 60}ms`;
+  let row = 0;
+  const delay = () => ({ animationDelay: `${row++ * 60}ms` });
 
   return (
-    <div className="harness-diff-card max-w-2xl border border-border rounded-lg bg-bg-surface overflow-hidden">
-      <div className="flex items-center justify-between gap-3 px-4 py-2.5 border-b border-border">
-        <div className="text-sm font-medium min-w-0">
-          Ambient rule created
-          <span className="ml-2 text-fg-subtle font-normal">{ev.name}</span>
-        </div>
-        <span className="text-[10px] font-semibold tracking-wider uppercase text-accent whitespace-nowrap">
-          standing
+    <div className="harness-diff-card surface overflow-hidden rounded-lg">
+      <div className="flex items-center gap-3 px-4 py-3">
+        <span className="flex size-7 shrink-0 items-center justify-center rounded-[8px] bg-bg-soft text-fg-muted">
+          <CalendarClockIcon className="size-4" />
         </span>
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-medium text-fg">Created a trigger for itself</p>
+          <p className="truncate text-xs text-fg-subtle" title={ev.name}>
+            {ev.name?.trim() || "Unnamed trigger"}
+          </p>
+        </div>
+        <StatusBadge status="active" label="On" className="shrink-0" />
       </div>
-      <div className="px-4 py-2.5 text-xs flex flex-col gap-1.5">
+
+      <div className="space-y-2.5 border-t border-border px-4 py-3.5 text-small">
+        {(schedule || ev.cron) && (
+          <p className="harness-diff-row text-fg" style={delay()}>
+            <span className="font-medium">{schedule ?? "On a custom schedule"}</span>
+            {!schedule && ev.cron && <span className="ml-1.5 font-mono text-xs text-fg-muted">{ev.cron}</span>}
+            {ev.timezone && <span className="text-fg-muted"> · {ev.timezone.replace(/_/g, " ")}</span>}
+          </p>
+        )}
         {ev.description && (
-          <div className="harness-diff-row text-fg-subtle" style={{ animationDelay: delayFor() }}>
+          <p className="harness-diff-row text-fg-muted" style={delay()}>
             {ev.description}
-          </div>
-        )}
-        {ev.cron && (
-          <div className="harness-diff-row flex items-baseline gap-2" style={{ animationDelay: delayFor() }}>
-            <span className="text-fg-subtle w-20 shrink-0">cadence</span>
-            <span className="font-mono">{ev.cron}</span>
-            {human && <span className="text-fg-subtle">— {human}</span>}
-            {ev.timezone && ev.timezone !== "UTC" && (
-              <span className="text-fg-subtle">({ev.timezone})</span>
-            )}
-          </div>
-        )}
-        {ev.wake_mode && (
-          <div className="harness-diff-row flex items-baseline gap-2" style={{ animationDelay: delayFor() }}>
-            <span className="text-fg-subtle w-20 shrink-0">wake mode</span>
-            <span className="font-mono">{ev.wake_mode}</span>
-            {WAKE_MODE_HINT[ev.wake_mode] && (
-              <span className="text-fg-subtle">— {WAKE_MODE_HINT[ev.wake_mode]}</span>
-            )}
-          </div>
+          </p>
         )}
         {ev.prompt && (
-          <div className="harness-diff-row flex items-baseline gap-2" style={{ animationDelay: delayFor() }}>
-            <span className="text-fg-subtle w-20 shrink-0">each run</span>
-            <span className="font-mono text-fg-muted break-words min-w-0">“{ev.prompt}”</span>
+          <p className="harness-diff-row border-l-2 border-border-strong pl-3 break-words text-fg-muted" style={delay()}>
+            <span className="text-fg-subtle">Each run is told: </span>
+            {ev.prompt}
+          </p>
+        )}
+        {(wake || firstRun) && (
+          <div className="harness-diff-row flex flex-wrap items-center gap-x-2.5 gap-y-1.5" style={delay()}>
+            {wake && <Chip title={wake.hint}>{wake.short}</Chip>}
+            {firstRun && (
+              <span className="text-xs text-fg-subtle" title={formatAbsolute(firstRun)}>
+                First run <RelativeTime value={firstRun} className="font-medium text-fg-muted" />
+              </span>
+            )}
           </div>
         )}
-        {nextWake && Number.isFinite(nextWake.getTime()) && (
-          <div className="harness-diff-row flex items-baseline gap-2" style={{ animationDelay: delayFor() }}>
-            <span className="text-fg-subtle w-20 shrink-0">first wake</span>
-            <span className="text-success font-medium">{nextWake.toLocaleString()}</span>
-          </div>
-        )}
-        <div className="harness-diff-row text-[11px] text-fg-subtle mt-1" style={{ animationDelay: delayFor() }}>
-          Each firing starts a fresh session of this agent. Manage it in the agent's Ambient panel.
-        </div>
+        <p className="harness-diff-row text-xs text-fg-subtle" style={delay()}>
+          Each time it fires, a fresh session of this agent starts. Pause or delete it on the agent's Triggers tab.
+        </p>
       </div>
     </div>
   );

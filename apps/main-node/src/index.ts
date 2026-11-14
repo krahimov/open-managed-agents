@@ -228,6 +228,9 @@ import {
 import { PgEventStreamHub } from "./lib/pg-event-stream-hub";
 import { NodeHarnessRuntime } from "./lib/node-harness-runtime";
 import { NodeSessionWakeups } from "./lib/node-session-wakeups";
+import { NodeUsageTracker } from "./lib/node-usage-tracker";
+import { buildWorkspaceAccessRoutes } from "./lib/workspace-access-routes";
+import { serverFeaturesBody } from "./lib/server-features";
 import {
   resolveClerkConfig,
   ClerkTokenVerifier,
@@ -1167,6 +1170,10 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
       findSkills: (tenantId, query) => findSkillsForTenant(tenantId, query),
       requestSkill: (tenantId, agentId, sessionId, a) =>
         postSkillRequest(tenantId, agentId, sessionId, a),
+      recordUsage: (tenantId, sessionId, agentId, u) =>
+        usageTracker
+          .record({ tenantId, sessionId, agentId, harness: "claude-agent-sdk", ...u })
+          .catch((err) => logger.warn({ err, op: "usage.record_failed" }, "usage record failed")),
     });
     const codexSdk = new CodexSdkHarness({
       resolveMcpTarget: resolveNodeMcpProxyTarget,
@@ -1190,6 +1197,10 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
         sessionWakeups.schedule({ tenantId, sessionId, agentId, ...a }),
       cancelWakeup: (sessionId, id) => sessionWakeups.cancel(sessionId, id),
       listWakeups: (sessionId) => sessionWakeups.list(sessionId),
+      recordUsage: (tenantId, sessionId, agentId, u) =>
+        usageTracker
+          .record({ tenantId, sessionId, agentId, harness: "codex-sdk", ...u })
+          .catch((err) => logger.warn({ err, op: "usage.record_failed" }, "usage record failed")),
     });
     // Loaded lazily on first use: importing Pi's provider SDKs (openai,
     // @anthropic-ai/sdk, @google/genai, bedrock) at boot is dead weight for
@@ -1256,6 +1267,36 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
       hub,
       sandbox: input.sandbox,
       abortSignal: input.abortSignal,
+      // DefaultHarness / Pi usage tap: span.model_request_end (and
+      // compaction) events carry each model call's token buckets. The SDK
+      // harnesses record through their own recordUsage dep instead.
+      // model_usage.input_tokens is the TOTAL input (AI SDK semantics, which
+      // Pi mirrors); the tracker stores the uncached part separately.
+      // The spans name the agent's model handle (a model card's model_id,
+      // which can be any name); record the model string the card actually
+      // sends instead, so the call is priced and matches the card's model.
+      onModelUsage: ({ model, usage }) => {
+        const agentModel =
+          typeof input.agent.model === "string" ? input.agent.model : input.agent.model?.id;
+        const sentModel = !model || model === agentModel ? creds.model || agentModel : model;
+        const cacheRead = usage.cache_read_input_tokens ?? 0;
+        const cacheWrite = usage.cache_creation_input_tokens ?? 0;
+        void usageTracker
+          .record({
+            tenantId: input.tenantId,
+            sessionId: input.sessionId,
+            agentId: input.agent.id,
+            harness: harness ?? "default",
+            model: sentModel || "unknown",
+            usage: {
+              input_tokens: Math.max(0, (usage.input_tokens ?? 0) - cacheRead - cacheWrite),
+              cached_input_tokens: cacheRead,
+              cache_write_input_tokens: cacheWrite,
+              output_tokens: usage.output_tokens ?? 0,
+            },
+          })
+          .catch((err) => logger.warn({ err, op: "usage.record_failed" }, "usage record failed"));
+      },
     });
     await runtime.refreshHistory();
     // Setup sessions replace the agent's own system prompt with the setup
@@ -1480,6 +1521,13 @@ const sessionWakeups = new NodeSessionWakeups({
     (await sessionWorkQueue.hasEvent(sessionId, eventId)),
 });
 await sessionWakeups.ensureSchema();
+
+// Token/cost usage analytics (console Usage page, Home tiles, Models spend).
+// Rows are written by every harness path; the report is GET /v1/usage. The
+// table's DDL is owned by ensureSchema (no drizzle migration). History
+// starts on the day this ships.
+const usageTracker = new NodeUsageTracker({ sql, dialect });
+await usageTracker.ensureSchema();
 
 await sessionRegistry.bootstrap();
 void sessionWorkQueue.sweep().catch((err) => {
@@ -3771,6 +3819,35 @@ v1.delete("/files/:id", async (c) => {
     throw err;
   }
 });
+
+// ── Console support (read-only) ──
+// Registered here, before the mount below: v1 routes added after
+// `app.route("/v1", v1)` are never served.
+
+// GET /v1/server_features — the console's one read of what this server
+// backs; surfaces whose endpoints are missing stay hidden.
+v1.get("/server_features", (c) => c.json(serverFeaturesBody()));
+
+// GET /v1/usage?since=<ms>&until=<ms> — token/cost analytics. Cost figures
+// are API-price estimates (see node-usage-tracker.ts); subscription-harness
+// traffic shows what it would have cost on API keys.
+v1.get("/usage", async (c) => {
+  const until = Number(c.req.query("until")) || Date.now();
+  const since = Number(c.req.query("since")) || until - 30 * 86400000;
+  return c.json(await usageTracker.report(c.var.tenant_id, since, until));
+});
+
+// GET /v1/workspace/access — the caller's role, in the console's terms.
+// No role enforcement exists on this server; see workspace-access-routes.ts.
+v1.route("/workspace", buildWorkspaceAccessRoutes({
+  membershipRole: async (userId, tenantId) => {
+    const row = await sql
+      .prepare(`SELECT role FROM membership WHERE user_id = ? AND tenant_id = ? LIMIT 1`)
+      .bind(userId, tenantId)
+      .first<{ role: string }>();
+    return row?.role ?? null;
+  },
+}));
 
 app.route("/v1", v1);
 app.route("/public/v1", buildPublicGatewayRoutes({ kv, sessionsApp: sessionRoutesApp }));

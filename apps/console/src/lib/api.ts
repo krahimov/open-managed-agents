@@ -4,6 +4,24 @@ import { useCallback, useMemo } from "react";
 import { toast } from "sonner";
 import { FatalSseError, streamSse } from "./sse";
 import { getClerkBearerToken } from "./clerk-auth";
+import { failureSentence } from "./failure-text";
+import { reportReadFailure } from "./read-failures";
+
+/**
+ * Telling the person a request failed, when the caller does not do it
+ * itself (`silentErrors`).
+ *
+ * A write that fails says so at once, in a whole sentence: the server's own
+ * when it wrote one, ours around its word when it sent a bare token
+ * ("unavailable"). A read that fails is drawn where its data would have
+ * been, so it only raises a toast when nothing on the page reports it
+ * (lib/read-failures.ts).
+ */
+function tellFailure(method: string | undefined, error: unknown): void {
+  const isRead = !method || method.toUpperCase() === "GET" || method.toUpperCase() === "HEAD";
+  if (isRead) reportReadFailure(error);
+  else toast.error(failureSentence(error));
+}
 
 /**
  * Server error envelope after the Anthropic-compatible migration:
@@ -77,6 +95,34 @@ export class ApiError extends Error {
   }
 }
 
+/** The `code` of the ApiError (status 404) raised when a `/v1` path answers
+ *  with a web page instead of JSON: the server has no such endpoint. */
+export const NOT_ON_SERVER_CODE = "not_on_server";
+
+const NOT_ON_SERVER: ApiErrorInfo = {
+  code: NOT_ON_SERVER_CODE,
+  message: "This server does not have that feature.",
+};
+
+/** True when `err` says the endpoint is not on this server: a 404 (including
+ *  the `not_on_server` one above) or a 501. */
+export function isNotOnServer(err: unknown): boolean {
+  return err instanceof ApiError && (err.status === 404 || err.status === 501);
+}
+
+function isApiPath(path: string): boolean {
+  const p = path.startsWith("http") ? (() => { try { return new URL(path).pathname; } catch { return path; } })() : path;
+  return p.startsWith("/v1/") || p === "/v1" || p.startsWith("/public/v1/");
+}
+
+/** A 2xx body that is a web page, not JSON (or empty). */
+function looksLikeHtml(res: Response, text: string): boolean {
+  const type = (res.headers.get("content-type") || "").toLowerCase();
+  if (type.includes("text/html")) return true;
+  if (type.includes("json")) return false;
+  return /^\s*</.test(text);
+}
+
 /** localStorage key for the active tenant the Console wants to operate as.
  *  Sent on every /v1/* request as `x-active-tenant`; the backend validates
  *  membership before honoring. Single-tenant users never write this. */
@@ -131,6 +177,11 @@ export function useApi() {
          *  a 501 from a runtime that lacks the endpoint) and the caller
          *  renders the outcome itself. The `ApiError` still throws. */
         silentErrors?: boolean;
+        /** Suppress the toast for a 404 only. For reads of one record,
+         *  where "it does not exist" is a state the page draws itself (a
+         *  not-found page, a "no longer exists" reference). Other failures
+         *  still toast. */
+        quietNotFound?: boolean;
       }
     ): Promise<T> {
       const activeTenant = getActiveTenantId();
@@ -159,15 +210,16 @@ export function useApi() {
         });
       } catch (err) {
         // Network-level failure (DNS, CORS, offline, request aborted by route
-        // change). Show a single toast — the caller's catch likely just renders
-        // an empty state otherwise.
+        // change).
         const msg = err instanceof Error ? err.message : "network error";
-        // Don't toast aborted requests (component unmount is a normal flow).
+        // Don't report aborted requests (component unmount is a normal flow).
         if (!(err instanceof DOMException && err.name === "AbortError")) {
-          // User-facing toast: skip the METHOD path: prefix (debug noise);
-          // log the full thing to console for dev triage.
+          // The browser's own words ("Failed to fetch") go to the console for
+          // dev triage; the person is told the server could not be reached.
           console.error(`[api] ${(init?.method || "GET")} ${path}: ${msg}`);
-          toast.error(`Network error: ${msg}`);
+          // A caller that draws the failure itself (`silentErrors`: a notice
+          // on the composer, a Try again in place) gets no second copy of it.
+          if (!init?.silentErrors) tellFailure(init?.method, err);
         }
         throw err;
       }
@@ -209,19 +261,21 @@ export function useApi() {
         // every endpoint failure here is something the user could act on
         // (re-login, switch tenant, retry) once they know it happened.
         //
-        // Toast format: server message verbatim. The previous shape prefixed
-        // the API path (e.g. "/v1/sessions: Insufficient balance.") which
-        // leaked debug info into UX. Path + status still go to console for
-        // dev triage.
-        if (!init?.silentErrors && !shouldSilenceAuthError(path, res.status)) {
-          console.error(`[api] ${res.status} ${path}: ${info.message}`);
-          toast.error(info.message);
-        }
-        throw new ApiError({
+        // What is said is a sentence (`failureSentence`): the server's
+        // message when it is one, never a bare token such as "unavailable",
+        // and never the API path. Path + status go to the console for dev
+        // triage. A read is only toasted when the page does not report it.
+        const failure = new ApiError({
           ...info,
           status: res.status,
           requestId: typeof requestId === "string" ? requestId : undefined,
         });
+        const drawnInPlace = init?.silentErrors || (init?.quietNotFound && res.status === 404);
+        if (!drawnInPlace && !shouldSilenceAuthError(path, res.status)) {
+          console.error(`[api] ${res.status} ${path}: ${info.message}`);
+          tellFailure(init?.method, failure);
+        }
+        throw failure;
       }
       // Successful response — clear the self-heal sentinel so a future stale
       // tenant can self-heal again later in the same browser session.
@@ -231,6 +285,20 @@ export function useApi() {
       // turn a successful write into a thrown error for the caller. Parse
       // defensively: empty body → undefined.
       const text = await res.text();
+      // A server whose console fallback answers every unknown GET with the
+      // app page (index.html, 200) means "this server has no such endpoint".
+      // Report it as the 404 it is, so the quiet 404 handling everywhere
+      // (useQuietQuery, quietNotFound, feature probes) applies instead of a
+      // JSON SyntaxError.
+      if (isApiPath(path) && looksLikeHtml(res, text)) {
+        const failure = new ApiError({ ...NOT_ON_SERVER, status: 404 });
+        const drawnInPlace = init?.silentErrors || init?.quietNotFound;
+        if (!drawnInPlace) {
+          console.error(`[api] 404 (not on this server) ${path}`);
+          tellFailure(init?.method, failure);
+        }
+        throw failure;
+      }
       return (text ? JSON.parse(text) : undefined) as T;
     },
     [],
@@ -288,16 +356,29 @@ export function useApi() {
             reconnectToastShown = false;
             return;
           }
+          if (response.status >= 500) {
+            // 5xx is TRANSIENT here: a backend restart behind the dev proxy
+            // answers the reconnect with 502/500 while the server boots —
+            // treating that as fatal froze open session pages at their last
+            // rendered state (status chip stuck "Running", tools stuck
+            // mid-run) until a manual refresh. Fall through to onError's
+            // backoff; replay=1 heals the missed events on reconnect.
+            throw new Error(`status ${response.status}`);
+          }
           if (response.status >= 400) {
             // Surface stream open failures the same way as regular API calls —
             // previously a 401 / 500 on the SSE handshake meant the timeline
-            // just never updated. 4xx and 5xx alike get the same toast format
-            // so the user sees a real error message instead of silence.
+            // just never updated.
             const body = await response.json().catch(() => ({}));
             const message = readApiErrorMessage(body, response.status);
-            toast.error(`/v1/sessions/${sessionId}/events/stream: ${message}`);
-            // Non-retriable: 401/403/404 won't fix themselves on retry, and
-            // hammering a 5xx that's surfaced to the user is also pointless.
+            // The server's message, without the API path (debug noise; it
+            // is in the console). A 404 raises nothing: the session does not
+            // exist, and the page says so itself.
+            console.error(`[api] ${response.status} /v1/sessions/${sessionId}/events/stream: ${message}`);
+            if (response.status !== 404) {
+              toast.error(`The live updates for this session could not start. ${failureSentence(message, response.status)}`);
+            }
+            // Non-retriable: 401/403/404 won't fix themselves on retry.
             throw new FatalSseError(message);
           }
           // Anything non-ok that isn't ≥400 (3xx etc.) — fall through to

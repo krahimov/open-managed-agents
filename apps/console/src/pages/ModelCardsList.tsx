@@ -1,26 +1,50 @@
-import { useState, useMemo, useCallback } from "react";
-import { useApi } from "../lib/api";
-import { useInfiniteApiQuery } from "../lib/useApiQuery";
-import { Modal } from "../components/Modal";
-import { Button } from "@/components/ui/button";
-import { PopoverContent } from "@/components/ui/popover";
-import { DataTable, type ColumnDef } from "../components/DataTable";
-import { FacetedFilter } from "../components/FacetedFilter";
-import { FilterChip, CreatedFilterChip } from "../components/FilterChip";
-import { TextInput, SecretInput } from "../components/Input";
+import { useCallback, useMemo, useState } from "react";
 import { toast } from "sonner";
-import { useAsyncAction } from "../hooks/useAsyncAction";
+import { CopyIcon, CpuIcon, PencilIcon, Trash2Icon } from "lucide-react";
 import type { ModelCard } from "@open-managed-agents/api-types";
 
-// Provider enum — mirrors the whitelist on the server
-// (apps/main/src/routes/model-cards.ts GET handler). Anything outside
-// these four values is rejected with a 400 there, so the chip's option
-// set + the form's tile picker must stay in sync with this list.
+import { useAsyncAction } from "../hooks/useAsyncAction";
+import { useApi } from "../lib/api";
+import { copyText } from "../lib/clipboard";
+import { countWords, formatCompact, formatCost, toDate } from "../lib/format";
+import { describeModel, type ModelProvider } from "../lib/models";
+import { useServerFeature } from "../lib/server-features";
+import { useApiQuery, useInfiniteApiQuery } from "../lib/useApiQuery";
+import { EntityAvatar } from "../components/AgentAvatar";
+import { Chip } from "../components/Badge";
+import { BrandLoader } from "../components/BrandLoader";
+import { Callout } from "../components/Callout";
+import { ConfirmDialog } from "../components/ConfirmDialog";
+import { DataTable, RowLink, type ColumnDef } from "../components/DataTable";
+import { FacetedFilter } from "../components/FacetedFilter";
+import { Field } from "../components/Field";
+import { CreatedFilterChip, FilterChip } from "../components/FilterChip";
+import { SecretInput } from "../components/Input";
+import { LocalCombobox } from "../components/LocalCombobox";
+import { Modal } from "../components/Modal";
+import { RelativeTime } from "../components/RelativeTime";
+import { RowActionsMenu, type RowAction } from "../components/RowActionsMenu";
+import { Skeleton } from "../components/Skeleton";
+import { Tip } from "../components/Tip";
+import { OverflowTip } from "../components/OverflowTip";
+import { PROVIDER_MARKS } from "../components/resources/provider-marks";
+import { ChoiceCards, KeyValueRows, MaskedSecret, errorMessage } from "../components/resources/ResourceBits";
+import { ResourceListError } from "../components/resources/ResourceListError";
+import { UsedBy, useResourceUsage } from "../components/resources/usage";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { PopoverContent } from "@/components/ui/popover";
+import { Switch } from "@/components/ui/switch";
+import { withReason } from "../lib/failure-text";
+
+// Provider enum: mirrors the whitelist on the server (model-cards GET
+// handler). Anything outside these four is rejected with a 400 there, so
+// the filter options and the form's choice cards must stay in sync.
 const PROVIDERS = [
-  { value: "ant", label: "Anthropic", desc: "Claude models" },
-  { value: "ant-compatible", label: "Anthropic-compatible", desc: "Proxies speaking Anthropic API" },
-  { value: "oai", label: "OpenAI", desc: "GPT models" },
-  { value: "oai-compatible", label: "OpenAI-compatible", desc: "DeepSeek, Groq, Together, Ollama, etc." },
+  { value: "ant", label: "Anthropic", desc: "Claude models, direct from Anthropic" },
+  { value: "oai", label: "OpenAI", desc: "GPT models, direct from OpenAI" },
+  { value: "ant-compatible", label: "Anthropic-compatible", desc: "A proxy or gateway that speaks the Anthropic API" },
+  { value: "oai-compatible", label: "OpenAI-compatible", desc: "DeepSeek, Groq, Together, Ollama and others" },
 ] as const;
 
 type ProviderValue = (typeof PROVIDERS)[number]["value"];
@@ -30,7 +54,45 @@ const PROVIDER_FILTER_OPTIONS: { value: ProviderValue | "any"; label: string }[]
   ...PROVIDERS.map((p) => ({ value: p.value, label: p.label })),
 ];
 
-const OFFICIAL_PROVIDERS = new Set(["ant", "oai"]);
+const OFFICIAL_PROVIDERS = new Set<string>(["ant", "oai"]);
+
+const providerName = (p: string) => PROVIDERS.find((x) => x.value === p)?.label || p || "Custom";
+
+/** Whose model a card is: its provider when it is a first-party one, else the family its model id belongs to. */
+function providerOfCard(card: Pick<ModelCard, "provider" | "model">): ModelProvider {
+  if (card.provider === "ant") return "anthropic";
+  if (card.provider === "oai") return "openai";
+  return describeModel(card.model).provider;
+}
+
+/**
+ * The leading mark of a model row: the provider's own mark (Anthropic,
+ * OpenAI, Google), so a list of models can be told apart by who serves
+ * them at a glance. A model behind a gateway we cannot place keeps the
+ * generic chip.
+ */
+function ProviderTile({ card }: { card: Pick<ModelCard, "provider" | "model"> }) {
+  const mark = PROVIDER_MARKS[providerOfCard(card)];
+  if (!mark) return <EntityAvatar icon={CpuIcon} size="md" />;
+  return (
+    <EntityAvatar size="md" className="text-fg">
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" className="size-[52%]">
+        <path d={mark} />
+      </svg>
+    </EntityAvatar>
+  );
+}
+
+function hostOf(url: string | undefined | null): string | null {
+  if (!url) return null;
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
+
+const SUBTITLE = "The models your agents can run on, each with the provider key that pays for it.";
 
 const INITIAL_FORM = {
   provider: "ant" as ProviderValue,
@@ -42,19 +104,29 @@ const INITIAL_FORM = {
   custom_headers: [{ key: "", value: "" }] as Array<{ key: string; value: string }>,
 };
 
+interface UsageReport {
+  range?: { since: number; until: number };
+  models?: Array<{ model: string; provider: string; cost_usd: number; tokens: number }>;
+}
+
+/**
+ * Models — provider keys, as the models agents can pick. One row per
+ * model: who serves it, which key pays for it (masked), which agents run
+ * on it and what it has cost lately. Rows open the edit dialog.
+ */
 export function ModelCardsList() {
   const { api } = useApi();
-  const [showCreate, setShowCreate] = useState(false);
-  const [editingId, setEditingId] = useState<string | null>(null);
+  const usage = useResourceUsage();
+
+  const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState<ModelCard | null>(null);
   const [form, setForm] = useState({ ...INITIAL_FORM });
-  const [error, setError] = useState("");
+  const [formError, setFormError] = useState("");
   const [availableModels, setAvailableModels] = useState<Array<{ id: string; name: string }>>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
-  const [showModelSuggestions, setShowModelSuggestions] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState<ModelCard | null>(null);
 
-  // Server-driven filter state. Each piece flows into cardsParams below
-  // → useInfiniteApiQuery resets to page 1 on params change → the list
-  // reflects exactly what the server returned (no client-side faking).
+  // Server-driven filter state.
   const [provider, setProvider] = useState<ProviderValue | "any">("any");
   const [created, setCreated] = useState<{ after?: number; before?: number }>({});
   const [search, setSearch] = useState("");
@@ -62,12 +134,8 @@ export function ModelCardsList() {
   const cardsParams = useMemo(
     () => ({
       ...(provider !== "any" ? { provider } : {}),
-      ...(created.after !== undefined
-        ? { created_after: new Date(created.after).toISOString() }
-        : {}),
-      ...(created.before !== undefined
-        ? { created_before: new Date(created.before).toISOString() }
-        : {}),
+      ...(created.after !== undefined ? { created_after: new Date(created.after).toISOString() } : {}),
+      ...(created.before !== undefined ? { created_before: new Date(created.before).toISOString() } : {}),
       ...(search ? { q: search } : {}),
     }),
     [provider, created.after, created.before, search],
@@ -79,95 +147,61 @@ export function ModelCardsList() {
     hasMore,
     isLoadingMore,
     loadMore,
-    refresh: load,
+    refresh,
+    error,
   } = useInfiniteApiQuery<ModelCard>("/v1/model_cards", { limit: 20, params: cardsParams });
 
-  // Fetch models from official API using the user's key
-  const fetchModels = useCallback(async (provider: string, apiKey: string) => {
-    if (!OFFICIAL_PROVIDERS.has(provider) || !apiKey || apiKey.length < 8) {
-      setAvailableModels([]);
-      return;
-    }
-    setModelsLoading(true);
-    try {
-      const result = await api<{ data: Array<{ id: string; name: string }> }>("/v1/models/list", {
-        method: "POST",
-        body: JSON.stringify({ provider, api_key: apiKey }),
-      });
-      setAvailableModels(result.data);
-    } catch {
-      setAvailableModels([]);
-    } finally {
-      setModelsLoading(false);
-    }
-  }, [api]);
+  // Recent spend per model, from the same report the Usage page reads, where
+  // the server keeps one (without it the column is left out).
+  const usageOn = useServerFeature("usage");
+  const { data: report, isLoading: usageLoading } = useApiQuery<UsageReport>(usageOn ? "/v1/usage" : null);
+  const spendByModel = useMemo(() => {
+    const map = new Map<string, { cost: number; tokens: number }>();
+    for (const m of report?.models ?? []) map.set(m.model, { cost: m.cost_usd, tokens: m.tokens });
+    return map;
+  }, [report]);
+  const rangeDays = report?.range ? Math.max(1, Math.round((report.range.until - report.range.since) / 86_400_000)) : 30;
 
-  // Re-entrancy guarded: a double click on Create used to send two POSTs —
-  // the first succeeded and the second 409'd "model_id … already used".
-  const saveAction = useAsyncAction(async () => {
-    setError("");
-    if (!form.model_id || (!editingId && !form.api_key)) {
-      setError("Model ID and API Key are required.");
-      return;
-    }
-    try {
-      const payload: Record<string, unknown> = {
-        provider: form.provider,
-        model_id: form.model_id,
-        // model defaults to model_id when blank — common case is "the handle
-        // IS the LLM string". Users only fill `model` when they want a
-        // distinct wire-level value (e.g. handle "claude-prod" → wire
-        // "claude-sonnet-4-6").
-        model: form.model || form.model_id,
-        api_key: form.api_key,
-        is_default: form.is_default,
-      };
-      if (form.base_url) payload.base_url = form.base_url;
-      // Serialize custom headers from array to object
-      const hdrs: Record<string, string> = {};
-      for (const h of form.custom_headers) {
-        if (h.key && h.value) hdrs[h.key] = h.value;
+  // Fetch the provider's model list with the key the person just typed.
+  const fetchModels = useCallback(
+    async (prov: string, apiKey: string) => {
+      if (!OFFICIAL_PROVIDERS.has(prov) || !apiKey || apiKey.length < 8) {
+        setAvailableModels([]);
+        return;
       }
-      if (Object.keys(hdrs).length > 0) payload.custom_headers = hdrs;
-      if (editingId) {
-        if (!form.api_key) delete payload.api_key;
-        await api(`/v1/model_cards/${editingId}`, { method: "POST", body: JSON.stringify(payload) });
-      } else {
-        // Create returns the card + a probe result. Surface it so the user
-        // finds out NOW if their api_key / base_url / model id is broken.
-        const created = await api<{ probe?: { ok: boolean | null; message?: string; reason?: string } }>(
-          "/v1/model_cards",
-          { method: "POST", body: JSON.stringify(payload) },
-        );
-        const probe = created.probe;
-        if (probe?.ok === true) {
-          toast.success(`Model card created — ${form.provider} key verified.`);
-        } else if (probe?.ok === false) {
-          toast.warning(
-            probe.message
-              ? `Model card saved but the key didn't work: ${probe.message}`
-              : "Model card saved but the key didn't work — check api_key / base_url / model id.",
-          );
-        }
-        // ok === null (unsupported provider) → no toast, success is implicit.
+      setModelsLoading(true);
+      try {
+        const result = await api<{ data: Array<{ id: string; name: string }> }>("/v1/models/list", {
+          method: "POST",
+          body: JSON.stringify({ provider: prov, api_key: apiKey }),
+          silentErrors: true,
+        });
+        setAvailableModels(result.data);
+      } catch {
+        setAvailableModels([]);
+      } finally {
+        setModelsLoading(false);
       }
-      closeDialog(); load();
-    } catch (e: any) { setError(e?.message || "Failed to save"); }
-  });
+    },
+    [api],
+  );
 
-  const remove = async (id: string) => {
-    try { await api(`/v1/model_cards/${id}`, { method: "DELETE" }); load(); } catch {}
+  const openCreate = () => {
+    setEditing(null);
+    setForm({ ...INITIAL_FORM, custom_headers: [{ key: "", value: "" }] });
+    setAvailableModels([]);
+    setFormError("");
+    setShowForm(true);
   };
 
   const startEdit = (card: ModelCard) => {
     const hdrs = card.custom_headers
       ? Object.entries(card.custom_headers).map(([key, value]) => ({ key, value }))
-      : [{ key: "", value: "" }];
+      : [];
     if (hdrs.length === 0) hdrs.push({ key: "", value: "" });
     setForm({
-      // Older rows on disk may carry a provider value outside the current
-      // enum (e.g. legacy "anthropic"); the tile picker simply leaves none
-      // selected in that case. Cast keeps the form state strictly typed.
+      // Older rows may carry a provider outside the current enum; the
+      // choice cards then show none selected.
       provider: card.provider as ProviderValue,
       model_id: card.model_id,
       model: card.model,
@@ -176,324 +210,473 @@ export function ModelCardsList() {
       is_default: card.is_default || false,
       custom_headers: hdrs,
     });
-    setEditingId(card.id); setShowCreate(true); setError("");
+    setAvailableModels([]);
+    setEditing(card);
+    setFormError("");
+    setShowForm(true);
   };
 
-  const closeDialog = () => {
-    setShowCreate(false); setEditingId(null); setForm({ ...INITIAL_FORM }); setError("");
+  const closeForm = () => {
+    if (saving) return;
+    setShowForm(false);
+    setFormError("");
   };
 
-  const inputCls = "w-full border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
+  const official = OFFICIAL_PROVIDERS.has(form.provider);
+  const canSave = !!form.model_id.trim() && (!!editing || !!form.api_key);
 
-  const providerLabel = (p: string) => PROVIDERS.find((x) => x.value === p)?.label || p;
+  // Re-entrancy guarded: a double click on Add used to send two POSTs, and
+  // the second was refused with "model_id … already used".
+  const saveAction = useAsyncAction(async () => {
+    setFormError("");
+    if (!canSave) {
+      setFormError("A model ID and an API key are required.");
+      return;
+    }
+    try {
+      const payload: Record<string, unknown> = {
+        provider: form.provider,
+        model_id: form.model_id.trim(),
+        // The wire model defaults to the handle: the common case is "the
+        // handle IS the model string". A distinct value is only needed for
+        // an alias (handle "claude-prod" → wire "claude-sonnet-4-6").
+        model: form.model.trim() || form.model_id.trim(),
+        api_key: form.api_key,
+        is_default: form.is_default,
+      };
+      if (form.base_url) payload.base_url = form.base_url;
+      const hdrs: Record<string, string> = {};
+      for (const h of form.custom_headers) {
+        if (h.key && h.value) hdrs[h.key] = h.value;
+      }
+      if (Object.keys(hdrs).length > 0) payload.custom_headers = hdrs;
+      if (editing) {
+        if (!form.api_key) delete payload.api_key;
+        await api(`/v1/model_cards/${editing.id}`, {
+          method: "POST",
+          body: JSON.stringify(payload),
+          silentErrors: true,
+        });
+        toast.success("Model saved");
+      } else {
+        // Create returns the card plus a probe of the key, so a broken
+        // key / base URL / model id is reported now, not on the first turn.
+        const result = await api<{ probe?: { ok: boolean | null; message?: string; reason?: string } }>(
+          "/v1/model_cards",
+          { method: "POST", body: JSON.stringify(payload), silentErrors: true },
+        );
+        const probe = result.probe;
+        if (probe?.ok === true) {
+          toast.success(`Model added. The ${providerName(form.provider)} key was verified.`);
+        } else if (probe?.ok === false) {
+          toast.warning(
+            probe.message
+              ? `Model saved, but the key did not work: ${probe.message}`
+              : "Model saved, but the key did not work. Check the API key, base URL and model id.",
+          );
+        } else {
+          toast.success("Model added");
+        }
+      }
+      setShowForm(false);
+      refresh();
+    } catch (e) {
+      setFormError(withReason("The model could not be saved", e));
+    }
+  });
+  const saving = saveAction.loading;
 
-  const providerBadge = (p: string) => {
-    if (p === "ant" || p === "ant-compatible") return "bg-warning-subtle text-warning";
-    if (p === "oai" || p === "oai-compatible") return "bg-success-subtle text-success";
-    return "bg-bg-surface text-fg-muted";
-  };
+  const actionsFor = (c: ModelCard): RowAction[] => [
+    { label: "Edit", icon: <PencilIcon />, onSelect: () => startEdit(c) },
+    { label: "Copy model id", icon: <CopyIcon />, onSelect: () => void copyText(c.model_id) },
+    { label: "Delete", icon: <Trash2Icon />, destructive: true, onSelect: () => setConfirmDelete(c) },
+  ];
 
-  // TanStack column defs. Order, filtering, and search all flow through
-  // server params now — no per-column sort/filter UI. The id+model_id
-  // pair opts out of the Columns hide menu so the user can't end up
-  // with a table that has nothing identifying. Actions also stays
-  // visible — without Edit/Delete the table is read-only and there's
-  // no detail page to drill into.
   const columns = useMemo<ColumnDef<ModelCard>[]>(
-    () => [
-      {
-        id: "model_id",
-        accessorKey: "model_id",
-        header: "Model ID",
-        cell: ({ row }) => (
-          <>
-            <div className="font-medium text-fg">{row.original.model_id}</div>
-            <div className="text-xs text-fg-subtle font-mono">{row.original.id}</div>
-          </>
-        ),
-        enableHiding: false,
-      },
-      {
-        id: "provider",
-        accessorKey: "provider",
-        header: "API Format",
-        cell: ({ row }) => (
-          <span className={`px-2 py-0.5 rounded text-xs font-medium ${providerBadge(row.original.provider)}`}>
-            {providerLabel(row.original.provider)}
-          </span>
-        ),
-      },
-      {
-        id: "model",
-        accessorKey: "model",
-        header: "Wire Model",
-        cell: ({ row }) =>
-          row.original.model === row.original.model_id ? (
-            <span className="text-fg-subtle">(same)</span>
-          ) : (
-            <span className="font-mono text-xs text-fg-muted">{row.original.model}</span>
+    () => {
+      const all: ColumnDef<ModelCard>[] = [
+        {
+          id: "model_id",
+          accessorKey: "model_id",
+          header: "Model",
+          size: 310,
+          minSize: 230,
+          enableHiding: false,
+          enableSorting: true,
+          cell: ({ row }) => {
+            const c = row.original;
+            const info = describeModel(c.model_id);
+            const friendly = info.label !== c.model_id;
+            // The id agents ask for, and the model it sends when the two differ.
+            const secondary =
+              (friendly ? c.model_id : c.model !== c.model_id ? `sends ${c.model}` : providerName(c.provider)) +
+              (friendly && c.model !== c.model_id ? ` → ${c.model}` : "");
+            return (
+              <div className="flex min-w-0 items-center gap-3">
+                <ProviderTile card={c} />
+                <div className="min-w-0 flex-1">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <RowLink full={c.model_id} className={friendly ? "font-medium text-fg" : "font-mono text-xs font-medium text-fg"}>
+                      {info.label}
+                    </RowLink>
+                    {c.is_default && (
+                      <Tip label="Agents created without a model use this one">
+                        <span className="inline-flex shrink-0">
+                          <Chip>Default</Chip>
+                        </span>
+                      </Tip>
+                    )}
+                  </div>
+                  <div className="flex min-w-0">
+                    <OverflowTip label={secondary} focusable>
+                      <div className="min-w-0 truncate rounded-sm font-mono text-micro-size text-fg-subtle">{secondary}</div>
+                    </OverflowTip>
+                  </div>
+                </div>
+              </div>
+            );
+          },
+        },
+        {
+          id: "provider",
+          accessorKey: "provider",
+          header: "Provider",
+          size: 170,
+          cell: ({ row }) => {
+            const c = row.original;
+            const host = hostOf(c.base_url);
+            return (
+              <div className="min-w-0 leading-tight">
+                <div className="truncate text-fg">{providerName(c.provider)}</div>
+                {host && (
+                  <div className="truncate font-mono text-micro-size text-fg-subtle" title={c.base_url}>
+                    {host}
+                  </div>
+                )}
+              </div>
+            );
+          },
+        },
+        {
+          id: "api_key",
+          accessorFn: (c) => c.api_key_preview ?? "",
+          header: "API key",
+          size: 150,
+          // Its last characters only tell two keys apart; the edit dialog shows them too.
+          meta: { hideBelow: 1000 },
+          cell: ({ row }) => <MaskedSecret preview={row.original.api_key_preview} />,
+        },
+        {
+          id: "used_by",
+          header: "Used by",
+          size: 250,
+          cell: ({ row }) => <UsedBy agents={usage.models.get(row.original.model_id)} loading={usage.isLoading} />,
+        },
+        {
+          id: "spend",
+          accessorFn: (c) => (spendByModel.get(c.model) ?? spendByModel.get(c.model_id))?.cost,
+          header: `Last ${rangeDays} days`,
+          size: 150,
+          enableSorting: true,
+          sortDescFirst: true,
+          meta: { hideBelow: 720, align: "right", label: "Recent spend" },
+          cell: ({ row }) => {
+            if (usageLoading) return <Skeleton className="ml-auto h-3.5 w-14" rounded="sm" />;
+            const s = spendByModel.get(row.original.model) ?? spendByModel.get(row.original.model_id);
+            if (!s) return <span className="text-fg-subtle">No usage</span>;
+            return (
+              <div className="min-w-0 leading-tight">
+                <div className="truncate text-fg">{formatCost(s.cost)}</div>
+                <div className="truncate text-xs text-fg-subtle">{formatCompact(s.tokens)} tokens</div>
+              </div>
+            );
+          },
+        },
+        {
+          id: "created",
+          accessorFn: (c) => toDate(c.created_at)?.getTime(),
+          header: "Added",
+          size: 116,
+          enableSorting: true,
+          sortDescFirst: true,
+          cell: ({ row }) => <RelativeTime value={row.original.created_at} className="text-fg-muted" />,
+        },
+        {
+          id: "actions",
+          header: "",
+          size: 56,
+          enableHiding: false,
+          cell: ({ row }) => (
+            <RowActionsMenu label={`Actions for ${row.original.model_id}`} actions={actionsFor(row.original)} />
           ),
-      },
-      {
-        id: "api_key",
-        accessorFn: (c) => c.api_key_preview ?? "",
-        header: "API Key",
-        cell: ({ row }) => (
-          <span className="font-mono text-xs text-fg-subtle">
-            ****{row.original.api_key_preview}
-          </span>
-        ),
-      },
-      {
-        id: "base_url",
-        accessorFn: (c) => c.base_url ?? "",
-        header: "Base URL",
-        cell: ({ row }) => (
-          <span className="text-fg-muted text-xs">{row.original.base_url || "—"}</span>
-        ),
-      },
-      {
-        id: "default",
-        accessorFn: (c) => (c.is_default ? "default" : ""),
-        header: "Default",
-        cell: ({ row }) =>
-          row.original.is_default ? (
-            <span className="text-xs text-fg-muted bg-bg-surface px-1.5 py-0.5 rounded">
-              default
-            </span>
-          ) : null,
-      },
-      {
-        id: "created",
-        accessorFn: (c) => c.created_at,
-        header: "Created",
-        cell: ({ row }) => (
-          <span className="text-fg-muted">
-            {new Date(row.original.created_at).toLocaleDateString()}
-          </span>
-        ),
-      },
-    ],
-    // Intentionally empty: startEdit + remove close over `form`/`api`
-    // but the column defs only need to reflect identity, not capture a
-    // fresh closure on every render.
+        },
+      ];
+      return all.filter((c) => c.id !== "spend" || usageOn);
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
+    [usage, spendByModel, usageLoading, rangeDays, usageOn],
   );
 
-  // Active-filter chip displays — kept null when matching the default so
-  // the chip reads "Provider ▾" rather than "Provider: All ▾". The
-  // clear-X only renders when the chip is in non-default state.
   const providerDisplay =
-    provider === "any"
-      ? undefined
-      : PROVIDER_FILTER_OPTIONS.find((o) => o.value === provider)?.label;
+    provider === "any" ? undefined : PROVIDER_FILTER_OPTIONS.find((o) => o.value === provider)?.label;
+  const filtered = !!search || provider !== "any" || created.after !== undefined || created.before !== undefined;
+  const clearFilters = () => {
+    setSearch("");
+    setProvider("any");
+    setCreated({});
+  };
 
-  const filters = (
-    <>
-      <FilterChip
-        label="Provider"
-        active={provider !== "any"}
-        display={providerDisplay}
-        onClear={() => setProvider("any")}
-      >
-        <PopoverContent
-          align="start"
-          sideOffset={4}
-          collisionPadding={8}
-          className="w-56 p-0"
-        >
-          <FacetedFilter
-            options={PROVIDER_FILTER_OPTIONS}
-            value={provider}
-            onValueChange={(v) => setProvider(v as ProviderValue | "any")}
-            searchPlaceholder="Provider..."
-          />
-        </PopoverContent>
-      </FilterChip>
-
-      <CreatedFilterChip value={created} onChange={setCreated} />
-    </>
-  );
+  if (error && cards.length === 0) {
+    return <ResourceListError title="Models" subtitle={SUBTITLE} what="Models" error={error} retry={refresh} />;
+  }
 
   return (
     <DataTable<ModelCard>
-      createLabel="+ New model card"
-      onCreate={() => { setShowCreate(true); setError(""); }}
-      searchPlaceholder="Search model cards..."
+      title="Models"
+      subtitle={SUBTITLE}
+      createLabel="+ New model"
+      onCreate={openCreate}
+      searchPlaceholder="Search models"
       searchValue={search}
       onSearchChange={setSearch}
-      filters={filters}
+      filters={
+        <>
+          <FilterChip
+            label="Provider"
+            active={provider !== "any"}
+            display={providerDisplay}
+            onClear={() => setProvider("any")}
+          >
+            <PopoverContent align="start" sideOffset={6} collisionPadding={8} className="w-60 gap-0 p-0">
+              <FacetedFilter
+                options={PROVIDER_FILTER_OPTIONS}
+                value={provider}
+                onValueChange={(v) => setProvider(v as ProviderValue | "any")}
+                searchPlaceholder="Provider"
+              />
+            </PopoverContent>
+          </FilterChip>
+          <CreatedFilterChip value={created} onChange={setCreated} />
+        </>
+      }
+      summary={
+        loading || cards.length === 0
+          ? undefined
+          : countWords(cards.length, hasMore, "model")
+      }
       data={cards}
       loading={loading}
-      onRowClick={(c) => startEdit(c)}
+      onRowClick={startEdit}
       getRowId={(c) => c.id}
       hasMore={hasMore}
       loadingMore={isLoadingMore}
       onLoadMore={loadMore}
-      emptyTitle={search ? "No matching model cards" : "No model cards yet"}
-      emptyKind="model_card"
-      emptyAction={
-        !search && (
-          <Button onClick={() => { setShowCreate(true); setError(""); }}>
-            + New model card
-          </Button>
-        )
-      }
-      emptySubtitle={
-        search ? (
-          "Try a different search term."
-        ) : (
-          <>
-            <p>Add a model card to configure API credentials for your agents.</p>
-            <p className="text-xs mt-3">
-              Without model cards, agents use the environment ANTHROPIC_API_KEY.
-            </p>
-          </>
-        )
-      }
       columns={columns}
+      emptyKind="model_card"
+      emptyTitle={filtered ? "No models match" : "No models yet"}
+      emptySubtitle={
+        filtered
+          ? "Try a different name, or widen the filters."
+          : "Add a model with your own provider key and agents can run on it. Until you do, agents fall back to the key configured on the server."
+      }
+      filtered={filtered}
+      emptyAction={
+        filtered ? (
+          <Button variant="outline" onClick={clearFilters}>
+            Clear filters
+          </Button>
+        ) : (
+          <Button onClick={openCreate}>New model</Button>
+        )
+      }
     >
-      <Modal open={showCreate} onClose={closeDialog} title={editingId ? "Edit Model Card" : "New Model Card"}
+      <Modal
+        open={showForm}
+        onClose={closeForm}
+        title={editing ? "Edit model" : "New model"}
+        subtitle={
+          editing
+            ? "Change how this model is served. Agents keep referring to it by its model ID."
+            : "Connect a provider key and give the model a handle your agents can use."
+        }
+        maxWidth="max-w-2xl"
         footer={
           <>
-            {editingId && (
-              <Button
-                variant="ghost"
-                onClick={async () => {
-                  if (!confirm(`Delete model card ${form.model_id}? This can't be undone.`)) return;
-                  await remove(editingId);
-                  closeDialog();
-                }}
-                className="text-danger hover:text-danger hover:bg-danger-subtle mr-auto"
-              >
-                Delete
-              </Button>
-            )}
-            <Button variant="ghost" onClick={closeDialog}>Cancel</Button>
+            <Button variant="ghost" onClick={closeForm} disabled={saving}>
+              Cancel
+            </Button>
             <Button
               onClick={() => void saveAction.run()}
-              loading={saveAction.loading}
-              loadingLabel={editingId ? "Saving…" : "Creating…"}
-              disabled={!form.model_id || (!editingId && !form.api_key)}
+              disabled={!canSave}
+              loading={saving}
+              loadingLabel={editing ? "Saving…" : "Adding…"}
             >
-              {editingId ? "Save" : "Create"}
+              {editing ? "Save model" : "Add model"}
             </Button>
           </>
-        }>
-        <form autoComplete="off" onSubmit={(e) => e.preventDefault()} className="space-y-3">
-          {error && <div className="text-sm text-danger bg-danger-subtle border border-danger/30 rounded-lg px-3 py-2">{error}</div>}
+        }
+      >
+        <form autoComplete="off" onSubmit={(e) => e.preventDefault()} className="space-y-5">
+          {formError && <Callout tone="danger">{formError}</Callout>}
+
           <div>
-            <label htmlFor="modelcard-id" className="text-sm text-fg-muted block mb-1">
-              Model ID *
-              <span className="ml-1 text-xs text-fg-subtle">(tenant-unique handle agents reference)</span>
-            </label>
-            <TextInput id="modelcard-id" value={form.model_id} onChange={(e) => setForm({ ...form, model_id: e.target.value })} className={inputCls}
-              placeholder="claude-prod, claude-sonnet-4-6, bedrock-sonnet, ..." />
+            <p id="modelcard-provider-label" className="mb-1.5 text-small leading-5 font-medium text-fg">
+              API format
+            </p>
+            <ChoiceCards<ProviderValue>
+              label="API format"
+              value={PROVIDERS.some((p) => p.value === form.provider) ? form.provider : null}
+              onChange={(p) => {
+                setForm({ ...form, provider: p, model: "", base_url: "" });
+                setAvailableModels([]);
+              }}
+              options={PROVIDERS.map((p) => ({ value: p.value, label: p.label, description: p.desc }))}
+            />
           </div>
-          <div role="group" aria-labelledby="modelcard-provider-label">
-            <span id="modelcard-provider-label" className="text-sm text-fg-muted block mb-1">API Format *</span>
-            <div className="grid grid-cols-2 gap-2">
-              {PROVIDERS.map((p) => (
-                <button
-                  key={p.value}
-                  type="button"
-                  aria-pressed={form.provider === p.value}
-                  onClick={() => { setForm({ ...form, provider: p.value, model: "", base_url: "" }); setAvailableModels([]); }}
-                  className={`text-left px-3 py-2 border rounded-md text-sm transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
-                    form.provider === p.value
-                      ? "border-brand bg-brand-subtle text-fg"
-                      : "border-border text-fg-muted hover:border-fg-subtle"
-                  }`}
-                >
-                  <div className="font-medium">{p.label}</div>
-                  <div className="text-xs text-fg-subtle mt-0.5">{p.desc}</div>
-                </button>
-              ))}
-            </div>
-          </div>
+
+          <Field
+            label="Model ID"
+            hint="The handle agents reference. It must be unique in this workspace."
+          >
+            <Input
+              value={form.model_id}
+              onChange={(e) => setForm({ ...form, model_id: e.target.value })}
+              placeholder={form.provider.startsWith("oai") ? "gpt-5.5" : "claude-sonnet-4-6"}
+              autoComplete="off"
+              data-1p-ignore
+              className="font-mono text-small-size md:text-small-size"
+            />
+          </Field>
+
           <div>
-            <label htmlFor="modelcard-api-key" className="text-sm text-fg-muted block mb-1">API Key {editingId ? "" : "*"}</label>
-            <SecretInput id="modelcard-api-key" value={form.api_key} onChange={(e) => setForm({ ...form, api_key: e.target.value })} className={inputCls}
-              placeholder={editingId ? "Leave blank to keep current key" : "sk-..."}
+            <SecretInput
+              label="API key"
+              hint={
+                editing ? (
+                  <span className="inline-flex flex-wrap items-center gap-1.5">
+                    Current key <MaskedSecret preview={editing.api_key_preview} /> Leave blank to keep it.
+                  </span>
+                ) : (
+                  "Stored encrypted. After you save, only the last four characters are ever shown."
+                )
+              }
+              value={form.api_key}
+              onChange={(e) => setForm({ ...form, api_key: e.target.value })}
+              placeholder={editing ? "Paste a new key to replace the current one" : "sk-..."}
               name="model-api-key-field"
-              onBlur={() => { if (OFFICIAL_PROVIDERS.has(form.provider) && form.api_key) fetchModels(form.provider, form.api_key); }} />
-            {OFFICIAL_PROVIDERS.has(form.provider) && modelsLoading && (
-              <p className="text-xs text-fg-subtle mt-1">Loading models...</p>
-            )}
+              onBlur={() => {
+                if (official && form.api_key) void fetchModels(form.provider, form.api_key);
+              }}
+            />
           </div>
-          <div className="relative">
-            <label htmlFor="modelcard-wire-model" className="text-sm text-fg-muted block mb-1">
-              Wire Model
-              <span className="ml-1 text-xs text-fg-subtle">(sent to provider; defaults to Model ID)</span>
-            </label>
-            <input id="modelcard-wire-model" value={form.model}
-              onChange={(e) => { setForm({ ...form, model: e.target.value }); setShowModelSuggestions(true); }}
-              onFocus={() => setShowModelSuggestions(true)}
-              onBlur={() => setTimeout(() => setShowModelSuggestions(false), 150)}
-              className={inputCls}
-              placeholder={form.model_id || (OFFICIAL_PROVIDERS.has(form.provider)
-                ? (form.provider === "ant" ? "claude-sonnet-4-6" : "gpt-5.5")
-                : "e.g. deepseek-chat, llama-3.1-70b, ...")}
-              autoComplete="off" name="model-field" />
-            {showModelSuggestions && availableModels.length > 0 && (
-              <div className="absolute z-10 w-full mt-1 bg-bg border border-border rounded-md shadow-lg py-1 max-h-48 overflow-y-auto">
-                {availableModels
-                  .filter((m) => !form.model || m.id.includes(form.model) || m.name.toLowerCase().includes(form.model.toLowerCase()))
-                  .map((m) => (
-                    <button key={m.id} type="button"
-                      onMouseDown={() => { setForm({ ...form, model: m.id }); setShowModelSuggestions(false); }}
-                      className="w-full text-left px-3 py-1.5 min-h-11 sm:min-h-0 text-sm hover:bg-bg-surface">
-                      <span className="text-fg">{m.name !== m.id ? m.name : m.id}</span>
-                      {m.name !== m.id && <span className="text-fg-subtle text-xs ml-2">{m.id}</span>}
-                    </button>
-                  ))}
-              </div>
-            )}
-            {OFFICIAL_PROVIDERS.has(form.provider) && !availableModels.length && !modelsLoading && form.api_key && (
-              <p className="text-xs text-fg-subtle mt-1">Enter a valid API key to load available models</p>
-            )}
+
+          <div>
+            <div className="mb-1.5 flex items-center justify-between gap-3">
+              <label htmlFor="modelcard-wire-model" className="text-small leading-5 font-medium text-fg">
+                Wire model
+              </label>
+              {official && modelsLoading && (
+                <span className="inline-flex items-center gap-1.5 text-xs text-fg-subtle">
+                  <BrandLoader size="sm" label="Loading models" /> Loading models
+                </span>
+              )}
+            </div>
+            <LocalCombobox<{ id: string; name: string }>
+              id="modelcard-wire-model"
+              value={form.model}
+              onChange={(text) => setForm({ ...form, model: text })}
+              onPick={(m) => setForm({ ...form, model: m.id })}
+              options={availableModels}
+              filter={(m, q) => !q || m.id.toLowerCase().includes(q) || m.name.toLowerCase().includes(q)}
+              getKey={(m) => m.id}
+              renderItem={(m) => (
+                <div className="flex min-w-0 items-baseline gap-2 px-3 py-2">
+                  <span className="truncate text-sm text-fg">{m.name !== m.id ? m.name : m.id}</span>
+                  {m.name !== m.id && <span className="truncate font-mono text-xs text-fg-subtle">{m.id}</span>}
+                </div>
+              )}
+              placeholder={
+                form.model_id ||
+                (official
+                  ? form.provider === "ant"
+                    ? "claude-sonnet-4-6"
+                    : "gpt-5.5"
+                  : "deepseek-chat, llama-3.1-70b")
+              }
+              emptyHint={
+                official
+                  ? "Enter a valid API key above to list the provider's models, or type a model name."
+                  : "Type the model name your provider expects."
+              }
+            />
+            <p className="mt-1.5 text-xs text-fg-subtle">
+              The model name sent to the provider. Leave blank to send the model ID.
+            </p>
           </div>
-          {!OFFICIAL_PROVIDERS.has(form.provider) && (
+
+          {!official && (
+            <Field label="Base URL" hint="The endpoint that speaks this API format.">
+              <Input
+                value={form.base_url}
+                onChange={(e) => setForm({ ...form, base_url: e.target.value })}
+                placeholder={form.provider === "ant-compatible" ? "https://your-proxy.com/v1" : "https://api.deepseek.com/v1"}
+                autoComplete="off"
+                className="font-mono text-small-size md:text-small-size"
+              />
+            </Field>
+          )}
+
+          {!official && (
             <div>
-              <label htmlFor="modelcard-base-url" className="text-sm text-fg-muted block mb-1">Base URL *</label>
-              <input id="modelcard-base-url" value={form.base_url} onChange={(e) => setForm({ ...form, base_url: e.target.value })} className={inputCls}
-                placeholder={form.provider === "ant-compatible" ? "https://your-proxy.com/v1" : "https://api.deepseek.com/v1"} autoComplete="off" />
+              <p className="mb-1.5 text-small leading-5 font-medium text-fg">
+                Custom headers <span className="font-normal text-fg-subtle">(optional)</span>
+              </p>
+              <KeyValueRows
+                rows={form.custom_headers}
+                onChange={(rows) => setForm({ ...form, custom_headers: rows })}
+                keyPlaceholder="Header-Name"
+                valuePlaceholder="value"
+                addLabel="Add header"
+                noun="header"
+                minRows={1}
+              />
             </div>
           )}
-          {!OFFICIAL_PROVIDERS.has(form.provider) && (
-            <div>
-              <label className="text-sm text-fg-muted block mb-1">Custom Headers <span className="text-fg-subtle">(optional)</span></label>
-              <div className="space-y-1.5">
-                {form.custom_headers.map((h, i) => (
-                  <div key={i} className="flex gap-2 items-center">
-                    <input value={h.key} onChange={(e) => {
-                      const hdrs = [...form.custom_headers];
-                      hdrs[i] = { ...hdrs[i], key: e.target.value };
-                      setForm({ ...form, custom_headers: hdrs });
-                    }} className={inputCls} placeholder="Header-Name" aria-label={`Custom header ${i + 1} name`} autoComplete="off" />
-                    <input value={h.value} onChange={(e) => {
-                      const hdrs = [...form.custom_headers];
-                      hdrs[i] = { ...hdrs[i], value: e.target.value };
-                      setForm({ ...form, custom_headers: hdrs });
-                    }} className={inputCls} placeholder="value" aria-label={`Custom header ${i + 1} value`} autoComplete="off" />
-                    {form.custom_headers.length > 1 && (
-                      <button type="button" onClick={() => setForm({ ...form, custom_headers: form.custom_headers.filter((_, j) => j !== i) })}
-                        className="inline-flex items-center justify-center min-w-11 min-h-11 sm:min-w-0 sm:min-h-0 px-2 text-fg-subtle hover:text-danger text-xs shrink-0">Remove</button>
-                    )}
-                  </div>
-                ))}
-                <button type="button" onClick={() => setForm({ ...form, custom_headers: [...form.custom_headers, { key: "", value: "" }] })}
-                  className="inline-flex items-center justify-center min-h-11 sm:min-h-0 px-2 text-xs text-fg-muted hover:text-fg">+ Add header</button>
-              </div>
+
+          <div className="flex items-center justify-between gap-6 rounded-lg bg-bg-soft px-3.5 py-3">
+            <div className="min-w-0">
+              <label htmlFor="modelcard-default" className="block text-small-size font-medium text-fg">
+                Default model
+              </label>
+              <p className="mt-0.5 text-xs text-fg-muted">
+                Agents created without a model use this one. Only one model is the default.
+              </p>
             </div>
-          )}
-          <label className="flex items-center gap-2 text-sm text-fg-muted cursor-pointer">
-            <input type="checkbox" checked={form.is_default} onChange={(e) => setForm({ ...form, is_default: e.target.checked })} className="rounded accent-brand" />
-            Set as default model card
-          </label>
+            <Switch
+              id="modelcard-default"
+              checked={form.is_default}
+              onCheckedChange={(v) => setForm({ ...form, is_default: v })}
+            />
+          </div>
         </form>
       </Modal>
+
+      <ConfirmDialog
+        open={!!confirmDelete}
+        onClose={() => setConfirmDelete(null)}
+        destructive
+        title={`Delete ${confirmDelete?.model_id ?? "model"}?`}
+        body={`The model and its stored key are removed. ${(() => {
+          const n = confirmDelete ? (usage.models.get(confirmDelete.model_id)?.length ?? 0) : 0;
+          return n > 0 ? `${n} ${n === 1 ? "agent references" : "agents reference"} this model ID. ` : "";
+        })()}This cannot be undone.`}
+        confirmLabel="Delete model"
+        onConfirm={async () => {
+          if (!confirmDelete) return;
+          await api(`/v1/model_cards/${confirmDelete.id}`, { method: "DELETE" });
+          refresh();
+        }}
+      />
     </DataTable>
   );
 }

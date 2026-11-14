@@ -64,6 +64,23 @@ export interface NodeHarnessRuntimeOptions {
   sandbox: SandboxExecutor;
   /** Turn abort (user.interrupt / lease loss) from SessionStateMachine. */
   abortSignal?: AbortSignal;
+  /** Usage tap: called for every span.model_request_end /
+   *  span.compaction_summarize_end written through this runtime that
+   *  carries model_usage. This is how self-host analytics records the
+   *  DefaultHarness and Pi token usage (those harnesses only emit events;
+   *  see node-usage-tracker.ts). The SDK harnesses record through their own
+   *  recordUsage dep and never emit these spans, so nothing counts twice.
+   *  `usage` is in the event's own terms: input_tokens is the TOTAL input,
+   *  cache reads and writes included. Best-effort: a throw is swallowed. */
+  onModelUsage?: (info: {
+    model?: string;
+    usage: {
+      input_tokens: number;
+      output_tokens: number;
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+    };
+  }) => void;
 }
 
 export class NodeHarnessRuntime implements HarnessRuntime {
@@ -160,6 +177,7 @@ export class NodeHarnessRuntime implements HarnessRuntime {
       );
       return Promise.reject(Object.assign(new Error("harness runtime closed"), { code: "runtime_closed" }));
     }
+    this.tapUsage(event);
     this.history.appendInPlace(event);
     const write = this.writeChain.then(async () => {
       if (this.persistError) throw this.persistError;
@@ -175,6 +193,28 @@ export class NodeHarnessRuntime implements HarnessRuntime {
       this.abortController.abort({ kind: "persist_failed" });
     });
     return write;
+  }
+
+  private tapUsage(event: SessionEvent): void {
+    const tap = this.opts.onModelUsage;
+    if (!tap) return;
+    if (event.type !== "span.model_request_end" && event.type !== "span.compaction_summarize_end") return;
+    const ev = event as {
+      model?: string;
+      model_usage?: {
+        input_tokens: number;
+        output_tokens: number;
+        cache_read_input_tokens?: number;
+        cache_creation_input_tokens?: number;
+      };
+    };
+    if (!ev.model_usage) return;
+    try {
+      tap({ model: ev.model, usage: ev.model_usage });
+    } catch (err) {
+      // Usage tracking must never break the event pipeline.
+      log.warn({ err, op: "node_harness.usage_tap_failed" }, "usage tap threw");
+    }
   }
 
   // Stream lifecycle events: broadcast-only (NOT persisted to events log,

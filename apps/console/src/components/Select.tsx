@@ -1,5 +1,7 @@
 import { forwardRef, type ReactNode } from "react";
 
+import type { FieldControlProps } from "./Field";
+
 import {
   Select as ShadcnSelect,
   SelectContent as ShadcnSelectContent,
@@ -28,7 +30,7 @@ import {
  * every other shadcn surface.
  */
 
-interface SelectProps {
+interface SelectProps extends FieldControlProps {
   value: string;
   onValueChange: (value: string) => void;
   placeholder?: string;
@@ -39,9 +41,20 @@ interface SelectProps {
   /** Override the trigger className. Default uses shadcn's full-width
    *  trigger so it fills its container. */
   className?: string;
+  /** Accessible name when there is no visible label (inside <Field> the
+   *  label names it). Falls back to the placeholder. */
+  "aria-label"?: string;
   children: ReactNode;
 }
 
+/**
+ * Inside <Field> it takes the field's `id`, label, hint and error on the
+ * trigger, the element that takes focus:
+ *
+ *   <Field label="Applies to" hint="…" error={err}>
+ *     <Select value={scope} onValueChange={setScope}>…</Select>
+ *   </Field>
+ */
 export function Select({
   value,
   onValueChange,
@@ -49,6 +62,11 @@ export function Select({
   disabled,
   name,
   className,
+  id,
+  "aria-label": ariaLabel,
+  "aria-labelledby": labelledBy,
+  "aria-describedby": describedBy,
+  "aria-invalid": invalid,
   children,
 }: SelectProps) {
   return (
@@ -59,7 +77,12 @@ export function Select({
       name={name}
     >
       <SelectTrigger
-        aria-label={placeholder}
+        id={id}
+        // A visible label wins; the placeholder names it only when nothing else does.
+        aria-label={labelledBy ? undefined : (ariaLabel ?? placeholder)}
+        aria-labelledby={labelledBy}
+        aria-describedby={describedBy}
+        aria-invalid={invalid || undefined}
         // Override shadcn's default w-fit so the trigger fills the form
         // column it lives in (matches the previous TextInput look).
         className={className ?? "w-full"}

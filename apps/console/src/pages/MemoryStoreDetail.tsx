@@ -1,711 +1,540 @@
-import { useEffect, useState } from "react";
+import { useMemo, useState } from "react";
 import { useNavigate, useParams } from "react-router";
-import { useApi } from "../lib/api";
-import { useApiQuery } from "../lib/useApiQuery";
-import { Modal } from "../components/Modal";
+import {
+  ArchiveIcon,
+  BrainIcon,
+  CopyIcon,
+  FileTextIcon,
+  FolderIcon,
+  HistoryIcon,
+  PlusIcon,
+  SearchIcon,
+  Trash2Icon,
+} from "lucide-react";
+
+import { ApiError, useApi } from "../lib/api";
+import { useServerFeature } from "../lib/server-features";
+import { copyText } from "../lib/clipboard";
+import { plural } from "../lib/format";
+import { useApiQuery, useQueryClient } from "../lib/useApiQuery";
+import { EntityAvatar } from "../components/AgentAvatar";
+import { Chip, StatusBadge } from "../components/Badge";
+import { Callout } from "../components/Callout";
+import { ConfirmDialog } from "../components/ConfirmDialog";
+import { DetailHeader } from "../components/DetailHeader";
+import { EmptyState, RecordNotFound } from "../components/EmptyState";
+import { EntityRef } from "../components/EntityRef";
+import { CopyButton, IdChip } from "../components/IdChip";
 import { Page } from "../components/Page";
-import { PageHeader } from "../components/PageHeader";
+import { Property, PropertyList } from "../components/PropertyList";
+import { ErrorState } from "../components/QueryProblem";
+import { RelativeTime } from "../components/RelativeTime";
+import { RowActionsMenu } from "../components/RowActionsMenu";
+import { SectionCard } from "../components/SectionCard";
+import { Skeleton, SkeletonDetail } from "../components/Skeleton";
+import { TabBar, useTabParam } from "../components/TabBar";
+import { Tip } from "../components/Tip";
+import { memoryMounts, type Environment } from "../components/resources/environment";
+import {
+  baseName,
+  mountPath,
+  topFolder,
+  useMemoryEntries,
+  type MemoryListItem,
+  type MemoryStore,
+  type MemoryVersion,
+} from "../components/resources/memory";
+import { StoreLastWrite } from "../components/resources/lastWrite";
+import { Actor, MemoryEntrySheet, OperationBadge, WriteMemoryDialog } from "../components/resources/MemoryPanels";
+import { formatBytes } from "../components/resources/ResourceBits";
+import { useQuietQuery } from "@/lib/useApiQuery";
+import { UsedByList, useResourceUsage } from "../components/resources/usage";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Input } from "@/components/ui/input";
 
-interface MemoryStore {
-  id: string;
-  name: string;
-  description?: string;
-  created_at: string;
-  archived_at?: string;
-}
-interface MemoryListItem {
-  id: string;
-  store_id: string;
-  path: string;
-  content_sha256: string;
-  etag: string;
-  size_bytes: number;
-  created_at: string;
-  updated_at: string;
-}
-interface Memory extends MemoryListItem {
-  content: string;
-}
-interface MemoryVersion {
-  id: string;
-  memory_id: string;
-  store_id: string;
-  operation: "created" | "modified" | "deleted";
-  path?: string;
-  content?: string;
-  content_sha256?: string;
-  size_bytes?: number;
-  actor: { type: string; id: string };
-  created_at: string;
-  redacted?: boolean;
-}
+type TabKey = "entries" | "history";
 
-type TabKey = "memories" | "versions" | "settings";
+/** Label column for the narrow aside, so a full id fits beside it. */
+// The aside's label column: the same width as PropertyList labelWidth="narrow".
+const ASIDE_ROW = "grid-cols-[6.5rem_minmax(0,1fr)]";
+/** Entry rows: file · size · updated. */
+const ROW = "grid grid-cols-[minmax(0,1fr)_72px_96px] items-center gap-x-4";
 
+/**
+ * Memory store — a folder of notes that outlives a session. The page is
+ * a small file browser: entries grouped by their top folder, opened in a
+ * side panel to read, edit or roll back. History is the store-wide audit
+ * trail, where the runtime keeps one.
+ *
+ * Archiving, deleting and the History tab need a server that keeps memory
+ * versions (`useServerFeature("memory_writes")`); elsewhere they are left
+ * out, and entries can be read and added but not changed here.
+ */
 export function MemoryStoreDetail() {
   const { id: storeId } = useParams<{ id: string }>();
   const nav = useNavigate();
   const { api } = useApi();
-  const [tab, setTab] = useState<TabKey>("memories");
-  const [error, setError] = useState<string | null>(null);
+  const queryClient = useQueryClient();
+  const usage = useResourceUsage();
+  const writable = useServerFeature("memory_writes");
+  const [tabParam, setTab] = useTabParam<TabKey>("entries", ["entries", "history"]);
+  // A link to History on a server that keeps none opens the entries.
+  const tab: TabKey = writable ? tabParam : "entries";
 
-  // Top-level store fetch via TQ. The two child panels do their own
-  // queries — this one just gates the page render and seeds the header.
-  const { data: store, error: storeError } = useApiQuery<MemoryStore>(
+  const { data: store, error, isLoading, refetch } = useApiQuery<MemoryStore>(
     storeId ? `/v1/memory_stores/${storeId}` : null,
   );
-  useEffect(() => {
-    if (storeError) setError(errMsg(storeError));
-  }, [storeError]);
+  // Unfiltered totals for the header (shared with the list page's cache).
+  const totals = useMemoryEntries(storeId);
 
-  // Archive/Delete moved up from the list page when MemoryStoresList
-  // adopted the AgentsList chrome — the list rows no longer carry inline
-  // actions, so this is where users perform store-level lifecycle ops.
-  // Matches AgentDetail's header-actions pattern.
-  const archive = async () => {
-    if (!storeId) return;
-    if (
-      !confirm(
-        "Archive this store? It will become read-only and no new sessions can attach it. Archive is one-way.",
-      )
-    )
-      return;
-    try {
-      await api(`/v1/memory_stores/${storeId}/archive`, { method: "POST" });
-      nav("/memory");
-    } catch (e) {
-      setError(errMsg(e));
-    }
-  };
-
-  const del = async () => {
-    if (!storeId) return;
-    if (
-      !confirm(
-        "Delete this store and ALL its memories + version history? This cannot be undone.",
-      )
-    )
-      return;
-    try {
-      await api(`/v1/memory_stores/${storeId}`, { method: "DELETE" });
-      nav("/memory");
-    } catch (e) {
-      setError(errMsg(e));
-    }
-  };
-
-  if (!storeId) return <div className="p-8">Missing store id.</div>;
-  if (error) return (
-    <div className="flex-1 p-8">
-      <ErrorBanner message={error} onDismiss={() => setError(null)} />
-    </div>
+  // Environments that mount this store by default.
+  const { data: envRes } = useApiQuery<{ data: Environment[] }>("/v1/environments", ENV_PARAMS);
+  const mountedIn = useMemo(
+    () => (envRes?.data ?? []).filter((e) => memoryMounts(e).some((m) => m.storeId === storeId)),
+    [envRes, storeId],
   );
-  if (!store) return <div className="flex-1 p-8 text-fg-muted">Loading...</div>;
+
+  const [showWrite, setShowWrite] = useState(false);
+  const [confirm, setConfirm] = useState<"archive" | "delete" | null>(null);
+
+  if (error && !store) {
+    const missing = error instanceof ApiError && error.status === 404;
+    return (
+      <Page>
+        {missing ? (
+          <RecordNotFound thing="memory store" kind="memory" back={{ to: "/memory", label: "memory" }} className="mt-4" />
+        ) : (
+          <ErrorState title="This memory store could not be loaded" error={error} retry={() => void refetch()} className="mt-4" />
+        )}
+      </Page>
+    );
+  }
+  if (isLoading || !store || !storeId) {
+    return (
+      <Page>
+        <SkeletonDetail />
+      </Page>
+    );
+  }
+
+  const archived = !!store.archived_at;
+  const agents = usage.memoryStores.get(store.id) ?? [];
+  const path = mountPath(store);
+  const refreshEntries = () => {
+    void queryClient.invalidateQueries({ queryKey: [`/v1/memory_stores/${store.id}/memories`] });
+  };
 
   return (
-    <Page
-      header={
-        <PageHeader
-          title={store.name}
-          subtitle={
-            <>
-              {store.description && (
-                <span className="text-fg-muted">{store.description}</span>
-              )}
-              <span className="block text-fg-subtle text-xs font-mono mt-1">
-                {store.id} · /mnt/memory/{store.name}/
-                {store.archived_at && (
-                  <span className="ml-2 text-fg-muted">
-                    · archived {new Date(store.archived_at).toLocaleDateString()}
-                  </span>
-                )}
-              </span>
-            </>
-          }
-          actions={
-            <>
-              {!store.archived_at && (
-                <Button variant="outline" size="sm" onClick={archive}>
-                  Archive
-                </Button>
-              )}
-              <Button variant="destructive" size="sm" onClick={del}>
-                Delete
-              </Button>
-            </>
-          }
-        />
-      }
-    >
-      <div>
-        <Tabs value={tab} onValueChange={(v) => setTab(v as TabKey)} aria-label="Memory store sections" className="mt-2">
-          <TabsList className="mb-6">
-            <TabsTrigger value="memories">Memories</TabsTrigger>
-            <TabsTrigger value="versions">Version history</TabsTrigger>
-            <TabsTrigger value="settings">Settings</TabsTrigger>
-          </TabsList>
+    <Page>
+      <DetailHeader
+        avatar={<EntityAvatar icon={BrainIcon} size="xl" />}
+        title={store.name}
+        status={<StatusBadge status={archived ? "archived" : "active"} variant="soft" />}
+        description={store.description?.trim() || <span className="text-fg-subtle">No description yet.</span>}
+        meta={
+          <>
+            {totals.stats &&
+              (totals.stats.count === 0 ? (
+                // An empty store has no size worth a chip of its own ("0 B").
+                <Chip icon={FileTextIcon}>No entries yet</Chip>
+              ) : (
+                <>
+                  <Chip icon={FileTextIcon}>{plural(totals.stats.count, "entry", "entries")}</Chip>
+                  <Chip>{formatBytes(totals.stats.bytes)}</Chip>
+                </>
+              ))}
+          </>
+        }
+        actions={
+          !archived ? (
+            <Button
+              onClick={() => {
+                setTab("entries");
+                setShowWrite(true);
+              }}
+            >
+              <PlusIcon data-icon="inline-start" className="stroke-[2.25]" />
+              New entry
+            </Button>
+          ) : undefined
+        }
+        menu={
+          <RowActionsMenu
+            label={`Actions for ${store.name}`}
+            actions={[
+              { label: "Copy store id", icon: <CopyIcon />, onSelect: () => void copyText(store.id) },
+              { label: "Copy mount path", icon: <CopyIcon />, onSelect: () => void copyText(path) },
+              ...(writable
+                ? [
+                    { label: "Archive", icon: <ArchiveIcon />, disabled: archived, onSelect: () => setConfirm("archive" as const) },
+                    { label: "Delete", icon: <Trash2Icon />, destructive: true, onSelect: () => setConfirm("delete" as const) },
+                  ]
+                : []),
+            ]}
+          />
+        }
+      >
+        {writable && (
+          <TabBar<TabKey>
+            label="Memory store sections"
+            value={tab}
+            onChange={setTab}
+            tabs={[
+              { value: "entries", label: "Entries", count: totals.stats?.count },
+              { value: "history", label: "History" },
+            ]}
+          />
+        )}
+      </DetailHeader>
 
-          <TabsContent value="memories">
-            <MemoriesPanel storeId={storeId} archived={!!store.archived_at} />
-          </TabsContent>
-          <TabsContent value="versions">
-            <VersionsPanel storeId={storeId} />
-          </TabsContent>
-          <TabsContent value="settings">
-            <SettingsPanel store={store} archived={!!store.archived_at} />
-          </TabsContent>
-        </Tabs>
+      {archived && (
+        <Callout tone="neutral" icon={ArchiveIcon} title="This store is archived" className="mt-6">
+          It is read-only and cannot be attached to new sessions.
+        </Callout>
+      )}
+
+      <div className="mt-6 grid gap-4 xl:grid-cols-[minmax(0,1fr)_340px]">
+        <div className="min-w-0">
+          {tab === "entries" ? (
+            <EntriesPanel storeId={store.id} archived={archived} onNew={() => setShowWrite(true)} onChanged={refreshEntries} />
+          ) : (
+            <HistoryPanel storeId={store.id} />
+          )}
+        </div>
+
+        <aside className="min-w-0 space-y-4">
+          <SectionCard title="Used by" description={agents.length > 0 ? `${plural(agents.length, "agent")} ${agents.length === 1 ? "remembers" : "remember"} here.` : undefined}>
+            <UsedByList
+              agents={usage.memoryStores.get(store.id)}
+              loading={usage.isLoading}
+              empty="No agent remembers here yet. Turn on memory for an agent and choose this store."
+            />
+            {mountedIn.length > 0 && (
+              <div className="mt-4 border-t border-border pt-3.5">
+                <p className="text-small text-fg-subtle">Mounted by default in</p>
+                <ul className="mt-2 space-y-2">
+                  {mountedIn.map((e) => (
+                    <li key={e.id}>
+                      <EntityRef kind="environment" id={e.id} name={e.name} />
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </SectionCard>
+          <SectionCard title="Details">
+            <div className="mb-3 rounded-lg bg-bg-soft px-3 py-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-medium text-fg-subtle">Mount path</span>
+                <CopyButton value={path} label="Copy mount path" className="size-6" />
+              </div>
+              <code className="mt-0.5 block font-mono text-xs break-all text-fg">{path}</code>
+              <p className="mt-1.5 text-xs text-fg-muted">
+                When the store is attached to a session, the agent reads and writes here with its ordinary file tools.
+              </p>
+            </div>
+            <PropertyList>
+              <Property label="Created" className={ASIDE_ROW}>
+                <RelativeTime value={store.created_at} />
+              </Property>
+              <Property label="Last write" className={ASIDE_ROW}>
+                {/* From the entries alone: an empty store has no last write to show. */}
+                <StoreLastWrite stats={totals.stats} isLoading={totals.isLoading} />
+              </Property>
+              {archived && (
+                <Property label="Archived" className={ASIDE_ROW}>
+                  <RelativeTime value={store.archived_at} />
+                </Property>
+              )}
+              <Property label="Store id" className={ASIDE_ROW}>
+                {/* memstore ids are too long for this column in full */}
+                <IdChip id={store.id} />
+              </Property>
+            </PropertyList>
+          </SectionCard>
+        </aside>
       </div>
+
+      <WriteMemoryDialog storeId={store.id} open={showWrite && !archived} onClose={() => setShowWrite(false)} onSaved={refreshEntries} />
+
+      <ConfirmDialog
+        open={confirm !== null}
+        onClose={() => setConfirm(null)}
+        destructive={confirm === "delete"}
+        title={confirm === "delete" ? `Delete ${store.name}?` : `Archive ${store.name}?`}
+        body={
+          confirm === "delete"
+            ? "The store, every entry in it and its version history are removed. This cannot be undone."
+            : "The store becomes read-only and can no longer be attached to new sessions. Archiving cannot be reversed."
+        }
+        confirmLabel={confirm === "delete" ? "Delete store" : "Archive store"}
+        onConfirm={async () => {
+          if (confirm === "delete") await api(`/v1/memory_stores/${store.id}`, { method: "DELETE" });
+          else await api(`/v1/memory_stores/${store.id}/archive`, { method: "POST" });
+          void queryClient.invalidateQueries({ queryKey: ["/v1/memory_stores"] });
+          nav("/memory");
+        }}
+      />
     </Page>
   );
 }
 
-// =================================================================
-// Memories tab — list, create, view, edit, delete
-// =================================================================
+const ENV_PARAMS = { limit: "200" } as const;
 
-function MemoriesPanel({ storeId, archived }: { storeId: string; archived: boolean }) {
-  const { api } = useApi();
-  const [error, setError] = useState<string | null>(null);
+// ── Entries ─────────────────────────────────────────────────────────
+
+function EntriesPanel({
+  storeId,
+  archived,
+  onNew,
+  onChanged,
+}: {
+  storeId: string;
+  archived: boolean;
+  onNew: () => void;
+  onChanged: () => void;
+}) {
   const [pathPrefix, setPathPrefix] = useState("");
   const [depth, setDepth] = useState("");
-  const [showWrite, setShowWrite] = useState(false);
-  const [open, setOpen] = useState<Memory | null>(null);
+  const [open, setOpen] = useState<MemoryListItem | null>(null);
 
-  // List query — TQ keys on (path, params), so changing pathPrefix/depth
-  // gets a fresh cache slot and refetch automatically. The previous hand-
-  // rolled load() had the same shape, just without the cache and dedup.
-  const params = {
-    path_prefix: pathPrefix || undefined,
-    depth: depth || undefined,
-  };
-  const {
-    data: listRes,
-    isLoading: loading,
-    error: listError,
-    refetch,
-  } = useApiQuery<{ data: MemoryListItem[] }>(
+  // Both filters are server params. `depth` only means something below a prefix.
+  const params = useMemo(
+    () => ({ path_prefix: pathPrefix || undefined, depth: pathPrefix && depth ? depth : undefined }),
+    [pathPrefix, depth],
+  );
+  const { data, isLoading, error, refetch } = useApiQuery<{ data: MemoryListItem[] }>(
     `/v1/memory_stores/${storeId}/memories`,
     params,
   );
-  useEffect(() => {
-    if (listError) setError(errMsg(listError));
-  }, [listError]);
-  const memories = listRes?.data ?? [];
-  const load = () => {
-    void refetch();
-  };
+  const entries = useMemo(() => data?.data ?? [], [data]);
+  const filtered = !!pathPrefix;
 
-  const openMemory = async (m: MemoryListItem) => {
-    try {
-      const full = await api<Memory>(`/v1/memory_stores/${storeId}/memories/${m.id}`);
-      setOpen(full);
-    } catch (e) {
-      setError(errMsg(e));
+  // Group by top folder, root files first, folders by name.
+  const groups = useMemo(() => {
+    const map = new Map<string, MemoryListItem[]>();
+    for (const m of entries) {
+      const key = topFolder(m.path);
+      const list = map.get(key);
+      if (list) list.push(m);
+      else map.set(key, [m]);
     }
-  };
+    return [...map.entries()]
+      .sort((a, b) => (a[0] === "" ? -1 : b[0] === "" ? 1 : a[0].localeCompare(b[0])))
+      .map(([folder, items]) => ({ folder, items: [...items].sort((a, b) => a.path.localeCompare(b.path)) }));
+  }, [entries]);
 
   return (
-    <div>
-      {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
-
-      <div className="flex gap-2 mb-4">
-        <input
-          placeholder="Filter by path prefix (e.g. /preferences/)"
-          aria-label="Filter by path prefix"
-          value={pathPrefix}
-          onChange={(e) => setPathPrefix(e.target.value)}
-          className="flex-1 border border-border rounded-lg px-3 py-2 text-sm bg-bg text-fg outline-none focus:border-border-strong"
-        />
-        <input
-          placeholder="Depth"
-          aria-label="Depth filter"
-          value={depth}
-          onChange={(e) => setDepth(e.target.value.replace(/[^0-9]/g, ""))}
-          className="w-24 border border-border rounded-lg px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-border-strong"
-        />
-        {!archived && (
-          <button onClick={() => setShowWrite(true)}
-            className="inline-flex items-center justify-center px-4 py-2 min-h-11 sm:min-h-0 bg-brand text-brand-fg rounded-lg text-sm font-medium hover:bg-brand-hover transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] whitespace-nowrap">
-            + New memory
-          </button>
-        )}
-      </div>
-
-      {showWrite && !archived && (
-        <WriteMemoryDialog
-          storeId={storeId}
-          existing={null}
-          onClose={() => setShowWrite(false)}
-          onSaved={() => { setShowWrite(false); load(); }}
-        />
-      )}
-
-      {loading ? <p className="text-fg-subtle text-sm py-4">Loading...</p> : (
-        <div className="border border-border rounded-lg overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase">
-                <th className="text-left px-4 py-2.5">Path</th>
-                <th className="text-left px-4 py-2.5">Size</th>
-                <th className="text-left px-4 py-2.5">SHA-256</th>
-                <th className="text-left px-4 py-2.5">Updated</th>
-              </tr>
-            </thead>
-            <tbody>
-              {memories.map((m) => (
-                <tr
-                  key={m.id}
-                  onClick={() => openMemory(m)}
-                  className="border-t border-border cursor-pointer hover:bg-bg-surface transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-                >
-                  <td className="px-4 py-3 font-mono text-xs">{m.path}</td>
-                  <td className="px-4 py-3">{m.size_bytes} B</td>
-                  <td className="px-4 py-3 font-mono text-xs text-fg-muted">{m.content_sha256.slice(0, 12)}…</td>
-                  <td className="px-4 py-3 text-fg-muted">{new Date(m.updated_at).toLocaleString()}</td>
-                </tr>
-              ))}
-              {!memories.length && (
-                <tr><td colSpan={4} className="px-4 py-8 text-center text-fg-subtle">No memories</td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {open && (
-        <MemoryDetailDialog
-          storeId={storeId}
-          memory={open}
-          archived={archived}
-          onClose={() => setOpen(null)}
-          onSaved={() => { setOpen(null); load(); }}
-        />
-      )}
-    </div>
-  );
-}
-
-// =================================================================
-// Memory detail dialog — view + edit + delete + version history sub-panel
-// =================================================================
-
-function MemoryDetailDialog({
-  storeId, memory, archived, onClose, onSaved,
-}: {
-  storeId: string;
-  memory: Memory;
-  archived: boolean;
-  onClose: () => void;
-  onSaved: () => void;
-}) {
-  const { api } = useApi();
-  const [editing, setEditing] = useState(false);
-  const [content, setContent] = useState(memory.content);
-  const [path, setPath] = useState(memory.path);
-  const [error, setError] = useState<string | null>(null);
-  const [versions, setVersions] = useState<MemoryVersion[] | null>(null);
-  const [showVersions, setShowVersions] = useState(false);
-
-  const loadVersions = async () => {
-    try {
-      const { data } = await api<{ data: MemoryVersion[] }>(
-        `/v1/memory_stores/${storeId}/memory_versions?memory_id=${memory.id}`,
-      );
-      setVersions(data);
-    } catch (e) {
-      setError(errMsg(e));
-    }
-  };
-
-  const save = async () => {
-    setError(null);
-    try {
-      await api(`/v1/memory_stores/${storeId}/memories/${memory.id}`, {
-        method: "POST",
-        body: JSON.stringify({
-          path: path !== memory.path ? path : undefined,
-          content: content !== memory.content ? content : undefined,
-          // CAS guard: refuse to clobber if someone else wrote since we read.
-          precondition: { type: "content_sha256", content_sha256: memory.content_sha256 },
-        }),
-      });
-      onSaved();
-    } catch (e) {
-      setError(errMsg(e));
-    }
-  };
-
-  const remove = async () => {
-    if (!confirm(`Delete memory "${memory.path}"? Audit history is preserved.`)) return;
-    setError(null);
-    try {
-      await api(
-        `/v1/memory_stores/${storeId}/memories/${memory.id}?expected_content_sha256=${memory.content_sha256}`,
-        { method: "DELETE" },
-      );
-      onSaved();
-    } catch (e) {
-      setError(errMsg(e));
-    }
-  };
-
-  const rollback = async (v: MemoryVersion) => {
-    if (v.content === undefined || v.content === null) {
-      alert("This version's content has been redacted — can't roll back.");
-      return;
-    }
-    if (!confirm(`Roll back to version ${v.id} (${new Date(v.created_at).toLocaleString()})?\n\nThis writes a new version with the old content.`)) return;
-    setError(null);
-    try {
-      await api(`/v1/memory_stores/${storeId}/memories/${memory.id}`, {
-        method: "POST",
-        body: JSON.stringify({
-          content: v.content,
-          // CAS against current head so we don't clobber a concurrent write.
-          precondition: { type: "content_sha256", content_sha256: memory.content_sha256 },
-        }),
-      });
-      onSaved();
-    } catch (e) {
-      setError(errMsg(e));
-    }
-  };
-
-  const redact = async (v: MemoryVersion) => {
-    if (v.content_sha256 && v.content_sha256 === memory.content_sha256) {
-      alert("Can't redact the live head version. Write a new version first or delete the memory.");
-      return;
-    }
-    if (!confirm(`Redact version ${v.id}? Content will be wiped; audit row stays.`)) return;
-    setError(null);
-    try {
-      await api(`/v1/memory_stores/${storeId}/memory_versions/${v.id}/redact`, { method: "POST" });
-      loadVersions();
-    } catch (e) {
-      setError(errMsg(e));
-    }
-  };
-
-  return (
-    <Modal
-      open
-      onClose={onClose}
-      title={memory.path}
-      subtitle={`${memory.id} · sha256=${memory.content_sha256.slice(0, 16)}… · ${memory.size_bytes}B`}
-      maxWidth="max-w-3xl"
-      footer={
-        <div className="flex gap-2 w-full">
-          {!archived && !editing && (
-            <button
-              onClick={() => setEditing(true)}
-              className="inline-flex items-center justify-center px-3 py-1.5 min-h-11 sm:min-h-0 bg-brand text-brand-fg rounded-lg text-sm font-medium hover:bg-brand-hover transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-            >
-              Edit
-            </button>
-          )}
-          {editing && (
-            <>
-              <button
-                onClick={save}
-                className="inline-flex items-center justify-center px-3 py-1.5 min-h-11 sm:min-h-0 bg-brand text-brand-fg rounded-lg text-sm font-medium hover:bg-brand-hover transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-              >
-                Save
-              </button>
-              <button
-                onClick={() => {
-                  setEditing(false);
-                  setContent(memory.content);
-                  setPath(memory.path);
-                }}
-                className="inline-flex items-center justify-center px-3 py-1.5 min-h-11 sm:min-h-0 border border-border rounded-lg text-sm hover:bg-bg-surface transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-              >
-                Cancel
-              </button>
-            </>
-          )}
-          {!editing && (
-            <button
-              onClick={() => {
-                setShowVersions((s) => !s);
-                if (!showVersions) loadVersions();
-              }}
-              className="inline-flex items-center justify-center px-3 py-1.5 min-h-11 sm:min-h-0 border border-border rounded-lg text-sm hover:bg-bg-surface transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-              aria-expanded={showVersions}
-            >
-              {showVersions ? "Hide" : "Show"} version history
-            </button>
-          )}
-          {!archived && !editing && (
-            <button
-              onClick={remove}
-              className="ml-auto inline-flex items-center justify-center px-3 py-1.5 min-h-11 sm:min-h-0 bg-danger/10 border border-danger/30 text-danger rounded-lg text-sm hover:bg-danger/20 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-            >
-              Delete memory
-            </button>
-          )}
-        </div>
-      }
-    >
-      {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
-
-      {editing && (
-        <div className="mb-3">
-          <label htmlFor="memory-edit-path" className="sr-only">Memory path</label>
-          <input
-            id="memory-edit-path"
-            value={path}
-            onChange={(e) => setPath(e.target.value)}
-            className="w-full font-mono text-sm border border-border rounded-lg px-3 py-1.5 min-h-11 sm:min-h-0 bg-bg outline-none focus:border-border-strong"
+    <SectionCard title="Entries" description="Files in this store, by folder." flush>
+      {/* Both filters are sent to the server. */}
+      <div className="flex items-center gap-2 border-b border-border px-5 py-3">
+        <div className="relative min-w-0 flex-1">
+          <SearchIcon className="pointer-events-none absolute top-1/2 left-3 size-3.5 -translate-y-1/2 text-fg-subtle" />
+          <Input
+            value={pathPrefix}
+            onChange={(e) => setPathPrefix(e.target.value)}
+            placeholder="Filter by path, for example /policies/"
+            aria-label="Filter by path prefix"
+            spellCheck={false}
+            autoComplete="off"
+            className="h-8 rounded-full pl-8 text-small-size md:text-small-size"
           />
         </div>
+        <Tip label={pathPrefix ? "How many folder levels below the prefix to include" : "Type a path prefix first"}>
+          <span className="shrink-0">
+            <Input
+              value={depth}
+              onChange={(e) => setDepth(e.target.value.replace(/[^0-9]/g, ""))}
+              placeholder="Depth"
+              aria-label="Depth filter"
+              inputMode="numeric"
+              disabled={!pathPrefix}
+              className="h-8 w-[76px] rounded-full px-3 text-center text-small-size md:text-small-size"
+            />
+          </span>
+        </Tip>
+      </div>
+      {error && entries.length === 0 ? (
+        <div className="p-5">
+          <ErrorState compact title="Entries could not be loaded" error={error} retry={() => void refetch()} />
+        </div>
+      ) : isLoading ? (
+        <ul aria-hidden="true">
+          {[0, 1, 2, 3, 4].map((i) => (
+            <li key={i} className="flex h-[52px] items-center gap-3 border-t border-border px-5 first:border-t-0">
+              <Skeleton className="size-8 shrink-0" rounded="lg" />
+              <div className="flex-1 space-y-1.5">
+                <Skeleton className="h-3" rounded="sm" style={{ width: `${24 + ((i * 11) % 22)}%` }} />
+                <Skeleton className="h-2.5" rounded="sm" style={{ width: `${34 + ((i * 7) % 20)}%` }} />
+              </div>
+              <Skeleton className="h-3 w-10" rounded="sm" />
+            </li>
+          ))}
+        </ul>
+      ) : entries.length === 0 ? (
+        filtered ? (
+          <EmptyState
+            size="md"
+            variant="plain"
+            icon={<FolderIcon />}
+            title="No entries under that path"
+            body="Paths start with a slash and are matched from the beginning."
+            action={
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  setPathPrefix("");
+                  setDepth("");
+                }}
+              >
+                Clear filter
+              </Button>
+            }
+          />
+        ) : (
+          <EmptyState
+            kind="memory"
+            size="md"
+            variant="plain"
+            title="Nothing remembered yet"
+            body={
+              archived
+                ? "This store was archived while it was empty."
+                : "Agents write here as they work, when memory is on. You can also add an entry yourself: a policy, a preference, a fact worth keeping."
+            }
+            action={
+              !archived && (
+                <Button variant="secondary" size="sm" onClick={onNew}>
+                  <PlusIcon data-icon="inline-start" />
+                  New entry
+                </Button>
+              )
+            }
+          />
+        )
+      ) : (
+        <>
+          <div className={cn(ROW, "h-9 border-b border-border px-5 text-xs font-medium text-fg-subtle")}>
+            <span>Name</span>
+            <span className="text-right">Size</span>
+            <span>Updated</span>
+          </div>
+          {groups.map((g) => (
+            <section key={g.folder || "/"}>
+              <h4 className="flex h-9 items-center gap-2 border-t border-border bg-bg-inset/60 px-5 text-xs font-medium text-fg-muted first:border-t-0">
+                <FolderIcon className="size-3.5 text-fg-subtle" />
+                <span className="font-mono text-micro-size">/{g.folder}</span>
+                <span className="font-normal text-fg-subtle">{g.items.length}</span>
+              </h4>
+              <ul>
+                {g.items.map((m) => (
+                  <li key={m.id} className="border-t border-border">
+                    <button
+                      type="button"
+                      onClick={() => setOpen(m)}
+                      className={cn(ROW, "h-[52px] w-full px-5 text-left transition-quick hover:bg-bg-hover")}
+                    >
+                      <span className="flex min-w-0 items-center gap-3">
+                        <EntityAvatar icon={FileTextIcon} size="md" />
+                        <span className="min-w-0">
+                          <span className="block truncate text-small-size font-medium text-fg" title={m.path}>
+                            {baseName(m.path)}
+                          </span>
+                          <span className="block truncate font-mono text-micro-size text-fg-subtle">{m.path}</span>
+                        </span>
+                      </span>
+                      <span className="text-right text-small text-fg-muted">{formatBytes(m.size_bytes)}</span>
+                      <RelativeTime value={m.updated_at} className="text-small text-fg-muted" />
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          ))}
+        </>
       )}
 
-      {editing ? (
-        <textarea
-          value={content}
-          onChange={(e) => setContent(e.target.value)}
-          rows={20}
-          aria-label="Memory content"
-          className="w-full border border-border rounded-lg px-3 py-2 text-sm bg-bg text-fg font-mono outline-none focus:border-border-strong"
+      <MemoryEntrySheet
+        storeId={storeId}
+        item={open}
+        archived={archived}
+        onClose={() => setOpen(null)}
+        onChanged={() => {
+          void refetch();
+          onChanged();
+        }}
+      />
+    </SectionCard>
+  );
+}
+
+// ── History (store-wide audit trail) ────────────────────────────────
+
+function HistoryPanel({ storeId }: { storeId: string }) {
+  const versions = useQuietQuery<{ data: MemoryVersion[] }>(`/v1/memory_stores/${storeId}/memory_versions`);
+  const list = versions.data?.data ?? [];
+
+  return (
+    <SectionCard title="History" description="Every write to this store, newest first." flush>
+      {versions.isLoading ? (
+        <ul aria-hidden="true">
+          {[0, 1, 2, 3].map((i) => (
+            <li key={i} className="flex h-[52px] items-center gap-4 border-t border-border px-5 first:border-t-0">
+              <Skeleton className="h-3 w-16" rounded="sm" />
+              <Skeleton className="h-3 flex-1" rounded="sm" style={{ maxWidth: `${40 + i * 8}%` }} />
+              <Skeleton className="h-3 w-14" rounded="sm" />
+            </li>
+          ))}
+        </ul>
+      ) : versions.missing ? (
+        <EmptyState
+          size="md"
+          variant="plain"
+          icon={<HistoryIcon />}
+          title="History is not kept on this server"
+          body="This runtime stores the current content of each entry, without a record of earlier versions."
+        />
+      ) : versions.error ? (
+        <div className="p-5">
+          <ErrorState compact title="History could not be loaded" error={versions.error} retry={() => void versions.refetch()} />
+        </div>
+      ) : list.length === 0 ? (
+        <EmptyState
+          size="md"
+          variant="plain"
+          icon={<HistoryIcon />}
+          title="No history yet"
+          body="Each time an entry is created, edited or deleted, it is recorded here."
         />
       ) : (
-        <pre className="whitespace-pre-wrap bg-bg-surface border border-border rounded-lg p-3 max-h-[40vh] overflow-auto text-sm font-mono text-fg">
-          {memory.content || <span className="text-fg-subtle">(empty)</span>}
-        </pre>
-      )}
-
-      {showVersions && versions && (
-        <div className="mt-4 border border-border rounded-lg overflow-x-auto">
-          <table className="w-full text-xs">
-            <thead>
-              <tr className="bg-bg-surface/60 text-fg-muted uppercase">
-                <th className="text-left px-3 py-2">When</th>
-                <th className="text-left px-3 py-2">Op</th>
-                <th className="text-left px-3 py-2">Actor</th>
-                <th className="text-left px-3 py-2">SHA-256</th>
-                <th className="text-right px-3 py-2"></th>
-              </tr>
-            </thead>
-            <tbody>
-              {versions.map((v) => {
-                const isLiveHead = v.content_sha256 && v.content_sha256 === memory.content_sha256;
-                return (
-                  <tr key={v.id} className="border-t border-border">
-                    <td className="px-3 py-2 text-fg-muted">{new Date(v.created_at).toLocaleString()}</td>
-                    <td className="px-3 py-2 font-mono">{v.operation}{v.redacted && " · redacted"}</td>
-                    <td className="px-3 py-2 font-mono text-fg-muted">{v.actor.type}:{v.actor.id}</td>
-                    <td className="px-3 py-2 font-mono text-fg-muted">
-                      {v.content_sha256 ? v.content_sha256.slice(0, 12) + "…" : "—"}
-                      {isLiveHead && <span className="ml-2 text-brand">(head)</span>}
-                    </td>
-                    <td className="px-3 py-2 text-right">
-                      {!archived && !v.redacted && v.content !== undefined && v.content !== null && !isLiveHead && (
-                        <button onClick={() => rollback(v)}
-                          className="inline-flex items-center justify-center min-w-11 min-h-11 sm:min-w-0 sm:min-h-0 px-2 text-xs text-brand hover:underline mr-1 sm:mr-2">
-                          Roll back
-                        </button>
-                      )}
-                      {!archived && !v.redacted && !isLiveHead && (
-                        <button onClick={() => redact(v)}
-                          className="inline-flex items-center justify-center min-w-11 min-h-11 sm:min-w-0 sm:min-h-0 px-2 text-xs text-danger hover:underline">
-                          Redact
-                        </button>
-                      )}
-                    </td>
-                  </tr>
-                );
-              })}
-              {!versions.length && (
-                <tr><td colSpan={5} className="px-3 py-4 text-center text-fg-subtle">No versions</td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </Modal>
-  );
-}
-
-// =================================================================
-// Versions tab (store-wide audit timeline)
-// =================================================================
-
-function VersionsPanel({ storeId }: { storeId: string }) {
-  const [error, setError] = useState<string | null>(null);
-  const {
-    data: res,
-    isLoading: loading,
-    error: queryError,
-  } = useApiQuery<{ data: MemoryVersion[] }>(
-    `/v1/memory_stores/${storeId}/memory_versions`,
-  );
-  useEffect(() => {
-    if (queryError) setError(errMsg(queryError));
-  }, [queryError]);
-  const versions = res?.data ?? [];
-
-  if (error) return <ErrorBanner message={error} onDismiss={() => setError(null)} />;
-  if (loading) return <p className="text-fg-subtle text-sm py-4">Loading...</p>;
-  if (!versions.length) return <p className="text-fg-subtle text-sm py-4">No versions yet.</p>;
-
-  return (
-    <div className="border border-border rounded-lg overflow-x-auto">
-      <table className="w-full text-sm">
-        <thead>
-          <tr className="bg-bg-surface/60 text-fg-muted text-xs uppercase">
-            <th className="text-left px-4 py-2.5">When</th>
-            <th className="text-left px-4 py-2.5">Op</th>
-            <th className="text-left px-4 py-2.5">Path</th>
-            <th className="text-left px-4 py-2.5">Actor</th>
-            <th className="text-left px-4 py-2.5">SHA-256</th>
-          </tr>
-        </thead>
-        <tbody>
-          {versions.map((v) => (
-            <tr key={v.id} className="border-t border-border">
-              <td className="px-4 py-3 text-fg-muted">{new Date(v.created_at).toLocaleString()}</td>
-              <td className="px-4 py-3 font-mono text-xs">{v.operation}{v.redacted && " · redacted"}</td>
-              <td className="px-4 py-3 font-mono text-xs">{v.path ?? "—"}</td>
-              <td className="px-4 py-3 font-mono text-xs text-fg-muted">{v.actor.type}:{v.actor.id}</td>
-              <td className="px-4 py-3 font-mono text-xs text-fg-muted">
-                {v.content_sha256 ? v.content_sha256.slice(0, 12) + "…" : "—"}
-              </td>
-            </tr>
+        <ul>
+          {list.map((v) => (
+            <li
+              key={v.id}
+              className="grid min-h-[52px] grid-cols-[104px_minmax(0,1fr)_96px] items-center gap-x-4 border-t border-border px-5 py-2 first:border-t-0"
+            >
+              <OperationBadge version={v} />
+              <div className="min-w-0">
+                <div className="truncate font-mono text-xs text-fg" title={v.path}>
+                  {v.path ?? "Path not recorded"}
+                </div>
+                <div className="mt-0.5 flex items-center gap-1.5 text-xs text-fg-subtle">
+                  <Actor actor={v.actor} />
+                  {v.size_bytes != null && (
+                    <>
+                      <span aria-hidden="true">·</span>
+                      <span>{formatBytes(v.size_bytes)}</span>
+                    </>
+                  )}
+                </div>
+              </div>
+              <RelativeTime value={v.created_at} className="text-small text-fg-muted" />
+            </li>
           ))}
-        </tbody>
-      </table>
-    </div>
-  );
-}
-
-// =================================================================
-// Settings tab — info + archive + delete
-// =================================================================
-
-function SettingsPanel({ store, archived }: { store: MemoryStore; archived: boolean }) {
-  return (
-    <div className="space-y-4 text-sm">
-      <div>
-        <div className="text-fg-muted text-xs uppercase mb-1">Store ID</div>
-        <code className="font-mono text-xs">{store.id}</code>
-      </div>
-      <div>
-        <div className="text-fg-muted text-xs uppercase mb-1">Mount path</div>
-        <code className="font-mono text-xs">/mnt/memory/{store.name}/</code>
-        <p className="text-fg-subtle text-xs mt-1">
-          When this store is attached to a session, the agent reads/writes under this path with standard file tools.
-        </p>
-      </div>
-      <div>
-        <div className="text-fg-muted text-xs uppercase mb-1">Created</div>
-        <span>{new Date(store.created_at).toLocaleString()}</span>
-      </div>
-      {archived && (
-        <div>
-          <div className="text-fg-muted text-xs uppercase mb-1">Archived</div>
-          <span>{new Date(store.archived_at!).toLocaleString()}</span>
-          <p className="text-fg-subtle text-xs mt-1">Archived stores are read-only and cannot be attached to new sessions.</p>
-        </div>
+        </ul>
       )}
-      <p className="text-fg-subtle text-xs pt-4 border-t border-border">
-        To archive or delete this store, use the actions in the page header.
-      </p>
-    </div>
+    </SectionCard>
   );
-}
-
-// =================================================================
-// Write memory dialog (create or first-write)
-// =================================================================
-
-function WriteMemoryDialog({
-  storeId, existing, onClose, onSaved,
-}: {
-  storeId: string;
-  existing: Memory | null;
-  onClose: () => void;
-  onSaved: () => void;
-}) {
-  const { api } = useApi();
-  const [path, setPath] = useState(existing?.path ?? "/");
-  const [content, setContent] = useState(existing?.content ?? "");
-  const [error, setError] = useState<string | null>(null);
-
-  const save = async () => {
-    setError(null);
-    try {
-      const body: Record<string, unknown> = { path, content };
-      if (!existing) body.precondition = { type: "not_exists" };
-      await api(`/v1/memory_stores/${storeId}/memories`, {
-        method: "POST",
-        body: JSON.stringify(body),
-      });
-      onSaved();
-    } catch (e) {
-      setError(errMsg(e));
-    }
-  };
-
-  return (
-    <Modal
-      open
-      onClose={onClose}
-      title="New memory"
-      maxWidth="max-w-2xl"
-      footer={
-        <>
-          <button
-            onClick={onClose}
-            className="inline-flex items-center justify-center px-3 py-1.5 min-h-11 sm:min-h-0 border border-border rounded-lg text-sm hover:bg-bg-surface transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={save}
-            className="inline-flex items-center justify-center px-3 py-1.5 min-h-11 sm:min-h-0 bg-brand text-brand-fg rounded-lg text-sm font-medium hover:bg-brand-hover transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-          >
-            Create
-          </button>
-        </>
-      }
-    >
-      {error && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
-
-      <label htmlFor="new-memory-path" className="block text-xs font-medium uppercase text-fg-muted mb-1">Path</label>
-      <input
-        id="new-memory-path"
-        placeholder="/preferences/formatting.md"
-        value={path}
-        onChange={(e) => setPath(e.target.value)}
-        className="w-full font-mono border border-border rounded-lg px-3 py-2 text-sm mb-3 bg-bg text-fg outline-none focus:border-border-strong"
-      />
-
-      <label htmlFor="new-memory-content" className="block text-xs font-medium uppercase text-fg-muted mb-1">Content (max 100KB)</label>
-      <textarea
-        id="new-memory-content"
-        value={content}
-        onChange={(e) => setContent(e.target.value)}
-        rows={14}
-        className="w-full border border-border rounded-lg px-3 py-2 text-sm bg-bg text-fg font-mono outline-none focus:border-border-strong"
-      />
-    </Modal>
-  );
-}
-
-function ErrorBanner({ message, onDismiss }: { message: string; onDismiss: () => void }) {
-  return (
-    <div className="bg-danger/10 border border-danger/30 rounded-lg px-4 py-3 mb-4 flex items-start justify-between gap-4">
-      <p className="text-danger text-sm">{message}</p>
-      <button onClick={onDismiss} className="inline-flex items-center min-h-11 sm:min-h-0 text-danger/70 hover:text-danger text-sm flex-shrink-0">Dismiss</button>
-    </div>
-  );
-}
-
-function errMsg(e: unknown): string {
-  if (e instanceof Error) return e.message;
-  if (typeof e === "string") return e;
-  return "Unknown error";
 }

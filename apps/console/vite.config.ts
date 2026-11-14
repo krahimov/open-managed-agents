@@ -26,6 +26,12 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  // noVNC uses top-level await. build.target covers production builds only;
+  // the dev server's dependency pre-bundling needs the same target or
+  // `vite` crashes at startup.
+  optimizeDeps: {
+    esbuildOptions: { target: "es2022" },
+  },
   build: {
     // noVNC probes WebCodecs with top-level await in its lazy desktop chunk.
     target: "es2022",

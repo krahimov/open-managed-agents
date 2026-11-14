@@ -24,7 +24,7 @@ type CommonProps = Omit<
 // below iOS HIG / WCAG 2.5.5 — bump the minimum on small viewports and
 // fall back to shadcn's intrinsic height on sm+ so dense forms don't
 // grow on desktop.
-const TOUCH_TARGET = "min-h-11 sm:min-h-0";
+const TOUCH_TARGET = "max-sm:min-h-11";
 
 /**
  * Plain text input. Defaults `autoComplete="off"` to prevent the browser
@@ -73,22 +73,34 @@ export function TextInput({
  * directly, otherwise the browser autofills the user's iCloud/Google
  * password into a place it doesn't belong, AND the user has to paste
  * blind into a row of dot-fields.
+ *
+ * Type: what is typed is a token, so it is set in mono (masked or shown);
+ * the placeholder is a label or a hint ("Composio API key", "Starts with
+ * lin_wh_"), so it stays in the UI face. Callers do not set either.
  */
-export function SecretInput({
-  className,
-  label,
-  hint,
-  ...rest
-}: CommonProps) {
+export function SecretInput({ label, hint, ...rest }: CommonProps) {
+  // The box (input + eye) is its own component so that <Field> hands its
+  // id, label and hint to it and it puts them on the <input>: cloned onto
+  // a wrapping <div>, the label pointed at the div and named nothing.
+  const input = <SecretBox {...rest} />;
+  if (!label && !hint) return input;
+  return (
+    <Field label={label} hint={hint}>
+      {input}
+    </Field>
+  );
+}
+
+function SecretBox({ className, ...rest }: Omit<CommonProps, "label" | "hint">) {
   const [revealed, setRevealed] = useState(false);
-  const input = (
+  return (
     <div className="relative">
       <Input
         type={revealed ? "text" : "password"}
         autoComplete="new-password"
         data-1p-ignore
         data-lpignore="true"
-        className={[TOUCH_TARGET, "pr-10", className].filter(Boolean).join(" ")}
+        className={[TOUCH_TARGET, "pr-10 font-mono placeholder:font-sans", className].filter(Boolean).join(" ")}
         {...rest}
       />
       <Button
@@ -96,18 +108,12 @@ export function SecretInput({
         variant="ghost"
         size="icon-sm"
         onClick={() => setRevealed((r) => !r)}
-        className="absolute inset-y-0 right-1 my-auto text-fg-subtle hover:text-fg-muted"
+        className="absolute inset-y-0 right-1 my-auto size-7 text-fg-subtle hover:text-fg"
         title={revealed ? "Hide" : "Show"}
         aria-label={revealed ? "Hide secret" : "Show secret"}
       >
         {revealed ? <EyeOffIcon /> : <EyeIcon />}
       </Button>
     </div>
-  );
-  if (!label && !hint) return input;
-  return (
-    <Field label={label} hint={hint}>
-      {input}
-    </Field>
   );
 }

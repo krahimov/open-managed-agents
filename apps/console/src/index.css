@@ -1,135 +1,408 @@
 @import "tailwindcss";
+@import "tw-animate-css";
 
 /* Code highlight theme — light by default */
 @import "highlight.js/styles/github.css";
 
-/* ---------- Dark mode: class-based ---------- */
+/* ==========================================================================
+   MUSE — design tokens. The full reference lives in apps/console/DESIGN.md.
+   Read that before adding a colour, a radius or a shadow: the answer is
+   almost always "use an existing token".
+   ========================================================================== */
+
+/* ---------- Vendored typeface: Hanken Grotesk (OFL, see assets/fonts) ---------- */
+@font-face {
+  font-family: "Hanken Grotesk Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("./assets/fonts/hanken-grotesk/hanken-grotesk-latin-ext-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329,
+    U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "Hanken Grotesk Variable";
+  font-style: normal;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("./assets/fonts/hanken-grotesk/hanken-grotesk-latin-wght-normal.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+    U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Hanken Grotesk Variable";
+  font-style: italic;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("./assets/fonts/hanken-grotesk/hanken-grotesk-latin-ext-wght-italic.woff2") format("woff2-variations");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329,
+    U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+@font-face {
+  font-family: "Hanken Grotesk Variable";
+  font-style: italic;
+  font-display: swap;
+  font-weight: 100 900;
+  src: url("./assets/fonts/hanken-grotesk/hanken-grotesk-latin-wght-italic.woff2") format("woff2-variations");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329,
+    U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+/* ---------- Variants ---------- */
 @custom-variant dark (&:where(.dark, .dark *));
 
-/* ---------- Light theme (default) ---------- */
+/* Radix / cmdk state variants. The shadcn primitives in components/ui and
+   components/ai-elements are written against these names; without the
+   definitions `data-open:` would only match a literal [data-open] attribute
+   (which Radix never sets) and `data-selected:` / `data-active:` would match
+   "false" as well as "true". */
+@custom-variant data-open (&:where([data-state="open"], [data-open]:not([data-open="false"])));
+@custom-variant data-closed (&:where([data-state="closed"], [data-closed]:not([data-closed="false"])));
+@custom-variant data-checked (&:where([data-state="checked"], [data-checked]:not([data-checked="false"])));
+@custom-variant data-active (&:where([data-state="active"], [data-active]:not([data-active="false"])));
+@custom-variant data-selected (&:where([data-selected]:not([data-selected="false"])));
+@custom-variant data-disabled (&:where([data-disabled]:not([data-disabled="false"])));
+@custom-variant data-horizontal (&:where([data-orientation="horizontal"]));
+@custom-variant data-vertical (&:where([data-orientation="vertical"]));
+
+/* ==========================================================================
+   Light theme (default)
+   ========================================================================== */
 :root {
-  /* Single accent: coral. Reserved for primary actions, focus, active nav —
-     never decoration. (Design direction: cool near-monochrome + one accent.) */
-  --brand: #d9564a;
-  --brand-hover: #c74b40;
-  --brand-subtle: #fdefed;
-  --brand-fg: #ffffff;
+  /* --- Ink: text and the primary button. A deep plum-black, never #000. --- */
+  --ink: oklch(0.235 0.03 330);
+  --ink-hover: oklch(0.32 0.035 330);
+  --on-ink: oklch(0.99 0.004 40);
 
-  --bg: #fbfbfc;
-  --bg-sidebar: #f4f4f6;
-  --bg-surface: #ffffff;
-  /* One step BELOW the page — code wells, stat insets, terminal chrome. */
-  --bg-inset: #f1f2f4;
-  --bg-overlay: oklch(0 0 0 / 0.28);
+  /* --- Plum: the single accent. Links, focus, selection, progress. --- */
+  --plum: oklch(0.5 0.165 342);
+  --plum-hover: oklch(0.43 0.16 342);
+  --plum-subtle: oklch(0.957 0.026 342);
+  --on-plum: #ffffff;
 
-  --fg: #17171a;
-  --fg-muted: #6a6b72;
-  --fg-subtle: #a0a1a9;
+  /* --- Surfaces, lowest to highest. --- */
+  --bg-sidebar: oklch(0.963 0.006 30); /* stage: the frame behind sidebar + panel */
+  --bg: oklch(0.99 0.003 30); /* panel: the page canvas */
+  --bg-surface: #ffffff; /* cards, inputs */
+  --bg-raised: #ffffff; /* popovers, menus, dialogs, toasts */
+  --bg-inset: oklch(0.972 0.005 30); /* wells: code, table heads, read-only blocks */
+  /* Alpha fills sit on any surface. */
+  --bg-soft: oklch(0.235 0.03 330 / 0.045); /* chips, tool blocks, quiet buttons */
+  --bg-hover: oklch(0.235 0.03 330 / 0.06);
+  --bg-pressed: oklch(0.235 0.03 330 / 0.1);
+  --bg-overlay: oklch(0.25 0.025 330 / 0.22);
 
-  --border: #e6e7eb;
-  --border-strong: #cacdd5;
+  /* --- Text. --- */
+  --fg: var(--ink);
+  --fg-muted: oklch(0.46 0.02 330); /* secondary text */
+  --fg-subtle: oklch(0.52 0.016 330); /* captions, placeholders: AA on every surface and on a hovered row */
+  --fg-faint: oklch(0.7 0.012 330); /* decorative glyphs, disabled; never body text (readable text set in it is raised, see "Faint text") */
 
-  --success: #178a55;
-  --success-subtle: #eaf7f0;
-  --warning: #a56315;
-  --warning-subtle: #fff3df;
-  --danger: #c93d47;
-  --danger-subtle: #fff0f1;
-  --info: #2f6fed;
-  --info-subtle: #edf4ff;
-  --accent-violet: #7c5cff;
-  --accent-violet-subtle: #f3f0ff;
+  /* --- Lines. Alpha so they hold on any surface. --- */
+  --border: oklch(0.235 0.03 330 / 0.09);
+  --border-strong: oklch(0.235 0.03 330 / 0.17);
 
-  /* Surface elevation — single shadow token, theme-aware. Light mode
-     uses near-black at 10% opacity; dark mode bumps to 50% so drop
-     shadows actually read against the dark surface. */
-  --shadow-md: 0 14px 34px -28px rgb(23 23 26 / 0.32);
-  --shadow-sm: 0 1px 2px rgb(23 23 26 / 0.04), 0 1px 1px rgb(23 23 26 / 0.03);
+  /* --- Status: text/icon colour + soft tint. --- */
+  --success: oklch(0.5 0.115 155);
+  --success-subtle: oklch(0.955 0.035 155);
+  --warning: oklch(0.52 0.115 68);
+  --warning-subtle: oklch(0.958 0.045 85);
+  /* A card that is waiting on a person: a tool approval, an access request,
+     a skill request (.needs-you-card). The full warning tint made three
+     request cards in a row three saturated amber slabs, and a disabled ink
+     pill on it read muddy (round 3). As in dark, the fill is the surface's
+     own step with only a trace of amber, and the amber edge (stronger than
+     before) and the amber mark carry "needs you". */
+  --needs-you-bg: oklch(0.987 0.014 84);
+  --needs-you-border: color-mix(in oklab, var(--warning) 48%, transparent);
+  /* A failed turn's card (<EventCard kind="error">): in light the danger tint. */
+  --failed-bg: var(--danger-subtle);
+  --failed-border: color-mix(in oklab, var(--danger) 20%, transparent);
+  --danger: oklch(0.53 0.185 25);
+  --danger-subtle: oklch(0.958 0.025 20);
+  --info: oklch(0.52 0.15 255);
+  --info-subtle: oklch(0.956 0.024 255);
+  --accent-violet: oklch(0.52 0.16 295);
+  --accent-violet-subtle: oklch(0.957 0.026 295);
+  /* Solid fills for dots, meters and progress: brighter than the text
+     tone, never used for text. */
+  --success-solid: oklch(0.64 0.15 155);
+  --warning-solid: oklch(0.76 0.15 75);
+  --danger-solid: oklch(0.62 0.2 25);
+  --info-solid: oklch(0.62 0.16 255);
 
-  /* Motion tokens. Default Tailwind transitions feel "computer-y" (linear
-     timing-function, 150ms blanket duration). These curves + scale give
-     interactions weight without being slow:
-     - soft: iOS-style spring out, perfect for modal/toast/menu reveal
-     - snap: tight ease-out for press states, hover state changes
-     - quart: gentle deceleration for layout-affecting changes
-     Pair with --dur-quick (button hover, focus), --dur-base (most state
-     changes), --dur-slow (overlays, page-level changes). */
+  /* --- The wash: peach → rose → lilac. Hero moments only (see .wash). --- */
+  --wash-peach: oklch(0.945 0.042 66);
+  --wash-rose: oklch(0.93 0.048 12);
+  --wash-lilac: oklch(0.925 0.046 305);
+
+  /* --- Chart series. Validated with the dataviz palette checker (adjacent
+     CVD ΔE ≥ 11, normal ΔE ≥ 21, ≥ 3:1 on the surface). Fixed order. --- */
+  --chart-1: #b0408a; /* plum */
+  --chart-2: #d9791f; /* apricot */
+  --chart-3: #17969a; /* teal */
+  --chart-4: #dd5a55; /* coral */
+  --chart-5: #5673dd; /* periwinkle */
+  --chart-6: #3c955a; /* green */
+  --chart-anthropic: var(--chart-2);
+  --chart-openai: var(--chart-3);
+  --chart-other: oklch(0.62 0.012 330);
+  --chart-grid: oklch(0.235 0.03 330 / 0.08);
+
+  /* --- Category colours: kinds of work and kinds of token. Two families of
+     their own, so a provider colour (apricot, teal) never also means a
+     category on the same screen.
+     Work (--kind-*): the berry arc of the brand, plum to indigo to lilac,
+     stepped in lightness so the three stay apart without hue. Checked with
+     the dataviz palette validator over ALL pairs: CVD ΔE ≥ 9.4, normal
+     ΔE ≥ 16.4, ≥ 3:1 on the surface.
+     Tokens (--mix-*): one ink ramp, lightest to darkest by what a token
+     costs (cached, new input, cache write, output). It is an amount, not
+     an identity, so it carries no hue; every step is solid enough (the
+     lightest is 2.8:1 on the surface) that the largest part never reads as
+     an empty track. Steps 0.13 L apart. --- */
+  --kind-model: #b2417f; /* plum: the model is generating */
+  --kind-tool: #504096; /* indigo: a built-in or custom tool is running */
+  --kind-app: #b182ce; /* lilac: a call to a connected app */
+  --kind-wait: oklch(0.8 0.01 330); /* asleep until a wake-up: not work, so no hue */
+  --mix-cached: #a497a2;
+  --mix-input: #7e6f7c;
+  --mix-write: #5a4a58;
+  --mix-output: #382836;
+
+  /* --- Elevation. Shadows are tinted with ink, never neutral grey. --- */
+  --shadow-xs: 0 1px 2px oklch(0.235 0.03 330 / 0.05);
+  --shadow-sm: 0 1px 2px oklch(0.235 0.03 330 / 0.04), 0 2px 8px -2px oklch(0.235 0.03 330 / 0.06);
+  --shadow-md: 0 2px 6px -1px oklch(0.235 0.03 330 / 0.05), 0 12px 32px -12px oklch(0.235 0.03 330 / 0.16);
+  --shadow-lg: 0 4px 12px -2px oklch(0.235 0.03 330 / 0.06), 0 28px 64px -24px oklch(0.235 0.03 330 / 0.28);
+  --shadow-focus: 0 0 0 3px oklch(0.5 0.165 342 / 0.18);
+
+  /* --- Motion. 120 / 180 / 240ms; one "rise" curve for enter, snap for press. --- */
+  --ease-rise: cubic-bezier(0.22, 1, 0.36, 1);
   --ease-soft: cubic-bezier(0.32, 0.72, 0, 1);
   --ease-snap: cubic-bezier(0.5, 0, 0.1, 1);
   --ease-quart: cubic-bezier(0.25, 1, 0.5, 1);
-  --dur-quick: 100ms;
-  --dur-base: 150ms;
-  --dur-slow: 220ms;
+  --dur-quick: 120ms;
+  --dur-base: 180ms;
+  --dur-slow: 240ms;
 
-  --ring: var(--brand);
+  /* --- Legacy aliases (pre-Muse code). New code uses ink / plum. --- */
+  --brand: var(--ink);
+  --brand-hover: var(--ink-hover);
+  --brand-subtle: var(--bg-soft);
+  --brand-fg: var(--on-ink);
+
+  --ring: var(--plum);
   color-scheme: light;
 }
 
-/* ---------- Dark theme ---------- */
+/* ==========================================================================
+   Dark theme — a warm near-black. Surfaces step up in lightness with
+   elevation; shadows give way to hairlines and a top glint.
+   ========================================================================== */
 .dark {
-  --brand: #ff8d7e;
-  --brand-hover: #ffa294;
-  --brand-subtle: #36211d;
-  --brand-fg: #1c0f0c;
+  --ink: oklch(0.945 0.012 70);
+  --ink-hover: oklch(1 0 0);
+  --on-ink: oklch(0.21 0.025 340);
 
-  --bg: #111113;
-  --bg-sidebar: #17171a;
-  --bg-surface: #1c1c20;
-  /* One step below the page for inset wells. */
-  --bg-inset: #0c0c0e;
-  --bg-overlay: oklch(0 0 0 / 0.6);
+  --plum: oklch(0.8 0.11 342);
+  --plum-hover: oklch(0.86 0.09 342);
+  --plum-subtle: oklch(0.31 0.055 342);
+  --on-plum: oklch(0.2 0.03 340);
 
-  --fg: #f1f1f3;
-  --fg-muted: #a5a7af;
-  --fg-subtle: #777a84;
+  --bg-sidebar: oklch(0.172 0.008 345);
+  --bg: oklch(0.203 0.008 345);
+  --bg-surface: oklch(0.243 0.009 345);
+  --bg-raised: oklch(0.272 0.01 345);
+  --bg-inset: oklch(0.182 0.008 345);
+  --bg-soft: oklch(1 0 0 / 0.055);
+  --bg-hover: oklch(1 0 0 / 0.075);
+  --bg-pressed: oklch(1 0 0 / 0.12);
+  --bg-overlay: oklch(0.08 0.01 345 / 0.6);
 
-  /* Hairlines as alpha so they sit on any surface step without banding. */
-  --border: oklch(1 0 0 / 0.09);
-  --border-strong: oklch(1 0 0 / 0.18);
+  --fg: oklch(0.955 0.006 70);
+  --fg-muted: oklch(0.77 0.012 340);
+  --fg-subtle: oklch(0.69 0.012 340); /* AA on every surface and on a hovered row */
+  --fg-faint: oklch(0.5 0.012 340);
 
-  --success: #53d18c;
-  --success-subtle: #163325;
-  --warning: #f0ad4e;
-  --warning-subtle: #352817;
-  --danger: #ff7782;
-  --danger-subtle: #371d21;
-  --info: #80a9ff;
-  --info-subtle: #172644;
-  --accent-violet: #b09cff;
-  --accent-violet-subtle: #261f40;
+  --border: oklch(1 0 0 / 0.085);
+  --border-strong: oklch(1 0 0 / 0.17);
 
-  /* Dark-mode shadow — needs more opacity to register against #151515.
-     shadow-sm carries a 1px top glint so raised surfaces read as lit
-     from above (the cheap trick behind "rich" dark UIs). */
-  --shadow-md: 0 18px 42px -28px rgb(0 0 0 / 0.85);
-  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.45), inset 0 1px 0 rgb(255 255 255 / 0.04);
+  --success: oklch(0.8 0.13 155);
+  --success-subtle: oklch(0.3 0.045 155);
+  --warning: oklch(0.82 0.12 80);
+  --warning-subtle: oklch(0.31 0.045 75);
+  /* In dark the full tint made three request cards in a row three slabs of
+     brown, and a lighter tint (0.268 / 0.024) still read heavy (round 3).
+     The card's fill is now the surface's own step with only a trace of
+     amber, so it reads as a card and not as a brown panel; the amber edge
+     (stronger than before) and the amber mark say "needs you". */
+  --needs-you-bg: oklch(0.252 0.011 72);
+  --needs-you-border: color-mix(in oklab, var(--warning) 55%, transparent);
+  /* The same for a failed turn's card: the full danger tint made two failed
+     cards on Operations two maroon slabs, heavier than anything beside them
+     (round 3). The fill is the surface's step with a trace of red, and the
+     red edge and mark carry the signal. */
+  --failed-bg: oklch(0.252 0.013 20);
+  --failed-border: color-mix(in oklab, var(--danger) 50%, transparent);
+  --danger: oklch(0.77 0.13 22);
+  --danger-subtle: oklch(0.3 0.06 20);
+  --info: oklch(0.78 0.105 250);
+  --info-subtle: oklch(0.3 0.055 255);
+  --accent-violet: oklch(0.79 0.11 295);
+  --accent-violet-subtle: oklch(0.31 0.06 295);
+  --success-solid: oklch(0.74 0.15 155);
+  --warning-solid: oklch(0.8 0.14 78);
+  --danger-solid: oklch(0.7 0.17 22);
+  --info-solid: oklch(0.72 0.13 250);
 
-  --ring: var(--brand);
+  /* The wash in dark is a faint glow in the light wash's family: warm on the
+     left, rose in the middle, lilac on the right. No orange can come along:
+     any orange or coral laid thinly over a dark canvas lands as brown or
+     maroon, whatever its lightness (round 2 saw "brown in the left third"
+     at hue 14-17, chroma 0.034). So the warm end is a pale warm pink (hue 8)
+     that adds more light than colour: on Home it lands at hue 0-5, chroma
+     about 0.02, a touch lighter than the canvas around it, and reads as a
+     rosy glow beside the rose (hue 349-353) and the lilac (hue 314-316).
+     Chroma stays 0.017-0.033 all the way across, so no stretch goes grey or
+     muddy. Measured with _rig/notes/muse/tools/r2-leftover/washsample.mjs.
+     Round 3 still saw a warm grey patch at the left and top-left: that pale
+     pink added more light (L 0.29-0.30) than colour (C 0.020) and so read
+     as grey-brown beside the rose. The warm end is now the rose's own
+     family at lower lightness and alpha (hue 353, L 0.24-0.26, C 0.019-0.027
+     across the left fifth, measured with r3-state/wash.mjs): no lighter than
+     the middle, so the glow runs rose → lilac with no patch of its own. */
+  --wash-peach: oklch(0.72 0.15 356 / 0.1);
+  --wash-rose: oklch(0.68 0.16 352 / 0.15);
+  --wash-lilac: oklch(0.58 0.16 302 / 0.16);
+
+  /* Dark steps of the same six hues, validated against --bg-surface. */
+  --chart-1: #c565a3;
+  --chart-2: #cc7d2e;
+  --chart-3: #27a0a0;
+  --chart-4: #d8655f;
+  --chart-5: #6a82e2;
+  --chart-6: #4ba168;
+  --chart-anthropic: var(--chart-2);
+  --chart-openai: var(--chart-3);
+  --chart-other: oklch(0.62 0.012 340);
+  --chart-grid: oklch(1 0 0 / 0.08);
+
+  /* Dark steps of the category families, validated against --bg-surface
+     (all pairs: CVD ΔE ≥ 8.8, normal ΔE ≥ 15.9; the indigo is 2.7:1 on the
+     surface, and every bar it colours is also named). The ink ramp turns
+     over: on a dark surface the dearest token is the lightest step. */
+  --kind-model: #c64a89;
+  --kind-tool: #5757b2;
+  --kind-app: #9e83d7;
+  --kind-wait: oklch(0.42 0.012 340);
+  --mix-cached: #71656d;
+  --mix-input: #978991;
+  --mix-write: #bdb0b8;
+  --mix-output: #e5dbe1;
+
+  --shadow-xs: inset 0 1px 0 oklch(1 0 0 / 0.04);
+  --shadow-sm: 0 1px 2px oklch(0 0 0 / 0.3), inset 0 1px 0 oklch(1 0 0 / 0.045);
+  --shadow-md: 0 12px 32px -12px oklch(0 0 0 / 0.7), 0 0 0 1px oklch(1 0 0 / 0.04), inset 0 1px 0 oklch(1 0 0 / 0.05);
+  --shadow-lg: 0 28px 72px -24px oklch(0 0 0 / 0.85), 0 0 0 1px oklch(1 0 0 / 0.05), inset 0 1px 0 oklch(1 0 0 / 0.06);
+  --shadow-focus: 0 0 0 3px oklch(0.8 0.11 342 / 0.26);
+
+  --brand: var(--ink);
+  --brand-hover: var(--ink-hover);
+  --brand-subtle: var(--bg-soft);
+  --brand-fg: var(--on-ink);
+
+  --ring: var(--plum);
   color-scheme: dark;
 }
 
-/* ---------- Tailwind theme tokens ---------- */
+/* ==========================================================================
+   Tailwind theme mapping
+   ========================================================================== */
 @theme {
   /* Fonts */
-  --font-display: "Geist Variable", -apple-system, "Segoe UI", sans-serif;
-  --font-sans: "Geist Variable", -apple-system, "Segoe UI", sans-serif;
-  --font-mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+  --font-sans: "Hanken Grotesk Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-display: "Hanken Grotesk Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono Variable", "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
 
-  /* Color palette — resolves dynamically via :root / .dark vars */
-  --color-brand: var(--brand);
-  --color-brand-hover: var(--brand-hover);
-  --color-brand-subtle: var(--brand-subtle);
-  --color-brand-fg: var(--brand-fg);
+  /* Type scale — one utility per role (size + line-height + tracking + weight). */
+  --text-display: 2.5rem;
+  --text-display--line-height: 1.08;
+  --text-display--letter-spacing: -0.03em;
+  --text-display--font-weight: 560;
+  /* Numbers that are the point of a card: `hero` leads a page (Usage's
+     headline), `stat` is every StatTile value. */
+  --text-hero: 2.25rem;
+  --text-hero--line-height: 1;
+  --text-hero--letter-spacing: -0.03em;
+  --text-hero--font-weight: 600;
+  --text-stat: 1.75rem;
+  --text-stat--line-height: 1;
+  --text-stat--letter-spacing: -0.025em;
+  --text-stat--font-weight: 600;
+  --text-h1: 1.625rem;
+  --text-h1--line-height: 1.2;
+  --text-h1--letter-spacing: -0.022em;
+  --text-h1--font-weight: 600;
+  --text-h2: 1.125rem;
+  --text-h2--line-height: 1.35;
+  --text-h2--letter-spacing: -0.012em;
+  --text-h2--font-weight: 600;
+  --text-h3: 0.9375rem;
+  --text-h3--line-height: 1.4;
+  --text-h3--letter-spacing: -0.006em;
+  --text-h3--font-weight: 600;
+  --text-prose: 0.96875rem;
+  --text-prose--line-height: 1.65;
+  --text-body: 0.875rem;
+  --text-body--line-height: 1.55;
+  --text-small: 0.8125rem;
+  --text-small--line-height: 1.5;
+  --text-caption: 0.75rem;
+  --text-caption--line-height: 1.35;
+  --text-micro: 0.6875rem;
+  --text-micro--line-height: 1.3;
+  --text-micro--letter-spacing: 0.01em;
+
+  /* Radii — soft. Buttons and chips are full pills; these are for boxes. */
+  --radius-xs: 0.25rem; /* 4  — kbd, checkbox */
+  --radius-sm: 0.375rem; /* 6  — inline code, tiny chips */
+  --radius-md: 0.625rem; /* 10 — menu items, inputs */
+  --radius-lg: 0.875rem; /* 14 — popovers, small cards, tool blocks */
+  --radius-xl: 1.125rem; /* 18 — cards */
+  --radius-2xl: 1.5rem; /* 24 — composer, dialogs, hero blocks */
+  --radius-3xl: 2rem; /* 32 — login card, large hero */
+  --radius: 0.625rem;
+
+  /* Motion */
+  --ease-rise: cubic-bezier(0.22, 1, 0.36, 1);
+  --animate-rise-in: rise-in var(--dur-slow) var(--ease-rise) both;
+  --animate-fade-in: fade-in var(--dur-base) ease-out both;
+  --animate-pop-in: pop-in var(--dur-base) var(--ease-rise) both;
+
+  /* Colours — resolve through :root / .dark */
+  --color-ink: var(--ink);
+  --color-ink-hover: var(--ink-hover);
+  --color-on-ink: var(--on-ink);
+  --color-plum: var(--plum);
+  --color-plum-hover: var(--plum-hover);
+  --color-plum-subtle: var(--plum-subtle);
+  --color-on-plum: var(--on-plum);
 
   --color-bg: var(--bg);
   --color-bg-sidebar: var(--bg-sidebar);
   --color-bg-surface: var(--bg-surface);
+  --color-bg-raised: var(--bg-raised);
   --color-bg-inset: var(--bg-inset);
+  --color-bg-soft: var(--bg-soft);
+  --color-bg-hover: var(--bg-hover);
+  --color-bg-pressed: var(--bg-pressed);
   --color-bg-overlay: var(--bg-overlay);
 
   --color-fg: var(--fg);
   --color-fg-muted: var(--fg-muted);
   --color-fg-subtle: var(--fg-subtle);
+  --color-fg-faint: var(--fg-faint);
 
   --color-border: var(--border);
   --color-border-strong: var(--border-strong);
@@ -144,85 +417,141 @@
   --color-info-subtle: var(--info-subtle);
   --color-accent-violet: var(--accent-violet);
   --color-accent-violet-subtle: var(--accent-violet-subtle);
+  --color-success-solid: var(--success-solid);
+  --color-warning-solid: var(--warning-solid);
+  --color-danger-solid: var(--danger-solid);
+  --color-info-solid: var(--info-solid);
+
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-chart-6: var(--chart-6);
+  --color-kind-model: var(--kind-model);
+  --color-kind-tool: var(--kind-tool);
+  --color-kind-app: var(--kind-app);
+  --color-kind-wait: var(--kind-wait);
+  --color-mix-cached: var(--mix-cached);
+  --color-mix-input: var(--mix-input);
+  --color-mix-write: var(--mix-write);
+  --color-mix-output: var(--mix-output);
 
   --color-ring: var(--ring);
 
-  /* shadcn-style primitive aliases. The ai-elements + components/ui
-     primitives are vanilla shadcn copy-paste and reach for tokens like
-     `--color-secondary`, `--color-muted-foreground`, etc. Without these
-     aliases Tailwind v4 emits no rule for `bg-secondary`, `text-muted-
-     foreground`, `bg-popover`, `border-input` (the lookup just silently
-     yields nothing) and the lifted shadcn surfaces render unstyled.
-     Mapping straight onto the console palette keeps the chat surface
-     visually consistent with the rest of the console — no second palette
-     to maintain. Both themes (light + dark) get correct values automatically
-     because the tokens above are theme-aware. */
+  /* Legacy brand aliases: brand == ink in Muse. */
+  --color-brand: var(--brand);
+  --color-brand-hover: var(--brand-hover);
+  --color-brand-subtle: var(--brand-subtle);
+  --color-brand-fg: var(--brand-fg);
+
+  /* shadcn alias tokens. components/ui and components/ai-elements are
+     shadcn copy-paste and reach for these names; they map straight onto
+     the Muse roles so there is one palette. */
   --color-background: var(--bg);
   --color-foreground: var(--fg);
-  --color-card: var(--bg);
+  --color-card: var(--bg-surface);
   --color-card-foreground: var(--fg);
-  --color-popover: var(--bg);
+  --color-popover: var(--bg-raised);
   --color-popover-foreground: var(--fg);
-  --color-primary: var(--brand);
-  --color-primary-foreground: var(--brand-fg);
-  --color-secondary: var(--bg-surface);
+  --color-primary: var(--ink);
+  --color-primary-foreground: var(--on-ink);
+  --color-secondary: var(--bg-soft);
   --color-secondary-foreground: var(--fg);
-  --color-muted: var(--bg-surface);
+  --color-muted: var(--bg-soft);
   --color-muted-foreground: var(--fg-muted);
-  --color-accent: var(--bg-surface);
+  --color-accent: var(--bg-hover);
   --color-accent-foreground: var(--fg);
   --color-destructive: var(--danger);
   --color-destructive-foreground: #ffffff;
-  --color-input: var(--border);
+  --color-input: var(--border-strong);
 
-  /* shadcn primitives derive button + input rounding from --radius
-     via `rounded-[min(var(--radius-md),12px)]` and similar. The console's
-     existing rounded utilities use the Tailwind defaults, so pin a
-     value that matches our existing chat bubble feel (rounded-lg). */
-  --radius: 0.4375rem;
-  --radius-md: 0.4375rem;
-
-  /* shadcn `Sidebar` primitive lookups. The sidebar component reaches
-     for its own --sidebar* family so its theming can drift from the
-     main canvas (typical use: subtly different bg, darker borders).
-     The console wants the sidebar to share the existing palette, so we alias
-     straight through — bg-sidebar / fg / brand are all already
-     theme-aware via :root / .dark. */
   --color-sidebar: var(--bg-sidebar);
   --color-sidebar-foreground: var(--fg);
-  --color-sidebar-primary: var(--brand);
-  --color-sidebar-primary-foreground: var(--brand-fg);
-  --color-sidebar-accent: var(--bg-surface);
+  --color-sidebar-primary: var(--ink);
+  --color-sidebar-primary-foreground: var(--on-ink);
+  --color-sidebar-accent: var(--bg-hover);
   --color-sidebar-accent-foreground: var(--fg);
   --color-sidebar-border: var(--border);
-  --color-sidebar-ring: var(--brand);
+  --color-sidebar-ring: var(--plum);
 }
 
-/* ---------- Base typography ---------- */
+/* ==========================================================================
+   Base
+   ========================================================================== */
 body {
   font-family: var(--font-sans);
   font-size: 0.875rem; /* 14px base for app UI */
-  line-height: 1.6;
-  /* Numbers align in tables, stats, timestamps — app-wide instrument feel. */
+  line-height: 1.55;
+  /* Numbers align in tables, stats and timestamps. */
   font-variant-numeric: tabular-nums;
+  font-feature-settings: "ss01" 0, "calt" 1;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
-/* Display headings track tighter — large Geist at default tracking reads
-   airy/marketing; tools read tight. */
-h1, h2, h3 {
-  letter-spacing: -0.02em;
+/* Element defaults live in @layer base so utilities (text-h1's tracking,
+   font-sans on a <kbd>) can override them. Unlayered rules would win. */
+@layer base {
+  h1,
+  h2,
+  h3 {
+    letter-spacing: -0.015em;
+  }
+
+  code,
+  kbd,
+  pre,
+  samp {
+    font-family: var(--font-mono);
+    font-variant-ligatures: none;
+  }
+
+  /* One stroke weight for every lucide icon: 1.75 on the 16px grid. A
+     utility (stroke-2, stroke-[2.25]) can still thicken a specific glyph,
+     e.g. the plus inside a small filled circle. */
+  .lucide {
+    stroke-width: 1.75;
+  }
 }
 
-/* Lock the viewport — the AppShell sidebar + breadcrumb header are
-   global frame elements that must NEVER scroll out of view. Without
-   this, `html`/`body`/`#root` are auto-height by default; a tall portal,
-   absolutely-positioned overlay, or stray content can push body taller
-   than the viewport and let the whole document scroll, taking the
-   "fixed" frame with it. Pinning all three at exactly the viewport
-   height forces every scroll to happen inside `<main>` (the only
-   `overflow-y: auto` container in the shell). */
+/* Faint text. `--fg-faint` is for glyphs that decorate (chevrons, icons,
+   separators, the dash of an empty cell, a neutral dot) and for disabled
+   controls; at about 2.7:1 it is too light to be read. Where
+   `text-fg-faint` sets words that carry meaning ("· 7 of 20" in the
+   timeline inspector, a queued pill, a raw record's id) the role is raised
+   to `--fg-subtle`, which passes AA on every surface in both themes. What
+   stays faint is what decorates: an icon (svg), anything aria-hidden,
+   anything disabled, and a stand-in glyph whose words are for a screen
+   reader (an `.sr-only` child). Only the role's variable changes on the
+   element, so its hover and group-hover colours still win, a `bg-` or
+   `border-fg-faint` elsewhere is untouched, and the whole selector weighs
+   nothing (every part sits in :where). */
+:where(.text-fg-faint):not(
+    :where(
+      svg,
+      [aria-hidden="true"],
+      :disabled,
+      [aria-disabled="true"],
+      [data-disabled]:not([data-disabled="false"]),
+      :has(> .sr-only)
+    )
+  ) {
+  --color-fg-faint: var(--fg-subtle);
+}
+/* …and a decorative piece inside raised text keeps the faint role. */
+:where(.text-fg-faint) :where(svg, [aria-hidden="true"], :disabled, [aria-disabled="true"]) {
+  --color-fg-faint: var(--fg-faint);
+}
+
+::selection {
+  background: color-mix(in oklab, var(--plum) 22%, transparent);
+}
+
+/* Lock the viewport — the AppShell sidebar and top bar are global frame
+   elements that must never scroll out of view. Every scroll happens inside
+   `<main>` (the only `overflow-y: auto` container in the shell). */
 html,
 body,
 #root {
@@ -231,49 +560,272 @@ body,
   overflow: hidden;
 }
 
-/* Focus ring — brand-colored. Wrapped in @layer base so Tailwind utility
-   variants (focus-visible:outline-none, etc.) can override per-element.
-   Unlayered rules win over layered rules regardless of specificity, which
-   would otherwise make this impossible to suppress on a per-element basis. */
+/* Focus ring — plum, 2px, offset. In @layer base so a utility
+   (focus-visible:outline-none) can still opt a specific element out when it
+   draws its own focus treatment (inputs use border + --shadow-focus). */
 @layer base {
   *:focus-visible {
     outline: 2px solid var(--ring);
     outline-offset: 2px;
   }
+  button,
+  [role="button"],
+  a,
+  summary,
+  label[for],
+  select,
+  [role="tab"],
+  [role="menuitem"],
+  [role="option"] {
+    cursor: pointer;
+  }
+  button:disabled,
+  [aria-disabled="true"] {
+    cursor: not-allowed;
+  }
+  /* Tailwind's preflight leaves the border colour at currentColor; a bare
+     `border` should be a Muse hairline. */
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--border);
+  }
 }
 
-/* Scrollbar subtle styling */
+/* Scrollbars: thin, quiet, round. */
 ::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
+  width: 10px;
+  height: 10px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
   background: var(--border-strong);
-  border-radius: 3px;
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background-clip: content-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: var(--fg-subtle);
+  background: var(--fg-faint);
+  border: 3px solid transparent;
+  background-clip: content-box;
 }
 
-/* Dark mode code highlights — github.css ships light-mode token colors
-   (greens, blues, purples) that look dim against --bg-surface in dark
-   mode. Override with github-dark token palette so syntax stays readable. */
+/* ==========================================================================
+   Muse utilities
+   ========================================================================== */
+
+/* A type role's size alone, without its line height, for text inside a box
+   that already sets the rhythm: a 32px button, a 52px table cell, a menu
+   item, a count badge, a key cap, an avatar's initials. Such text keeps the
+   line height of where it sits, as it did before these sizes came from the
+   tokens, so moving it onto them moved no text. Text that is a block of its
+   own uses the role itself (`text-small`, `text-micro`…), line height and all. */
+@utility text-small-size {
+  font-size: var(--text-small);
+}
+@utility text-micro-size {
+  font-size: var(--text-micro);
+}
+@utility text-caption-size {
+  font-size: var(--text-caption);
+}
+@utility text-body-size {
+  font-size: var(--text-body);
+}
+
+/* The signature wash. Put it on an absolutely-positioned, pointer-events-none
+   layer behind hero content (see <Wash />). Never behind dense reading. */
+@utility wash {
+  background-image:
+    radial-gradient(46% 64% at 16% 0%, var(--wash-peach), transparent 72%),
+    radial-gradient(42% 66% at 52% -10%, var(--wash-rose), transparent 72%),
+    radial-gradient(46% 64% at 88% 0%, var(--wash-lilac), transparent 72%);
+}
+/* A smaller, single-corner wash for profile headers and empty states. */
+@utility wash-corner {
+  background-image:
+    radial-gradient(60% 120% at 0% 0%, var(--wash-peach), transparent 70%),
+    radial-gradient(50% 120% at 45% -20%, var(--wash-rose), transparent 70%),
+    radial-gradient(60% 120% at 100% 0%, var(--wash-lilac), transparent 70%);
+}
+
+/* Card surface recipe: fill + hairline + soft shadow. Radius is separate. */
+@utility surface {
+  background-color: var(--bg-surface);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-sm);
+}
+/* Popover/menu/dialog surface. */
+@utility surface-raised {
+  background-color: var(--bg-raised);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow-md);
+}
+
+/* State transitions: colour-ish properties, quick. */
+@utility transition-quick {
+  transition-property: color, background-color, border-color, box-shadow, opacity, transform, fill, stroke;
+  transition-duration: var(--dur-quick);
+  transition-timing-function: var(--ease-rise);
+}
+@utility transition-base {
+  transition-property: color, background-color, border-color, box-shadow, opacity, transform, fill, stroke;
+  transition-duration: var(--dur-base);
+  transition-timing-function: var(--ease-rise);
+}
+
+/* Press feedback for cards and large targets (buttons have it built in). */
+@utility press {
+  &:active {
+    transform: scale(0.985);
+  }
+}
+
+/* Lift on hover for clickable cards. */
+@utility lift {
+  transition:
+    transform var(--dur-base) var(--ease-rise),
+    box-shadow var(--dur-base) var(--ease-rise),
+    border-color var(--dur-base) var(--ease-rise),
+    background-color var(--dur-base) var(--ease-rise);
+  &:hover {
+    transform: translateY(-1px);
+    box-shadow: var(--shadow-md);
+    border-color: var(--border-strong);
+  }
+  &:active {
+    transform: translateY(0) scale(0.99);
+  }
+}
+
+/* Page columns (components/Page.tsx).
+   A record page is a centred reading column, but it only centres once the
+   panel has real room on both sides: 80px or more each. Below that it sits
+   on the left edge every other page starts on, so a record is either on its
+   list's edge or clearly set in from it, never 19px off. The step is done
+   without a container query (which would trap page-level overlays, see
+   DESIGN §3 Stacking): the middle term is hugely negative below the
+   threshold and hugely positive above it, so clamp() picks 0 or the
+   centring margin.
+   The same step sets the width. Below the threshold the record fills the
+   panel like the list it was opened from, so the two END on one edge as
+   well as start on one (at 1440 a record used to stop 37px short of its
+   list). Above it the record is the 1120px reading column. */
+@utility page-record-default {
+  margin-left: clamp(0px, calc((100% - 1280px) * 9999), calc((100% - 1120px) / 2));
+  max-width: clamp(1120px, calc((1280px - 100%) * 9999), 100%);
+}
+@utility page-record-narrow {
+  margin-left: clamp(0px, calc((100% - 920px) * 9999), calc((100% - 760px) / 2));
+}
+
+@utility no-scrollbar {
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Stagger helper: set style={{ "--i": n }} on children with animate-rise-in. */
+@utility stagger {
+  animation-delay: calc(var(--i, 0) * 40ms);
+}
+
+/* A card that is waiting on a person. Unlayered on purpose: it sets the
+   fill and edge of an <EventCard kind="approval">, whose own utilities live
+   in the utilities layer. */
+.needs-you-card {
+  background-color: var(--needs-you-bg);
+  border-color: var(--needs-you-border);
+}
+
+/* Agent/identity tints — six soft hues taken from the wash. Used by
+   <AgentAvatar>. Identity only; they never encode type or status. */
+.tint-1 { --tint-bg: oklch(0.925 0.055 70); --tint-fg: oklch(0.4 0.085 62); }
+.tint-2 { --tint-bg: oklch(0.92 0.055 38); --tint-fg: oklch(0.42 0.11 35); }
+.tint-3 { --tint-bg: oklch(0.925 0.05 8); --tint-fg: oklch(0.42 0.13 8); }
+.tint-4 { --tint-bg: oklch(0.925 0.05 338); --tint-fg: oklch(0.41 0.13 338); }
+.tint-5 { --tint-bg: oklch(0.925 0.045 302); --tint-fg: oklch(0.41 0.13 302); }
+.tint-6 { --tint-bg: oklch(0.925 0.04 268); --tint-fg: oklch(0.42 0.12 268); }
+.dark .tint-1 { --tint-bg: oklch(0.37 0.055 65); --tint-fg: oklch(0.9 0.07 75); }
+.dark .tint-2 { --tint-bg: oklch(0.37 0.065 38); --tint-fg: oklch(0.89 0.07 45); }
+.dark .tint-3 { --tint-bg: oklch(0.37 0.07 8); --tint-fg: oklch(0.89 0.065 10); }
+.dark .tint-4 { --tint-bg: oklch(0.37 0.07 338); --tint-fg: oklch(0.89 0.065 338); }
+.dark .tint-5 { --tint-bg: oklch(0.37 0.07 302); --tint-fg: oklch(0.89 0.065 302); }
+.dark .tint-6 { --tint-bg: oklch(0.37 0.065 268); --tint-fg: oklch(0.89 0.06 268); }
+
+/* ---------- Keyframes ---------- */
+/* End on `transform: none`, not translateY(0): a lingering transform would
+   make the element a containing block for fixed descendants. */
+@keyframes rise-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+@keyframes pop-in {
+  from { opacity: 0; transform: scale(0.96); }
+  to   { opacity: 1; transform: none; }
+}
+/* Live dot: a soft halo that breathes. Used by StatusBadge "running". */
+@keyframes live-ping {
+  0%   { transform: scale(1);   opacity: 0.55; }
+  70%  { transform: scale(2.6); opacity: 0; }
+  100% { transform: scale(2.6); opacity: 0; }
+}
+.live-dot {
+  position: relative;
+}
+.live-dot::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  background: currentColor;
+  animation: live-ping 1600ms var(--ease-rise) infinite;
+}
+/* Streaming caret / shimmer for "thinking" text. */
+@keyframes shimmer-slide {
+  from { background-position: 200% 0; }
+  to   { background-position: -200% 0; }
+}
+.text-shimmer {
+  background: linear-gradient(90deg, var(--fg-subtle) 0%, var(--fg) 45%, var(--fg-subtle) 90%);
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: shimmer-slide 2200ms linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .live-dot::after { animation: none; opacity: 0; }
+  .text-shimmer { animation: none; color: var(--fg-muted); background: none; }
+}
+
+/* ---------- Code highlighting ---------- */
+pre code.hljs {
+  background: transparent;
+  padding: 0;
+}
 .dark pre code.hljs {
-  background: var(--bg-surface);
+  background: transparent;
   color: var(--fg);
 }
 .dark .hljs-comment,
 .dark .hljs-quote {
-  color: #8b949e;
+  color: #9a8f9c;
 }
 .dark .hljs-keyword,
 .dark .hljs-selector-tag,
 .dark .hljs-section,
 .dark .hljs-link {
-  color: #ff7b72;
+  color: #f08fa3;
 }
 .dark .hljs-string,
 .dark .hljs-attr,
@@ -283,22 +835,22 @@ body,
 .dark .hljs-number,
 .dark .hljs-literal,
 .dark .hljs-symbol {
-  color: #79c0ff;
+  color: #8cc4ff;
 }
 .dark .hljs-built_in,
 .dark .hljs-type,
 .dark .hljs-class .hljs-title {
-  color: #ffa657;
+  color: #f2b06b;
 }
 .dark .hljs-title,
 .dark .hljs-name,
 .dark .hljs-function .hljs-title {
-  color: #d2a8ff;
+  color: #d8b0f2;
 }
 .dark .hljs-variable,
 .dark .hljs-template-variable,
 .dark .hljs-attribute {
-  color: #ffa657;
+  color: #f2b06b;
 }
 .dark .hljs-deletion {
   color: #ffdcd7;
@@ -309,13 +861,10 @@ body,
   background-color: #033a16;
 }
 
-/* BrandLoader dot pulse — wave from left to right via staggered
-   animation-delay on each child. Smoother than animate-pulse
-   (Tailwind's default opacity 0.5↔1) because the dots dim further
-   (0.25) and back, giving a clearer "moving" feel. */
+/* ---------- BrandLoader: three dots, a soft wave ---------- */
 @keyframes brand-loader-dot {
   0%, 100% { opacity: 0.25; transform: translateY(0); }
-  50%      { opacity: 1;    transform: translateY(-1px); }
+  50%      { opacity: 1;    transform: translateY(-2px); }
 }
 .brand-loader-dot {
   display: inline-block;
@@ -325,25 +874,21 @@ body,
   .brand-loader-dot { animation: none; opacity: 0.6; }
 }
 
-/* Modal (Radix Dialog) overlay + content animations.
-   Driven by data-state on Dialog.Overlay and Dialog.Content; Radix
-   waits for the closed-state animation to finish before unmounting
-   via its built-in Presence wrapper. Durations match the previous
-   hand-rolled Modal (overlay = --dur-base, content = --dur-slow). */
+/* ---------- Modal (Radix Dialog) ---------- */
 @keyframes modal-overlay-in  { from { opacity: 0 } to { opacity: 1 } }
 @keyframes modal-overlay-out { from { opacity: 1 } to { opacity: 0 } }
 @keyframes modal-content-in {
-  from { opacity: 0; transform: translate(-50%, -50%) scale(0.96); }
-  to   { opacity: 1; transform: translate(-50%, -50%) scale(1);    }
+  from { opacity: 0; transform: translate(-50%, calc(-50% + 8px)) scale(0.98); }
+  to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
 }
 @keyframes modal-content-out {
-  from { opacity: 1; transform: translate(-50%, -50%) scale(1);    }
-  to   { opacity: 0; transform: translate(-50%, -50%) scale(0.96); }
+  from { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+  to   { opacity: 0; transform: translate(-50%, calc(-50% + 4px)) scale(0.985); }
 }
-.modal-overlay[data-state="open"]    { animation: modal-overlay-in  var(--dur-base) var(--ease-soft); }
-.modal-overlay[data-state="closed"]  { animation: modal-overlay-out var(--dur-base) var(--ease-soft); }
-.modal-content[data-state="open"]    { animation: modal-content-in  var(--dur-slow) var(--ease-soft); }
-.modal-content[data-state="closed"]  { animation: modal-content-out var(--dur-slow) var(--ease-soft); }
+.modal-overlay[data-state="open"]    { animation: modal-overlay-in  var(--dur-base) ease-out; }
+.modal-overlay[data-state="closed"]  { animation: modal-overlay-out var(--dur-quick) ease-in; }
+.modal-content[data-state="open"]    { animation: modal-content-in  var(--dur-slow) var(--ease-rise); }
+.modal-content[data-state="closed"]  { animation: modal-content-out var(--dur-quick) ease-in; }
 @media (prefers-reduced-motion: reduce) {
   .modal-overlay[data-state="open"],
   .modal-overlay[data-state="closed"],
@@ -353,28 +898,17 @@ body,
   }
 }
 
-/* Skeleton placeholder pulse — quieter than animate-pulse (Tailwind's
-   default goes opacity 0.5↔1, which reads as "flashing" in long lists).
-   This stays subtle: 0.4↔0.65 with the same soft easing as the rest. */
+/* ---------- Skeleton ---------- */
 @keyframes skeleton-pulse {
-  0%, 100% { opacity: 0.4;  }
-  50%      { opacity: 0.65; }
+  0%, 100% { opacity: 0.55; }
+  50%      { opacity: 1; }
 }
-.skeleton-pulse { animation: skeleton-pulse 1500ms var(--ease-soft) infinite; }
+.skeleton-pulse { animation: skeleton-pulse 1600ms var(--ease-soft) infinite; }
 @media (prefers-reduced-motion: reduce) {
-  .skeleton-pulse { animation: none; opacity: 0.55; }
+  .skeleton-pulse { animation: none; opacity: 0.8; }
 }
 
-/* Radix Toast root animations. Driven by data-state (open/closed) and
-   data-swipe (start/move/cancel/end) that Radix sets on Toast.Root.
-
-   - Open: slide in from the right + fade. We use --dur-slow so the
-     reveal has the same weight as the modal reveal.
-   - Close (timeout or X / Escape): slide back out the right + fade.
-   - Swipe: during a drag, Radix exposes --radix-toast-swipe-move-x and
-     we follow the pointer. On cancel, snap back. On end (past the
-     swipeThreshold), fly off using --radix-toast-swipe-end-x as the
-     starting point so the motion is continuous with the gesture. */
+/* ---------- Radix Toast (legacy) ---------- */
 @keyframes toast-slide-in {
   from { transform: translateX(calc(100% + 1rem)); opacity: 0; }
   to   { transform: translateX(0);                 opacity: 1; }
@@ -406,19 +940,36 @@ body,
   }
 }
 
-/* Radix Collapsible (Disclosure) panel slide. The library exposes
-   --radix-collapsible-content-height on the Content element so we can
-   animate height from 0 → measured (or vice versa). */
+/* ---------- Sonner toasts (the live toast system) ---------- */
+.toaster .cn-toast {
+  font-family: var(--font-sans);
+  border-radius: var(--radius-lg) !important;
+  border: 1px solid var(--border) !important;
+  background: var(--bg-raised) !important;
+  color: var(--fg) !important;
+  box-shadow: var(--shadow-md) !important;
+  padding: 12px 14px !important;
+  gap: 10px !important;
+  font-size: var(--text-small) !important;
+}
+.toaster .cn-toast [data-title] { font-weight: 550; }
+.toaster .cn-toast [data-description] { color: var(--fg-muted) !important; }
+.toaster .cn-toast[data-type="success"] [data-icon] { color: var(--success); }
+.toaster .cn-toast[data-type="error"] [data-icon] { color: var(--danger); }
+.toaster .cn-toast[data-type="warning"] [data-icon] { color: var(--warning); }
+.toaster .cn-toast[data-type="info"] [data-icon] { color: var(--info); }
+
+/* ---------- Radix Collapsible (Disclosure) ---------- */
 @keyframes collapsible-down {
-  from { height: 0; }
-  to   { height: var(--radix-collapsible-content-height); }
+  from { height: 0; opacity: 0; }
+  to   { height: var(--radix-collapsible-content-height); opacity: 1; }
 }
 @keyframes collapsible-up {
-  from { height: var(--radix-collapsible-content-height); }
-  to   { height: 0; }
+  from { height: var(--radix-collapsible-content-height); opacity: 1; }
+  to   { height: 0; opacity: 0; }
 }
-.collapsible-content[data-state="open"]   { animation: collapsible-down var(--dur-base) var(--ease-soft); }
-.collapsible-content[data-state="closed"] { animation: collapsible-up   var(--dur-base) var(--ease-soft); }
+.collapsible-content[data-state="open"]   { animation: collapsible-down var(--dur-base) var(--ease-rise); }
+.collapsible-content[data-state="closed"] { animation: collapsible-up   var(--dur-quick) ease-in; }
 @media (prefers-reduced-motion: reduce) {
   .collapsible-content[data-state="open"],
   .collapsible-content[data-state="closed"] {
@@ -426,31 +977,17 @@ body,
   }
 }
 
-/* ---------- Reduced-motion fallback ----------
-   WCAG 2.3.3 (AAA) — honor the OS-level `prefers-reduced-motion: reduce`
-   signal across the whole console. Strategy:
-
-   1) Zero out the motion tokens. Every component that animates via
-      `duration-[var(--dur-quick|base|slow)]` (Tailwind arbitrary value)
-      or `transition: ... var(--dur-*) ...` inline picks this up for free.
-      This is the load-bearing line — adds reduced-motion coverage to
-      every existing + future user of the tokens with one rule.
-   2) Tailwind's `animate-*` utilities ship their own keyframes that
-      bypass our tokens, so override them explicitly. `animate-pulse` and
-      `animate-bounce` freeze (they're decorative). `animate-spin` slows
-      to 5s rather than stopping — a frozen spinner reads as "stuck",
-      and the spinner's semantic job (still working) needs *some* motion
-      to communicate. 5s is slow enough not to provoke motion sickness.
-   3) `.nav-progress-*` classes are added to NavigationProgress to give
-      its inline `transition` strings (which include hardcoded 200/400ms
-      values that don't go through the tokens) a hook to neutralize.
-
-   Tailwind utilities like `transition-transform` / `transition-colors`
-   used without a duration arbitrary value pick up Tailwind's default
-   150ms — short enough that we leave them as-is for reduced-motion
-   users (the task brief explicitly allows ≤300ms transitions to pass
-   through). The rules above target the long-duration / infinite
-   animations that actually trigger motion sickness. */
+/* ==========================================================================
+   Reduced motion
+   --------------------------------------------------------------------------
+   1) Zero the motion tokens: everything that animates through --dur-* (all
+      Muse utilities and components) collapses to 1ms.
+   2) Tailwind / tw-animate utilities carry their own durations; neutralise
+      the long or infinite ones. A spinner slows rather than stops, because a
+      frozen spinner reads as "stuck".
+   3) Every remaining transition is shortened to 1ms, whatever utility set it.
+   4) Scroll-linked movement (the wash's drift) is switched off.
+   ========================================================================== */
 @media (prefers-reduced-motion: reduce) {
   :root,
   .dark {
@@ -466,47 +1003,70 @@ body,
   .animate-spin {
     animation-duration: 5s !important;
   }
+  .animate-in,
+  .animate-out,
+  .animate-rise-in,
+  .animate-fade-in,
+  .animate-pop-in {
+    animation-duration: 1ms !important;
+    animation-delay: 0ms !important;
+  }
+  .lift:hover,
+  .lift:active,
+  .press:active {
+    transform: none;
+  }
 
   .nav-progress-root,
   .nav-progress-bar {
     transition-duration: 1ms !important;
   }
+
+  /* 3) Anything that still carries its own duration utility (the sidebar
+        sliding away, a sheet, a row's colour fade) settles at once. */
+  *,
+  *::before,
+  *::after {
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+  /* 4) The wash keeps fading as the page scrolls but no longer drifts. */
+  [data-wash] {
+    transform: none !important;
+  }
 }
 
-/* ---------- Print stylesheet ----------
-   The console is web-app-first, but operators do print session timelines,
-   eval reports, and run summaries (PDF export via the OS print dialog is
-   the path of least resistance). The rules below:
-
-   1) Force a light palette regardless of `.dark` on <html>, so the page
-      isn't a wall of inverted ink.
-   2) Hide non-content chrome (sidebar, nav header, modal portals, action
-      buttons) — anything an operator wouldn't want on paper.
-   3) Strip animations so transitions don't leave half-rendered frames in
-      the snapshot.
-   4) Expand min-h-screen / h-screen containers to their natural height so
-      content past the first viewport isn't clipped.
-   5) Print external link URLs inline (in parens after the anchor text),
-      because a printed page loses click affordance. Internal nav (#hash
-      and relative paths) is excluded — those URLs are noise on paper.
-   6) Avoid breaking cards / table rows across page boundaries. */
+/* ==========================================================================
+   Print
+   --------------------------------------------------------------------------
+   Operators print session timelines, eval reports and run summaries. Force a
+   light palette, hide chrome, strip motion, let containers grow, print link
+   URLs, and avoid breaking cards across pages.
+   ========================================================================== */
 @media print {
   :root,
   .dark {
-    /* Force light tokens. We list both selectors because the app may have
-       `.dark` on <html> at print time, and we want the override to win
-       regardless of theme state. */
     --bg: #ffffff;
     --bg-sidebar: #ffffff;
-    --bg-surface: #f5f5f5;
+    --bg-surface: #ffffff;
+    --bg-raised: #ffffff;
+    --bg-inset: #f5f5f5;
+    --bg-soft: #f5f5f5;
     --bg-overlay: transparent;
+    --ink: #1a1a1a;
+    --on-ink: #ffffff;
     --fg: #1a1a1a;
     --fg-muted: #555555;
-    --fg-subtle: #888888;
+    --fg-subtle: #777777;
     --border: #cccccc;
     --border-strong: #999999;
-    --shadow-md: none;
+    --wash-peach: transparent;
+    --wash-rose: transparent;
+    --wash-lilac: transparent;
+    --shadow-xs: none;
     --shadow-sm: none;
+    --shadow-md: none;
+    --shadow-lg: none;
     color-scheme: light;
   }
 
@@ -521,15 +1081,14 @@ body,
     line-height: 1.45;
   }
 
-  /* Hide chrome that has no place on a printed page. The aria-label
-     selectors target buttons rendered in Layout / TopBar / CommandPalette
-     without coupling to Tailwind class strings. */
   aside,
   nav,
   [role="dialog"],
   [role="alertdialog"],
   [data-radix-portal],
   [data-radix-popper-content-wrapper],
+  [data-slot="sidebar"],
+  [data-slot="topbar"],
   .toast-root,
   button[aria-label="Open menu"],
   button[aria-label="Close menu"],
@@ -543,9 +1102,6 @@ body,
     display: none !important;
   }
 
-  /* Print every external link's URL inline so the page is usable on
-     paper. Internal links (`/agents`, `#section`) are skipped to keep
-     the printed output readable. */
   a[href^="http"]::after,
   a[href^="mailto:"]::after {
     content: " (" attr(href) ")";
@@ -554,8 +1110,6 @@ body,
     word-break: break-all;
   }
 
-  /* Strip all motion. Transitions / animations mid-print can leave a
-     half-faded toast or modal in the snapshot. */
   *,
   *::before,
   *::after {
@@ -563,8 +1117,6 @@ body,
     transition: none !important;
   }
 
-  /* Containers with screen-locked heights (h-screen, min-h-screen) clip
-     long content to ~one viewport when printed. Let them grow. */
   main,
   .h-screen,
   .min-h-screen,
@@ -575,7 +1127,6 @@ body,
     overflow: visible !important;
   }
 
-  /* Keep logical content units together when possible. */
   tr,
   article,
   section,
@@ -588,9 +1139,6 @@ body,
     break-inside: avoid;
   }
 
-  /* Code blocks: keep their background tint so syntax highlighting is
-     legible on paper. color-adjust: exact tells the browser not to
-     "ink-save" the swatch out of existence. */
   pre,
   code,
   .hljs {
@@ -600,24 +1148,19 @@ body,
     print-color-adjust: exact;
   }
 
-  /* Headings shouldn't dangle alone at page bottom. */
   h1, h2, h3, h4 {
     page-break-after: avoid;
     break-after: avoid;
     color: #000000 !important;
   }
 
-  /* Skeleton placeholders are loading states — never useful on paper. */
   .skeleton-pulse {
     display: none !important;
   }
 
-  /* Evidence export: the Audit trail "Export" button adds
-     .print-audit-only to <body> for the duration of the print dialog so
-     ONLY the audit section prints (standalone authority record, no page
-     chrome or sibling panels). visibility (not display) keeps the layout
-     tree so the section retains its computed width and typography; the
-     section is then lifted to the page origin. */
+  /* Evidence export: the Audit trail "Export" button adds .print-audit-only
+     to <body> for the duration of the print dialog so only the audit section
+     prints. */
   body.print-audit-only * {
     visibility: hidden;
   }
@@ -632,17 +1175,12 @@ body,
     width: 100%;
   }
 
-  /* Interactive controls inside the audit section (date pickers, Export,
-     Download CSV) are meaningless on paper. */
   .audit-no-print {
     display: none !important;
   }
 }
 
-/* ── Harness diff card (agent setup) ──────────────────────────────────────
-   Entrance choreography for the update_harness diff card: the card lifts in,
-   then rows reveal top-to-bottom (animation-delay staggered inline per row).
-   Both animations collapse to a plain fade under prefers-reduced-motion. */
+/* ---------- Harness diff card (agent setup) ---------- */
 @keyframes harness-diff-card-in {
   from { opacity: 0; transform: translateY(6px); }
   to   { opacity: 1; transform: translateY(0); }

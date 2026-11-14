@@ -1,4 +1,4 @@
-import { StrictMode, Suspense } from "react";
+import { StrictMode, Suspense, useEffect, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Navigate,
@@ -8,14 +8,15 @@ import {
   type UIMatch,
 } from "react-router";
 import { QueryClientProvider } from "@tanstack/react-query";
-// Bundled fonts keep first paint stable without waiting on Google Fonts.
-import "@fontsource-variable/geist";
+// Fonts are bundled: Hanken Grotesk is vendored under assets/fonts and
+// declared in index.css; JetBrains Mono comes from the installed package.
 import "@fontsource-variable/jetbrains-mono";
 import "./index.css";
 import { AuthProvider } from "./lib/auth";
 import { MaybeClerkProvider } from "./lib/clerk-auth";
 import { Toaster } from "./components/ui/sonner";
 import { AppShell } from "./components/AppShell";
+import { BrandLoader } from "./components/BrandLoader";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { queryClient } from "./lib/query-client";
 import { installChunkReloadHandlers } from "./lib/chunk-reload";
@@ -61,7 +62,26 @@ import {
   IntegrationsSlackWorkspace,
   IntegrationsSlackPublishPage,
 } from "./pages/IntegrationsSlack";
+import { NotFound } from "./pages/NotFound";
 import { consolePlugins } from "./plugins/registry";
+import { BRAND_NAME } from "./lib/brand";
+import type { EntityKind } from "./lib/directory";
+
+/** Tab title for a page outside the shell (sign-in and its relatives). Inside
+ *  the shell the title comes from the breadcrumb trail: see `useRouteTitle`. */
+function Titled({ title, children }: { title: string; children: ReactNode }) {
+  useEffect(() => {
+    document.title = `${title} · ${BRAND_NAME}`;
+  }, [title]);
+  return children;
+}
+
+/** Breadcrumb for a record route: AppBreadcrumb resolves the id to the
+ *  record's name (never shows the raw id in the trail). */
+function entityCrumb(kind: EntityKind, m: UIMatch, fallback: string) {
+  const id = m.params.id as string | undefined;
+  return id ? { entity: { kind, id } } : { label: fallback };
+}
 
 /**
  * Router config. Migrated from declarative `<BrowserRouter><Routes>` to
@@ -83,8 +103,23 @@ import { consolePlugins } from "./plugins/registry";
  * the loader) pass a function that reads the match.
  */
 
+/**
+ * The Muse kit: every shared component with live data, the visual companion
+ * to DESIGN.md. Not linked from the navigation, and only in dev builds: in
+ * production `/_kit` is an unknown address like any other.
+ */
+const kitRoutes: RouteObject[] = import.meta.env.DEV
+  ? [
+      {
+        path: "_kit",
+        handle: { crumb: "Design kit" },
+        lazy: lazyRoute(() => import("./pages/Kit"), "Kit"),
+      },
+    ]
+  : [];
+
 const protectedRoutes: RouteObject[] = [
-  { index: true, element: <Dashboard />, handle: { crumb: "Dashboard" } },
+  { index: true, element: <Dashboard />, handle: { crumb: "Home" } },
   // Nested route groups so detail pages publish a proper hierarchy
   // through `useMatches()` — `/agents/:id` resolves to
   // [agents-parent, agents/:id], so AppBreadcrumb renders
@@ -95,17 +130,21 @@ const protectedRoutes: RouteObject[] = [
     children: [
       { index: true, element: <AgentsList /> },
       {
-        // Agent setup session — the agent's first session, where it reads its
-        // own harness and interviews the user to refine it. Lazy (pulls in
-        // ai-elements + Shiki like SessionDetail), so keep it out of the list bundle.
-        path: ":id/setup",
-        handle: { crumb: "Setup" },
-        lazy: lazyRoute(() => import("./pages/agents/AgentSetup"), "AgentSetup"),
-      },
-      {
+        // The agent's record, and under it the setup conversation, so the
+        // trail reads Agents › {agent} › Setup.
         path: ":id",
-        element: <AgentDetail />,
-        handle: { crumb: (m: UIMatch) => (m.params.id as string | undefined) ?? "Agent" },
+        handle: { crumb: (m: UIMatch) => entityCrumb("agent", m, "Agent") },
+        children: [
+          { index: true, element: <AgentDetail /> },
+          {
+            // Agent setup session — the agent's first session, where it reads its
+            // own harness and interviews the user to refine it. Lazy (pulls in
+            // ai-elements + Shiki like SessionDetail), so keep it out of the list bundle.
+            path: "setup",
+            handle: { crumb: "Setup" },
+            lazy: lazyRoute(() => import("./pages/agents/AgentSetup"), "AgentSetup"),
+          },
+        ],
       },
     ],
   },
@@ -117,7 +156,7 @@ const protectedRoutes: RouteObject[] = [
       { index: true, element: <SessionsList /> },
       {
         path: ":id",
-        handle: { crumb: (m: UIMatch) => (m.params.id as string | undefined) ?? "Session" },
+        handle: { crumb: (m: UIMatch) => entityCrumb("session", m, "Session") },
         // SessionDetail lazy-loads — it pulls in ai-elements + Shiki +
         // Streamdown + mermaid + dozens of language defs (~500 kB
         // gzipped). Splitting it out keeps the initial bundle for
@@ -128,22 +167,29 @@ const protectedRoutes: RouteObject[] = [
   },
   { path: "files", element: <FilesList />, handle: { crumb: "Files" } },
   {
+    path: "usage",
+    handle: { crumb: "Usage" },
+    lazy: lazyRoute(() => import("./pages/UsagePage"), "UsagePage"),
+  },
+  {
     path: "evals",
-    handle: { crumb: "Eval Runs" },
+    handle: { crumb: "Evals" },
     children: [
       { index: true, element: <EvalRunsList /> },
       {
         path: ":id",
-        handle: { crumb: (m: UIMatch) => (m.params.id as string | undefined) ?? "Eval Run" },
+        // The run is named for its suite (or its kind), never by its id.
+        handle: { crumb: (m: UIMatch) => entityCrumb("eval_run", m, "Run") },
         children: [
           { index: true, element: <EvalRunDetail /> },
           {
             path: "trials/:taskId/:trialIndex",
             handle: {
-              crumb: (m: UIMatch) =>
-                `${(m.params.taskId as string | undefined) ?? "task"} · trial ${
-                  (m.params.trialIndex as string | undefined) ?? "?"
-                }`,
+              // Trials are zero-based in the URL; people count from one.
+              crumb: (m: UIMatch) => {
+                const index = Number(m.params.trialIndex);
+                return `${(m.params.taskId as string | undefined) ?? "task"} · trial ${Number.isInteger(index) ? index + 1 : "?"}`;
+              },
             },
             // Lazy: pulls in TimelineView + trajectory panels, only
             // needed once an operator drills into a trial.
@@ -161,39 +207,41 @@ const protectedRoutes: RouteObject[] = [
       {
         path: ":id",
         element: <EnvironmentDetail />,
-        handle: { crumb: (m: UIMatch) => (m.params.id as string | undefined) ?? "Environment" },
+        handle: { crumb: (m: UIMatch) => entityCrumb("environment", m, "Environment") },
       },
     ],
   },
   { path: "skills", element: <SkillsList />, handle: { crumb: "Skills" } },
-  { path: "skills/catalog", element: <SkillsCatalog />, handle: { crumb: "Catalog" } },
+  { path: "skills/catalog", element: <SkillsCatalog />, handle: { crumb: "Skill catalog" } },
   {
     path: "vaults",
-    handle: { crumb: "Credential Vaults" },
+    handle: { crumb: "Vaults" },
     children: [
       { index: true, element: <VaultsList /> },
       {
         path: ":id",
         element: <VaultDetail />,
-        handle: { crumb: (m: UIMatch) => (m.params.id as string | undefined) ?? "Vault" },
+        handle: { crumb: (m: UIMatch) => entityCrumb("vault", m, "Vault") },
       },
     ],
   },
   {
     path: "memory",
-    handle: { crumb: "Memory Stores" },
+    handle: { crumb: "Memory" },
     children: [
       { index: true, element: <MemoryStoresList /> },
       {
         path: ":id",
         element: <MemoryStoreDetail />,
-        handle: { crumb: (m: UIMatch) => (m.params.id as string | undefined) ?? "Memory Store" },
+        handle: { crumb: (m: UIMatch) => entityCrumb("memory_store", m, "Memory store") },
       },
     ],
   },
-  { path: "model-cards", element: <ModelCardsList />, handle: { crumb: "Model Cards" } },
-  { path: "api-keys", element: <ApiKeysList />, handle: { crumb: "API Keys" } },
-  { path: "runtimes", element: <RuntimesList />, handle: { crumb: "Local Runtimes" } },
+  { path: "model-cards", element: <ModelCardsList />, handle: { crumb: "Models" } },
+  { path: "api-keys", element: <ApiKeysList />, handle: { crumb: "API keys" } },
+  { path: "operations", handle: { crumb: "Operations" }, lazy: lazyRoute(() => import("./pages/Operations"), "Operations") },
+  { path: "workspace", handle: { crumb: "Workspace" }, lazy: lazyRoute(() => import("./pages/WorkspaceSettings"), "WorkspaceSettings") },
+  { path: "runtimes", element: <RuntimesList />, handle: { crumb: "Local runtimes" } },
   {
     path: "integrations",
     handle: { crumb: "Integrations" },
@@ -212,12 +260,12 @@ const protectedRoutes: RouteObject[] = [
           {
             path: "publish",
             element: <IntegrationsLinearPublishPage />,
-            handle: { crumb: "Publish" },
+            handle: { crumb: "Publish an agent" },
           },
           {
             path: "install-pat",
             element: <IntegrationsLinearPatInstallPage />,
-            handle: { crumb: "Install PAT" },
+            handle: { crumb: "Install with an API key" },
           },
           {
             path: "installations/:id",
@@ -234,7 +282,7 @@ const protectedRoutes: RouteObject[] = [
           {
             path: "bind",
             element: <IntegrationsGitHubBindPage />,
-            handle: { crumb: "Bind" },
+            handle: { crumb: "Bind an agent" },
           },
           {
             path: "installations/:id",
@@ -251,7 +299,7 @@ const protectedRoutes: RouteObject[] = [
           {
             path: "publish",
             element: <IntegrationsSlackPublishPage />,
-            handle: { crumb: "Publish" },
+            handle: { crumb: "Publish an agent" },
           },
           {
             path: "installations/:id",
@@ -262,26 +310,47 @@ const protectedRoutes: RouteObject[] = [
       },
     ],
   },
+  // The Muse kit (dev builds only, see `kitRoutes`).
+  ...kitRoutes,
   // Plugin-contributed routes (hosted-only extensions). Default empty in
   // OSS — hosted deploy overlays plugins/registry.ts to inject billing
   // / etc. PluginRoute keeps the same `{ path, element }` shape that
   // RouteObject expects.
   ...consolePlugins.flatMap((p) => p.routes ?? []),
-  { path: "*", element: <Navigate to="/agents" replace /> },
+  // An address that matches nothing says so, inside the shell, instead of
+  // quietly landing on Agents.
+  { path: "*", element: <NotFound />, handle: { crumb: "Page not found" } },
 ];
 
+/**
+ * What shows while a lazy page's code arrives on the first load (a typed URL
+ * or a reload on /usage, /sessions/:id …): the same quiet loader the shell
+ * shows while the sign-in is read. Without it the router renders nothing
+ * and warns.
+ */
+function PageHydrating() {
+  return (
+    <div className="flex h-screen items-center justify-center bg-bg-sidebar">
+      <BrandLoader size="lg" label="Loading" />
+    </div>
+  );
+}
+
 const router = createBrowserRouter([
-  { path: "login", element: <Login /> },
-  { path: "cli/login", element: <CliLogin /> },
-  { path: "connect-runtime", element: <ConnectRuntime /> },
+  { path: "login", element: <Titled title="Sign in"><Login /></Titled> },
+  { path: "cli/login", element: <Titled title="Authorize the CLI"><CliLogin /></Titled> },
+  { path: "connect-runtime", element: <Titled title="Connect this machine"><ConnectRuntime /></Titled> },
+  { path: "composio/callback", element: <Titled title="Connecting an app"><ComposioCallback /></Titled> },
   {
+    // A Telegram bot's Connect button opens this inside Telegram. Outside the
+    // shell: Telegram's signed launch data is the proof, not a console sign-in.
     path: "telegram/connect/:sessionId/:requestId",
+    HydrateFallback: PageHydrating,
     lazy: lazyRoute(() => import("./pages/TelegramConnect"), "TelegramConnect"),
-    handle: { crumb: "Connect agent app" },
   },
-  { path: "composio/callback", element: <ComposioCallback /> },
   {
     element: <AppShell />,
+    HydrateFallback: PageHydrating,
     children: protectedRoutes,
   },
 ]);
@@ -289,10 +358,10 @@ const router = createBrowserRouter([
 // A deploy replaces every hashed chunk; tabs opened before it still hold
 // the old index.html and fail to lazy-load chunks. A failed route chunk
 // loads the target URL fresh (loop-guarded); any other chunk (grammars,
-// diagrams, desktop viewer) just shows the update prompt - never a forced
-// reload mid-session.
+// diagrams, the desktop viewer) just shows the update prompt - never a
+// forced reload mid-session.
 installChunkReloadHandlers({ router, onStaleChunk: () => showUpdateToast() });
-// Long-lived tabs otherwise keep running the old build forever — prompt
+// Long-lived tabs otherwise keep running the old build forever: prompt
 // (never force) a reload when a newer deploy is live.
 installUpdatePrompt(router);
 

@@ -1,16 +1,19 @@
-// Deleting an agent from its page: the confirm says for certain whether its
-// computer goes too, the page leaves for a list that no longer shows it, and
-// nothing keeps asking the server about the deleted agent.
+// Deleting an agent from its page: the confirmation says for certain
+// whether its computer goes too, the page leaves for a list that no longer
+// shows it, and nothing keeps asking the server about the deleted agent.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { useState } from "react";
+import { render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { Outlet, RouterProvider, createMemoryRouter } from "react-router";
 import { QueryClient, QueryClientProvider, type InfiniteData } from "@tanstack/react-query";
 import { AgentDetail } from "./AgentDetail";
+import { ApiError } from "../lib/api";
 import { useInfiniteApiQuery } from "../lib/useApiQuery";
+import { http, HttpResponse } from "msw";
+import { server } from "../mocks/server";
 
 const api = vi.hoisted(() => vi.fn());
-const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn(), info: vi.fn() }));
+const toast = vi.hoisted(() => ({ success: vi.fn(), error: vi.fn(), info: vi.fn(), warning: vi.fn(), message: vi.fn() }));
 vi.mock("../lib/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../lib/api")>()),
   useApi: () => ({ api, streamEvents: vi.fn() }),
@@ -49,23 +52,10 @@ function AgentsListStub() {
   );
 }
 
-/** Stands in for AppShell: the header slot PageHeader portals into. */
-function Shell() {
-  const [pageHeaderSlot, setPageHeaderSlot] = useState<HTMLDivElement | null>(null);
-  return (
-    <>
-      <div ref={setPageHeaderSlot} />
-      <main>
-        <Outlet context={{ pageHeaderSlot }} />
-      </main>
-    </>
-  );
-}
-
 function mount(client: QueryClient) {
   const router = createMemoryRouter(
     [{
-      element: <Shell />,
+      element: <main><Outlet /></main>,
       children: [
         { path: "/agents", element: <AgentsListStub /> },
         { path: "/agents/:id", element: <AgentDetail /> },
@@ -84,12 +74,20 @@ function mount(client: QueryClient) {
 const newClient = () =>
   new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 30_000 } } });
 
+async function chooseDelete(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(await screen.findByRole("button", { name: "More actions for Ops agent" }));
+  await user.click(await screen.findByRole("menuitem", { name: "Delete" }));
+  return screen.findByRole("dialog", { name: "Delete Ops agent?" });
+}
+
 beforeEach(() => {
+  // What production main answers. (lib/server-features is loaded by the test
+  // setup with the real api(), so msw answers it, not the useApi mock.)
+  server.use(http.get("*/v1/server_features", () => HttpResponse.json({ features: ["workspace_access", "usage"] })));
   machine = null;
   deleted = false;
   api.mockReset();
-  toast.success.mockReset();
-  toast.error.mockReset();
+  for (const fn of Object.values(toast)) fn.mockReset();
   api.mockImplementation(async (path: string, init?: RequestInit) => {
     if (path === "/v1/agents/agent_test" && init?.method === "DELETE") {
       deleted = true;
@@ -104,7 +102,7 @@ beforeEach(() => {
     if (path === "/v1/environments/env_session") {
       return { id: "env_session", name: "Session sandbox", config: { sandbox: { provider: "subprocess" } } };
     }
-    if (path === "/v1/agents/agent_test/memory") throw new Error("not found");
+    if (path === "/v1/agents/agent_test/memory") throw new ApiError({ status: 404, code: "not_found", message: "not found" } as never);
     return { data: [] };
   });
 });
@@ -116,22 +114,22 @@ afterEach(() => {
 describe("AgentDetail delete", () => {
   it("names the agent and its computer, then lands on a list without it", async () => {
     machine = runningMachine;
+    const user = userEvent.setup();
     const client = newClient();
     // The list was visited first, so its page is cached with the agent in it.
     client.setQueryData<InfiniteData<{ data: { id: string; name: string }[] }>>(
       ["/v1/agents", "infinite", 20, "{}", "cursor"],
       { pages: [{ data: [{ id: "agent_test", name: "Ops agent" }] }], pageParams: [undefined] },
     );
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     const router = mount(client);
 
     expect(await screen.findByText("Running")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    const dialog = await chooseDelete(user);
+    expect(dialog).toHaveTextContent("Its computer and all files on its disk will be deleted too.");
+    expect(dialog).toHaveTextContent("This cannot be undone.");
+    await user.click(within(dialog).getByRole("button", { name: "Delete agent" }));
 
     await waitFor(() => expect(router.state.location.pathname).toBe("/agents"));
-    expect(confirm).toHaveBeenCalledWith(
-      'Delete agent "Ops agent"? Its computer and all files on its disk will be deleted too. This cannot be undone.',
-    );
     expect(api).toHaveBeenCalledWith("/v1/agents/agent_test", { method: "DELETE" });
     expect(await screen.findByRole("heading", { name: "Agents list" })).toBeInTheDocument();
     expect(screen.queryByText("Ops agent")).not.toBeInTheDocument();
@@ -151,19 +149,19 @@ describe("AgentDetail delete", () => {
   });
 
   it("checks for a computer before confirming when the panel hasn't loaded it", async () => {
+    const user = userEvent.setup();
     const client = newClient();
-    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     mount(client);
 
-    await screen.findByRole("button", { name: "Delete" });
+    await screen.findByRole("heading", { name: "Ops agent" });
     client.removeQueries({ queryKey: ["/v1/agents/agent_test/machine"] });
-    fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    const callsBefore = api.mock.calls.filter(([path]) => path === "/v1/agents/agent_test/machine").length;
+    const dialog = await chooseDelete(user);
 
-    await waitFor(() =>
-      expect(confirm).toHaveBeenCalledWith(
-        'Delete agent "Ops agent"? It has no computer, so there is no computer or disk to delete. This cannot be undone.',
-      ),
-    );
+    expect(dialog).toHaveTextContent("It has no computer, so there is no computer or disk to delete.");
+    expect(api.mock.calls.filter(([path]) => path === "/v1/agents/agent_test/machine").length).toBeGreaterThan(callsBefore);
+    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
     expect(api).not.toHaveBeenCalledWith("/v1/agents/agent_test", { method: "DELETE" });
     expect(screen.getByRole("heading", { name: "Ops agent" })).toBeInTheDocument();
   });
@@ -180,7 +178,7 @@ describe("AgentDetail delete", () => {
       if (path === "/v1/environments/env_session") {
         // Like api(): a failed request toasts unless the caller asked for quiet.
         if (!init?.silentErrors) toast.error("Environment not found");
-        throw Object.assign(new Error("Environment not found"), { status: 404 });
+        throw new ApiError({ status: 404, code: "not_found", message: "Environment not found" } as never);
       }
       return fallback(path, init);
     });

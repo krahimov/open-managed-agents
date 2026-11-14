@@ -1,15 +1,23 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate } from "react-router";
+import { ArrowLeftIcon, MailIcon } from "lucide-react";
+import { toast } from "sonner";
+
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+
 import { authClient } from "../lib/auth-client";
 import { useAuth } from "../lib/auth";
-import { toast } from "sonner";
 import { Turnstile } from "../components/Turnstile";
-import { Logo } from "../components/Logo";
 import { setActiveTenantId } from "../lib/api";
 import { useApiQuery } from "../lib/useApiQuery";
 import { BrandLoader } from "../components/BrandLoader";
-import { BRAND_NAME, BRAND_TAGLINE } from "../lib/brand";
+import { Callout } from "../components/Callout";
+import { Field } from "../components/Field";
+import { GitHubIcon } from "../components/icons";
+import { BRAND_NAME } from "../lib/brand";
 import { clerkEnabled, ClerkLoginScreen } from "../lib/clerk-auth";
+import { AuthDivider, AuthLink, AuthShell, OtpInput, PasswordInput } from "./auth/AuthShell";
 
 // Clear browser-cached tenant pin on every successful auth transition.
 // The pin is per-user — different login → different membership set →
@@ -21,9 +29,10 @@ function onLoginSuccess(redirect: () => void) {
   redirect();
 }
 
-function GoogleIcon() {
+/** Google's mark, in its own colours (a brand mark, not a UI colour). */
+function GoogleIcon({ className }: { className?: string }) {
   return (
-    <svg className="w-4 h-4" viewBox="0 0 24 24" aria-hidden="true">
+    <svg className={className} viewBox="0 0 24 24" aria-hidden="true">
       <path
         d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"
         fill="#4285F4"
@@ -40,14 +49,6 @@ function GoogleIcon() {
         d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"
         fill="#EA4335"
       />
-    </svg>
-  );
-}
-
-function GitHubIcon() {
-  return (
-    <svg className="w-4 h-4" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-      <path d="M12 2C6.48 2 2 6.58 2 12.26c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-1.04-.01-1.88-2.78.62-3.37-1.21-3.37-1.21-.45-1.18-1.11-1.49-1.11-1.49-.91-.64.07-.63.07-.63 1 .07 1.53 1.06 1.53 1.06.9 1.57 2.35 1.12 2.93.86.09-.67.35-1.12.63-1.38-2.22-.26-4.56-1.14-4.56-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.71 0 0 .84-.27 2.75 1.05A9.37 9.37 0 0112 7.01c.85 0 1.7.12 2.5.34 1.9-1.32 2.74-1.05 2.74-1.05.55 1.41.2 2.45.1 2.71.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.8-4.57 5.06.36.32.68.95.68 1.92 0 1.38-.01 2.5-.01 2.84 0 .27.18.59.69.49A10.14 10.14 0 0022 12.26C22 6.58 17.52 2 12 2z" />
     </svg>
   );
 }
@@ -92,6 +93,8 @@ function ClassicLogin() {
   const [name, setName] = useState("");
   const [otp, setOtp] = useState("");
   const [error, setError] = useState("");
+  /** A quiet confirmation ("We sent a new code"). Cleared with the error. */
+  const [notice, setNotice] = useState("");
   const [loading, setLoading] = useState(false);
   // /auth-info is a public unauthenticated endpoint advertising which
   // providers (google / github / email-otp) are wired up and the Turnstile public
@@ -219,9 +222,33 @@ function ClassicLogin() {
     return { headers: { "cf-turnstile-token": token } };
   };
 
+  // What is wrong with a field, said next to it. The form is `noValidate`
+  // so these replace the browser's own bubbles; the rules are the same
+  // ones the inputs declared before (required, 8-character passwords).
+  const [fieldErrors, setFieldErrors] = useState<{ email?: string; password?: string }>({});
+  const validate = (): boolean => {
+    const next: { email?: string; password?: string } = {};
+    const needsEmail = mode === "login" || mode === "signup" || mode === "otp-login" || mode === "forgot";
+    const needsPassword = mode === "login" || mode === "signup" || mode === "reset-otp";
+    if (needsEmail) {
+      if (!email.trim()) next.email = "Enter your email address.";
+      else if (!/^[^\s@]+@[^\s@]+$/.test(email.trim())) next.email = "That does not look like an email address.";
+    }
+    if (needsPassword) {
+      if (!password) next.password = mode === "login" ? "Enter your password." : "Choose a password.";
+      else if (password.length < 8) next.password = "Passwords are at least 8 characters.";
+    }
+    setFieldErrors(next);
+    if (next.email) document.getElementById("auth-email")?.focus();
+    else if (next.password) document.getElementById(mode === "reset-otp" ? "auth-new-password" : "auth-password")?.focus();
+    return !next.email && !next.password;
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+    setNotice("");
+    if (!validate()) return;
     setLoading(true);
 
     try {
@@ -351,6 +378,7 @@ function ClassicLogin() {
 
   const handleResend = async () => {
     setError("");
+    setNotice("");
     setLoading(true);
     try {
       const typeMap: Record<string, "sign-in" | "email-verification" | "forget-password"> = {
@@ -366,6 +394,8 @@ function ClassicLogin() {
       });
       if (error) throw new Error(error.message);
       clearOtp();
+      setNotice(`We sent a new code to ${email}.`);
+      otpRef.current?.focus();
     } catch (err: any) {
       setError(err.message || "Failed to resend code");
     } finally {
@@ -374,18 +404,26 @@ function ClassicLogin() {
     }
   };
 
+  const [socialPending, setSocialPending] = useState<"google" | "github" | null>(null);
   const handleSocialSignIn = async (provider: "google" | "github") => {
-    await authClient.signIn.social({
-      provider,
-      callbackURL: nextUrl,
-    });
+    setSocialPending(provider);
+    try {
+      await authClient.signIn.social({
+        provider,
+        callbackURL: nextUrl,
+      });
+    } finally {
+      // On success the browser is already leaving; this only matters when
+      // the redirect did not happen.
+      setSocialPending(null);
+    }
   };
 
   if (isLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-bg">
+      <AuthShell bare>
         <BrandLoader size="lg" label="Loading session" />
-      </div>
+      </AuthShell>
     );
   }
 
@@ -397,381 +435,309 @@ function ClassicLogin() {
     authInfo.providers[0] === "clerk"
   ) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-bg">
-        <div className="max-w-md w-full border border-border rounded-xl bg-bg-surface p-8 text-center space-y-3 shadow-[var(--shadow-sm)]">
-          <Logo className="mx-auto h-8 w-8" />
-          <h1 className="text-lg font-semibold text-fg">Sign-in runs through Clerk</h1>
-          <p className="text-sm text-fg-muted">
-            This server accepts only Clerk sessions, but this console build was
-            made without <code className="text-xs">VITE_CLERK_PUBLISHABLE_KEY</code>.
-            Rebuild the console with that variable set to enable the Clerk
-            sign-in screen.
+      <AuthShell
+        title="Sign-in runs through Clerk"
+        subtitle="This console build cannot show the sign-in screen yet."
+      >
+        <div className="space-y-3 text-small leading-relaxed text-fg-muted">
+          <p>
+            This server accepts only Clerk sessions, but this console build was made without{" "}
+            <code className="rounded-sm bg-bg-soft px-1 py-0.5 font-mono text-xs text-fg">VITE_CLERK_PUBLISHABLE_KEY</code>.
           </p>
+          <p>Rebuild the console with that variable set to enable the Clerk sign-in screen.</p>
         </div>
-      </div>
+      </AuthShell>
     );
   }
 
-  const inputCls =
-    "w-full border border-border rounded-md px-3 py-2.5 text-sm bg-bg-surface text-fg shadow-[var(--shadow-sm)] outline-none focus:border-brand focus:ring-2 focus:ring-brand/20 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
-
   const isOtpMode = mode === "verify-signup" || mode === "verify-login" || mode === "reset-otp";
+  // The three ways in. Only these offer the provider buttons.
+  const isEntryMode = mode === "login" || mode === "signup" || mode === "otp-login";
+
+  const go = (next: Mode) => {
+    setMode(next);
+    setError("");
+    setNotice("");
+    setFieldErrors({});
+  };
 
   const titles: Record<Mode, string> = {
     login: "Welcome back",
-    signup: "Create your workspace",
-    "otp-login": "Sign in with email code",
-    "verify-signup": "Verify your email",
-    "verify-login": "Enter your code",
-    forgot: "Reset password",
-    "reset-otp": "Reset your password",
+    signup: "Create your account",
+    "otp-login": "Sign in with a code",
+    "verify-signup": "Check your email",
+    "verify-login": "Check your email",
+    forgot: "Reset your password",
+    "reset-otp": "Choose a new password",
   };
 
   const subtitles: Record<Mode, string> = {
-    login: `Sign in to ${BRAND_NAME}`,
-    signup: `Get started with ${BRAND_NAME}`,
-    "otp-login": "We'll send a 6-digit code to your email",
-    "verify-signup": `We sent a code to ${email}`,
-    "verify-login": `We sent a code to ${email}`,
-    forgot: "We'll send a code to reset your password",
-    "reset-otp": `Enter the code sent to ${email}`,
+    login: "Sign in to run and supervise your agents.",
+    signup: `Set up ${BRAND_NAME} and put your first agent to work.`,
+    "otp-login": "We'll email you a six-digit code. No password needed.",
+    "verify-signup": "Enter the six-digit code we sent to finish creating your account.",
+    "verify-login": "Enter the six-digit code we sent to sign in.",
+    forgot: "Tell us your email and we'll send a code to reset it.",
+    "reset-otp": "Enter the code we sent, then pick a new password.",
   };
 
+  const errorTitles: Record<Mode, string> = {
+    login: "We could not sign you in",
+    signup: "Your account was not created",
+    "otp-login": "The code was not sent",
+    "verify-signup": "That code did not work",
+    "verify-login": "That code did not work",
+    forgot: "The reset code was not sent",
+    "reset-otp": "Your password was not reset",
+  };
+
+  const submitLabels: Record<Mode, string> = {
+    login: "Sign in",
+    signup: "Create account",
+    "otp-login": "Send code",
+    "verify-signup": "Verify",
+    "verify-login": "Verify",
+    forgot: "Send reset code",
+    "reset-otp": "Reset password",
+  };
+
+  // The code steps wait for all six digits. Everywhere else the button is
+  // live from the start and a missing field is explained next to it.
+  const submitDisabled = isOtpMode && otp.length < 6;
+
+  const below =
+    mode === "login" || mode === "otp-login" ? (
+      <>
+        New to {BRAND_NAME}? <AuthLink onClick={() => go("signup")}>Sign up</AuthLink>
+      </>
+    ) : mode === "signup" ? (
+      <>
+        Already have an account? <AuthLink onClick={() => go("login")}>Sign in</AuthLink>
+      </>
+    ) : mode === "forgot" ? (
+      <>
+        Remember your password? <AuthLink onClick={() => go("login")}>Sign in</AuthLink>
+      </>
+    ) : (
+      <>
+        Didn't receive the code?{" "}
+        <AuthLink onClick={handleResend} disabled={loading}>
+          Resend
+        </AuthLink>
+      </>
+    );
+
   return (
-    <div className="min-h-screen flex items-center justify-center bg-sidebar p-4">
-      <div className="w-full max-w-[380px] rounded-lg border border-border bg-bg p-6 shadow-[var(--shadow-md)]">
-        {/* Header */}
-        <div className="text-center mb-6">
-          <Logo size="lg" className="mx-auto" />
-          <div className="mt-3 text-[11px] font-semibold uppercase text-fg-subtle">
-            {BRAND_TAGLINE}
-          </div>
-          <h1 className="text-xl font-semibold text-fg mt-2">
-            {titles[mode]}
-          </h1>
-          <p className="text-sm text-fg-muted mt-1">{subtitles[mode]}</p>
-        </div>
-
-        {/* Social sign-in (only on login/signup/otp-login) */}
-        {socialProviders.length > 0 &&
-          (mode === "login" || mode === "signup" || mode === "otp-login") && (
-            <div className="mb-4 space-y-3">
-              {socialProviders.map((provider) => (
-                <button
-                  key={provider.id}
-                  onClick={() => void handleSocialSignIn(provider.id)}
-                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 border border-border rounded-md bg-bg-surface text-sm text-fg shadow-[var(--shadow-sm)] hover:border-border-strong hover:bg-bg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-                >
-                  {provider.id === "google" ? (
-                    <GoogleIcon />
-                  ) : (
-                    <GitHubIcon />
-                  )}
-                  Continue with {provider.label}
-                </button>
-              ))}
-              <div className="flex items-center gap-3">
-                <div className="flex-1 h-px bg-border" />
-                <span className="text-xs text-fg-subtle">or</span>
-                <div className="flex-1 h-px bg-border" />
-              </div>
-            </div>
-          )}
-
-        {/* Form */}
-        <form onSubmit={handleSubmit} className="space-y-3">
-          {error && (
-            <div className="text-sm text-danger bg-danger-subtle border border-danger/30 rounded-lg px-3 py-2">
-              {error}
-            </div>
-          )}
-
-          {/* Name — signup only */}
-          {mode === "signup" && (
-            <div>
-              <label htmlFor="auth-name" className="text-sm text-fg-muted block mb-1">Name</label>
-              <input
-                id="auth-name"
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                className={inputCls}
-                placeholder="Your name"
-              />
-            </div>
-          )}
-
-          {/* Email — non-OTP modes */}
-          {!isOtpMode && (
-            <div>
-              <label htmlFor="auth-email" className="text-sm text-fg-muted block mb-1">Email</label>
-              <input
-                id="auth-email"
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                className={inputCls}
-                placeholder="you@example.com"
-                required
-                autoFocus
-                // Explicit role so browser keeps autofill scoped to
-                // sign-in fields and doesn't spread it to arbitrary
-                // text inputs on other pages (Sessions Title /
-                // ListPage search). HTML5 spec: "username" is the
-                // canonical token for sign-in identifier.
-                name="email"
-                autoComplete={mode === "signup" ? "email" : "username"}
-              />
-            </div>
-          )}
-
-          {/* Password — login / signup */}
-          {(mode === "login" || mode === "signup") && (
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label htmlFor="auth-password" className="text-sm text-fg-muted">Password</label>
-                {mode === "login" && (
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setMode("forgot");
-                      setError("");
-                    }}
-                    className="inline-flex items-center min-h-11 sm:min-h-0 text-xs text-brand hover:underline"
-                  >
-                    Forgot password?
-                  </button>
-                )}
-              </div>
-              <input
-                id="auth-password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className={inputCls}
-                placeholder="Min 8 characters"
-                required
-                minLength={8}
-                name="password"
-                // current-password for login (pw managers offer to
-                // fill); new-password for signup (suggest strong + skip
-                // fill).
-                autoComplete={mode === "login" ? "current-password" : "new-password"}
-              />
-            </div>
-          )}
-
-          {/* OTP input */}
-          {isOtpMode && (
-            <div>
-              <label htmlFor="auth-otp" className="text-sm text-fg-muted block mb-1">
-                Verification code
-              </label>
-              <input
-                id="auth-otp"
-                ref={otpRef}
-                type="text"
-                inputMode="numeric"
-                pattern="[0-9]*"
-                maxLength={6}
-                value={otp}
-                onChange={(e) =>
-                  setOtp(e.target.value.replace(/\D/g, "").slice(0, 6))
-                }
-                className={`${inputCls} text-center text-2xl font-mono`}
-                placeholder="000000"
-                required
-                autoComplete="one-time-code"
-              />
-            </div>
-          )}
-
-          {/* New password — reset-otp */}
-          {mode === "reset-otp" && (
-            <div>
-              <label htmlFor="auth-new-password" className="text-sm text-fg-muted block mb-1">
-                New password
-              </label>
-              <input
-                id="auth-new-password"
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                className={inputCls}
-                placeholder="Min 8 characters"
-                required
-                minLength={8}
-                name="new-password"
-                autoComplete="new-password"
-              />
-            </div>
-          )}
-
-          {/* Turnstile bot challenge — only on email-send modes. When the
-              backend hasn't been configured (turnstileSiteKey === null),
-              widget renders nothing and the submit button doesn't gate on
-              the token (matches the soft-pass middleware behavior).
-
-              Widget is rendered hidden so it loads + runs the challenge
-              in the background while the user fills in the form. The
-              submit button stays clickable; if the token isn't ready
-              yet, handleSubmit awaits it and the user just sees the
-              normal Loading state. */}
-          {isEmailSendMode && turnstileSiteKey && (
-            <div className="hidden" aria-hidden="true">
-              <Turnstile
-                key={turnstileNonce}
-                siteKey={turnstileSiteKey}
-                onToken={handleTurnstileToken}
-                onExpire={resetTurnstile}
-              />
-            </div>
-          )}
-
-          {/* Submit */}
-          <button
-            type="submit"
-            disabled={
-              loading ||
-              (!isOtpMode && !email) ||
-              (isOtpMode && otp.length < 6) ||
-              ((mode === "login" || mode === "signup") && !password) ||
-              (mode === "reset-otp" && !password)
-            }
-            className="w-full px-4 py-2.5 bg-brand text-brand-fg rounded-md text-sm font-medium shadow-[var(--shadow-sm)] hover:bg-brand-hover disabled:opacity-50 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-          >
-            {loading
-              ? "Loading..."
-              : mode === "login"
-                ? "Sign in"
-                : mode === "signup"
-                  ? "Create account"
-                  : mode === "otp-login"
-                    ? "Send code"
-                    : mode === "forgot"
-                      ? "Send reset code"
-                      : mode === "reset-otp"
-                        ? "Reset password"
-                        : "Verify"}
-          </button>
-        </form>
-
-        {/* Resend for OTP modes */}
-        {isOtpMode && (
-          <p className="mt-4 text-sm text-fg-muted text-center">
-            Didn't receive the code?{" "}
-            <button
-              onClick={handleResend}
-              disabled={loading}
-              className="inline-flex items-center min-h-11 sm:min-h-0 text-brand hover:underline disabled:opacity-50"
+    <AuthShell title={titles[mode]} subtitle={subtitles[mode]} contentKey={mode} below={below}>
+      {/* Providers first: the quickest way in. */}
+      {isEntryMode && socialProviders.length > 0 && (
+        <div className="mb-6 space-y-2.5">
+          {socialProviders.map((provider) => (
+            <Button
+              key={provider.id}
+              type="button"
+              variant="outline"
+              size="lg"
+              className="h-11 w-full"
+              loading={socialPending === provider.id}
+              disabled={socialPending !== null}
+              onClick={() => void handleSocialSignIn(provider.id)}
             >
-              Resend
-            </button>
-          </p>
+              {socialPending !== provider.id &&
+                (provider.id === "google" ? (
+                  <GoogleIcon className="size-[18px]" />
+                ) : (
+                  <GitHubIcon className="size-[18px]" />
+                ))}
+              Continue with {provider.label}
+            </Button>
+          ))}
+          <div className="pt-3.5">
+            <AuthDivider />
+          </div>
+        </div>
+      )}
+
+      {/* Where the code went, with the way back. */}
+      {isOtpMode && (
+        <div className="mb-6 flex items-center gap-3 rounded-lg bg-bg-soft py-2.5 pr-2 pl-3.5">
+          <MailIcon className="size-4 shrink-0 text-fg-muted" aria-hidden="true" />
+          <span className="min-w-0 flex-1 truncate text-small font-medium text-fg" title={email}>
+            {email}
+          </span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="xs"
+            onClick={() => {
+              go(mode === "verify-signup" ? "signup" : mode === "verify-login" ? "otp-login" : "forgot");
+              clearOtp();
+            }}
+          >
+            <ArrowLeftIcon data-icon="inline-start" />
+            Go back
+          </Button>
+        </div>
+      )}
+
+      <form onSubmit={handleSubmit} noValidate className="space-y-5">
+        {error && (
+          <Callout tone="danger" title={errorTitles[mode]}>
+            {error}
+          </Callout>
+        )}
+        {!error && notice && <Callout tone="success">{notice}</Callout>}
+
+        {/* Name — signup only */}
+        {mode === "signup" && (
+          <Field label="Name">
+            <Input
+              id="auth-name"
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="Your name"
+              name="name"
+              autoComplete="name"
+              autoFocus
+              className="h-10"
+            />
+          </Field>
         )}
 
-        {/* Mode switchers */}
-        <p className="mt-5 text-sm text-fg-muted text-center">
-          {mode === "login" && (
-            <>
-              <button
-                onClick={() => {
-                  setMode("otp-login");
-                  setError("");
-                }}
-                className="inline-flex items-center min-h-11 sm:min-h-0 text-brand hover:underline"
-              >
-                Sign in with email code
-              </button>
-              <span className="mx-2">&middot;</span>
-              <button
-                onClick={() => {
-                  setMode("signup");
-                  setError("");
-                }}
-                className="inline-flex items-center min-h-11 sm:min-h-0 text-brand hover:underline"
-              >
-                Sign up
-              </button>
-            </>
-          )}
-          {mode === "signup" && (
-            <>
-              Already have an account?{" "}
-              <button
-                onClick={() => {
-                  setMode("login");
-                  setError("");
-                }}
-                className="inline-flex items-center min-h-11 sm:min-h-0 text-brand hover:underline"
-              >
-                Sign in
-              </button>
-            </>
-          )}
-          {mode === "otp-login" && (
-            <>
-              <button
-                onClick={() => {
-                  setMode("login");
-                  setError("");
-                }}
-                className="inline-flex items-center min-h-11 sm:min-h-0 text-brand hover:underline"
-              >
-                Sign in with password
-              </button>
-              <span className="mx-2">&middot;</span>
-              <button
-                onClick={() => {
-                  setMode("signup");
-                  setError("");
-                }}
-                className="inline-flex items-center min-h-11 sm:min-h-0 text-brand hover:underline"
-              >
-                Sign up
-              </button>
-            </>
-          )}
-          {(mode === "verify-signup" || mode === "verify-login") && (
-            <button
-              onClick={() => {
-                setMode(mode === "verify-signup" ? "signup" : "otp-login");
-                setError("");
-                clearOtp();
+        {/* Email — non-OTP modes */}
+        {!isOtpMode && (
+          <Field label="Email" error={fieldErrors.email}>
+            <Input
+              id="auth-email"
+              type="email"
+              value={email}
+              onChange={(e) => {
+                setEmail(e.target.value);
+                if (fieldErrors.email) setFieldErrors((f) => ({ ...f, email: undefined }));
               }}
-              className="inline-flex items-center min-h-11 sm:min-h-0 text-brand hover:underline"
-            >
-              Go back
-            </button>
-          )}
-          {mode === "forgot" && (
-            <>
-              Remember your password?{" "}
-              <button
-                onClick={() => {
-                  setMode("login");
-                  setError("");
-                }}
-                className="inline-flex items-center min-h-11 sm:min-h-0 text-brand hover:underline"
-              >
-                Sign in
-              </button>
-            </>
-          )}
-          {mode === "reset-otp" && (
-            <button
-              onClick={() => {
-                setMode("forgot");
-                setError("");
-                clearOtp();
+              placeholder="you@example.com"
+              required
+              autoFocus={mode !== "signup"}
+              // Explicit role so browser keeps autofill scoped to
+              // sign-in fields and doesn't spread it to arbitrary
+              // text inputs on other pages (Sessions Title /
+              // ListPage search). HTML5 spec: "username" is the
+              // canonical token for sign-in identifier.
+              name="email"
+              autoComplete={mode === "signup" ? "email" : "username"}
+              className="h-10"
+            />
+          </Field>
+        )}
+
+        {/* Password — login / signup */}
+        {(mode === "login" || mode === "signup") && (
+          <div>
+            <div className="mb-1.5 flex items-center justify-between gap-3">
+              <label htmlFor="auth-password" className="text-small leading-5 font-medium text-fg">
+                Password
+              </label>
+              {mode === "login" && (
+                <AuthLink onClick={() => go("forgot")} className="text-xs">
+                  Forgot password?
+                </AuthLink>
+              )}
+            </div>
+            <PasswordInput
+              id="auth-password"
+              value={password}
+              onChange={(e) => {
+                setPassword(e.target.value);
+                if (fieldErrors.password) setFieldErrors((f) => ({ ...f, password: undefined }));
               }}
-              className="inline-flex items-center min-h-11 sm:min-h-0 text-brand hover:underline"
-            >
-              Go back
-            </button>
+              required
+              minLength={8}
+              name="password"
+              aria-invalid={fieldErrors.password ? true : undefined}
+              aria-describedby={fieldErrors.password || mode === "signup" ? "auth-password-hint" : undefined}
+              // current-password for login (pw managers offer to
+              // fill); new-password for signup (suggest strong + skip
+              // fill).
+              autoComplete={mode === "login" ? "current-password" : "new-password"}
+            />
+            {fieldErrors.password ? (
+              <p id="auth-password-hint" role="alert" className="mt-1.5 text-xs text-danger">
+                {fieldErrors.password}
+              </p>
+            ) : (
+              mode === "signup" && (
+                <p id="auth-password-hint" className="mt-1.5 text-xs text-fg-subtle">
+                  At least 8 characters.
+                </p>
+              )
+            )}
+          </div>
+        )}
+
+        {/* OTP input */}
+        {isOtpMode && (
+          <Field label="Verification code">
+            <OtpInput id="auth-otp" inputRef={otpRef} value={otp} onChange={setOtp} required />
+          </Field>
+        )}
+
+        {/* New password — reset-otp */}
+        {mode === "reset-otp" && (
+          <Field label="New password" hint="At least 8 characters." error={fieldErrors.password}>
+            <PasswordInput
+              id="auth-new-password"
+              value={password}
+              onChange={(e) => {
+                setPassword(e.target.value);
+                if (fieldErrors.password) setFieldErrors((f) => ({ ...f, password: undefined }));
+              }}
+              required
+              minLength={8}
+              name="new-password"
+              autoComplete="new-password"
+            />
+          </Field>
+        )}
+
+        {/* Turnstile bot challenge — only on email-send modes. When the
+            backend hasn't been configured (turnstileSiteKey === null),
+            widget renders nothing and the submit button doesn't gate on
+            the token (matches the soft-pass middleware behavior).
+
+            The widget loads and runs the challenge in the background
+            while the person fills in the form, and takes no room unless
+            Cloudflare needs them to interact. The submit button stays
+            clickable; if the token isn't ready yet, handleSubmit awaits
+            it and the person just sees the button's busy state. */}
+        <div>
+          {isEmailSendMode && turnstileSiteKey && (
+            <Turnstile
+              key={turnstileNonce}
+              siteKey={turnstileSiteKey}
+              onToken={handleTurnstileToken}
+              onExpire={resetTurnstile}
+              className="mb-5"
+            />
           )}
-        </p>
-      </div>
-    </div>
+          <Button type="submit" size="lg" className="h-11 w-full" loading={loading} disabled={submitDisabled}>
+            {submitLabels[mode]}
+          </Button>
+        </div>
+      </form>
+
+      {/* The other way in with the same email. */}
+      {(mode === "login" || mode === "otp-login") && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="lg"
+          className="mt-2 h-11 w-full"
+          onClick={() => go(mode === "login" ? "otp-login" : "login")}
+        >
+          {mode === "login" ? "Sign in with email code" : "Sign in with password"}
+        </Button>
+      )}
+    </AuthShell>
   );
 }

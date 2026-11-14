@@ -1,12 +1,22 @@
 import { useEffect, useState } from "react";
-import { toast } from "sonner";
+import { BoxIcon } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+
 import { useApi } from "../lib/api";
 import { useApiQuery, useQueryClient } from "../lib/useApiQuery";
 import { useAsyncAction } from "../hooks/useAsyncAction";
-import { Modal } from "./Modal";
-import { Select, SelectOption } from "./Select";
-import { Button } from "@/components/ui/button";
 import type { AgentRecord } from "../types/agent";
+import { AgentAvatar } from "./AgentAvatar";
+import { PickSelect } from "./agents/controls";
+import { Callout } from "./Callout";
+import { Combobox } from "./Combobox";
+import { CodeWell, EventSection } from "./EventCard";
+import { Field } from "./Field";
+import { Modal } from "./Modal";
+import { withReason } from "@/lib/failure-text";
 
 /**
  * Deployment wire shape — `DeploymentRecord` from the management API minus
@@ -33,6 +43,7 @@ export interface Deployment {
 interface EnvironmentRecord {
   id: string;
   name: string;
+  description?: string | null;
 }
 
 // Radix Select items can't carry an empty-string value, so the "no
@@ -40,13 +51,10 @@ interface EnvironmentRecord {
 const AGENT_DEFAULT_ENV = "__agent_default__";
 const LATEST_VERSION = "latest";
 
-const inputCls =
-  "w-full border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
-
-/** Ready-to-paste frontend snippet for a freshly minted publishable key.
- *  Uses the console's own origin as baseUrl — the public gateway is
- *  mounted on the same host under /public/v1. */
-function deploymentSnippet(key: string): string {
+/** Ready-to-paste frontend snippet for a publishable key. Uses the
+ *  console's own origin as baseUrl — the public gateway is mounted on the
+ *  same host under /public/v1. */
+export function deploymentSnippet(key: string): string {
   return `import { AgentClient } from "@openma/agent-sdk";
 
 const client = new AgentClient({
@@ -60,50 +68,29 @@ for await (const ev of session.chat("Hello!")) {
 }`;
 }
 
-const copy = (text: string, what: string) => {
-  void navigator.clipboard.writeText(text);
-  toast.success(`${what} copied to clipboard`);
-};
-
 /**
  * Show-once key reveal — shared between "deployment created" and "key
  * rotated". The key is never retrievable again after this dialog closes,
  * so the body leads with the warning and pairs the raw key with a
- * drop-in @openma/agent-sdk snippet.
+ * drop-in @openma/agent-sdk snippet. Each block has its own copy button.
  */
 export function DeploymentKeyReveal({ deploymentKey }: { deploymentKey: string }) {
+  const snippet = deploymentSnippet(deploymentKey);
   return (
-    <div className="space-y-3">
-      <div className="text-sm text-warning bg-warning-subtle border border-warning/30 rounded-lg px-3 py-2">
-        Copy this key now — it won't be shown again. If you lose it, rotate
-        the deployment to mint a new one.
-      </div>
-      <div>
-        <div className="text-sm text-fg-muted mb-1">Publishable key</div>
-        <div className="bg-bg-surface border border-border rounded-lg p-3">
-          <code className="text-sm font-mono text-fg break-all select-all">
-            {deploymentKey}
-          </code>
-        </div>
-        <button
-          onClick={() => copy(deploymentKey, "Key")}
-          className="inline-flex items-center min-h-11 sm:min-h-0 text-sm text-brand hover:underline"
-        >
-          Copy key
-        </button>
-      </div>
-      <div>
-        <div className="text-sm text-fg-muted mb-1">Use it from your frontend</div>
-        <pre className="bg-bg-surface border border-border rounded-lg p-3 text-xs font-mono text-fg-muted leading-relaxed overflow-x-auto">
-          {deploymentSnippet(deploymentKey)}
-        </pre>
-        <button
-          onClick={() => copy(deploymentSnippet(deploymentKey), "Snippet")}
-          className="inline-flex items-center min-h-11 sm:min-h-0 text-sm text-brand hover:underline"
-        >
-          Copy snippet
-        </button>
-      </div>
+    <div className="space-y-5">
+      <Callout tone="warning" title="Copy this key now">
+        It won't be shown again. If you lose it, rotate the deployment's key to get a new one.
+      </Callout>
+      <EventSection label="Publishable key" copy={deploymentKey}>
+        <CodeWell className="py-3 text-small-size break-all select-all">{deploymentKey}</CodeWell>
+      </EventSection>
+      <EventSection label="Use it from your frontend" copy={snippet}>
+        <CodeWell className="max-h-64 whitespace-pre">{snippet}</CodeWell>
+      </EventSection>
+      <p className="text-xs text-fg-subtle">
+        A publishable key is safe to ship in browser code. It can only start and continue sessions with this
+        deployment's agent.
+      </p>
     </div>
   );
 }
@@ -126,6 +113,7 @@ export function DeploymentKeyModal({
       open={open}
       onClose={onClose}
       title={title}
+      subtitle="The previous key has stopped working. Update your frontend with this one."
       maxWidth="max-w-xl"
       footer={<Button onClick={onClose}>Done</Button>}
     >
@@ -143,9 +131,9 @@ interface CreateDeploymentDialogProps {
 
 /**
  * Two-phase create dialog, mirroring ApiKeysList's New API Key modal:
- * phase 1 is the form (agent / environment / name / origins / version
- * pin), phase 2 swaps the same modal to the show-once key reveal after
- * the POST succeeds. Shared by DeploymentsList and AgentDetail.
+ * phase 1 is the form (agent / name / environment / version pin /
+ * origins), phase 2 swaps the same modal to the show-once key reveal
+ * after the POST succeeds. Shared by DeploymentsList and AgentDetail.
  */
 export function CreateDeploymentDialog({
   open,
@@ -156,6 +144,7 @@ export function CreateDeploymentDialog({
   const queryClient = useQueryClient();
 
   const [agentId, setAgentId] = useState(initialAgentId ?? "");
+  const [agentName, setAgentName] = useState("");
   const [name, setName] = useState("");
   const [environmentId, setEnvironmentId] = useState(AGENT_DEFAULT_ENV);
   const [version, setVersion] = useState(LATEST_VERSION);
@@ -168,6 +157,7 @@ export function CreateDeploymentDialog({
   useEffect(() => {
     if (!open) return;
     setAgentId(initialAgentId ?? "");
+    setAgentName("");
     setName("");
     setEnvironmentId(AGENT_DEFAULT_ENV);
     setVersion(LATEST_VERSION);
@@ -176,11 +166,6 @@ export function CreateDeploymentDialog({
     setError("");
   }, [open, initialAgentId]);
 
-  const { data: agentsRes } = useApiQuery<{ data: AgentRecord[] }>(
-    "/v1/agents",
-    { limit: "200" },
-    { enabled: open },
-  );
   const { data: envsRes } = useApiQuery<{ data: EnvironmentRecord[] }>(
     "/v1/environments",
     { limit: "200" },
@@ -193,9 +178,18 @@ export function CreateDeploymentDialog({
     { enabled: open && !!agentId },
   );
 
-  const agents = agentsRes?.data ?? [];
   const environments = envsRes?.data ?? [];
-  const versions = versionsRes?.data ?? [];
+  const versions = [...(versionsRes?.data ?? [])].sort((a, b) => b.version - a.version);
+
+  // Comma- or newline-separated origins → string[].
+  const originList = origins
+    .split(/[\n,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  // The gateway compares the browser's Origin header to this list exactly,
+  // and an Origin is always scheme://host[:port]. Anything else can never
+  // match, so say so before the deployment is created.
+  const badOrigins = originList.filter((o) => !/^https?:\/\/[^/\s]+$/i.test(o));
 
   const create = useAsyncAction(async () => {
     setError("");
@@ -204,12 +198,7 @@ export function CreateDeploymentDialog({
       if (name.trim()) body.name = name.trim();
       if (environmentId !== AGENT_DEFAULT_ENV) body.environment_id = environmentId;
       if (version !== LATEST_VERSION) body.agent_version = Number(version);
-      // Comma- or newline-separated origins → string[]. Empty → omitted,
-      // which the server stores as null (any origin).
-      const originList = origins
-        .split(/[\n,]+/)
-        .map((s) => s.trim())
-        .filter(Boolean);
+      // Empty → omitted, which the server stores as null (any origin).
       if (originList.length > 0) body.allowed_origins = originList;
 
       const result = await api<Deployment & { key: string }>("/v1/deployments", {
@@ -219,19 +208,21 @@ export function CreateDeploymentDialog({
       setCreatedKey(result.key);
       void queryClient.invalidateQueries({ queryKey: ["/v1/deployments"] });
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to create deployment");
+      setError(withReason("The deployment was not created", e));
     }
   });
 
   return (
     <Modal
       open={open}
-      onClose={onClose}
-      title={createdKey ? "Deployment Created" : "New Deployment"}
+      onClose={() => {
+        if (!create.loading) onClose();
+      }}
+      title={createdKey ? "Deployment created" : "New deployment"}
       subtitle={
         createdKey
-          ? undefined
-          : "Publish an agent behind a publishable key (oma_pk_…) for direct frontend access."
+          ? "Your frontend can now talk to this agent directly."
+          : "Publish an agent behind a publishable key, so your own frontend can talk to it without a server in between."
       }
       maxWidth="max-w-xl"
       footer={
@@ -242,13 +233,8 @@ export function CreateDeploymentDialog({
             <Button variant="ghost" onClick={onClose} disabled={create.loading}>
               Cancel
             </Button>
-            <Button
-              onClick={create.run}
-              disabled={!agentId}
-              loading={create.loading}
-              loadingLabel="Creating…"
-            >
-              Create
+            <Button onClick={create.run} disabled={!agentId || badOrigins.length > 0} loading={create.loading}>
+              Create deployment
             </Button>
           </>
         )
@@ -257,89 +243,96 @@ export function CreateDeploymentDialog({
       {createdKey ? (
         <DeploymentKeyReveal deploymentKey={createdKey} />
       ) : (
-        <div className="space-y-3">
+        <div className="space-y-5">
           {error && (
-            <div className="text-sm text-danger bg-danger-subtle border border-danger/30 rounded-lg px-3 py-2">
+            <Callout tone="danger" title="The deployment was not created">
               {error}
-            </div>
+            </Callout>
           )}
-          <div>
-            <label className="text-sm text-fg-muted block mb-1">Agent *</label>
-            <Select
+
+          <Field label="Agent">
+            <Combobox<AgentRecord>
               value={agentId}
-              onValueChange={(v) => {
+              onValueChange={(v, item) => {
                 setAgentId(v);
+                setAgentName(item?.name ?? "");
                 setVersion(LATEST_VERSION);
               }}
-              placeholder="Select an agent…"
-            >
-              {agents.map((a) => (
-                <SelectOption key={a.id} value={a.id}>
-                  {a.name}
-                </SelectOption>
-              ))}
-            </Select>
-          </div>
-          <div>
-            <label htmlFor="deploy-name" className="text-sm text-fg-muted block mb-1">
-              Name <span className="text-fg-subtle">(optional, defaults to the agent name)</span>
-            </label>
-            <input
+              endpoint="/v1/agents"
+              getValue={(a) => a.id}
+              getLabel={(a) => (
+                <span className="flex min-w-0 items-center gap-2">
+                  <AgentAvatar name={a.name} id={a.id} size="xs" />
+                  <span className="truncate">{a.name}</span>
+                </span>
+              )}
+              getTextLabel={(a) => a.name}
+              placeholder="Choose an agent"
+            />
+          </Field>
+
+          <Field label="Name" hint="Optional. Shown in the deployments list.">
+            <Input
               id="deploy-name"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              className={inputCls}
-              placeholder="e.g. Marketing site chat"
+              placeholder={agentName || "Marketing site chat"}
+              autoComplete="off"
             />
+          </Field>
+
+          <div className="grid gap-x-3 gap-y-5 sm:grid-cols-2">
+            <Field label="Environment">
+              <PickSelect
+                value={environmentId}
+                onValueChange={setEnvironmentId}
+                options={[
+                  { value: AGENT_DEFAULT_ENV, label: "Agent default", hint: "Whatever the agent is set to use." },
+                  ...environments.map((e) => ({
+                    value: e.id,
+                    label: e.name,
+                    hint: e.description ?? undefined,
+                    icon: BoxIcon,
+                  })),
+                ]}
+              />
+            </Field>
+            <Field label="Version">
+              <PickSelect
+                value={version}
+                onValueChange={setVersion}
+                disabled={!agentId}
+                options={[
+                  { value: LATEST_VERSION, label: "Latest", hint: "Follows the agent as it is edited." },
+                  ...versions.map((v) => ({
+                    value: String(v.version),
+                    label: `v${v.version}`,
+                    hint: "Pinned. Edits to the agent do not reach this deployment.",
+                  })),
+                ]}
+              />
+            </Field>
           </div>
-          <div>
-            <label className="text-sm text-fg-muted block mb-1">
-              Environment <span className="text-fg-subtle">(optional)</span>
-            </label>
-            <Select
-              value={environmentId}
-              onValueChange={setEnvironmentId}
-              placeholder="Agent default"
-            >
-              <SelectOption value={AGENT_DEFAULT_ENV}>Agent default</SelectOption>
-              {environments.map((e) => (
-                <SelectOption key={e.id} value={e.id}>
-                  {e.name}
-                </SelectOption>
-              ))}
-            </Select>
-          </div>
-          <div>
-            <label className="text-sm text-fg-muted block mb-1">
-              Version pin <span className="text-fg-subtle">(optional)</span>
-            </label>
-            <Select
-              value={version}
-              onValueChange={setVersion}
-              placeholder="Latest"
-              disabled={!agentId}
-            >
-              <SelectOption value={LATEST_VERSION}>Latest (follows updates)</SelectOption>
-              {versions.map((v) => (
-                <SelectOption key={v.version} value={String(v.version)}>
-                  v{v.version}
-                </SelectOption>
-              ))}
-            </Select>
-          </div>
-          <div>
-            <label htmlFor="deploy-origins" className="text-sm text-fg-muted block mb-1">
-              Allowed origins <span className="text-fg-subtle">(optional, comma or newline separated; blank allows any)</span>
-            </label>
-            <textarea
+
+          <Field
+            label="Allowed origins"
+            hint="One per line. Leave empty to accept requests from any origin."
+            error={
+              badOrigins.length > 0
+                ? `Origins look like https://example.com, with no path or trailing slash. Check: ${badOrigins.join(", ")}`
+                : undefined
+            }
+          >
+            <Textarea
               id="deploy-origins"
               value={origins}
               onChange={(e) => setOrigins(e.target.value)}
-              className={`${inputCls} min-h-20 font-mono text-xs resize-y`}
+              className="min-h-[4.5rem] resize-y font-mono text-xs leading-relaxed md:text-xs"
               placeholder={"https://example.com\nhttps://app.example.com"}
               rows={3}
+              spellCheck={false}
             />
-          </div>
+          </Field>
         </div>
       )}
     </Modal>

@@ -1,24 +1,43 @@
 import { useState } from "react";
 import { useParams, Link } from "react-router";
 import { toast } from "sonner";
-import { useApi } from "../lib/api";
+import { PuzzleIcon } from "lucide-react";
+
 import { Button } from "@/components/ui/button";
+
+import { useApi } from "../lib/api";
 import type { Event } from "../lib/events";
+import { Chip } from "./Badge";
+import { EventCard } from "./EventCard";
+import { humanSkillName, skillSummary } from "./resources/skills";
+import { AnsweredRequest, NEEDS_YOU_CARD, PassedRequest } from "./sessions/RequestParts";
+import { withReason } from "@/lib/failure-text";
 
 /**
- * Agent-initiated skill acquisition — rendered for system.skill_request
- * events (the agent's request_skill tool). One click ratifies: the backend
- * installs if needed (quarantine-enforced — blocked content 422s there),
- * attaches the skill to the agent, and injects the playbook into the
- * running session so the agent continues immediately. Same card family as
- * access-request / harness-diff / ambient-rule.
+ * Agent-initiated skill acquisition, shown for system.skill_request events
+ * (the agent's request_skill tool). One click ratifies it: the backend
+ * installs the skill if needed (quarantine-enforced: blocked content is
+ * refused there), attaches it to the agent, and hands the playbook to the
+ * running session so the agent continues immediately.
+ *
+ * It is a request waiting on a person, so it wears the same amber card as
+ * a tool approval; once attached it relaxes into one quiet line. Which of
+ * the two it is comes from the session's log (`state`, see
+ * sessions/requests.ts), so it survives a reload; a request the person
+ * replied past without attaching is a neutral row that can still be used.
  */
 export function SkillRequestCard({
   event,
   sessionId: sessionIdProp,
+  state = "open",
+  agentName: agentNameProp,
 }: {
   event: Event;
-  /** SessionChat must pass this — its route param is the AGENT id. */
+  /** The asking agent's name; "The agent" when unknown. */
+  agentName?: string;
+  /** What the log says became of this request. */
+  state?: "open" | "answered" | "passed";
+  /** SessionChat must pass this: its route param is the AGENT id. */
   sessionId?: string;
 }) {
   const { api } = useApi();
@@ -34,7 +53,12 @@ export function SkillRequestCard({
     resolution?: "installed" | "catalog" | "unknown";
     description?: string;
   };
-  const name = ev.skill_name ?? "skill";
+  const slug = ev.skill_name ?? "skill";
+  // The same reading the catalog and the Skills page give a skill: a name
+  // people say ("Word documents") and one whole sentence about what it does,
+  // not the instructions its author wrote for the model.
+  const name = humanSkillName(slug);
+  const summary = skillSummary(ev.description, 140);
   const [status, setStatus] = useState<"pending" | "working" | "attached" | "error">("pending");
   const [error, setError] = useState<string | null>(null);
 
@@ -52,54 +76,86 @@ export function SkillRequestCard({
         }),
       });
       setStatus("attached");
-      toast.success(`Skill ${name} attached.`);
+      toast.success(`${name} attached`);
     } catch (err) {
       setStatus("error");
-      setError(err instanceof Error ? err.message : "Attach failed");
+      setError(withReason("The skill could not be attached", err));
     }
   };
 
-  const provenance =
-    ev.resolution === "installed"
-      ? "already installed in this workspace"
-      : ev.resolution === "catalog"
-        ? `curated catalog · ${ev.catalog_source}`
-        : "not found in store or catalog";
+  const unknown = ev.resolution === "unknown";
+  const agentName = agentNameProp?.trim() || "The agent";
+  if (status === "attached" || state === "answered") {
+    return (
+      <AnsweredRequest>
+        <span className="font-medium text-fg">{name}</span> attached.{" "}
+        {status === "attached" ? `${agentName} has the playbook and is picking the task back up.` : `${agentName} was given the playbook and carried on.`}
+      </AnsweredRequest>
+    );
+  }
+
+  if (state === "passed" && status === "pending") {
+    return (
+      <PassedRequest
+        icon={PuzzleIcon}
+        title={`${agentName} asked for the ${name} skill`}
+        note={ev.reason}
+        action={
+          unknown ? (
+            <Button asChild variant="outline" size="sm">
+              <Link to="/skills/catalog">Browse the catalog</Link>
+            </Button>
+          ) : (
+            <Button variant="outline" size="sm" onClick={attach}>
+              {ev.resolution === "catalog" ? "Scan and attach it" : "Attach it"}
+            </Button>
+          )
+        }
+      />
+    );
+  }
 
   return (
-    <div className="max-w-2xl border border-border rounded-lg bg-bg-surface px-4 py-3">
-      <div className="flex items-center justify-between gap-3">
-        <div className="min-w-0">
-          <div className="text-sm font-medium">
-            Agent requests the <span className="font-mono">{name}</span> skill
-          </div>
-          {ev.reason && <div className="text-xs text-fg-subtle mt-0.5">{ev.reason}</div>}
-          <div className="text-[11px] text-fg-subtle mt-1 font-mono">{provenance}</div>
-        </div>
-        {status === "attached" ? (
-          <span className="text-xs font-medium text-success whitespace-nowrap">Attached ✓</span>
-        ) : ev.resolution === "unknown" ? (
+    <div data-needs-you={state === "open" ? "skill" : undefined} className="scroll-my-24">
+    <EventCard
+      kind="approval"
+      className={NEEDS_YOU_CARD}
+      icon={PuzzleIcon}
+      title={`${agentName} asks for the ${name} skill`}
+      subtitle={ev.reason || "It says this skill would help with the task."}
+      meta={
+        ev.resolution === "installed" ? (
+          <Chip>Installed in this workspace</Chip>
+        ) : ev.resolution === "catalog" ? (
+          <Chip title={ev.catalog_source ? `${slug} · ${ev.catalog_source}` : slug}>From the curated catalog</Chip>
+        ) : (
+          <Chip tone="outline">Not found</Chip>
+        )
+      }
+      actions={
+        unknown ? (
           <Button asChild variant="outline" size="sm">
-            <Link to="/skills/catalog">Browse catalog</Link>
+            <Link to="/skills/catalog">Browse the catalog</Link>
           </Button>
         ) : (
-          <Button size="sm" onClick={attach} disabled={status === "working"}>
-            {status === "working"
-              ? "Attaching…"
-              : ev.resolution === "catalog"
-                ? `Scan & attach ${name}`
-                : `Attach ${name}`}
+          <Button size="sm" onClick={attach} loading={status === "working"} loadingLabel="Attaching…">
+            {ev.resolution === "catalog" ? "Scan and attach it" : "Attach it"}
           </Button>
-        )}
-      </div>
-      {ev.description && status !== "attached" && (
-        <p className="mt-2 text-[11px] text-fg-subtle line-clamp-2">{ev.description}</p>
+        )
+      }
+    >
+      {summary && <p className="text-small text-fg">{summary}</p>}
+      {error && (
+        <p role="alert" className="text-small text-danger">
+          {error}
+        </p>
       )}
-      {error && <div className="mt-2 text-xs text-danger">{error}</div>}
-      <div className="mt-2 text-[11px] text-fg-subtle">
-        Attaching scans the content, pins its hash, and hands the playbook to the running
-        session — the agent picks the task back up immediately.
-      </div>
+      <p className="text-xs leading-relaxed text-fg-muted">
+        {unknown
+          ? "No skill with this name is installed or in the curated catalog. Install one, then ask the agent to try again."
+          : "Attaching scans the content, pins its hash and hands the playbook to the running session, so the agent continues right away."}
+      </p>
+    </EventCard>
     </div>
   );
 }

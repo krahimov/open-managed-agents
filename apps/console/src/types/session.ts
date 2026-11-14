@@ -10,10 +10,23 @@
 export interface SessionRecord {
   id: string;
   title?: string | null;
-  agent: { id: string; version: number };
+  /** The list and detail endpoints embed a snapshot of the agent as it was
+   *  when the session started, so the agent's name is available without a
+   *  second request. */
+  agent: {
+    id: string;
+    version: number;
+    name?: string;
+    description?: string;
+    model?: string | { id: string; speed?: string };
+  };
   environment_id: string;
   status?: string;
   created_at: string;
-  archived_at?: string;
+  updated_at?: string | null;
+  archived_at?: string | null;
+  terminated_at?: string | null;
+  vault_ids?: string[];
   metadata?: Record<string, unknown>;
+  stats?: { duration_seconds?: number };
 }

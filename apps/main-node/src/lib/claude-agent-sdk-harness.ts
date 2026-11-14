@@ -229,6 +229,83 @@ export interface ClaudeAgentSdkHarnessDeps {
     sessionId: string,
     args: { skill_name: string; reason: string },
   ) => Promise<{ request_id: string; status: string; note?: string }>;
+  /** Usage analytics tap: called per model on each SDK result message
+   *  (its modelUsage map, or the aggregate usage when the map is empty).
+   *  Best-effort; a failure never fails the turn. */
+  recordUsage?: (
+    tenantId: string,
+    sessionId: string,
+    agentId: string,
+    u: SdkUsageRecord,
+  ) => Promise<void> | void;
+}
+
+/** One model's share of an SDK turn, in usage-tracker terms
+ *  (input_tokens = the uncached portion, as Anthropic reports it). */
+export interface SdkUsageRecord {
+  model: string;
+  costUsd?: number;
+  usage: {
+    input_tokens: number;
+    cached_input_tokens?: number;
+    cache_write_input_tokens?: number;
+    output_tokens: number;
+    reasoning_tokens?: number;
+  };
+}
+
+/**
+ * The usage an SDK `result` message reports. It carries a per-model map
+ * (with the SDK's own cost accounting) and an aggregate fallback. Field
+ * names are read defensively: they are additive SDK surface. Error results
+ * (max turns, execution error) still cost tokens, so they count too.
+ */
+export function usageFromSdkResult(msg: unknown, fallbackModel: string | undefined): SdkUsageRecord[] {
+  const r = msg as {
+    modelUsage?: Record<
+      string,
+      {
+        inputTokens?: number;
+        outputTokens?: number;
+        cacheReadInputTokens?: number;
+        cacheCreationInputTokens?: number;
+        costUSD?: number;
+      }
+    >;
+    usage?: {
+      input_tokens?: number;
+      output_tokens?: number;
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+    };
+    total_cost_usd?: number;
+  } | null;
+  if (!r) return [];
+  if (r.modelUsage && Object.keys(r.modelUsage).length > 0) {
+    return Object.entries(r.modelUsage).map(([usedModel, u]) => ({
+      model: usedModel,
+      costUsd: u.costUSD,
+      usage: {
+        input_tokens: u.inputTokens ?? 0,
+        cached_input_tokens: u.cacheReadInputTokens ?? 0,
+        cache_write_input_tokens: u.cacheCreationInputTokens ?? 0,
+        output_tokens: u.outputTokens ?? 0,
+      },
+    }));
+  }
+  if (r.usage) {
+    return [{
+      model: fallbackModel ?? "claude-default",
+      costUsd: r.total_cost_usd,
+      usage: {
+        input_tokens: r.usage.input_tokens ?? 0,
+        cached_input_tokens: r.usage.cache_read_input_tokens ?? 0,
+        cache_write_input_tokens: r.usage.cache_creation_input_tokens ?? 0,
+        output_tokens: r.usage.output_tokens ?? 0,
+      },
+    }];
+  }
+  return [];
 }
 
 /**
@@ -974,6 +1051,15 @@ export class ClaudeAgentSdkHarness {
           continue;
         }
         if (msg.type === "result") {
+          const record = this.#deps.recordUsage;
+          if (record) {
+            const tenantForUsage = ctx.tenant_id ?? "default";
+            for (const u of usageFromSdkResult(msg, model)) {
+              void Promise.resolve()
+                .then(() => record(tenantForUsage, sessionId, ctx.agent.id, u))
+                .catch(() => {});
+            }
+          }
           if (msg.subtype !== "success") {
             throw new Error(`claude-agent-sdk turn failed: ${msg.subtype}`);
           }
