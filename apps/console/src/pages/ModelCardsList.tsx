@@ -3,10 +3,12 @@ import { toast } from "sonner";
 import { CopyIcon, CpuIcon, PencilIcon, Trash2Icon } from "lucide-react";
 import type { ModelCard } from "@open-managed-agents/api-types";
 
+import { useAsyncAction } from "../hooks/useAsyncAction";
 import { useApi } from "../lib/api";
 import { copyText } from "../lib/clipboard";
 import { countWords, formatCompact, formatCost, toDate } from "../lib/format";
 import { describeModel, type ModelProvider } from "../lib/models";
+import { useServerFeature } from "../lib/server-features";
 import { useApiQuery, useInfiniteApiQuery } from "../lib/useApiQuery";
 import { EntityAvatar } from "../components/AgentAvatar";
 import { Chip } from "../components/Badge";
@@ -120,7 +122,6 @@ export function ModelCardsList() {
   const [editing, setEditing] = useState<ModelCard | null>(null);
   const [form, setForm] = useState({ ...INITIAL_FORM });
   const [formError, setFormError] = useState("");
-  const [saving, setSaving] = useState(false);
   const [availableModels, setAvailableModels] = useState<Array<{ id: string; name: string }>>([]);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState<ModelCard | null>(null);
@@ -150,8 +151,10 @@ export function ModelCardsList() {
     error,
   } = useInfiniteApiQuery<ModelCard>("/v1/model_cards", { limit: 20, params: cardsParams });
 
-  // Recent spend per model, from the same report the Usage page reads.
-  const { data: report, isLoading: usageLoading } = useApiQuery<UsageReport>("/v1/usage");
+  // Recent spend per model, from the same report the Usage page reads, where
+  // the server keeps one (without it the column is left out).
+  const usageOn = useServerFeature("usage");
+  const { data: report, isLoading: usageLoading } = useApiQuery<UsageReport>(usageOn ? "/v1/usage" : null);
   const spendByModel = useMemo(() => {
     const map = new Map<string, { cost: number; tokens: number }>();
     for (const m of report?.models ?? []) map.set(m.model, { cost: m.cost_usd, tokens: m.tokens });
@@ -222,13 +225,14 @@ export function ModelCardsList() {
   const official = OFFICIAL_PROVIDERS.has(form.provider);
   const canSave = !!form.model_id.trim() && (!!editing || !!form.api_key);
 
-  const save = async () => {
+  // Re-entrancy guarded: a double click on Add used to send two POSTs, and
+  // the second was refused with "model_id … already used".
+  const saveAction = useAsyncAction(async () => {
     setFormError("");
     if (!canSave) {
       setFormError("A model ID and an API key are required.");
       return;
     }
-    setSaving(true);
     try {
       const payload: Record<string, unknown> = {
         provider: form.provider,
@@ -278,10 +282,9 @@ export function ModelCardsList() {
       refresh();
     } catch (e) {
       setFormError(withReason("The model could not be saved", e));
-    } finally {
-      setSaving(false);
     }
-  };
+  });
+  const saving = saveAction.loading;
 
   const actionsFor = (c: ModelCard): RowAction[] => [
     { label: "Edit", icon: <PencilIcon />, onSelect: () => startEdit(c) },
@@ -406,9 +409,9 @@ export function ModelCardsList() {
           <RowActionsMenu label={`Actions for ${row.original.model_id}`} actions={actionsFor(row.original)} />
         ),
       },
-    ],
+    ].filter((c) => c.id !== "spend" || usageOn),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [usage, spendByModel, usageLoading, rangeDays],
+    [usage, spendByModel, usageLoading, rangeDays, usageOn],
   );
 
   const providerDisplay =
@@ -499,7 +502,12 @@ export function ModelCardsList() {
             <Button variant="ghost" onClick={closeForm} disabled={saving}>
               Cancel
             </Button>
-            <Button onClick={() => void save()} disabled={!canSave} loading={saving}>
+            <Button
+              onClick={() => void saveAction.run()}
+              disabled={!canSave}
+              loading={saving}
+              loadingLabel={editing ? "Saving…" : "Adding…"}
+            >
               {editing ? "Save model" : "Add model"}
             </Button>
           </>

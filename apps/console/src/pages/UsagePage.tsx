@@ -22,6 +22,9 @@
  * enough in it to compare with, and then every number that can change
  * shows one and names its baseline ("8 in the 30 days before"). One tile
  * with an arrow beside two without reads as a mistake.
+ *
+ * A server without the usage tracker (`useServerFeature("usage")` off) is
+ * never asked for the report: the page says usage is not recorded there.
  */
 
 import { useCallback, useMemo } from "react";
@@ -47,6 +50,7 @@ import { harnessLabel } from "@/lib/agents";
 import { useRecentSessions } from "@/lib/directory";
 import { formatCompact, formatCost, plural } from "@/lib/format";
 import { describeModel } from "@/lib/models";
+import { useServerFeatures } from "@/lib/server-features";
 import { usageWindow } from "@/lib/usage-window";
 import { useApiQuery } from "@/lib/useApiQuery";
 import { cn } from "@/lib/utils";
@@ -114,11 +118,14 @@ export function UsagePage() {
   // request and one number on both pages, and the period before is the same length.
   const { since, until, params, previousParams: prevParams } = useMemo(() => usageWindow(Number(range)), [range]);
 
-  const { data, isLoading, isFetching, isPlaceholderData, error, refetch } = useApiQuery<UsageReport>("/v1/usage", params, {
+  const features = useServerFeatures();
+  const tracked = features.data?.features.has("usage") ?? false;
+  const notTracked = !features.isLoading && !tracked;
+  const { data, isLoading, isFetching, isPlaceholderData, error, refetch } = useApiQuery<UsageReport>(tracked ? "/v1/usage" : null, params, {
     refetchInterval: 60_000,
   });
   // The same report for the period before, to say whether things went up or down.
-  const previous = useApiQuery<UsageReport>("/v1/usage", prevParams, { staleTime: 5 * 60_000 });
+  const previous = useApiQuery<UsageReport>(tracked ? "/v1/usage" : null, prevParams, { staleTime: 5 * 60_000 });
   const prev = previous.isPlaceholderData ? undefined : previous.data?.totals;
 
   const words = RANGES.find((r) => r.value === range)?.words ?? `${range} days`;
@@ -211,6 +218,27 @@ export function UsagePage() {
       }
     />
   );
+
+  if (notTracked) {
+    return (
+      <Page header={<PageHeader width="wide" title="Usage" subtitle="What your agents consumed, priced at API rates." />} width="wide">
+        <EmptyState
+          size="lg"
+          icon={<ChartColumnIcon />}
+          title="Usage is not recorded on this server"
+          body="This server does not keep a record of model calls, so there is no spend or token count to show. Each session still shows its own activity."
+        />
+      </Page>
+    );
+  }
+
+  if ((features.isLoading || (isLoading && !data)) && !error) {
+    return (
+      <Page header={header} width="wide">
+        <UsageSkeleton />
+      </Page>
+    );
+  }
 
   if (error && !data) {
     return (

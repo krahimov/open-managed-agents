@@ -33,6 +33,15 @@ import { linePath, niceTicks, pickLabelIndices, useMeasure, type ChartSeries } f
  *   bar   discrete buckets (per day / per run) where each bar is read alone
  * One y axis only. Two measures of different scale get two charts.
  */
+/**
+ * About half the drawn width of an x label in the micro size (11px Geist,
+ * whose digits and letters average a little over 6px). An estimate is
+ * enough: it only keeps a label from running past the chart's edge.
+ */
+export function labelHalfWidth(text: string): number {
+  return Math.ceil(text.length * 3.3);
+}
+
 export function TimeSeriesChart({
   type = "area",
   labels,
@@ -143,18 +152,20 @@ export function TimeSeriesChart({
               </g>
             ))}
 
-            {/* x labels */}
-            {xLabels.map((i) => (
-              <text
-                key={i}
-                x={x(i)}
-                y={height - 6}
-                textAnchor={i === 0 && band < 60 ? "start" : i === n - 1 && band < 60 ? "end" : "middle"}
-                className="fill-fg-subtle text-micro-size"
-              >
-                {formatLabel(labels[i])}
-              </text>
-            ))}
+            {/* x labels: each centred under its own column or point. Only a
+                label that would run off the chart is moved in, by just
+                enough (the left margin holds the y ticks, so in practice
+                only the last label on a narrow chart moves). */}
+            {xLabels.map((i) => {
+              const text = formatLabel(labels[i]);
+              const half = labelHalfWidth(text);
+              const cx = Math.min(Math.max(x(i), half + 1), width - half - 1);
+              return (
+                <text key={i} x={cx} y={height - 6} textAnchor="middle" className="fill-fg-subtle text-micro-size">
+                  {text}
+                </text>
+              );
+            })}
 
             <g clipPath={`url(#${clipId})`}>
               {type === "bar"
