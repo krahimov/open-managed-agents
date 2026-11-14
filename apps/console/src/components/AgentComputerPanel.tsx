@@ -314,8 +314,8 @@ export function AgentComputerPanel({ agentId, localRuntime = false, defaultEnvir
           <p className="text-small text-fg-muted">Its computer is created when its next session starts.</p>
         ) : sandboxOnly ? (
           <p className="text-small text-fg-muted">
-            To give it a persistent computer that keeps its files and browser between sessions, edit the agent and,
-            under Sandbox, choose a default environment marked “{AGENT_COMPUTER_LABEL}”.
+            To give it a persistent computer that keeps its files and browser between sessions, edit the agent, open
+            All settings and, under Sandbox, choose a default environment marked “{AGENT_COMPUTER_LABEL}”.
             {onEdit && (
               <>
                 {" "}

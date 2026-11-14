@@ -352,7 +352,15 @@ export function AgentDetail() {
         {tab === "access" && <AccessTab agentId={agent.id} agentName={agent.name} sessions={sessions} />}
       </div>
 
-      <EditAgentDialog agent={agent} open={editing} onClose={() => setEditing(false)} />
+      <EditAgentDialog
+        agent={agent}
+        open={editing}
+        onClose={() => setEditing(false)}
+        onOpenSetup={() => {
+          setEditing(false);
+          void openSetup();
+        }}
+      />
       <AddTriggerDialog agentId={agent.id} agentName={agent.name} open={showAddTrigger} onClose={() => setShowAddTrigger(false)} />
       <RunUntilDoneDialog agentId={agent.id} open={showRunDialog} onClose={() => setShowRunDialog(false)} />
       <CreateDeploymentDialog open={showDeploy} onClose={() => setShowDeploy(false)} initialAgentId={agent.id} />

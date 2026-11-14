@@ -228,7 +228,8 @@ export function MemoryStoresList() {
       onSearchChange={found.setSearch}
       filters={
         <>
-          <ArchiveStatusFilter value={status} onChange={setStatus} />
+          {/* Nothing can be archived on a server without memory writes. */}
+          {writable && <ArchiveStatusFilter value={status} onChange={setStatus} />}
           <CreatedFilterChip value={created} onChange={setCreated} />
         </>
       }

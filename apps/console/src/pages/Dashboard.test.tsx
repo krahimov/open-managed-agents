@@ -88,6 +88,9 @@ describe("Home when the server cannot be reached", () => {
     expect(screen.queryByText("Usage could not be loaded")).not.toBeInTheDocument();
     expect(screen.queryByText("Workspace summary could not be loaded")).not.toBeInTheDocument();
     expect(screen.getByText(/Not known right now/)).toBeInTheDocument();
+    // One red block: the starter leaves the outage to the page's banner.
+    await waitFor(() => expect(screen.getByPlaceholderText("Agents could not be loaded")).toBeInTheDocument());
+    expect(screen.queryByText("Agents could not be loaded")).not.toBeInTheDocument();
   });
 });
 

@@ -255,7 +255,12 @@ export function Dashboard() {
           </div>
 
           <div className="stagger mt-8 animate-rise-in" style={{ "--i": 1 } as React.CSSProperties}>
-            <SessionStarter variant="home" initialAgentId={intent?.agentId} focusSignal={intent?.compose} />
+            <SessionStarter
+              variant="home"
+              initialAgentId={intent?.agentId}
+              focusSignal={intent?.compose}
+              quietFailure={everythingDown}
+            />
           </div>
         </div>
       </div>

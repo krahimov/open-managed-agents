@@ -18,7 +18,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { getActiveTenantId } from "@/lib/api";
+import { fetchFileContent } from "../files/files";
 import type { Event } from "@/lib/events";
 import type { SessionOutputFile } from "@/lib/session-outputs";
 import { useCopy } from "@/lib/clipboard";
@@ -377,9 +377,9 @@ function FileThumb({ fileId }: { fileId: string }) {
   useEffect(() => {
     let url: string | null = null;
     let cancelled = false;
-    const tenant = getActiveTenantId();
-    fetch(`/v1/files/${fileId}/content`, { credentials: "include", headers: tenant ? { "x-active-tenant": tenant } : {} })
-      .then((res) => (res.ok ? res.blob() : Promise.reject(new Error(String(res.status)))))
+    const ctrl = new AbortController();
+    // fetchFileContent sends the Clerk bearer and the workspace header.
+    fetchFileContent(fileId, ctrl.signal)
       .then((blob) => {
         if (cancelled) return;
         url = URL.createObjectURL(blob);
@@ -388,6 +388,7 @@ function FileThumb({ fileId }: { fileId: string }) {
       .catch(() => !cancelled && setFailed(true));
     return () => {
       cancelled = true;
+      ctrl.abort();
       if (url) URL.revokeObjectURL(url);
     };
   }, [fileId]);
@@ -733,12 +734,12 @@ function BlockView({
 
     case "card":
       if (block.card === "access_request")
-        return <AccessRequestCard event={block.event} sessionId={sessionId} state={block.request} granted={block.granted} />;
+        return <AccessRequestCard event={block.event} sessionId={sessionId} state={block.request} granted={block.granted} agentName={agent.name} />;
       if (block.card === "saved_login") return <SavedLoginLine event={block.event} sessionId={sessionId} switched={block.granted} />;
       if (block.card === "memory_enabled") return <MemoryEnabledCard event={block.event} />;
       if (block.card === "ambient_rule") return <AmbientRuleCard event={block.event} />;
       if (block.card === "mission_verdict") return <MissionVerdictCard event={block.event} />;
-      return <SkillRequestCard event={block.event} sessionId={sessionId} state={block.request} />;
+      return <SkillRequestCard event={block.event} sessionId={sessionId} state={block.request} agentName={agent.name} />;
 
     case "note":
       return <InlineNote block={block} onSelectThread={onSelectThread} />;

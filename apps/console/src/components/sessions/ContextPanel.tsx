@@ -169,10 +169,12 @@ export function ContextPanel({
 }) {
   const ready = trajectory && trajectory !== "loading" && trajectory !== "error" ? trajectory : null;
   const tokens = ready?.summary?.token_usage;
-  const input = tokens?.input_tokens ?? usage.inputTokens;
+  // The trajectory's input_tokens is the total input, cache included; `input`
+  // here is the uncached part, as in SessionUsage.
   const output = tokens?.output_tokens ?? usage.outputTokens;
   const cached = tokens?.cache_read_input_tokens ?? usage.cacheReadTokens;
   const cacheWrite = tokens?.cache_creation_input_tokens ?? usage.cacheWriteTokens;
+  const input = tokens ? Math.max(0, (tokens.input_tokens ?? 0) - cached - cacheWrite) : usage.inputTokens;
   const totalTokens = input + output + cached + cacheWrite;
   const cost = ready?.trace_facts?.est_cost_usd;
   const localRuntime = environmentId === "env_local_runtime";

@@ -71,7 +71,7 @@ export function TrajectoryViewerModal({
   const s = ready?.summary;
   const tokens = s?.token_usage;
   const totalTokens = tokens
-    ? tokens.input_tokens + tokens.output_tokens + tokens.cache_read_input_tokens + (tokens.cache_creation_input_tokens ?? 0)
+    ? tokens.input_tokens + tokens.output_tokens // input_tokens already includes the cache
     : 0;
 
   return (

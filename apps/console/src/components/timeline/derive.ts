@@ -230,7 +230,7 @@ export function deriveSpans(
       if (matched?.e) sourceEvents.push(matched.e);
       if (ftMatch?.e) sourceEvents.push(ftMatch.e);
       const tokSummary = usage
-        ? `${formatCompact(usage.input_tokens + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0))} in · ${formatCompact(usage.output_tokens)} out`
+        ? `${formatCompact(usage.input_tokens)} in · ${formatCompact(usage.output_tokens)} out`
         : undefined;
       const ttftMs = ftMatch ? Math.max(0, ftMatch.t - t) : undefined;
       const ttftSummary = typeof ttftMs === "number" ? `first token ${formatElapsed(ttftMs)}` : undefined;

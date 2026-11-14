@@ -131,6 +131,11 @@ export function readRequests(
         const first = open.find((r) => r.kind === "skill");
         settle((r) => !(r.kind === "skill" && (named ? r.match === grant.skill : r === first)), "answered");
       } else if (isPersonMessage(e)) settle(() => false, "passed");
+    } else if (e.type === "system.access_granted") {
+      // The server's durable record of a grant, by request id. It settles the
+      // card even when no "[access granted]" note follows.
+      const rid = (e as { request_id?: unknown }).request_id;
+      if (typeof rid === "string" && rid) settle((r) => !(r.kind === "access" && r.key === rid), "answered");
     } else if (e.type === "session.status_terminated") {
       settle(() => false, "passed");
     }

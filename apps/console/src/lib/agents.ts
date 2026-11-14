@@ -33,6 +33,7 @@ const appName = (server: string) => MCP_REGISTRY.find((entry) => entry.id === se
 const HARNESS_LABEL: Record<string, string> = {
   "claude-agent-sdk": "Claude Agent SDK",
   "codex-sdk": "Codex SDK",
+  pi: "Pi agent",
   "acp-proxy": "Local runtime",
 };
 

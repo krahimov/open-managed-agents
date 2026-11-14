@@ -54,6 +54,7 @@ import {
   type EvalTrial,
   type Verdict,
 } from "../lib/evals";
+import { isReasoningLevel, REASONING_LEVEL_LABELS } from "@open-managed-agents/api-types";
 import type { Event } from "../lib/events";
 import { formatCompact, plural } from "../lib/format";
 import { cn } from "../lib/utils";
@@ -361,7 +362,7 @@ function TrialPage({
                         {grader && !judgeFailed && scored && !trajectoryPending && (
                           <p className="mt-2 text-xs text-fg-subtle">
                             Graded by {grader}
-                            {meta?.judge_reasoning_level ? ` at ${meta.judge_reasoning_level} reasoning` : ""}
+                            {meta?.judge_reasoning_level ? ` at ${reasoningWords(meta.judge_reasoning_level)} reasoning` : ""}
                           </p>
                         )}
                       </div>
@@ -482,7 +483,7 @@ function TrialPage({
                       <Property label="Judge" className={ASIDE_ROW}>
                         <span className="flex min-w-0 flex-wrap items-center gap-x-2">
                           <ModelBadge model={meta.judge_model_id} variant="plain" className="text-fg" />
-                          {meta.judge_reasoning_level && <span className="text-xs text-fg-subtle">{meta.judge_reasoning_level} reasoning</span>}
+                          {meta.judge_reasoning_level && <span className="text-xs text-fg-subtle">{reasoningWords(meta.judge_reasoning_level)} reasoning</span>}
                         </span>
                       </Property>
                     )}
@@ -661,4 +662,9 @@ function TrialSkeleton() {
       </div>
     </div>
   );
+}
+
+/** A reasoning level in words ("Extra High"), lower-cased to sit mid-sentence. */
+function reasoningWords(level: string): string {
+  return (isReasoningLevel(level) ? REASONING_LEVEL_LABELS[level] : level.replace(/[-_]/g, " ")).toLowerCase();
 }

@@ -9,6 +9,7 @@ import { useAsyncAction } from "../hooks/useAsyncAction";
 import { useApi } from "../lib/api";
 import { plural } from "../lib/format";
 import { useApiQuery } from "../lib/useApiQuery";
+import { useServerFeature } from "../lib/server-features";
 import type { AgentRecord } from "../types/agent";
 import { Callout } from "./Callout";
 import { ModelBadge } from "./ModelBadge";
@@ -28,6 +29,8 @@ const link = inlineLink;
 export function FirstRunGuide() {
   const { api } = useApi();
   const nav = useNavigate();
+  const hasRuntimes = useServerFeature("runtimes");
+  const hasOperations = useServerFeature("operations");
   const agents = useApiQuery<{ data: AgentRecord[] }>("/v1/agents", { limit: "50", status: "active" });
   const [chosenAgent, setChosenAgent] = useState("");
   const [sampleSession, setSampleSession] = useState<string | null>(null);
@@ -64,12 +67,14 @@ export function FirstRunGuide() {
     },
     {
       title: "Check execution access",
-      body: "Configure a model provider and environment, or connect a local runtime. Connect the apps your task needs.",
+      body: hasRuntimes
+        ? "Configure a model provider and environment, or connect a local runtime. Connect the apps your task needs."
+        : "Configure a model provider and an environment. Connect the apps your task needs.",
       links: (
         <>
           <Link className={link} to="/model-cards">Models</Link>
           <Link className={link} to="/environments">Environments</Link>
-          <Link className={link} to="/runtimes">Runtimes</Link>
+          {hasRuntimes && <Link className={link} to="/runtimes">Runtimes</Link>}
           <Link className={link} to="/integrations/apps">Apps</Link>
         </>
       ),
@@ -77,7 +82,9 @@ export function FirstRunGuide() {
     {
       title: "Try a small task",
       body: "Send the sample below, then inspect its response, events, and usage.",
-      links: <Link className={link} to="/operations">Review approvals and failures</Link>,
+      links: hasOperations
+        ? <Link className={link} to="/operations">Review approvals and failures</Link>
+        : <Link className={link} to="/sessions">See your sessions</Link>,
       done: !!sampleSession,
     },
   ];

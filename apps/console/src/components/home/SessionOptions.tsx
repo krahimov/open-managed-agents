@@ -493,7 +493,9 @@ function OptionsBody({ options, agent }: { options: SessionOptions; agent: Agent
     options.environmentId === options.pinnedEnvironmentId ? (
       "The environment you started from. It stays if you change the agent."
     ) : undefined
-  ) : options.environmentMissing || options.environmentChanged ? undefined : (
+  ) : options.environmentMissing || options.environmentChanged ? undefined : options.environmentIsFallback ? (
+    `The first environment in this workspace. ${agent?.name ?? "This agent"} has no default of its own.`
+  ) : (
     `${agent?.name ?? "This agent"}'s default environment.`
   );
 

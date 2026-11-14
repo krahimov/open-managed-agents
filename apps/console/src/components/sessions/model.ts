@@ -760,6 +760,9 @@ export function buildConversation(events: Event[], opts: { running?: boolean } =
 // ── usage ───────────────────────────────────────────────────────────────
 
 export interface SessionUsage {
+  /** Input that was neither read from nor written to the cache. The runtime's
+   *  `model_usage.input_tokens` is the TOTAL input (AI SDK semantics, which Pi
+   *  mirrors), so the cache buckets are taken out of it here. */
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens: number;
@@ -801,10 +804,12 @@ export function summarizeUsage(events: Event[]): SessionUsage {
         (e.data as { model_usage?: Record<string, number> } | undefined)?.model_usage;
       u.modelCalls += 1;
       if (usage) {
-        u.inputTokens += usage.input_tokens ?? 0;
+        const cacheRead = usage.cache_read_input_tokens ?? 0;
+        const cacheWrite = usage.cache_creation_input_tokens ?? 0;
+        u.inputTokens += Math.max(0, (usage.input_tokens ?? 0) - cacheRead - cacheWrite);
         u.outputTokens += usage.output_tokens ?? 0;
-        u.cacheReadTokens += usage.cache_read_input_tokens ?? 0;
-        u.cacheWriteTokens += usage.cache_creation_input_tokens ?? 0;
+        u.cacheReadTokens += cacheRead;
+        u.cacheWriteTokens += cacheWrite;
       }
     } else if (TOOL_USE.has(e.type)) {
       u.toolCalls += 1;

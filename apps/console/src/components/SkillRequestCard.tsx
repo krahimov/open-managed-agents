@@ -30,8 +30,11 @@ export function SkillRequestCard({
   event,
   sessionId: sessionIdProp,
   state = "open",
+  agentName: agentNameProp,
 }: {
   event: Event;
+  /** The asking agent's name; "The agent" when unknown. */
+  agentName?: string;
   /** What the log says became of this request. */
   state?: "open" | "answered" | "passed";
   /** SessionChat must pass this: its route param is the AGENT id. */
@@ -81,11 +84,12 @@ export function SkillRequestCard({
   };
 
   const unknown = ev.resolution === "unknown";
+  const agentName = agentNameProp?.trim() || "The agent";
   if (status === "attached" || state === "answered") {
     return (
       <AnsweredRequest>
         <span className="font-medium text-fg">{name}</span> attached.{" "}
-        {status === "attached" ? "The agent has the playbook and is picking the task back up." : "The agent was given the playbook and carried on."}
+        {status === "attached" ? `${agentName} has the playbook and is picking the task back up.` : `${agentName} was given the playbook and carried on.`}
       </AnsweredRequest>
     );
   }
@@ -94,7 +98,7 @@ export function SkillRequestCard({
     return (
       <PassedRequest
         icon={PuzzleIcon}
-        title={`The agent asked for the ${name} skill`}
+        title={`${agentName} asked for the ${name} skill`}
         note={ev.reason}
         action={
           unknown ? (
@@ -117,7 +121,7 @@ export function SkillRequestCard({
       kind="approval"
       className={NEEDS_YOU_CARD}
       icon={PuzzleIcon}
-      title={`The agent asks for the ${name} skill`}
+      title={`${agentName} asks for the ${name} skill`}
       subtitle={ev.reason || "It says this skill would help with the task."}
       meta={
         ev.resolution === "installed" ? (

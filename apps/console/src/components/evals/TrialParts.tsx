@@ -353,7 +353,7 @@ export function TraceFactsCard({ facts }: { facts: TraceFacts }) {
     OUTCOME[facts.outcome] ?? humanizeId(facts.outcome),
     plural(facts.turns, "turn"),
     formatSpan(facts.duration_ms / 1000),
-    `${formatCompact(tok.input_tokens + (tok.cache_read_input_tokens ?? 0))} tokens in, ${formatCompact(tok.output_tokens)} out`,
+    `${formatCompact(tok.input_tokens)} tokens in, ${formatCompact(tok.output_tokens)} out`,
   ];
   const empty =
     tools.length === 0 &&

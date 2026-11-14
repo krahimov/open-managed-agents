@@ -114,6 +114,7 @@ export function SessionStarter({
   autoFocus,
   onNavigate,
   onBusyChange,
+  quietFailure,
   className,
 }: {
   /** `home`: centred under the greeting. `dialog`: inside <NewSessionDialog>. */
@@ -129,6 +130,9 @@ export function SessionStarter({
    *  the agent gallery): a dialog that holds it closes. */
   onNavigate?: () => void;
   onBusyChange?: (busy: boolean) => void;
+  /** The page already says the workspace could not be reached (and retries
+   *  the agents): the starter keeps its own failure notice out of the way. */
+  quietFailure?: boolean;
   className?: string;
 }) {
   const nav = useNavigate();
@@ -765,7 +769,7 @@ export function SessionStarter({
             <span>Paste or drop a file to attach it</span>
           </p>
         )}
-        {agentsFailed ? (
+        {agentsFailed && quietFailure ? null : agentsFailed ? (
           <QueryProblem
             compact
             className="w-full text-left"

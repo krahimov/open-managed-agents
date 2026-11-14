@@ -244,7 +244,8 @@ function turnTokens(events: Event[]) {
       (e.data as { model_usage?: Record<string, number> } | undefined)?.model_usage;
     calls += 1;
     if (usage) {
-      input += (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
+      // input_tokens is already the total input, cache reads and writes included.
+      input += usage.input_tokens ?? 0;
       output += usage.output_tokens ?? 0;
     }
   }

@@ -47,6 +47,13 @@ describe("requests an agent makes of a person", () => {
     expect(readRequests(skill).states.get("skreq-3")).toBe("answered");
   });
 
+  it("are answered by the server's durable grant record, with no note after it", () => {
+    const log = events([say("Build the plan"), HUBSPOT, RETELL, { type: "system.access_granted", request_id: "acreq-2", service: "retell" }]);
+    const read = readRequests(log);
+    expect(read.open.map((r) => r.name)).toEqual(["HubSpot"]);
+    expect(read.states.get("acreq-2")).toBe("answered");
+  });
+
   it("are passed over, not left waiting for ever, when the person replies in words", () => {
     const log = events([say("Build the plan"), HUBSPOT, DOCX, say("Skip HubSpot, use what the ticket says.")]);
     const read = readRequests(log);

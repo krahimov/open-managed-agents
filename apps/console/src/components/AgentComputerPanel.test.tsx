@@ -81,7 +81,7 @@ describe("AgentComputerPanel", () => {
     renderPanel();
 
     expect(await screen.findByText(/runs each session in a fresh sandbox/)).toBeInTheDocument();
-    expect(screen.getByText(/edit the agent and, under Sandbox/)).toHaveTextContent(
+    expect(screen.getByText(/edit the agent, open All settings and, under Sandbox/)).toHaveTextContent(
       "choose a default environment marked “persistent agent computer”",
     );
     expect(screen.queryByText(/not enabled/)).not.toBeInTheDocument();

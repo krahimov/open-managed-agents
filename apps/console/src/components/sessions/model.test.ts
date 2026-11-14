@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { Event } from "@/lib/events";
 import { sessionTitle } from "@/lib/sessions";
 
-import { briefFailures, buildConversation, grantedRequestIds, handoffKey, handoffKeyOf, type Block, type Conversation, type ToolCall } from "./model";
+import { briefFailures, buildConversation, grantedRequestIds, handoffKey, handoffKeyOf, summarizeUsage, type Block, type Conversation, type ToolCall } from "./model";
 
 const events = (list: Array<Record<string, unknown>>): Event[] =>
   list.map((e, i) => ({ id: `e${i}`, seq: i + 1, ts: 1_800_000_000_000 + i * 1000, ...e })) as unknown as Event[];
@@ -377,5 +377,21 @@ describe("a grant the server recorded", () => {
         ),
       ],
     ).toEqual(["a"]);
+  });
+});
+
+describe("session usage", () => {
+  it("does not count cached input twice: the runtime's input_tokens is the total", () => {
+    const u = summarizeUsage(
+      events([
+        { type: "user.message", content: [{ type: "text", text: "hi" }] },
+        { type: "span.model_request_end", model_usage: { input_tokens: 5200, output_tokens: 40, cache_read_input_tokens: 4000, cache_creation_input_tokens: 0 } },
+        { type: "span.model_request_end", model_usage: { input_tokens: 1200, output_tokens: 10, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
+      ]),
+    );
+    expect(u.inputTokens).toBe(2400);
+    expect(u.cacheReadTokens).toBe(4000);
+    expect(u.outputTokens).toBe(50);
+    expect(u.modelCalls).toBe(2);
   });
 });
