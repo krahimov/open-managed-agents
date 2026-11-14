@@ -1,5 +1,82 @@
 # Muse console on main: port notes
 
+## Final state (integration pass, 2026-11-14)
+
+Branch `feat/muse-console` in `~/Desktop/oma-muse-prod`, on top of `origin/main` e9d33b8d2. Not pushed. Option C of `~/Desktop/oma-redesign-r3/_rig/notes/muse/port-scout/PLAN.md`, with the adversarial check's corrections.
+
+### What ships
+
+- **Console**: Muse (`apps/console/`) with main's newer console features rebuilt in Muse's design: stale-chunk reload and the update prompt, the Telegram connect page and band, any-file attachments with output links, per-turn files and authed downloads, approvals on the session's own `user.tool_confirmation` (deny reason, sub-agent thread), deferred-MCP unwrapping, custom-tool waits, the `system.access_granted` fold (session page and lists), MCP sign-in through the start token with the one-time app setup, the saved-login line, the agent computer panel and live desktop (noVNC), Setup chat, computer-aware delete, the model/reasoning pickers (main's five levels, Medium as unset), explicit memory Off, default environments that never pick a persistent agent computer, and the 402 shown in place.
+- **Backend (apps/main-node, additive, no drizzle migration, no auth change)**: JSON 404 for unknown `/v1/*` and `/public/v1/*` when the console is served; `GET /v1/server_features` → `{features:["workspace_access","usage"]}`; read-only `GET /v1/workspace/access` (role nested under `authorization`, `member` → `admin`, auth-disabled and API-key callers → `owner`, never null); the usage tracker (`usage_turns`, created by ensureSchema, BIGINT/DOUBLE) behind `GET /v1/usage`, wired to the default loop, Pi, claude-agent-sdk and codex-sdk.
+- **CI**: `.github/workflows/ci.yml` now runs `pnpm --filter managed-agents-console typecheck` before the console tests (correction 1).
+- **Dev**: `vite.config.ts` sets `optimizeDeps.esbuildOptions.target = "es2022"`, so `vite` dev starts with noVNC's top-level await. `__main_tests__/` is gone and its tsc/vitest excludes removed.
+
+### Hidden in production, and why
+
+`/v1/server_features` lists only `workspace_access` and `usage`. Everything else the console can draw is hidden by `useServerFeature`, because main-node has no endpoint for it (or only a stub). A typed URL reaches the page's "not available on this server" state, never an error.
+
+| Surface | Feature key | Why it is hidden on main |
+|---|---|---|
+| Operations page, its nav item, count and `g` chord; Home's "Open operations" | `operations` | No `/v1/operations` on main. Home's bands and the Sessions filters (Waiting on you, Failed, Stalled) are served from the session logs instead. |
+| Run until done, mission banner and stop | `missions` | Missions are not on main (verifiers not yet reviewed for prod). |
+| Workspace members list, role change, history | `workspace_admin` | No RBAC/audit on main. Workspace shows only you, read-only. |
+| Budgets | `budgets` | No execution budgets on main. |
+| API key scopes, resources, expiry | `scoped_keys` | Main mints full-access keys that never expire; the form says so ("Full access, no expiry"). |
+| New simulation, Generate scenarios | `simulations`, `draft_scenarios` | Not on main. |
+| Compare versions | `comparisons` | No `/v1/evals/comparisons` on main. |
+| Memory store edit, delete, archive, history, redact; the Archived filter | `memory_writes` | Main has only create/read routes for memory stores. |
+| Skill zip upload and versions | `skill_versions` | CF-only routes. |
+| Local runtimes (nav, page, connect, revoke; the first-run guide's link) | `runtimes` | `GET /v1/runtimes` is a stub on Node; no runtime bridge. |
+| CLI device-flow sign-in in Add credential | `cap_cli` | CF-only routes. |
+| `/_kit` | (dev builds only) | Design kit; reads `/v1/usage`. |
+
+### Gate (all at the final commit)
+
+- `corepack pnpm --filter managed-agents-console typecheck`: pass. `test`: 79 files, 606 tests, 0 skipped. `build`: pass.
+- `corepack pnpm run typecheck` (root: packages incl. api-types, auth, http-routes, plus main-node): pass. `http-routes` and `auth` own tsconfigs: pass.
+- `corepack pnpm --filter main-node test` with `PG_TEST_URL` on a throwaway `postgres:16-alpine`: 821 pass, 3 fail, 2 skipped. The 3 failures are **pre-existing on origin/main**, in code this branch does not touch (byte-identical to main): `pg-queue.test.ts` (2, packages/queue SKIP LOCKED test) and `pg-better-auth.test.ts` (1, its test-only schema lacks `tenant."createdAt"`). CI never sets `PG_TEST_URL`, so CI does not run them. Without `PG_TEST_URL` the suite is green.
+- `docker build .` (root Dockerfile): pass; the image boots, serves the console at `/` and answers an unknown `/v1` path with JSON 404.
+
+### Browser walk
+
+Against a local main-node built from this branch serving the built console (`CONSOLE_DIR=apps/console/dist`), with a local mock of the Anthropic Messages API behind an `ant-compatible` model card (no API credits). Light and dark, 1440 wide, plus a 390-wide pass.
+
+1. Fresh SQLite, auth disabled (:8891). 2. Throwaway Postgres 16 with better-auth sign-up through the console, then a second user as a plain `member` of the first user's pinned workspace (:8893). 3. Clerk mode: `scripts/clerk-sim.mjs` JWKS and tokens, a console built with a Clerk publishable key, and a stand-in for clerk-js in the browser (the real clerk-js needs a real Clerk instance); a pinned non-default workspace and the free-plan 402 (:8895).
+
+Walked: Home (attach CSV + PNG, send), session (report.md link downloads, turn files, attachment chips, image thumbnail), approvals (deny with a reason, allow; sub-agent thread approval sends `session_thread_id`), deferred-MCP rows, the custom-tool wait, the granted access card, Agents (blank agent with memory chosen Off and a trigger: memory stays `{mode:"off"}`), agent page (computer panel on a sandbox-only agent, Setup chat, computer-aware delete), Sessions, Files (Upload button), Vaults (MCP OAuth through the start token: no confirm page), Integrations, Evals (a scripted run and its page), Usage (after turns), Workspace (owner; member reads Administrator), API keys (no scope fields), Telegram connect page, a stale tab after a rebuild (the chunk reloads into the page; the update toast). No `/v1` response was text/html; no console errors except expected resource 404s (see caveats).
+
+### Before merging / deploying
+
+- **Check prod Postgres for an existing `usage_turns` table** (Neon is shared). `CREATE TABLE IF NOT EXISTS` would silently adopt a same-named table. Usage history starts on deploy day.
+- `PLATFORM_ROOT_SECRET` must be set in prod for the native integration cards (Slack, GitHub, Linear) to read their installations; without it those reads 404 and the cards say "Status unavailable".
+- Rollback is a redeploy of the previous image; there are no drizzle migrations.
+
+### Known gaps (not blockers)
+
+- The real clerk-js sign-in widget was not exercised (needs a real Clerk instance); the console's Clerk token bridge, bearer and tenant headers were, through the stand-in.
+- claude-agent-sdk and codex-sdk usage recording is covered by unit tests only (needs host CLIs and subscriptions).
+- The noVNC live desktop was checked only with a mocked machine (no Daytona locally).
+- The access card keeps "Waiting for <App>…" if the popup is closed without finishing (same as main).
+- Eval sessions are titled by the runner (`eval evrun-… :: task`), a raw server string in Recents.
+- `/v1/sessions/:id/memory_stores` routes in index.ts are registered after `app.route("/v1", v1)` and so are dead (as on main). The model-card probe for `ant-compatible` cards whose `base_url` ends in `/v1` calls `/v1/v1/messages` (as on main).
+- `test/e2e/console.spec.ts` (Playwright) is stale on main too and stays out of the gate (correction 11).
+
+### Later waves (each its own PR; add the key to `apps/main-node/src/lib/server-features.ts` and its test in the same change)
+
+1. Memory-store write routes, ported from CF into http-routes/memory (`memory_writes`). M, no migration.
+2. Operations-lite GET (bounded scan, `dead` → `dead_letter`), then retry/discard on main's lease-epoch queue (`operations`). M.
+3. Eval comparisons (`comparisons`). M.
+4. RBAC, audit and scoped/expiring API keys together (`workspace_admin`, `scoped_keys`). L. Renumbered `0009_administration` with a fresh `when`, without the bootstrap `API_KEY` line.
+5. Budgets (`budgets`). L.
+6. Simulations, draft_scenarios and memory facts (`simulations`, `draft_scenarios`). L. Renumbered migrations.
+7. Missions, after a sandboxed-verifier review (`missions`). L.
+8. Skill versions and cap-cli (`skill_versions`, `cap_cli`). M.
+9. Runtimes (`runtimes`). L.
+
+---
+
+## Step 0 baseline (historical)
+
 Step 0 (baseline) of `~/Desktop/oma-redesign-r3/_rig/notes/muse/port-scout/PLAN.md`, option C, with the plan's "Adversarial check" corrections applied. Read the plan for the why; this file is the what.
 
 ## Refs
@@ -61,7 +138,7 @@ The rules that cross slices:
 
 - **Run the console with** `corepack pnpm --filter managed-agents-console typecheck|test|build`. `--filter console` matches nothing and exits 0.
 - msw is strict (`onUnhandledRequest: "error"`). The global handler in `mocks/handlers.ts` answers `/v1/server_features` with every feature on. To test a hidden surface: `server.use(http.get("*/v1/server_features", () => HttpResponse.json({ features: [] })))`.
-- Many Muse tests mock `useApi` wholesale (`vi.mock("../lib/api", …)`, e.g. pages/Operations.test.tsx). Once a component calls `useServerFeature`, that mock receives `"/v1/server_features"`. Answer it, e.g. `if (path === "/v1/server_features") return { features: [...SERVER_FEATURE_KEYS] }`. A mock that throws a plain Error turns every feature off. `isNotOnServer` still comes from the real module when the mock spreads `original`.
+- **Corrected at integration:** mocking `useApi` wholesale does **not** reach `useServerFeature`. `src/test/setup.ts` loads `mocks/handlers.ts`, which imports `lib/server-features`, so its `./api` is bound to the real module before any test's `vi.mock` applies; the feature read always goes through msw (all features on by default). To test a hidden surface use `server.use(http.get("*/v1/server_features", …))` or `setQueryData(SERVER_FEATURES_QUERY_KEY, …)`. A test that stubs global `fetch` sees no features.
 - A ported main test is "done" when it lives next to its code, passes, and is deleted from `__main_tests__/`.
 
 ## File ownership
