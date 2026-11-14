@@ -10,6 +10,7 @@ import { cn } from "@/lib/utils";
 import { useAgents } from "../lib/directory";
 import { formatCompact, formatCost, plural } from "../lib/format";
 import type { WorkspaceAccess } from "../lib/operations";
+import { useServerFeatures } from "../lib/server-features";
 import { useApiMutation, useApiQuery } from "../lib/useApiQuery";
 import { Avatar } from "../components/Avatar";
 import { Chip, StatusBadge } from "../components/Badge";
@@ -75,20 +76,33 @@ const AUDIT_PREVIEW = 8;
  * Workspace settings: who you are here, who else is, how much agents may
  * spend, and a record of configuration changes. One narrow column, one
  * card per topic, the settings pattern the rest of the console follows.
+ *
+ * Each card is there only where the server keeps what it shows
+ * (`useServerFeatures`): roles (`workspace_access`), the member list, role
+ * changes and the history (`workspace_admin`), limits (`budgets`). A server
+ * without the member list still has you: Members then shows your own row,
+ * read-only, and says that roles are not managed here.
  */
 export function WorkspaceSettings() {
-  const access = useApiQuery<WorkspaceAccess>("/v1/workspace/access");
+  const features = useServerFeatures();
+  const has = (key: "workspace_access" | "workspace_admin" | "budgets") => features.data?.features.has(key) ?? false;
+  const accessOn = has("workspace_access");
+  const adminOn = has("workspace_admin");
+  const access = useApiQuery<WorkspaceAccess>(accessOn ? "/v1/workspace/access" : null);
   const me = useApiQuery<Me>("/v1/me");
   const auth = access.data?.authorization;
   const admin = !!auth && ["owner", "admin"].includes(auth.role);
-  const editable = admin && auth?.kind !== "api_key";
-  const budgetsSupported = !!access.data?.budgets_supported;
+  const editable = admin && auth?.kind !== "api_key" && adminOn;
+  const budgetsSupported = !!access.data?.budgets_supported && has("budgets");
 
-  const members = useApiQuery<{ data: Member[] }>("/v1/workspace/members", undefined, { enabled: admin });
-  const audit = useApiQuery<{ data: Audit[] }>("/v1/workspace/audit", AUDIT_PARAMS, { enabled: admin });
+  const members = useApiQuery<{ data: Member[] }>("/v1/workspace/members", undefined, { enabled: admin && adminOn });
+  const audit = useApiQuery<{ data: Audit[] }>("/v1/workspace/audit", AUDIT_PARAMS, { enabled: admin && adminOn });
   const budgets = useApiQuery<{ data: Budget[] }>("/v1/workspace/budgets", undefined, { enabled: admin && budgetsSupported });
 
   const tenantName = me.data?.tenant?.name;
+  const topics = [adminOn ? "Members" : "Your access", budgetsSupported ? "execution limits" : "", adminOn ? "administrative history" : ""].filter(Boolean);
+  const about = topics.length === 1 ? topics[0] : `${topics.slice(0, -1).join(", ")} and ${topics[topics.length - 1]}`;
+  const loading = features.isLoading || (accessOn && access.isLoading);
 
   return (
     <Page
@@ -100,11 +114,7 @@ export function WorkspaceSettings() {
         <PageHeader
           title="Workspace"
           width="wide"
-          subtitle={
-            tenantName
-              ? `Members, execution limits and administrative history for ${tenantName}.`
-              : "Members, execution limits and administrative history."
-          }
+          subtitle={tenantName ? `${about} for ${tenantName}.` : `${about}.`}
           actions={
             <Button variant="outline" asChild>
               <Link to="/api-keys">
@@ -116,10 +126,15 @@ export function WorkspaceSettings() {
         />
       }
     >
-      {access.error ? (
+      {accessOn && access.error ? (
         <ErrorState title="Your access could not be loaded" error={access.error} retry={access.refetch} />
-      ) : access.isLoading ? (
+      ) : loading ? (
         <LoadingStack />
+      ) : !accessOn ? (
+        // No roles on this server: everyone signed in manages the workspace.
+        <div className="animate-rise-in space-y-6">
+          <AccessCard auth={null} me={me.data ?? null} rolesKept={false} />
+        </div>
       ) : (
         <div className="animate-rise-in space-y-6">
           {/* Who you are here is said once. An administrator finds themselves
@@ -137,26 +152,29 @@ export function WorkspaceSettings() {
           {admin && (
             <>
               <MembersCard
-                query={members}
+                query={adminOn ? members : ONLY_YOU}
                 me={me.data ?? null}
                 selfRole={auth?.role}
                 editable={editable}
                 viewerIsOwner={auth?.role === "owner"}
+                listed={adminOn}
                 onSaved={() => {
                   void members.refetch();
                   void audit.refetch();
                 }}
               />
-              <LimitsCard
-                supported={budgetsSupported}
-                query={budgets}
-                editable={editable}
-                onSaved={() => {
-                  void budgets.refetch();
-                  void audit.refetch();
-                }}
-              />
-              <HistoryCard query={audit} me={me.data ?? null} />
+              {budgetsSupported && (
+                <LimitsCard
+                  supported
+                  query={budgets}
+                  editable={editable}
+                  onSaved={() => {
+                    void budgets.refetch();
+                    void audit.refetch();
+                  }}
+                />
+              )}
+              {adminOn && <HistoryCard query={audit} me={me.data ?? null} />}
             </>
           )}
         </div>
@@ -168,6 +186,9 @@ export function WorkspaceSettings() {
 const AUDIT_PARAMS = { limit: "50" } as const;
 
 type Query<T> = { data?: T; error: unknown; isLoading: boolean; isFetching: boolean; refetch: () => unknown };
+
+/** Where the server keeps no member list: an empty one, so Members shows only you. */
+const ONLY_YOU: Query<{ data: Member[] }> = { data: { data: [] }, error: null, isLoading: false, isFetching: false, refetch: () => undefined };
 
 function LoadingStack() {
   return (
@@ -208,7 +229,35 @@ function RowSkeletons({ rows }: { rows: number }) {
  * the one place their role is said. (An administrator's own row in
  * Members says it; showing both put the same person on the page twice.)
  */
-function AccessCard({ auth, me }: { auth: WorkspaceAccess["authorization"]; me: Me | null }) {
+function AccessCard({
+  auth,
+  me,
+  rolesKept = true,
+}: {
+  auth: WorkspaceAccess["authorization"];
+  me: Me | null;
+  /** False on a server that keeps no workspace roles: there is no role to say. */
+  rolesKept?: boolean;
+}) {
+  if (!rolesKept) {
+    const name = me?.user?.name?.trim() || me?.user?.email || "You";
+    return (
+      <section className="surface rounded-xl">
+        <div className="flex flex-col gap-4 p-5 sm:flex-row sm:items-center">
+          <Avatar name={name} size="lg" />
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-h3 text-fg" title={name}>
+              {name}
+            </p>
+            {me?.user?.email && me.user.name && <p className="mt-0.5 truncate text-small text-fg-muted">{me.user.email}</p>}
+          </div>
+        </div>
+        <div className="border-t border-border px-5 py-3 text-small text-fg-muted">
+          This server keeps no workspace roles: everyone signed in to the workspace can run and change its agents.
+        </div>
+      </section>
+    );
+  }
   if (!auth) {
     return (
       <Callout tone="warning" title="No workspace role">
@@ -251,6 +300,7 @@ function MembersCard({
   selfRole,
   editable,
   viewerIsOwner,
+  listed: kept = true,
   onSaved,
 }: {
   query: Query<{ data: Member[] }>;
@@ -259,6 +309,8 @@ function MembersCard({
   selfRole?: string;
   editable: boolean;
   viewerIsOwner: boolean;
+  /** False on a server that keeps no member list: only your own row, read-only. */
+  listed?: boolean;
   onSaved: () => void;
 }) {
   const listed = query.data?.data ?? [];
@@ -270,17 +322,21 @@ function MembersCard({
   return (
     <SectionCard
       title="Members"
-      description="People in this workspace and what each may do."
+      description={kept ? "People in this workspace and what each may do." : "Who you are in this workspace."}
       flush
       footer={
-        <dl className="grid gap-x-8 gap-y-2.5 sm:grid-cols-2">
-          {ROLES.map((r) => (
-            <div key={r.value}>
-              <dt className="text-xs font-medium text-fg">{r.label}</dt>
-              <dd className="text-xs text-fg-subtle">{r.can}</dd>
-            </div>
-          ))}
-        </dl>
+        !kept ? (
+          <span>This server does not list the other members or change roles from the console.</span>
+        ) : (
+          <dl className="grid gap-x-8 gap-y-2.5 sm:grid-cols-2">
+            {ROLES.map((r) => (
+              <div key={r.value}>
+                <dt className="text-xs font-medium text-fg">{r.label}</dt>
+                <dd className="text-xs text-fg-subtle">{r.can}</dd>
+              </div>
+            ))}
+          </dl>
+        )
       }
     >
       {query.error ? (
@@ -304,8 +360,17 @@ function MembersCard({
               member={member}
               isYou={!!me?.user && me.user.id === member.user_id}
               displayName={me?.user && me.user.id === member.user_id ? me.user.name?.trim() || me.user.email : undefined}
-              caption={onlyYou ? "The only member so far. Others appear here once they sign in." : undefined}
+              caption={
+                onlyYou
+                  ? kept
+                    ? "The only member so far. Others appear here once they sign in."
+                    : me?.user?.name?.trim() && me.user.email
+                      ? me.user.email
+                      : "Your account"
+                  : undefined
+              }
               editable={editable && !onlyYou}
+              readOnly={!kept}
               viewerIsOwner={viewerIsOwner}
               onSaved={onSaved}
             />
@@ -323,6 +388,7 @@ function MemberRow({
   caption,
   editable,
   viewerIsOwner,
+  readOnly = false,
   onSaved,
 }: {
   member: Member;
@@ -332,6 +398,8 @@ function MemberRow({
   caption?: string;
   editable: boolean;
   viewerIsOwner: boolean;
+  /** The role is said, not offered: there is nothing to change it with. */
+  readOnly?: boolean;
   onSaved: () => void;
 }) {
   const current = member.role === "member" ? "operator" : member.role;
@@ -373,41 +441,45 @@ function MemberRow({
             )}
           </p>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          {dirty && (
-            <>
-              <Button variant="ghost" size="sm" onClick={() => setRole(current)} disabled={save.isPending}>
-                Cancel
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                loading={save.isPending}
-                onClick={() =>
-                  save.mutate({ path: `/v1/workspace/members/${encodeURIComponent(member.user_id)}`, method: "PUT", body: { role } })
-                }
-              >
-                Save role
-              </Button>
-            </>
-          )}
-          <Tip label={lockReason}>
-            <span>
-              <Select
-                value={role}
-                onValueChange={setRole}
-                disabled={locked || save.isPending}
-                placeholder={`Role for ${name}`}
-                className="h-8 w-[9.5rem]"
-              >
-                <SelectOption value="viewer">Viewer</SelectOption>
-                <SelectOption value="operator">Operator</SelectOption>
-                <SelectOption value="admin">Administrator</SelectOption>
-                {(viewerIsOwner || member.role === "owner") && <SelectOption value="owner">Owner</SelectOption>}
-              </Select>
-            </span>
-          </Tip>
-        </div>
+        {readOnly ? (
+          <Chip className="shrink-0">{roleMeta(current).label}</Chip>
+        ) : (
+          <div className="flex shrink-0 items-center gap-2">
+            {dirty && (
+              <>
+                <Button variant="ghost" size="sm" onClick={() => setRole(current)} disabled={save.isPending}>
+                  Cancel
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  loading={save.isPending}
+                  onClick={() =>
+                    save.mutate({ path: `/v1/workspace/members/${encodeURIComponent(member.user_id)}`, method: "PUT", body: { role } })
+                  }
+                >
+                  Save role
+                </Button>
+              </>
+            )}
+            <Tip label={lockReason}>
+              <span>
+                <Select
+                  value={role}
+                  onValueChange={setRole}
+                  disabled={locked || save.isPending}
+                  placeholder={`Role for ${name}`}
+                  className="h-8 w-[9.5rem]"
+                >
+                  <SelectOption value="viewer">Viewer</SelectOption>
+                  <SelectOption value="operator">Operator</SelectOption>
+                  <SelectOption value="admin">Administrator</SelectOption>
+                  {(viewerIsOwner || member.role === "owner") && <SelectOption value="owner">Owner</SelectOption>}
+                </Select>
+              </span>
+            </Tip>
+          </div>
+        )}
       </div>
       {save.error && (
         <p role="alert" className="mt-2 text-xs text-danger">

@@ -9,6 +9,7 @@ import { useAsyncAction } from "../hooks/useAsyncAction";
 import { useApi } from "../lib/api";
 import { copyText } from "../lib/clipboard";
 import { formatAbsolute, formatDate, formatRelativeTime, plural, toDate } from "../lib/format";
+import { useServerFeature } from "../lib/server-features";
 import { Chip, StatusBadge } from "../components/Badge";
 import { Callout } from "../components/Callout";
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -85,9 +86,16 @@ function expiryState(expiresAt: string | null | undefined): ExpiryState {
  * key (what it can do, when it stops working, when it was last used), a
  * create dialog that defaults to the safest choice, and a one-time reveal
  * of the secret.
+ *
+ * Scopes, resource restrictions and expiry are offered only where the server
+ * honours them (`useServerFeature("scoped_keys")`). Elsewhere a key has full
+ * access and never expires whatever the form says, so the form asks for a
+ * name only, says so, and lists every key as "Full access". "Last used" is
+ * shown only when the server records it.
  */
 export function ApiKeysList() {
   const { api } = useApi();
+  const scoped = useServerFeature("scoped_keys");
   const [keys, setKeys] = useState<ApiKey[]>([]);
   const found = useLocalSearch(keys, (k) => [k.name, k.prefix, ...(k.scopes ?? [])]);
   const [loading, setLoading] = useState(true);
@@ -105,6 +113,9 @@ export function ApiKeysList() {
   const resetTimer = useRef<number | null>(null);
 
   const [revoking, setRevoking] = useState<ApiKey | null>(null);
+  // A server that records when a key was last used sends the field on every
+  // row (null until first use); one that does not, never sends it.
+  const lastUsedKept = keys.some((k) => "last_used_at" in k);
 
   const load = async () => {
     setLoading(true);
@@ -153,6 +164,14 @@ export function ApiKeysList() {
   const create = useAsyncAction(async () => {
     setError("");
     try {
+      const keyName = name.trim() || "Untitled key";
+      if (!scoped) {
+        // The server makes every key a full-access key that does not expire.
+        const result = await api<{ key: string }>("/v1/api_keys", { method: "POST", body: JSON.stringify({ name: keyName }) });
+        setCreated({ key: result.key, name: keyName, scopes: ["*"], expiresAt: null });
+        void load();
+        return;
+      }
       const parsedScopes = scopes.split(/[\s,]+/).filter(Boolean);
       if (!parsedScopes.length) throw new Error("Choose at least one permission scope.");
       const expiresAt = expiry ? new Date(`${expiry}T23:59:59.999Z`).toISOString() : null;
@@ -173,7 +192,6 @@ export function ApiKeysList() {
           throw new Error("Each resource restriction needs a nonempty list of IDs.");
         }
       }
-      const keyName = name.trim() || "Untitled key";
       const result = await api<{ key: string }>("/v1/api_keys", {
         method: "POST",
         body: JSON.stringify({ name: keyName, scopes: parsedScopes, expires_at: expiresAt, ...(ids ? { resource_ids: ids } : {}) }),
@@ -218,9 +236,9 @@ export function ApiKeysList() {
         size: 320,
         cell: ({ row }) => {
           const k = row.original;
-          const raw = k.scopes ?? ["*"];
+          const raw = scoped ? (k.scopes ?? ["*"]) : ["*"];
           const parts = describeScopes(raw);
-          const restricted = Object.entries(k.resource_ids ?? {});
+          const restricted = scoped ? Object.entries(k.resource_ids ?? {}) : [];
           return (
             <div className="flex min-w-0 items-center gap-1.5">
               <ChipRow label="Scopes" items={parts.map((p) => ({ key: p.label, label: p.label, mono: p.mono }))} />
@@ -248,7 +266,7 @@ export function ApiKeysList() {
         enableSorting: true,
         cell: ({ row }) => {
           const k = row.original;
-          const state = expiryState(k.expires_at);
+          const state = scoped ? expiryState(k.expires_at) : "none";
           if (state === "none") return <span className="text-fg-subtle">Never</span>;
           if (state === "expired") return <StatusBadge status="expired" />;
           if (state === "soon") {
@@ -301,8 +319,8 @@ export function ApiKeysList() {
           />
         ),
       },
-    ],
-    [],
+    ].filter((c) => c.id !== "last_used" || lastUsedKept),
+    [scoped, lastUsedKept],
   );
 
   const activePreset = SCOPE_PRESETS.find((p) => normalizeScopes(p.value) === normalizeScopes(scopes));
@@ -317,7 +335,9 @@ export function ApiKeysList() {
         subtitle={
           created
             ? "This is the only time the full key is shown."
-            : "Give the key the least access that does the job."
+            : scoped
+              ? "Give the key the least access that does the job."
+              : "A key can do everything in this workspace until it is revoked."
         }
         footer={
           created ? (
@@ -373,67 +393,76 @@ export function ApiKeysList() {
               />
             </Field>
 
-            <div>
-              <Field label="Permission scopes">
-                <TextInput value={scopes} onChange={(e) => setScopes(e.target.value)} className="font-mono" spellCheck={false} />
-              </Field>
-              <PresetRow label="Scope presets">
-                {SCOPE_PRESETS.map((p) => (
-                  <PresetButton key={p.label} active={activePreset?.label === p.label} onClick={() => setScopes(p.value)}>
-                    {p.label}
-                  </PresetButton>
-                ))}
-              </PresetRow>
-              <p className="mt-2 text-xs text-fg-subtle">
-                {activePreset
-                  ? activePreset.hint
-                  : "Comma-separated, as resource:read or resource:write. For example agents:read, sessions:write."}
-              </p>
-            </div>
+            {!scoped ? (
+              <Callout tone="neutral" title="Full access, no expiry">
+                This server does not limit what a key can do or how long it works. Keep the key somewhere safe, and revoke it as soon
+                as it is no longer needed.
+              </Callout>
+            ) : (
+              <>
+                <div>
+                  <Field label="Permission scopes">
+                    <TextInput value={scopes} onChange={(e) => setScopes(e.target.value)} className="font-mono" spellCheck={false} />
+                  </Field>
+                  <PresetRow label="Scope presets">
+                    {SCOPE_PRESETS.map((p) => (
+                      <PresetButton key={p.label} active={activePreset?.label === p.label} onClick={() => setScopes(p.value)}>
+                        {p.label}
+                      </PresetButton>
+                    ))}
+                  </PresetRow>
+                  <p className="mt-2 text-xs text-fg-subtle">
+                    {activePreset
+                      ? activePreset.hint
+                      : "Comma-separated, as resource:read or resource:write. For example agents:read, sessions:write."}
+                  </p>
+                </div>
 
-            <div>
-              <Field label="Expiration date">
-                <DateField
-                  value={expiry}
-                  onChange={setExpiry}
-                  min={isoDay(0)}
-                  // The key ends at the end of a UTC day, so "today" is the UTC one.
-                  today={isoDay(0)}
-                  placeholder="No expiry"
-                  className="max-w-[13rem]"
-                />
-              </Field>
-              <PresetRow label="Expiry presets">
-                {EXPIRY_PRESETS.map((p) => (
-                  <PresetButton
-                    key={p.label}
-                    active={expiryPreset?.label === p.label}
-                    onClick={() => setExpiry(p.days === null ? "" : isoDay(p.days))}
+                <div>
+                  <Field label="Expiration date">
+                    <DateField
+                      value={expiry}
+                      onChange={setExpiry}
+                      min={isoDay(0)}
+                      // The key ends at the end of a UTC day, so "today" is the UTC one.
+                      today={isoDay(0)}
+                      placeholder="No expiry"
+                      className="max-w-[13rem]"
+                    />
+                  </Field>
+                  <PresetRow label="Expiry presets">
+                    {EXPIRY_PRESETS.map((p) => (
+                      <PresetButton
+                        key={p.label}
+                        active={expiryPreset?.label === p.label}
+                        onClick={() => setExpiry(p.days === null ? "" : isoDay(p.days))}
+                      >
+                        {p.label}
+                      </PresetButton>
+                    ))}
+                  </PresetRow>
+                  <p className="mt-2 text-xs text-fg-subtle">
+                    {expiry ? "The key stops working at the end of this day, UTC." : "The key works until someone revokes it."}
+                  </p>
+                </div>
+
+                <Disclosure title="Restrict to specific resources" meta={resourceIds.trim() ? "On" : "Optional"}>
+                  <Field
+                    label="Resource IDs as JSON"
+                    hint="A restricted key cannot list a restricted collection or read workspace-wide reports."
                   >
-                    {p.label}
-                  </PresetButton>
-                ))}
-              </PresetRow>
-              <p className="mt-2 text-xs text-fg-subtle">
-                {expiry ? "The key stops working at the end of this day, UTC." : "The key works until someone revokes it."}
-              </p>
-            </div>
-
-            <Disclosure title="Restrict to specific resources" meta={resourceIds.trim() ? "On" : "Optional"}>
-              <Field
-                label="Resource IDs as JSON"
-                hint="A restricted key cannot list a restricted collection or read workspace-wide reports."
-              >
-                <Textarea
-                  rows={3}
-                  value={resourceIds}
-                  onChange={(e) => setResourceIds(e.target.value)}
-                  className="font-mono text-xs md:text-xs"
-                  placeholder={'{"sessions": ["sess_123"]}'}
-                  spellCheck={false}
-                />
-              </Field>
-            </Disclosure>
+                    <Textarea
+                      rows={3}
+                      value={resourceIds}
+                      onChange={(e) => setResourceIds(e.target.value)}
+                      className="font-mono text-xs md:text-xs"
+                      placeholder={'{"sessions": ["sess_123"]}'}
+                      spellCheck={false}
+                    />
+                  </Field>
+                </Disclosure>
+              </>
+            )}
           </div>
         )}
       </Modal>
@@ -498,7 +527,9 @@ export function ApiKeysList() {
       emptySubtitle={
         found.searching
           ? "Keys are searched by name, prefix and scope."
-          : "Create a key to reach this workspace from the CLI, the SDK or your own services. New keys are read-only and expire in 90 days unless you choose otherwise."
+          : scoped
+            ? "Create a key to reach this workspace from the CLI, the SDK or your own services. New keys are read-only and expire in 90 days unless you choose otherwise."
+            : "Create a key to reach this workspace from the CLI, the SDK or your own services. A key has full access until it is revoked."
       }
       filtered={found.searching}
       emptyAction={
