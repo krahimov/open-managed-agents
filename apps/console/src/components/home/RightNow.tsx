@@ -5,6 +5,7 @@ import { ArrowRightIcon, CircleAlertIcon, CircleCheckIcon, CircleHelpIcon, HandI
 
 import { useApi } from "@/lib/api";
 import { useAgents, useOperations, useRecentSessions } from "@/lib/directory";
+import { useServerFeature } from "@/lib/server-features";
 import type { Event } from "@/lib/events";
 import { plural, toDate } from "@/lib/format";
 import { quietWords, STALLED_AFTER_MS, UNKNOWN_DETAIL, type SessionReading } from "@/lib/session-state";
@@ -48,9 +49,24 @@ import { formatClock, readPulse, type SessionPulse } from "./activity";
  *
  * Side by side from `lg`, stacked below it. When nothing is running and
  * nothing is waiting, the band is one quiet line.
+ *
+ * On a server without the operations report the bands read the stand-in
+ * the session logs make (`useSessionReadings().report`, source "logs"):
+ * running sessions from the sessions list, approvals and requests from each
+ * session's log. Failed work and budgets are the report's alone, so they are
+ * not listed (a failed turn is under "Recently finished"), and every "see
+ * all" goes to the Sessions list, filtered, instead of Operations.
  */
 
 type Ops = ReturnType<typeof useOperations>;
+
+/** Where "see all" goes: Operations where the server has it, else the Sessions list, filtered the same way. */
+function useBandLinks() {
+  const operations = useServerFeature("operations");
+  return operations
+    ? { running: "/operations?tab=running", approvals: "/operations?tab=approvals", waiting: "/operations", all: "/operations", allLabel: "Open operations" }
+    : { running: "/sessions?status=running", approvals: "/sessions?status=approval", waiting: "/sessions?status=approval", all: "/sessions?status=approval", allLabel: "Waiting on you" };
+}
 
 /** The newest events of a session, newest first. `live` keeps reading while the agent works. */
 export function useSessionTail(sessionId: string | undefined, opts: { live?: boolean; limit?: number } = {}) {
@@ -326,6 +342,7 @@ const MAX_STALLED = 2;
 
 export function RunningNow({ running, loading }: { running: RunningSession[]; loading: boolean }) {
   const { read } = useSessionReadings();
+  const links = useBandLinks();
   const now = useNow(30_000);
   // Live work and stalled work are told apart by the reading the lists
   // already hold; each row then sharpens it from its own newest events.
@@ -347,7 +364,7 @@ export function RunningNow({ running, loading }: { running: RunningSession[]; lo
         tone="info"
         action={
           running.length > 0 ? (
-            <Link to="/operations?tab=running" className={sectionLinkClass}>
+            <Link to={links.running} className={sectionLinkClass}>
               All running <ArrowRightIcon className="size-3.5" />
             </Link>
           ) : undefined
@@ -369,7 +386,7 @@ export function RunningNow({ running, loading }: { running: RunningSession[]; lo
               {more > 0 && (
                 <li>
                   <Link
-                    to="/operations?tab=running"
+                    to={links.running}
                     className="flex items-center justify-between px-4 py-3 text-small font-medium text-fg-muted transition-quick hover:bg-bg-hover hover:text-fg"
                   >
                     {plural(more, "more session")} running
@@ -401,7 +418,7 @@ export function RunningNow({ running, loading }: { running: RunningSession[]; lo
                 {moreStalled > 0 && (
                   <li>
                     <Link
-                      to="/operations?tab=running"
+                      to={links.running}
                       className="flex items-center justify-between px-4 py-3 text-small font-medium text-fg-muted transition-quick hover:bg-bg-hover hover:text-fg"
                     >
                       {plural(moreStalled, "more session")} stalled
@@ -450,14 +467,17 @@ export function NeedsAttention({ ops, view: given }: { ops: Ops; view: Operation
   // from each session's newest events, not from the report): add them here,
   // so the rows and the count are right whoever built the view.
   const readings = useSessionReadings();
+  const report = readings.report;
+  const fromLogs = readings.source === "logs";
+  const links = useBandLinks();
   const { byId: agents } = useAgents();
   const { sessions: recent } = useRecentSessions();
   const view = useMemo(
-    () => (given && ops.report ? buildOperationsView(ops.report, agents, recent, readings.requests, Date.now(), readings.failures) : given),
-    [given, ops.report, agents, recent, readings.requests, readings.failures],
+    () => (given && report ? buildOperationsView(report, agents, recent, readings.requests, Date.now(), readings.failures) : given),
+    [given, report, agents, recent, readings.requests, readings.failures],
   );
   const unknownIds = readings.unknownIds;
-  const titleOf = useMemo(() => sessionTitleLookup(ops.report, recent), [ops.report, recent]);
+  const titleOf = useMemo(() => sessionTitleLookup(report, recent), [report, recent]);
   const rows = useMemo<AttentionRow[]>(() => {
     if (!view) return [];
     const out: AttentionRow[] = [];
@@ -496,7 +516,7 @@ export function NeedsAttention({ ops, view: given }: { ops: Ops; view: Operation
           .slice(2)
           .map((a) => a.session.title)
           .join(" · "),
-        to: "/operations?tab=approvals",
+        to: links.approvals,
         action: "See all",
       });
     }
@@ -520,7 +540,7 @@ export function NeedsAttention({ ops, view: given }: { ops: Ops; view: Operation
           .slice(2)
           .map((r) => r.session.title)
           .join(" · "),
-        to: "/operations",
+        to: links.waiting,
         action: "See all",
       });
     }
@@ -542,7 +562,7 @@ export function NeedsAttention({ ops, view: given }: { ops: Ops; view: Operation
         kind: "unknown",
         title: `${plural(unknownIds.length, "session")} could not be checked for requests`,
         detail: unknownIds.map(titleOf).join(" · "),
-        to: "/operations",
+        to: links.waiting,
         action: "See all",
       });
     }
@@ -582,7 +602,7 @@ export function NeedsAttention({ ops, view: given }: { ops: Ops; view: Operation
       }
     }
     return out;
-  }, [view, unknownIds, titleOf, readings.unknown]);
+  }, [view, unknownIds, titleOf, readings.unknown, links]);
 
   // The band is drawn once, from whole evidence: the report, the names, and
   // the open requests (read from each session's newest events). Drawn
@@ -592,7 +612,9 @@ export function NeedsAttention({ ops, view: given }: { ops: Ops; view: Operation
   // take a while, and the report alone is worth showing by then.
   // The patience is the tab's, shared with the sidebar's badge.
   const waitForRequests = usePatienceForRequests(readings.requestsLoading);
-  const loading = ops.isLoading || waitForRequests;
+  // From the logs, approvals are in the same reads as the requests: without
+  // them nothing is known yet, so there is nothing to draw early.
+  const loading = ops.isLoading || (fromLogs ? readings.requestsLoading : waitForRequests);
 
   return (
     <section aria-label="Needs attention" className="flex min-w-0 flex-col">
@@ -601,12 +623,12 @@ export function NeedsAttention({ ops, view: given }: { ops: Ops; view: Operation
         count={loading ? undefined : view?.attention}
         tone="warning"
         action={
-          <Link to="/operations" className={sectionLinkClass}>
-            Open operations <ArrowRightIcon className="size-3.5" />
+          <Link to={links.all} className={sectionLinkClass}>
+            {links.allLabel} <ArrowRightIcon className="size-3.5" />
           </Link>
         }
       />
-      {ops.unsupported ? (
+      {ops.unsupported && !report ? (
         <Quiet title="Not reported by this runtime">
           Approvals and failures are shown on each session instead.{" "}
           <Link className={cn(quietLink, "text-fg")} to="/sessions">
@@ -619,7 +641,9 @@ export function NeedsAttention({ ops, view: given }: { ops: Ops; view: Operation
         <BandSkeleton />
       ) : rows.length === 0 ? (
         <Quiet icon={<CircleCheckIcon className="size-[18px] text-success" />} title="Nothing is waiting on you">
-          Approvals and requests an agent makes, and turns that fail, are listed here the moment they happen.
+          {fromLogs
+            ? "Approvals an agent asks for, and its requests for access to an app or for a skill, are listed here."
+            : "Approvals and requests an agent makes, and turns that fail, are listed here the moment they happen."}
         </Quiet>
       ) : (
         <>
@@ -672,8 +696,10 @@ export function NeedsAttention({ ops, view: given }: { ops: Ops; view: Operation
               );
             })}
           </ul>
-          {ops.report?.truncated && (
-            <p className="mt-2 text-xs text-fg-subtle">Counts cover the recent records returned by this runtime.</p>
+          {report?.truncated && (
+            <p className="mt-2 text-xs text-fg-subtle">
+              {fromLogs ? "Read from the 100 most recent sessions." : "Counts cover the recent records returned by this runtime."}
+            </p>
           )}
         </>
       )}
@@ -682,7 +708,7 @@ export function NeedsAttention({ ops, view: given }: { ops: Ops; view: Operation
 }
 
 /** A session's title by id, from the recent sessions or the report. */
-function sessionTitleLookup(report: Ops["report"], recent: SessionRecord[]) {
+function sessionTitleLookup(report: Ops["report"] | undefined, recent: SessionRecord[]) {
   const known = new Map(recent.map((s) => [s.id, s]));
   const rows = new Map((report?.sessions ?? []).map((s) => [s.id, s]));
   return (id: string): string => {
@@ -744,17 +770,18 @@ function BandSkeleton() {
  */
 export function AllQuiet() {
   const readings = useSessionReadings();
-  const ops = useOperations();
+  const { ops, report } = readings;
   const { byId: agents } = useAgents();
   const { sessions: recent } = useRecentSessions();
   // A session that could not be checked may be waiting on you: then this is
-  // not the quiet line either, but the band that says so.
+  // not the quiet line either, but the band that says so. (From the logs, an
+  // approval is found by the same reads, so it counts here too.)
   const view = useMemo(
     () =>
-      ops.report && (readings.counts.requests > 0 || readings.counts.unknown > 0)
-        ? buildOperationsView(ops.report, agents, recent, readings.requests, Date.now(), readings.failures)
+      report && (readings.counts.requests > 0 || readings.counts.unknown > 0 || readings.counts.approvals > 0)
+        ? buildOperationsView(report, agents, recent, readings.requests, Date.now(), readings.failures)
         : null,
-    [ops.report, agents, recent, readings.requests, readings.counts.requests, readings.counts.unknown, readings.failures],
+    [report, agents, recent, readings.requests, readings.counts.requests, readings.counts.unknown, readings.counts.approvals, readings.failures],
   );
   if (view) return <NeedsAttention ops={ops} view={view} />;
   if (readings.requestsLoading) {
@@ -770,6 +797,24 @@ export function AllQuiet() {
       <CircleCheckIcon className="size-4 shrink-0 text-success" />
       <span>
         <span className="font-medium text-fg">All quiet.</span> Nothing is running and nothing is waiting on you.
+      </span>
+    </p>
+  );
+}
+
+/**
+ * The band when neither the sessions nor a report could be read: what is
+ * running and what is waiting are not known, and the band says that, in
+ * one neutral line, rather than "Nothing is running". Why the reads failed
+ * is said once, by Home's banner above.
+ */
+export function AllUnknown() {
+  return (
+    <p className="flex items-center gap-2.5 rounded-xl border border-dashed border-border-strong/70 px-4 py-3.5 text-small text-fg-muted">
+      <CircleHelpIcon className="size-4 shrink-0 text-fg-subtle" />
+      <span>
+        <span className="font-medium text-fg">Not known right now.</span> What is running and what is waiting on you shows here again once
+        the sessions can be read.
       </span>
     </p>
   );

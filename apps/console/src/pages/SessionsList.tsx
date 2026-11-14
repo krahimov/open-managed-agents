@@ -56,7 +56,10 @@ import type { SessionRecord as Session } from "../types/session";
  *   Waiting on you, Failed, Stalled  are not lifecycle states. They are
  *     read from the operations report and the newest events of each
  *     session, and those cover the 100 most recently active sessions that
- *     are not archived, no more. The sessions they name are fetched by id.
+ *     are not archived, no more. On a server without the report, the
+ *     sessions' own logs stand in for it (`useSessionReadings().report`):
+ *     the same 100 recent sessions, and a failure is read only for those
+ *     that have not ended. The sessions they name are fetched by id.
  *     The result says what it covers, in the summary and when it is empty:
  *     "none among the 100 most recently active" is not "none".
  *
@@ -170,6 +173,9 @@ export function SessionsList() {
   // newest events of the sessions that can still be answered.
   const readings = useSessionReadings();
   const { ops, read } = readings;
+  // The operations report, or where the server has none, the stand-in the logs make.
+  const report = readings.report;
+  const fromLogs = readings.source === "logs";
   const now = useMinuteClock();
   /** Which filter value a row belongs under: the status its reading draws. */
   // A session whose requests could not be read is at rest on the server: it
@@ -225,11 +231,6 @@ export function SessionsList() {
   }, [filterAgent, status, sort, search, archived]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const derived = isDerived(status);
-  // A link to "Waiting on you" on a runtime that keeps no operations
-  // report cannot be honoured: show the whole list rather than an error.
-  useEffect(() => {
-    if (derived && ops.unsupported) setStatus("any");
-  }, [derived, ops.unsupported]);
   const inRange = (s: Session) => {
     if (created.after === undefined && created.before === undefined) return true;
     const t = toDate(s.created_at)?.getTime();
@@ -261,14 +262,14 @@ export function SessionsList() {
   const derivedIds = useMemo(() => {
     if (!derived) return [];
     const ids = new Set<string>();
-    for (const row of ops.report?.sessions ?? []) {
+    for (const row of report?.sessions ?? []) {
       if (statusOf(row) === status) ids.add(row.id);
     }
     // A session can be waiting on a request without being in the report.
     if (status === "approval") for (const id of readings.requests.keys()) ids.add(id);
     return [...ids];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [derived, status, ops.report, read, readings.requests, now]);
+  }, [derived, status, report, read, readings.requests, now]);
   const byId = useQueries({
     queries: derivedIds.map((id) => ({
       // The session page reads the same entry.
@@ -278,7 +279,9 @@ export function SessionsList() {
       retry: false,
     })),
   });
-  const derivedLoading = derived && (ops.isLoading || (status === "approval" && readings.requestsLoading) || byId.some((q) => q.isLoading));
+  // From the logs every derived state is in the same reads as the requests.
+  const derivedLoading =
+    derived && (ops.isLoading || ((status === "approval" || fromLogs) && readings.requestsLoading) || byId.some((q) => q.isLoading));
   const derivedError = derived ? (ops.error ?? (byId.length > 0 && byId.every((q) => q.error) ? byId[0].error : null)) : null;
   const derivedKey = byId.map((q) => q.dataUpdatedAt).join(",");
   const derivedSessions = useMemo(() => {
@@ -314,7 +317,8 @@ export function SessionsList() {
   const loadError = derived ? derivedError : paged.error;
   const refreshSessions = () => {
     if (derived) {
-      void ops.refetch();
+      if (fromLogs) readings.retryRequests();
+      else void ops.refetch();
       for (const q of byId) void q.refetch();
     } else paged.refresh();
   };
@@ -471,11 +475,9 @@ export function SessionsList() {
       })),
     [agents],
   );
-  // The two derived states only exist where the operations report does.
-  const statusOptions = useMemo(
-    () => (ops.unsupported ? STATUS_OPTIONS.filter((o) => !isDerived(o.value)) : STATUS_OPTIONS),
-    [ops.unsupported],
-  );
+  // The derived states are read on every server: from the operations
+  // report, or from the sessions' own logs where there is none.
+  const statusOptions = STATUS_OPTIONS;
   const agentDisplay = filterAgent ? (agentsById.get(filterAgent)?.name ?? "1 agent") : undefined;
   const statusDisplay = status === "any" ? undefined : STATUS_OPTIONS.find((o) => o.value === status)?.label;
   const filtered =
@@ -542,10 +544,10 @@ export function SessionsList() {
 
   // What a derived filter can see: the report and the request reader cover
   // the most recently active sessions that are not archived, and no others.
-  const partial = derived && (!!ops.report?.truncated || archived === "show");
+  const partial = derived && (!!report?.truncated || archived === "show");
   const coverage = !derived
     ? null
-    : ops.report?.truncated
+    : report?.truncated
       ? `the ${REQUEST_WINDOW} most recently active sessions${archived === "show" ? ", archived ones excluded" : ""}`
       : archived === "show"
         ? "sessions that are not archived"
@@ -619,7 +621,7 @@ export function SessionsList() {
       emptyTitle={
         derived
           ? `${status === "approval" ? "Nothing is waiting on you" : status === "errored" ? "No failed sessions" : "No stalled sessions"}${
-              partial && ops.report?.truncated ? `, among the ${REQUEST_WINDOW} most recently active` : ""
+              partial && report?.truncated ? `, among the ${REQUEST_WINDOW} most recently active` : ""
             }`
           : filtered
             ? "No sessions match"
@@ -637,14 +639,16 @@ export function SessionsList() {
                     : "A session is listed here when it reports as running or retrying and has recorded nothing for half an hour."
             } ${
               // What was looked at, so "none" is never read as more than it is.
-              ops.report?.truncated
+              report?.truncated
                 ? `${derivedName} is read from the ${REQUEST_WINDOW} most recently active sessions${archived === "show" ? " that are not archived" : ""}: older ones are not checked. Search by title or filter by agent to find one of those.`
                 : archived === "show"
                   ? `${derivedName} is not read for archived sessions: every other session was checked.`
-                  : "Every session that is not archived was checked."
+                  : fromLogs && status === "errored"
+                    ? "Every session that is not archived and has not ended was checked."
+                    : "Every session that is not archived was checked."
             }`
           : filtered
-            ? "Try a different title, or widen the filters."
+            ? emptyFilteredSubtitle({ search, status, narrowed: !!filterAgent || created.after !== undefined || created.before !== undefined })
             : "A session is one conversation with an agent. Start one from Home, or let a trigger, Slack or the API start them for you."
       }
       filtered={filtered}
@@ -688,6 +692,23 @@ export function SessionsList() {
       />
     </DataTable>
   );
+}
+
+/**
+ * Why a filtered list is empty, in terms of what was actually chosen: a
+ * title is mentioned only when one was typed. Pure, for tests.
+ */
+export function emptyFilteredSubtitle({ search, status, narrowed }: { search: string; status: string; narrowed: boolean }): string {
+  if (search.trim()) return "Try a different title, or widen the filters.";
+  const lifecycle: Record<string, [string, string]> = {
+    running: ["No session is running", "right now"],
+    rescheduling: ["No session is retrying after a failure", "right now"],
+    idle: ["No session is idle", "right now"],
+    terminated: ["No session has ended", "yet"],
+  };
+  const none = lifecycle[status];
+  if (none) return narrowed ? `${none[0]} with these filters. Widen them to see the rest.` : `${none[0]} ${none[1]}.`;
+  return "None with these filters. Widen them to see the rest.";
 }
 
 /** "1 approval and 2 requests are waiting" */

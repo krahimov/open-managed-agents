@@ -4,6 +4,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ApiError, useApi } from "./api";
 import { runName, type EvalRun } from "./evals";
 import { useApiQuery } from "./useApiQuery";
+import { useServerFeatures } from "./server-features";
 import type { OperationsReport } from "./operations";
 import { attentionBySession, sessionTitle } from "./sessions";
 import type { AgentRecord } from "../types/agent";
@@ -76,27 +77,55 @@ export function useAgentActivity() {
 
 /**
  * Operations report (pending approvals, failed work, budgets). Shares its
- * cache entry with <OperationsSummary> and the Operations page. A runtime
- * that does not implement it answers 501; `unsupported` is true then.
+ * cache entry with <OperationsSummary> and the Operations page.
+ *
+ * Only some servers have it (`useServerFeature("operations")`). Where it is
+ * not, the report is never asked for: `unsupported` is true, `report` stays
+ * undefined and every count is 0, so the sidebar badge, Home and the
+ * session readings all fall back together to what the session lists and
+ * logs can say. `isLoading` covers the wait for the feature list too, so no
+ * caller draws "nothing waiting" before it is known whether anything could
+ * be. A runtime that lists the feature but answers 501 is `unsupported`
+ * as well.
  */
 export function useOperations() {
   const { api } = useApi();
+  const features = useServerFeatures();
+  const available = features.data?.features.has("operations") ?? false;
   const query = useQuery({
     queryKey: ["/v1/operations"],
     queryFn: ({ signal }) => api<OperationsReport>("/v1/operations", { signal, silentErrors: true }),
+    enabled: available,
     retry: false,
     staleTime: 20_000,
     refetchInterval: MINUTE,
   });
-  const report = query.data;
+  const featuresLoading = features.isLoading;
+  // Anything but a report (a stub, an older shape) is no report.
+  const report = isOperationsReport(query.data) ? query.data : undefined;
   const summary = useMemo(() => {
     const approvals = report?.sessions.reduce((n, s) => n + s.pending_approvals.length, 0) ?? 0;
     const failed =
       report?.work_items.filter((w) => w.status === "failed" || w.status === "dead_letter").length ?? 0;
     return { approvals, failed, total: approvals + failed, attention: attentionBySession(report) };
   }, [report]);
-  const unsupported = query.error instanceof ApiError && query.error.status === 501;
-  return { ...query, report, unsupported, ...summary };
+  const unsupported =
+    (!featuresLoading && !available) || (query.error instanceof ApiError && query.error.status === 501);
+  return {
+    ...query,
+    // A disabled query is never "loading"; until the feature list answers it is.
+    isLoading: featuresLoading || (available && query.isLoading),
+    // A missing report is not an error the person can retry.
+    error: unsupported ? null : query.error,
+    report,
+    unsupported,
+    ...summary,
+  };
+}
+
+function isOperationsReport(value: unknown): value is OperationsReport {
+  const r = value as Partial<OperationsReport> | null | undefined;
+  return !!r && Array.isArray(r.sessions) && Array.isArray(r.work_items);
 }
 
 // ────────────────────────────────────────────────────────────────────────

@@ -2,13 +2,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 
 import { useApi } from "@/lib/api";
+import { unwrapCallMcpTool } from "@/lib/deferred-mcp";
 import { useAgentActivity, useOperations, useRecentSessions, type AgentActivity } from "@/lib/directory";
+import type { Event } from "@/lib/events";
 import { readFailure } from "@/lib/failures";
 import { toDate } from "@/lib/format";
 import type { OperationsReport } from "@/lib/operations";
 import { readSession, type OpenRequest, type SessionReading } from "@/lib/session-state";
+import type { SessionRecord } from "@/types/session";
 
-import { failureText, openOf, readSessionLog, type EventsPage, type LogState, type ReadBudget } from "./log-reading";
+import { failureText, normalize, openOf, readSessionLog, type EventsPage, type LogState, type ReadBudget } from "./log-reading";
+import { eventTime } from "./model";
 import { requestsPending } from "./requests";
 
 /**
@@ -49,6 +53,15 @@ import { requestsPending } from "./requests";
  * read back once. A session whose events could not be read is "not known"
  * on every screen (never "Idle", never left out of a count without saying
  * so) and is asked for again on the next round, or on Try again.
+ *
+ * A server without the operations report (`useServerFeature("operations")`
+ * is off) still has every session's log. The same reads then also say what
+ * the report would have: which tool calls wait for a person's approval (the
+ * newest `session.status_idle` that `requires_action`, less the calls
+ * answered since) and when the session last recorded anything. From those
+ * and the recent sessions `logReport` builds a stand-in report, so every
+ * screen reads a session the same way on either server. It knows nothing
+ * of queued work, runs or budgets, and says so by leaving them empty.
  */
 
 /** Sessions whose logs are read for open requests: the report's window. */
@@ -57,7 +70,8 @@ export const LOG_BUDGET: ReadBudget = { tail: 40, page: 200, most: 2000 };
 const AT_ONCE = 4;
 /** How often sessions that could not be read are asked for again. */
 const RETRY_UNKNOWN_MS = 30_000;
-const STORE = "muse:session-log:v2";
+// v3: entries also keep the approvals and the newest time.
+const STORE = "muse:session-log:v3";
 
 type ReportSession = OperationsReport["sessions"][number];
 
@@ -72,9 +86,16 @@ interface Candidate {
 /** Why a session's requests are not known. */
 export type Unknown = "unreadable" | "too-long";
 
+/** A tool call waiting for a person's approval, as the log says it (the report's shape). */
+export type AskedApproval = OperationsReport["sessions"][number]["pending_approvals"][number];
+
 interface Known {
   stamp: string;
   state: LogState;
+  /** Tool calls waiting for approval as of `state.seq` (older entries have none). */
+  asked?: AskedApproval[];
+  /** When the newest event read was recorded. */
+  lastAt?: number | null;
   /** Set when the read stopped short of settling every request. */
   partial?: boolean;
   /** The read stopped at the budget: not asked again until the session records something new. */
@@ -127,10 +148,117 @@ const ms = (value: string | number | null | undefined): number | null => toDate(
 export interface LogReadings {
   /** Open access and skill requests, by session. */
   open: Map<string, OpenRequest[]>;
+  /** Tool calls waiting for approval, by session, read from the log. */
+  approvals: Map<string, AskedApproval[]>;
+  /** When each session whose log was read last recorded anything (null: nothing yet). */
+  lastEventAt: Map<string, number | null>;
   /** Sessions whose requests are not known, and why. */
   unknown: Map<string, Unknown>;
   /** Why a failed turn failed, by session, as the session page reads it (`readFailure` input). */
   failures: Map<string, string>;
+}
+
+const TOOL_USES = new Set(["agent.tool_use", "agent.mcp_tool_use", "agent.custom_tool_use"]);
+
+/**
+ * The tool calls a session waits on a person to approve, folded over events
+ * (oldest first) onto what was known. The runtime asks in the
+ * `session.status_idle` that ends a turn (`stop_reason.requires_action`,
+ * the tool calls in `event_ids`); a confirmation or a result answers one, and
+ * the session starting, ending or ending a turn some other way answers the
+ * rest. A custom tool's call waits on a program, not a person: not counted.
+ * Pure, for tests.
+ */
+export function foldApprovals(prev: readonly AskedApproval[], eventsAsc: readonly Event[]): AskedApproval[] {
+  const uses = new Map<string, { name: string; input: unknown; at: number | null; custom: boolean }>();
+  let asked: AskedApproval[] = [...prev];
+  const answer = (id: unknown) => {
+    if (typeof id === "string") asked = asked.filter((a) => a.tool_use_id !== id);
+  };
+  for (const e of eventsAsc) {
+    if (TOOL_USES.has(e.type)) {
+      if (typeof e.id !== "string") continue;
+      const deferred = unwrapCallMcpTool(e.name, e.input);
+      uses.set(e.id, {
+        name: deferred?.tool ?? (typeof e.name === "string" && e.name ? e.name : "a tool"),
+        input: deferred?.arguments ?? e.input ?? {},
+        at: eventTime(e),
+        custom: e.type === "agent.custom_tool_use",
+      });
+      continue;
+    }
+    switch (e.type) {
+      case "session.status_idle": {
+        const stop = e.stop_reason as { type?: string; action_type?: string; event_ids?: unknown } | undefined;
+        if (stop?.type !== "requires_action" || !Array.isArray(stop.event_ids)) {
+          asked = [];
+          break;
+        }
+        const at = eventTime(e);
+        asked = stop.event_ids.flatMap((id): AskedApproval[] => {
+          if (typeof id !== "string") return [];
+          const use = uses.get(id);
+          // Only a custom tool's result was asked for: nobody needs to approve anything.
+          if (use?.custom || (!use && stop.action_type === "custom_tool_result")) return [];
+          return [{ tool_use_id: id, name: use?.name ?? "a tool", input: use?.input ?? {}, requested_at: use?.at ?? at ?? 0 }];
+        });
+        break;
+      }
+      case "session.status_running":
+      case "session.status_rescheduled":
+      case "session.status_terminated":
+        asked = [];
+        break;
+      case "user.tool_confirmation":
+      case "agent.tool_result":
+        answer(e.tool_use_id);
+        break;
+      case "agent.mcp_tool_result":
+        answer(e.mcp_tool_use_id);
+        break;
+      case "user.custom_tool_result":
+        answer(e.custom_tool_use_id);
+        break;
+    }
+  }
+  return asked;
+}
+
+/**
+ * A stand-in for the operations report, built from the recent sessions and
+ * what their logs said, for a server that has no report. Only sessions whose
+ * log was read get a row (one that was not is read from its own record, as
+ * on a server with a report it would be when the report left it out).
+ * Queued work, runs and budgets are not known: empty. Pure, for tests.
+ */
+export function logReport(
+  recent: readonly SessionRecord[],
+  logs: Pick<LogReadings, "approvals" | "failures" | "lastEventAt">,
+  window: number = REQUEST_WINDOW,
+): OperationsReport {
+  const sessions: OperationsReport["sessions"] = [];
+  for (const s of recent) {
+    if (s.archived_at || !logs.lastEventAt.has(s.id)) continue;
+    sessions.push({
+      id: s.id,
+      title: s.title ?? "",
+      agent_id: s.agent?.id ?? "",
+      status: s.status ?? "idle",
+      updated_at: s.updated_at ?? s.created_at,
+      last_event_at: logs.lastEventAt.get(s.id) ?? null,
+      error: logs.failures.get(s.id) ?? null,
+      pending_approvals: logs.approvals.get(s.id) ?? [],
+    });
+  }
+  return {
+    sessions,
+    missions: [],
+    work_items: [],
+    usage: { totals: { cost_usd: 0, processed_tokens: 0, sessions: 0 } },
+    budgets: [],
+    // The recent list holds the newest sessions only: older ones are not read.
+    truncated: recent.length >= window,
+  };
 }
 
 /**
@@ -199,18 +327,37 @@ export function useOpenRequests() {
       await pooled(stale, AT_ONCE, async (c) => {
         if (signal.aborted) return;
         const known = read.get(c.id);
+        // Every event this read sees, for the approvals and the newest time
+        // (the request and failure fold keeps only what it needs).
+        const seen = new Map<number, Event>();
+        let unnumbered = false;
         try {
           const result = await readSessionLog(
-            (q) => api<EventsPage>(`/v1/sessions/${c.id}/events${q}`, { signal, silentErrors: true }),
+            async (q) => {
+              const page = await api<EventsPage>(`/v1/sessions/${c.id}/events${q}`, { signal, silentErrors: true });
+              for (const raw of Array.isArray(page?.data) ? page.data : []) {
+                const e = normalize(raw);
+                if (typeof e.seq === "number") seen.set(e.seq, e);
+                else unnumbered = true;
+              }
+              return page;
+            },
             known?.state ?? null,
             c.needFailure,
             LOG_BUDGET,
           );
+          const events = [...seen.values()].sort((a, b) => (a.seq as number) - (b.seq as number));
+          // Only what is newer than the last read is folded onto what it knew.
+          const from = known?.state.seq ?? 0;
+          const onTop = !!known && from > 0 && events.every((e) => (e.seq as number) > from);
+          const newest = events.length ? eventTime(events[events.length - 1]) : null;
           read.set(c.id, {
             stamp: c.stamp,
             state: result.state,
             partial: result.kind === "too-long" || undefined,
             exhausted: result.exhausted || undefined,
+            asked: unnumbered ? [] : foldApprovals(onTop ? (known?.asked ?? []) : [], events),
+            lastAt: newest ?? known?.lastAt ?? null,
           });
         } catch {
           // What was known is for an older version of the log: it says
@@ -220,7 +367,7 @@ export function useOpenRequests() {
       });
       const keep = new Set(candidates.map((c) => c.id));
       persist(keep);
-      const out: LogReadings = { open: new Map(), unknown: new Map(), failures: new Map() };
+      const out: LogReadings = { open: new Map(), approvals: new Map(), lastEventAt: new Map(), unknown: new Map(), failures: new Map() };
       for (const c of candidates) {
         if (failed.has(c.id)) {
           out.unknown.set(c.id, "unreadable");
@@ -233,6 +380,8 @@ export function useOpenRequests() {
         else if (known.partial) out.unknown.set(c.id, "too-long");
         const why = failureText(known.state);
         if (why) out.failures.set(c.id, why);
+        if (known.asked?.length) out.approvals.set(c.id, known.asked);
+        out.lastEventAt.set(c.id, known.lastAt ?? null);
       }
       return out;
     },
@@ -250,9 +399,18 @@ export function useOpenRequests() {
   const { refetch } = query;
   const retry = useCallback(() => void refetch(), [refetch]);
   const data = query.data ?? EMPTY;
-  return { bySession: data.open, unknown: data.unknown, failures: data.failures, isLoading, isFetching: query.isFetching, retry };
+  return {
+    bySession: data.open,
+    approvals: data.approvals,
+    lastEventAt: data.lastEventAt,
+    unknown: data.unknown,
+    failures: data.failures,
+    isLoading,
+    isFetching: query.isFetching,
+    retry,
+  };
 }
-const EMPTY: LogReadings = { open: new Map(), unknown: new Map(), failures: new Map() };
+const EMPTY: LogReadings = { open: new Map(), approvals: new Map(), lastEventAt: new Map(), unknown: new Map(), failures: new Map() };
 
 /**
  * How long a count that includes the open requests waits for them before it
@@ -301,10 +459,23 @@ export interface ReadableSession {
 export function useSessionReadings() {
   const ops = useOperations();
   const requests = useOpenRequests();
+  const recent = useRecentSessions();
+
+  // The report the readings stand on: the server's, or on a server without
+  // one, the stand-in the session logs make (see `logReport`).
+  const fromLogs = ops.unsupported;
+  const logs = useMemo(
+    () =>
+      fromLogs && recent.data
+        ? logReport(recent.sessions, { approvals: requests.approvals, failures: requests.failures, lastEventAt: requests.lastEventAt })
+        : undefined,
+    [fromLogs, recent.data, recent.sessions, requests.approvals, requests.failures, requests.lastEventAt],
+  );
+  const report = ops.report ?? logs;
 
   const reported = useMemo(
-    () => new Map<string, ReportSession>((ops.report?.sessions ?? []).map((s) => [s.id, s])),
-    [ops.report],
+    () => new Map<string, ReportSession>((report?.sessions ?? []).map((s) => [s.id, s])),
+    [report],
   );
 
   const read = useCallback(
@@ -341,21 +512,29 @@ export function useSessionReadings() {
     [requests.unknown, requests.bySession, reported],
   );
 
+  // Approvals as the report says them; from the logs, those of sessions that
+  // can still be answered.
+  const approvals = useMemo(() => {
+    if (!logs) return ops.approvals;
+    return logs.sessions.reduce((n, s) => n + (s.status === "terminated" ? 0 : s.pending_approvals.length), 0);
+  }, [logs, ops.approvals]);
+
   const counts = useMemo(() => {
     let open = 0;
     for (const list of requests.bySession.values()) open += list.length;
     return {
-      approvals: ops.approvals,
+      approvals,
       requests: open,
+      // Failed work is queued work: only the report knows it.
       failed: ops.failed,
       /** Things waiting on a person: approvals and requests. */
-      waiting: ops.approvals + open,
+      waiting: approvals + open,
       /** The one number for the sidebar, Home and Operations. */
-      attention: ops.approvals + open + ops.failed,
+      attention: approvals + open + ops.failed,
       /** Sessions that may be waiting on a person: their requests could not be read. */
       unknown: unknownIds.length,
     };
-  }, [ops.approvals, ops.failed, requests.bySession, unknownIds]);
+  }, [approvals, ops.failed, requests.bySession, unknownIds]);
 
   return {
     read,
@@ -369,6 +548,14 @@ export function useSessionReadings() {
     requestsFetching: requests.isFetching,
     counts,
     ops,
+    /**
+     * The report every overview builds on: the server's operations report,
+     * or the stand-in read from the session logs where the server has none
+     * (`source: "logs"`; approvals are then known only once the logs are
+     * read, `requestsLoading`). Undefined while neither is known.
+     */
+    report,
+    source: (ops.report ? "operations" : logs ? "logs" : null) as "operations" | "logs" | null,
   };
 }
 

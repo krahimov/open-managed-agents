@@ -9,6 +9,7 @@ import { BRAND_NAME } from "../lib/brand";
 import { useCopy } from "../lib/clipboard";
 import { useAgents, useOperations, useRecentSessions } from "../lib/directory";
 import { formatCompact, formatCost } from "../lib/format";
+import { useServerFeature } from "../lib/server-features";
 import { HARNESS_AGENT_BUILDER_PROMPT, HARNESS_AGENT_BUILDER_SKILL } from "../lib/harness-agent-builder-skill";
 import type { ComposeIntent } from "../lib/shell-events";
 import { usageWindow, utcDayKey } from "../lib/usage-window";
@@ -17,7 +18,7 @@ import { useApiQuery } from "../lib/useApiQuery";
 import { buildOperationsView } from "../components/operations/model";
 import { useSessionReadings } from "../components/sessions/readings";
 import { FirstRunGuide } from "../components/FirstRunGuide";
-import { AllQuiet, NeedsAttention, RunningNow, runningSessions } from "../components/home/RightNow";
+import { AllQuiet, AllUnknown, NeedsAttention, RunningNow, runningSessions } from "../components/home/RightNow";
 import { SessionStarter } from "../components/home/SessionStarter";
 import { finishedSessions, SinceLastVisit } from "../components/home/SinceLastVisit";
 import { useLastVisit } from "../components/home/useLastVisit";
@@ -46,6 +47,14 @@ import { quietLink } from "@/lib/links";
  *                                the same window and numbers as Usage
  *   Workspace                    counts that link to each resource, and the
  *                                agent-builder skill for coding agents
+ *
+ * On a server without the operations report, Running now and Needs
+ * attention read the session logs instead (`useSessionReadings().report`);
+ * without the usage tracker, the 30 days are left out. When reads fail, the
+ * failure is said once: one read that fails gets its own notice where its
+ * section would be; two or more, or the sessions list (which three sections
+ * stand on), become one banner at the top, and the sections they feed step
+ * aside rather than each repeating the same upstream error.
  *
  * The sidebar already lists frequent agents and recent sessions by name, so
  * Home does not repeat them: everything below the starter says something
@@ -89,8 +98,14 @@ export function Dashboard() {
   const navigate = useNavigate();
   const { user } = useAuth();
 
-  const { agents, byId, isLoading: agentsLoading, error: agentsError } = useAgents();
-  const { sessions, isLoading: sessionsLoading, error: sessionsError, refetch: refetchSessions } = useRecentSessions();
+  const { agents, byId, isLoading: agentsLoading, error: agentsError, refetch: refetchAgents } = useAgents();
+  const {
+    sessions,
+    data: sessionsData,
+    isLoading: sessionsLoading,
+    error: sessionsError,
+    refetch: refetchSessions,
+  } = useRecentSessions();
   const ops = useOperations();
   const statsQuery = useApiQuery<Stats>("/v1/stats");
   const stats = statsQuery.data ?? null;
@@ -126,21 +141,27 @@ export function Dashboard() {
   // the sessions that could not be checked. Without them a failed session
   // under "Since you were last here" would say "The model returned nothing"
   // while its page says the provider rejected the key.
+  //
+  // The report is the server's operations report, or where the server has
+  // none, the stand-in the session logs make: then the approvals are known
+  // only once the logs are read, and the bands wait for them.
   const readings = useSessionReadings();
+  const report = readings.report;
+  const fromLogs = readings.source === "logs";
   const view = useMemo(
     () =>
-      ops.report && !namesLoading
-        ? buildOperationsView(ops.report, byId, sessions, readings.requests, Date.now(), readings.failures, readings.unknown)
+      report && !namesLoading
+        ? buildOperationsView(report, byId, sessions, readings.requests, Date.now(), readings.failures, readings.unknown)
         : null,
-    [ops.report, byId, sessions, namesLoading, readings.requests, readings.failures, readings.unknown],
+    [report, byId, sessions, namesLoading, readings.requests, readings.failures, readings.unknown],
   );
   const attentionOps = { ...ops, isLoading: ops.isLoading || namesLoading } as typeof ops;
   const running = useMemo(() => runningSessions(sessions, view, byId, ops.attention), [sessions, view, byId, ops.attention]);
   // A session that could not be checked may be waiting on you, so it keeps
   // the bands up as a request does (Needs attention lists it).
   const waiting = view ? view.attention + view.unknown.length + view.budgets.filter((b) => b.warnings.length > 0).length : 0;
-  const bandLoading = namesLoading || ops.isLoading;
-  const allQuiet = !bandLoading && !ops.error && !ops.unsupported && running.length === 0 && waiting === 0;
+  const bandLoading = namesLoading || ops.isLoading || (fromLogs && readings.requestsLoading);
+  const allQuiet = !bandLoading && !ops.error && !!report && running.length === 0 && waiting === 0;
 
   // While something is running, Home keeps up with it: the lists are read
   // again every quarter of a minute (each running row reads its own
@@ -159,14 +180,16 @@ export function Dashboard() {
 
   // ── what finished ───────────────────────────────────────────────────
   const finished = useMemo(
-    () => finishedSessions({ sessions, view, report: ops.report?.sessions, agents: byId, since, causes: readings.failures }),
-    [sessions, view, ops.report, byId, since, readings.failures],
+    () => finishedSessions({ sessions, view, report: report?.sessions, agents: byId, since, causes: readings.failures }),
+    [sessions, view, report, byId, since, readings.failures],
   );
 
   // ── the last 30 days: the window and the numbers the Usage page shows ──
+  // Only where the server keeps usage; elsewhere the section is left out.
+  const usageOn = useServerFeature("usage");
   const win = useMemo(() => usageWindow(WINDOW_DAYS), []);
-  const usage = useApiQuery<UsageReport>("/v1/usage", win.params, { staleTime: 60_000 });
-  const before = useApiQuery<UsageReport>("/v1/usage", win.previousParams, { staleTime: 5 * 60_000 });
+  const usage = useApiQuery<UsageReport>(usageOn ? "/v1/usage" : null, win.params, { staleTime: 60_000 });
+  const before = useApiQuery<UsageReport>(usageOn ? "/v1/usage" : null, win.previousParams, { staleTime: 5 * 60_000 });
   const totals = usage.data?.totals;
   const prev = before.data?.totals;
   const series = useMemo(() => {
@@ -195,6 +218,22 @@ export function Dashboard() {
   const noUsage = !!totals && totals.calls === 0;
   // All three changes or none, as on Usage (one arrow beside two bare numbers reads as a mistake).
   const changes = totals ? periodChanges(totals, prev) : { comparable: false as const };
+
+  // ── what could not be read, said once ───────────────────────────────
+  // A read is down when it failed and has nothing on screen to fall back on.
+  const sessionsDown = !!sessionsError && sessionsData === undefined;
+  const problems = homeProblems([
+    { key: "sessions", what: "recent sessions", down: sessionsDown, error: sessionsError, retry: refetchSessions },
+    { key: "operations", what: "what needs attention", down: !!ops.error && !ops.report, error: ops.error, retry: ops.refetch },
+    { key: "usage", what: "usage", down: usageOn && !!usage.error && !usage.data, error: usage.error, retry: usage.refetch },
+    { key: "stats", what: "the workspace summary", down: !!statsQuery.error && !stats, error: statsQuery.error, retry: statsQuery.refetch },
+  ]);
+  // The sessions list feeds three sections: its failure is always the banner's.
+  const banner = problems.length >= 2 || sessionsDown ? problems : [];
+  const inBanner = (key: ProblemKey) => banner.some((p) => p.key === key);
+  // Neither the sessions nor a report: what is running and waiting is not known.
+  const bandsUnknown = sessionsDown && !report;
+  const everythingDown = agentsDown && sessionsDown && problems.some((p) => p.key === "stats");
 
   return (
     <div className="relative">
@@ -226,30 +265,41 @@ export function Dashboard() {
         {/* A container: what sits side by side depends on the room the panel
             has, not on the window (the sidebar takes 272px of it). */}
         <div className={`${CONTENT} @container space-y-12`}>
+          {banner.length > 0 && (
+            <QueryProblem
+              title={everythingDown ? "Your workspace could not be reached" : `${sentenceCase(listWords(banner.map((p) => p.what)))} could not be loaded`}
+              error={banner[0].error}
+              retry={() => {
+                for (const p of banner) void p.retry();
+                if (agentsDown) void refetchAgents();
+              }}
+            />
+          )}
+
           {(firstRun || showGuide) && <FirstRunGuide />}
 
           {!firstRun &&
-            (allQuiet ? (
+            (bandsUnknown ? (
+              <AllUnknown />
+            ) : allQuiet ? (
               <AllQuiet />
             ) : (
               <div className="grid gap-x-6 gap-y-12 @[880px]:grid-cols-2 @[880px]:items-start">
                 <RunningNow running={running} loading={bandLoading} />
-                <NeedsAttention ops={attentionOps} view={view} />
+                {inBanner("operations") ? null : <NeedsAttention ops={attentionOps} view={view} />}
               </div>
             ))}
 
-          {!firstRun && (
+          {!firstRun && !inBanner("sessions") && (
             <SinceLastVisit
               finished={finished}
               since={since}
               loading={sessionsLoading}
-              error={sessionsError}
-              retry={refetchSessions}
             />
           )}
 
           {/* The month's numbers */}
-          {!noUsage && (
+          {usageOn && !noUsage && !inBanner("usage") && (
             <Section
               title={`Last ${WINDOW_DAYS} days`}
               description={
@@ -318,7 +368,12 @@ export function Dashboard() {
           {/* Workspace counts + build from a coding agent */}
           <div className="space-y-4">
             <section className="surface rounded-xl px-5 py-4" aria-label="Workspace">
-              {statsQuery.error ? (
+              {inBanner("stats") ? (
+                <div className="flex items-baseline justify-between gap-4">
+                  <h3 className="text-h3 text-fg">Workspace</h3>
+                  <p className="text-small text-fg-muted">The counts are shown again once they can be read.</p>
+                </div>
+              ) : statsQuery.error && !stats ? (
                 <QueryProblem
                   compact
                   title="Workspace summary could not be loaded"
@@ -424,3 +479,28 @@ function CopyAction({
     </Button>
   );
 }
+
+// ── reads that failed ─────────────────────────────────────────────────────
+
+type ProblemKey = "sessions" | "operations" | "usage" | "stats";
+
+interface HomeProblem {
+  key: ProblemKey;
+  /** What could not be read, as it reads after "could not be loaded": "recent sessions". */
+  what: string;
+  error: unknown;
+  retry: () => unknown;
+}
+
+/** The reads that are down, in the order Home shows their sections. Pure, for tests. */
+export function homeProblems(reads: Array<HomeProblem & { down: boolean }>): HomeProblem[] {
+  return reads.filter((r) => r.down).map(({ down: _down, ...p }) => p);
+}
+
+/** "a", "a and b", "a, b and c". */
+export function listWords(items: string[]): string {
+  if (items.length <= 1) return items[0] ?? "";
+  return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
+}
+
+const sentenceCase = (s: string) => (s ? s[0].toUpperCase() + s.slice(1) : s);
