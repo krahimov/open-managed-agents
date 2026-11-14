@@ -9,13 +9,14 @@
  * does not care about (names, lists, the model picker) get a quiet empty
  * answer, the way a server with nothing to say would.
  */
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { render } from "@testing-library/react";
-import { MemoryRouter, Route, Routes, useLocation } from "react-router";
+import { MemoryRouter, Outlet, Route, Routes, useLocation } from "react-router";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { http, HttpResponse } from "msw";
 import type { Mock } from "vitest";
 
+import type { AppOutletContext } from "../../components/AppShell";
 import { server } from "../../mocks/server";
 import { SessionDetail } from "../SessionDetail";
 
@@ -50,7 +51,11 @@ export function rigApi(api: Mock, rig: PageRig) {
     return { data: [] };
   });
   // lib/server-features reads over msw (it is loaded before the mock).
-  server.use(http.get("*/v1/server_features", () => HttpResponse.json({ features: ["workspace_access", "usage"] })));
+  server.use(
+    http.get("*/v1/server_features", () => HttpResponse.json({ features: ["workspace_access", "usage"] })),
+    // The outputs listing is read with fetch (it sends the sign-in headers itself).
+    http.get("*/v1/sessions/sess-1/outputs", () => HttpResponse.json({ data: [], has_more: false })),
+  );
 }
 
 export function newRig(): PageRig {
@@ -61,6 +66,18 @@ export function newRig(): PageRig {
     onGet: () => undefined,
     session: { id: "sess-1", status: "idle", agent: { id: "agent-1", name: "QA agent" } },
   };
+}
+
+/** The app shell's slot for a page's own bar (the session bar is drawn there). */
+function Shell() {
+  const [slot, setSlot] = useState<HTMLDivElement | null>(null);
+  const context: AppOutletContext = { pageHeaderSlot: slot, backdropSlot: null, registerPageWidth: () => {}, topLevel: false };
+  return (
+    <>
+      <div ref={setSlot} data-testid="page-bar" />
+      <Outlet context={context} />
+    </>
+  );
 }
 
 function Where() {
@@ -74,7 +91,9 @@ export function mountSession(extraRoutes?: ReactNode) {
       <MemoryRouter initialEntries={["/sessions/sess-1"]}>
         <Where />
         <Routes>
-          <Route path="/sessions/:id" element={<SessionDetail />} />
+          <Route element={<Shell />}>
+            <Route path="/sessions/:id" element={<SessionDetail />} />
+          </Route>
           {extraRoutes}
           <Route path="*" element={<div>WRONG ROUTE</div>} />
         </Routes>
