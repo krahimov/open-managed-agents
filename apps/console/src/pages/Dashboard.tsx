@@ -1,17 +1,59 @@
-import { useState } from "react";
-import { useNavigate } from "react-router";
-import { Check, Copy, Terminal } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useLocation, useNavigate } from "react-router";
+import { ArrowRightIcon, CheckIcon, CopyIcon, TerminalIcon } from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+
 import { useAuth } from "../lib/auth";
-import { useApiQuery } from "../lib/useApiQuery";
-import { toast } from "sonner";
-import { StatusPill } from "../components/Badge";
-import { EmptyState } from "../components/EmptyState";
-import { Skeleton } from "../components/Skeleton";
 import { BRAND_NAME } from "../lib/brand";
-import {
-  HARNESS_AGENT_BUILDER_PROMPT,
-  HARNESS_AGENT_BUILDER_SKILL,
-} from "../lib/harness-agent-builder-skill";
+import { useCopy } from "../lib/clipboard";
+import { useAgents, useOperations, useRecentSessions } from "../lib/directory";
+import { formatCompact, formatCost } from "../lib/format";
+import { HARNESS_AGENT_BUILDER_PROMPT, HARNESS_AGENT_BUILDER_SKILL } from "../lib/harness-agent-builder-skill";
+import type { ComposeIntent } from "../lib/shell-events";
+import { usageWindow, utcDayKey } from "../lib/usage-window";
+import { useApiQuery } from "../lib/useApiQuery";
+
+import { buildOperationsView } from "../components/operations/model";
+import { useSessionReadings } from "../components/sessions/readings";
+import { FirstRunGuide } from "../components/FirstRunGuide";
+import { AllQuiet, NeedsAttention, RunningNow, runningSessions } from "../components/home/RightNow";
+import { SessionStarter } from "../components/home/SessionStarter";
+import { finishedSessions, SinceLastVisit } from "../components/home/SinceLastVisit";
+import { useLastVisit } from "../components/home/useLastVisit";
+import { Modal } from "../components/Modal";
+import { PAGE_GUTTER } from "../components/Page";
+import { QueryProblem } from "../components/QueryProblem";
+import { Section, sectionLinkClass } from "../components/SectionCard";
+import { Skeleton } from "../components/Skeleton";
+import { StatTile } from "../components/StatTile";
+import { Wash } from "../components/Wash";
+import { periodChanges, ProportionBar, type UsageReport } from "./usage/parts";
+import { cn } from "@/lib/utils";
+import { quietLink } from "@/lib/links";
+
+/**
+ * Home — the conversational front door.
+ *
+ *   greeting + session starter   give an agent something to do: a message
+ *                                box, the agent, attachments, Options, and
+ *                                three or four things to ask that agent
+ *   Running now                  what is being worked on this minute, live
+ *   Needs attention              what is waiting on a person
+ *   Since you were last here     what finished, and how it went, in the
+ *                                agent's own words
+ *   Last 30 days                 spend, sessions, tokens, cache savings:
+ *                                the same window and numbers as Usage
+ *   Workspace                    counts that link to each resource, and the
+ *                                agent-builder skill for coding agents
+ *
+ * The sidebar already lists frequent agents and recent sessions by name, so
+ * Home does not repeat them: everything below the starter says something
+ * the sidebar cannot (state, progress, outcome, cost).
+ *
+ * Starting a session is <SessionStarter>; the same component opens in a
+ * dialog everywhere else (<NewSessionDialog>).
+ */
 
 interface Stats {
   agents: number;
@@ -23,385 +65,362 @@ interface Stats {
   api_keys: number;
 }
 
-interface RecentSession {
-  id: string;
-  title: string;
-  agent_id: string;
-  status: string;
-  created_at: string;
+const CONTENT = "mx-auto w-full max-w-[1120px]";
+const WINDOW_DAYS = 30;
+
+function greeting(now = new Date()): string {
+  const h = now.getHours();
+  if (h < 5) return "Working late";
+  if (h < 12) return "Good morning";
+  if (h < 18) return "Good afternoon";
+  return "Good evening";
+}
+
+/** First name for the greeting; nothing for the local dev identity. */
+function firstName(user: { name?: string; email?: string } | null | undefined): string | null {
+  if (!user?.name) return null;
+  if (/@(localhost|local)$/i.test(user.email ?? "")) return null;
+  const first = user.name.trim().split(/\s+/)[0];
+  return first && first.length > 1 ? first : null;
 }
 
 export function Dashboard() {
-  const nav = useNavigate();
-  const { user: _user } = useAuth();
-  const [copied, setCopied] = useState<string | null>(null);
-  const [showGuide, setShowGuide] = useState(false);
+  const location = useLocation();
+  const navigate = useNavigate();
+  const { user } = useAuth();
 
-  // Headline cards + recent panel each ride their own TQ query so the
-  // dashboard renders the parts it has — a flaky /v1/stats no longer
-  // blocks the recent-sessions panel and vice versa. The previous
-  // hand-rolled `Promise.all` + single `loading` boolean made one failure
-  // hide both panels.
+  const { agents, byId, isLoading: agentsLoading, error: agentsError } = useAgents();
+  const { sessions, isLoading: sessionsLoading, error: sessionsError, refetch: refetchSessions } = useRecentSessions();
+  const ops = useOperations();
   const statsQuery = useApiQuery<Stats>("/v1/stats");
-  const sessionsQuery = useApiQuery<{ data: RecentSession[] }>(
-    "/v1/sessions",
-    { limit: "5" },
-  );
   const stats = statsQuery.data ?? null;
-  // Until /v1/stats settles we don't know whether this is a fresh workspace
-  // or an active one — render the neutral Overview shell and NO guide.
-  // Deciding "new user" from missing data made the whole onboarding panel
-  // (API-key step included) flash for a beat on every hard refresh, then
-  // vanish when stats landed.
-  const statsPending = statsQuery.isLoading;
-  const workspaceActive = (stats?.agents ?? 0) > 0;
-  const guideVisible = !statsPending && (!workspaceActive || showGuide);
-  const recentSessions = sessionsQuery.data?.data.slice(0, 5) ?? [];
+  const { since } = useLastVisit();
 
-  const copy = async (text: string, key: string) => {
-    try {
-      const fallbackCopy = () => {
-        const textarea = document.createElement("textarea");
-        textarea.value = text;
-        textarea.setAttribute("readonly", "");
-        textarea.style.position = "fixed";
-        textarea.style.left = "-9999px";
-        document.body.appendChild(textarea);
-        textarea.select();
-        const copiedFallback = document.execCommand("copy");
-        textarea.remove();
-        if (!copiedFallback) throw new Error("Clipboard fallback failed");
-      };
+  // "New session" (sidebar, palette, agent cards) lands here with an intent:
+  // the starter takes focus, with that agent chosen.
+  const intent = location.state as ComposeIntent | null;
+  // An intent is a request made once. It is taken out of the history entry
+  // as soon as the starter has it, so a reload or the back button does not
+  // ask again (and put the starter back on an agent the person has since
+  // moved on from).
+  useEffect(() => {
+    if (intent?.compose) navigate(".", { replace: true, state: null });
+  }, [intent?.compose, navigate]);
 
-      try {
-        if (!navigator.clipboard?.writeText) throw new Error("Clipboard API unavailable");
-        await navigator.clipboard.writeText(text);
-      } catch {
-        fallbackCopy();
-      }
+  // ── the workspace's state ───────────────────────────────────────────
+  const name = firstName(user);
+  const workspaceActive = (stats?.agents ?? agents.length) > 0;
+  // Agents failing to load is an outage, not an empty workspace.
+  const agentsDown = !!agentsError && agents.length === 0;
+  const firstRun = !!stats && !agentsDown && (!workspaceActive || stats.sessions === 0);
+  const [showGuide, setShowGuide] = useState(false);
+  const [showSkill, setShowSkill] = useState(false);
 
-      setCopied(key);
-      toast.success("Copied");
-      setTimeout(() => setCopied(null), 1600);
-    } catch {
-      toast.error("Copy failed");
-    }
-  };
+  // ── right now ───────────────────────────────────────────────────────
+  // A row is named by its session's title and its agent's name, which come
+  // from the directory. Until both lists have answered (or failed) the rows
+  // would be drawn with stand-in names and then change, so they wait.
+  const namesLoading = sessionsLoading || agentsLoading;
+  // The view is built from the same readings every other screen draws: the
+  // open requests and the failure causes read from each session's log, and
+  // the sessions that could not be checked. Without them a failed session
+  // under "Since you were last here" would say "The model returned nothing"
+  // while its page says the provider rejected the key.
+  const readings = useSessionReadings();
+  const view = useMemo(
+    () =>
+      ops.report && !namesLoading
+        ? buildOperationsView(ops.report, byId, sessions, readings.requests, Date.now(), readings.failures, readings.unknown)
+        : null,
+    [ops.report, byId, sessions, namesLoading, readings.requests, readings.failures, readings.unknown],
+  );
+  const attentionOps = { ...ops, isLoading: ops.isLoading || namesLoading } as typeof ops;
+  const running = useMemo(() => runningSessions(sessions, view, byId, ops.attention), [sessions, view, byId, ops.attention]);
+  // A session that could not be checked may be waiting on you, so it keeps
+  // the bands up as a request does (Needs attention lists it).
+  const waiting = view ? view.attention + view.unknown.length + view.budgets.filter((b) => b.warnings.length > 0).length : 0;
+  const bandLoading = namesLoading || ops.isLoading;
+  const allQuiet = !bandLoading && !ops.error && !ops.unsupported && running.length === 0 && waiting === 0;
 
-  const stat = (label: string, value: number | undefined, to: string) => (
-    <button
-      key={label}
-      onClick={() => nav(to)}
-      className="group relative text-left px-4 py-3.5 border border-border rounded-md bg-bg-surface shadow-[var(--shadow-sm)] hover:border-border-strong hover:bg-brand-subtle/45 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-    >
-      <div className="font-display text-[28px] leading-none font-semibold text-fg group-hover:text-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] tabular-nums">
-        {value ?? "–"}
-      </div>
-      <div className="mt-2 text-[11px] uppercase text-fg-muted font-medium">
-        {label}
-      </div>
-    </button>
+  // While something is running, Home keeps up with it: the lists are read
+  // again every quarter of a minute (each running row reads its own
+  // activity every few seconds).
+  const { refetch: refetchOps } = ops;
+  const anyRunning = running.length > 0;
+  useEffect(() => {
+    if (!anyRunning) return;
+    const id = window.setInterval(() => {
+      if (document.visibilityState !== "visible") return;
+      void refetchOps();
+      void refetchSessions();
+    }, 15_000);
+    return () => window.clearInterval(id);
+  }, [anyRunning, refetchOps, refetchSessions]);
+
+  // ── what finished ───────────────────────────────────────────────────
+  const finished = useMemo(
+    () => finishedSessions({ sessions, view, report: ops.report?.sessions, agents: byId, since, causes: readings.failures }),
+    [sessions, view, ops.report, byId, since, readings.failures],
   );
 
-  const stats_ = [
-    { label: "Agents", value: stats?.agents, to: "/agents" },
-    { label: "Sessions", value: stats?.sessions, to: "/sessions" },
-    { label: "Environments", value: stats?.environments, to: "/environments" },
-    { label: "Vaults", value: stats?.vaults, to: "/vaults" },
-    { label: "Skills", value: stats?.skills, to: "/skills" },
-    { label: "Model Cards", value: stats?.model_cards, to: "/model-cards" },
-  ];
-
-  const cmd = "npx -y -p @openma/cli oma";
-  const cmdGlobal = "npm i -g @openma/cli";
-  const examplePrompt =
-    `Use ${BRAND_NAME} to create a research agent that monitors arXiv for new ML papers daily`;
-  const skillPreview = HARNESS_AGENT_BUILDER_SKILL.split("\n").slice(0, 28).join("\n");
+  // ── the last 30 days: the window and the numbers the Usage page shows ──
+  const win = useMemo(() => usageWindow(WINDOW_DAYS), []);
+  const usage = useApiQuery<UsageReport>("/v1/usage", win.params, { staleTime: 60_000 });
+  const before = useApiQuery<UsageReport>("/v1/usage", win.previousParams, { staleTime: 5 * 60_000 });
+  const totals = usage.data?.totals;
+  const prev = before.data?.totals;
+  const series = useMemo(() => {
+    const cost = new Map<string, number>();
+    const tokens = new Map<string, number>();
+    for (const row of usage.data?.daily ?? []) {
+      cost.set(row.day, (cost.get(row.day) ?? 0) + row.cost_usd);
+      tokens.set(row.day, (tokens.get(row.day) ?? 0) + row.tokens);
+    }
+    // The report has no per-day session count; the directory's recent sessions do.
+    const started = new Map<string, number>();
+    for (const s of sessions) {
+      const day = utcDayKey(s.created_at);
+      started.set(day, (started.get(day) ?? 0) + 1);
+    }
+    // A trend needs something in it: a flat line under "$0.00" says nothing.
+    const spark = (values: number[]) => (values.some((v) => v > 0) ? values : undefined);
+    return {
+      cost: spark(win.dayKeys.map((d) => cost.get(d) ?? 0)),
+      tokens: spark(win.dayKeys.map((d) => tokens.get(d) ?? 0)),
+      sessions: spark(win.dayKeys.map((d) => started.get(d) ?? 0)),
+    };
+  }, [usage.data, sessions, win]);
+  const uncachedPrice = totals ? totals.cost_usd + totals.cache_savings_usd : 0;
+  const savedShare = totals && uncachedPrice > 0 ? totals.cache_savings_usd / uncachedPrice : 0;
+  const noUsage = !!totals && totals.calls === 0;
+  // All three changes or none, as on Usage (one arrow beside two bare numbers reads as a mistake).
+  const changes = totals ? periodChanges(totals, prev) : { comparable: false as const };
 
   return (
-    <div className="flex-1 overflow-y-auto">
-      <div className="pl-4 pr-5 py-6 space-y-10">
-        {/* Header — onboarding voice only until the workspace has agents;
-            after that the dashboard is an instrument, with the guide one
-            quiet toggle away. */}
-        <header className="flex items-start justify-between gap-4">
-          <div>
-            <h1 className="text-[20px] leading-tight font-semibold text-fg">
-              {workspaceActive || statsPending ? "Overview" : `Get started with ${BRAND_NAME}`}
+    <div className="relative">
+      <Wash />
+
+      {/* ── Hero: greeting + the session starter ──────────────────── */}
+      <div className={`${PAGE_GUTTER} pt-[clamp(3rem,11vh,7rem)] pb-12`}>
+        <div className="mx-auto w-full max-w-[760px]">
+          <div className="animate-rise-in text-center">
+            <h1 className="text-display text-balance text-fg">
+              {greeting()}
+              {name ? `, ${name}` : ""}
             </h1>
-            <p className="mt-1.5 text-[15px] text-fg-muted">
-              {workspaceActive || statsPending
-                ? "Workspace activity at a glance."
-                : "Install the CLI, mint a key, and let agents operate against your control plane."}
+            <p className="mt-3 text-[1.0625rem] text-fg-muted">
+              {firstRun && !workspaceActive
+                ? `Welcome to ${BRAND_NAME}. Create your first agent, then give it something to do.`
+                : "What should your agents work on?"}
             </p>
           </div>
-          {workspaceActive && (
-            <button
-              onClick={() => setShowGuide((v) => !v)}
-              className="shrink-0 text-[12px] text-fg-muted hover:text-fg border border-border rounded-md px-2.5 py-1.5 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-            >
-              {showGuide ? "Hide setup guide" : "Setup guide"}
-            </button>
-          )}
-        </header>
 
-        {/* Quickstart — single panel with three rows, no per-step cards */}
-        {guideVisible && (
-        <section className="border border-border rounded-lg bg-bg-surface shadow-[var(--shadow-sm)] overflow-hidden">
-          {/* Step 1 */}
-          <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6 border-b border-border">
-            <div>
-              <div className="font-mono text-[11px] text-fg-subtle tracking-wider">STEP 01</div>
-              <div className="mt-1 font-medium text-fg text-[15px]">Install the CLI</div>
-            </div>
-            <div className="space-y-2.5 min-w-0">
-              <p className="text-sm text-fg-muted">
-                The command-line client lets your
-                agent (or you) drive the platform from the terminal.
-              </p>
-              <button
-                onClick={() => copy(cmd, "cmd")}
-                className="group flex w-full sm:w-auto sm:inline-flex items-center gap-3 pl-3 pr-2 py-2 rounded-md border border-border bg-bg hover:border-border-strong hover:bg-brand-subtle/45 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] text-left"
-              >
-                <span className="text-fg-subtle select-none font-mono text-xs">›</span>
-                <span className="font-mono text-[13px] text-fg flex-1 truncate">{cmd}</span>
-                <span className="shrink-0 text-fg-subtle group-hover:text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] p-1">
-                  {copied === "cmd" ? (
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M20 6 9 17l-5-5" /></svg>
-                  ) : (
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" /></svg>
-                  )}
-                </span>
-              </button>
-              <p className="text-[12px] text-fg-subtle">
-                or globally:{" "}
-                <button
-                  onClick={() => copy(cmdGlobal, "cmd-global")}
-                  className="inline-flex items-center min-h-11 sm:min-h-0 font-mono text-fg-muted hover:text-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-                >
-                  {cmdGlobal}
-                </button>
-              </p>
-            </div>
+          <div className="stagger mt-8 animate-rise-in" style={{ "--i": 1 } as React.CSSProperties}>
+            <SessionStarter variant="home" initialAgentId={intent?.agentId} focusSignal={intent?.compose} />
           </div>
-
-          {/* Step 2 */}
-          <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6 border-b border-border">
-            <div>
-              <div className="font-mono text-[11px] text-fg-subtle tracking-wider">STEP 02</div>
-              <div className="mt-1 font-medium text-fg text-[15px]">Mint an API key</div>
-            </div>
-            <div className="space-y-2.5">
-              <p className="text-sm text-fg-muted">
-                Your agent needs this to authenticate. Keep it somewhere it can read.
-              </p>
-              <button
-                onClick={() => nav("/api-keys")}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-brand text-brand-fg rounded-md text-[13px] font-medium hover:bg-brand-hover transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-              >
-                Generate API key
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M5 12h14M13 6l6 6-6 6" /></svg>
-              </button>
-            </div>
-          </div>
-
-          {/* Step 3 */}
-          <div className="grid md:grid-cols-[180px_1fr] gap-x-6 gap-y-2 p-5 md:p-6">
-            <div>
-              <div className="font-mono text-[11px] text-fg-subtle tracking-wider">STEP 03</div>
-              <div className="mt-1 font-medium text-fg text-[15px]">Give it the task</div>
-            </div>
-            <div className="space-y-2.5">
-              <p className="text-sm text-fg-muted">
-                Point your agent at the CLI or API skill, then
-                ask for what you want:
-              </p>
-              <button
-                onClick={() => copy(examplePrompt, "prompt")}
-                className="group w-full text-left rounded-md border border-border bg-bg hover:border-border-strong hover:bg-brand-subtle/45 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] p-3 flex items-start gap-3"
-              >
-                <span className="shrink-0 mt-0.5 font-mono text-[10px] text-fg-subtle">
-                  PROMPT
-                </span>
-                <span className="flex-1 text-[13px] text-fg leading-snug">{examplePrompt}</span>
-                <span className="shrink-0 text-fg-subtle group-hover:text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] mt-0.5">
-                  {copied === "prompt" ? (
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M20 6 9 17l-5-5" /></svg>
-                  ) : (
-                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" /></svg>
-                  )}
-                </span>
-              </button>
-            </div>
-          </div>
-        </section>
-        )}
-
-        {/* Agent builder skill — copyable handoff for external coding agents */}
-        <section className="border border-border rounded-lg bg-bg-surface shadow-[var(--shadow-sm)] overflow-hidden">
-          <div className="grid lg:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
-            <div className="p-5 md:p-6 border-b lg:border-b-0 lg:border-r border-border min-w-0">
-              <div className="inline-flex items-center gap-1.5 rounded-md border border-border bg-bg px-2 py-1 text-[11px] font-medium uppercase text-fg-subtle">
-                <Terminal className="size-3.5" />
-                Codex / Claude Code
-              </div>
-              <h2 className="mt-4 font-display text-xl font-semibold text-fg">
-                Agent builder skill
-              </h2>
-              <p className="mt-2 text-sm text-fg-muted leading-6 max-w-[56ch]">
-                Paste this into your coding agent so it can create Harness Studio
-                agents, trigger CLI sign-in, route app OAuth, apply manifests,
-                and verify sessions.
-              </p>
-
-              <div className="mt-5 flex flex-col sm:flex-row gap-2">
-                <button
-                  onClick={() => copy(HARNESS_AGENT_BUILDER_SKILL, "agent-builder-skill")}
-                  className="inline-flex items-center justify-center gap-2 px-3.5 py-2 bg-brand text-brand-fg rounded-md text-[13px] font-medium hover:bg-brand-hover transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-                >
-                  {copied === "agent-builder-skill" ? (
-                    <Check className="size-4" />
-                  ) : (
-                    <Copy className="size-4" />
-                  )}
-                  Copy full skill
-                </button>
-                <button
-                  onClick={() => copy(HARNESS_AGENT_BUILDER_PROMPT, "agent-builder-prompt")}
-                  className="inline-flex items-center justify-center gap-2 px-3.5 py-2 rounded-md border border-border bg-bg hover:border-border-strong hover:bg-brand-subtle/45 text-[13px] font-medium text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-                >
-                  {copied === "agent-builder-prompt" ? (
-                    <Check className="size-4" />
-                  ) : (
-                    <Copy className="size-4" />
-                  )}
-                  Copy starter prompt
-                </button>
-              </div>
-
-              <ol className="mt-5 grid sm:grid-cols-3 gap-x-4 gap-y-2 text-[12px] text-fg-muted">
-                {["CLI sign-in", "OAuth handoff", "Smoke test"].map((item, index) => (
-                  <li key={item} className="flex items-center gap-2 min-w-0">
-                    <span className="font-mono text-[11px] text-brand">
-                      {String(index + 1).padStart(2, "0")}
-                    </span>
-                    <span className="truncate">{item}</span>
-                  </li>
-                ))}
-              </ol>
-            </div>
-
-            <div className="bg-bg min-w-0">
-              <div className="flex items-center justify-between gap-3 px-4 py-3 border-b border-border">
-                <div className="min-w-0">
-                  <p className="text-[11px] uppercase font-medium text-fg-subtle">
-                    SKILL.md preview
-                  </p>
-                  <p className="text-[12px] text-fg-muted truncate">
-                    Self-contained paste target
-                  </p>
-                </div>
-                <button
-                  onClick={() => copy(HARNESS_AGENT_BUILDER_SKILL, "agent-builder-skill-preview")}
-                  className="inline-flex items-center justify-center size-8 rounded-md border border-border text-fg-muted hover:text-fg hover:bg-bg-surface transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-                  aria-label="Copy agent builder skill"
-                >
-                  {copied === "agent-builder-skill-preview" ? (
-                    <Check className="size-4" />
-                  ) : (
-                    <Copy className="size-4" />
-                  )}
-                </button>
-              </div>
-              <pre className="max-h-[360px] overflow-auto p-4 text-[12px] leading-5 text-fg-muted font-mono whitespace-pre-wrap break-words">
-                {skillPreview}
-              </pre>
-            </div>
-          </div>
-        </section>
-
-        {/* Stats — number-forward, no decorative icons */}
-        <section>
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2.5">
-            {stats_.map((s) => stat(s.label, s.value, s.to))}
-          </div>
-        </section>
-
-        {/* Recent sessions */}
-        <section>
-          <div className="flex items-baseline justify-between mb-3">
-            <h2 className="font-display text-lg font-semibold text-fg">Recent sessions</h2>
-            <button
-              onClick={() => nav("/sessions")}
-              className="inline-flex items-center min-h-11 sm:min-h-0 text-[13px] text-fg-muted hover:text-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-            >
-              View all →
-            </button>
-          </div>
-
-          {sessionsQuery.isLoading ? (
-            <div className="border border-border rounded-lg divide-y divide-border">
-              {Array.from({ length: 4 }).map((_, i) => (
-                <div key={i} className="flex items-center gap-4 px-4 py-3">
-                  <Skeleton className="h-3.5 w-[40%]" rounded="sm" />
-                  <Skeleton className="h-3.5 w-16" rounded="sm" />
-                  <Skeleton className="h-3.5 w-32" rounded="sm" />
-                  <Skeleton className="h-3.5 w-20 ml-auto" rounded="sm" />
-                </div>
-              ))}
-            </div>
-          ) : recentSessions.length === 0 ? (
-            <EmptyState
-              title="No sessions yet"
-              body={
-                <>
-                  Tell your agent to start one, or visit the{" "}
-                  <button
-                    onClick={() => nav("/sessions")}
-                    className="inline-flex items-center min-h-11 sm:min-h-0 text-brand hover:underline"
-                  >
-                    Sessions page
-                  </button>
-                  .
-                </>
-              }
-            />
-          ) : (
-            <div className="border border-border rounded-lg bg-bg-surface shadow-[var(--shadow-sm)] overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="bg-bg text-fg-subtle text-[11px] uppercase">
-                    <th className="text-left px-4 py-2.5 font-medium">Title</th>
-                    <th className="text-left px-4 py-2.5 font-medium">Status</th>
-                    <th className="text-left px-4 py-2.5 font-medium">Agent</th>
-                    <th className="text-left px-4 py-2.5 font-medium">Created</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {recentSessions.map((s) => (
-                    <tr
-                      key={s.id}
-                      onClick={() => nav(`/sessions/${s.id}`)}
-                      className="border-t border-border hover:bg-brand-subtle/45 cursor-pointer transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-                    >
-                      <td className="px-4 py-2.5 text-fg">{s.title || "Untitled"}</td>
-                      <td className="px-4 py-2.5">
-                        <StatusPill status={s.status || "idle"} />
-                      </td>
-                      <td className="px-4 py-2.5 text-fg-muted font-mono text-[12px]">
-                        {s.agent_id}
-                      </td>
-                      <td className="px-4 py-2.5 text-fg-muted text-[12px]">
-                        {new Date(s.created_at).toLocaleDateString()}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
+        </div>
       </div>
+
+      {/* ── Below the fold ─────────────────────────────────────────── */}
+      <div className={`${PAGE_GUTTER} pb-20`}>
+        {/* A container: what sits side by side depends on the room the panel
+            has, not on the window (the sidebar takes 272px of it). */}
+        <div className={`${CONTENT} @container space-y-12`}>
+          {(firstRun || showGuide) && <FirstRunGuide />}
+
+          {!firstRun &&
+            (allQuiet ? (
+              <AllQuiet />
+            ) : (
+              <div className="grid gap-x-6 gap-y-12 @[880px]:grid-cols-2 @[880px]:items-start">
+                <RunningNow running={running} loading={bandLoading} />
+                <NeedsAttention ops={attentionOps} view={view} />
+              </div>
+            ))}
+
+          {!firstRun && (
+            <SinceLastVisit
+              finished={finished}
+              since={since}
+              loading={sessionsLoading}
+              error={sessionsError}
+              retry={refetchSessions}
+            />
+          )}
+
+          {/* The month's numbers */}
+          {!noUsage && (
+            <Section
+              title={`Last ${WINDOW_DAYS} days`}
+              description={
+                changes.comparable ? `Estimated at API prices. Changes compare with the ${WINDOW_DAYS} days before.` : "Estimated at API prices."
+              }
+              action={
+                <Link to="/usage" className={sectionLinkClass}>
+                  Usage <ArrowRightIcon className="size-3.5" />
+                </Link>
+              }
+            >
+              {usage.error ? (
+                <QueryProblem title="Usage could not be loaded" error={usage.error} retry={usage.refetch} />
+              ) : (
+                <div className="grid gap-4 @[480px]:grid-cols-2 @[860px]:grid-cols-4">
+                  <StatTile
+                    label="Estimated spend"
+                    value={formatCost(totals?.cost_usd)}
+                    delta={changes.cost}
+                    hint={totals && totals.sessions > 0 ? `${formatCost(totals.cost_usd / totals.sessions)} per session on average` : "at API prices"}
+                    spark={series.cost}
+                    to="/usage"
+                    loading={usage.isLoading}
+                  />
+                  <StatTile
+                    label="Sessions"
+                    value={(totals?.sessions ?? 0).toLocaleString()}
+                    delta={changes.sessions}
+                    hint="that used a model"
+                    spark={series.sessions}
+                    to="/sessions"
+                    loading={usage.isLoading}
+                  />
+                  <StatTile
+                    label="Tokens processed"
+                    value={formatCompact(totals?.processed_tokens)}
+                    delta={changes.tokens}
+                    hint={`${formatCompact(totals?.calls)} model calls`}
+                    spark={series.tokens}
+                    to="/usage"
+                    loading={usage.isLoading}
+                  />
+                  <StatTile
+                    label="Saved by caching"
+                    value={formatCost(totals?.cache_savings_usd)}
+                    hint={uncachedPrice > 0 ? `${Math.round(savedShare * 100)}% off the uncached price` : "Nothing was read from the cache"}
+                    footer={
+                      uncachedPrice > 0 ? (
+                        <ProportionBar
+                          label="Share of the uncached price saved by caching"
+                          parts={[
+                            { label: "Saved", value: savedShare, color: "var(--chart-6)" },
+                            { label: "Paid", value: 1 - savedShare, color: "var(--bg-pressed)" },
+                          ]}
+                        />
+                      ) : undefined
+                    }
+                    to="/usage"
+                    loading={usage.isLoading}
+                  />
+                </div>
+              )}
+            </Section>
+          )}
+
+          {/* Workspace counts + build from a coding agent */}
+          <div className="space-y-4">
+            <section className="surface rounded-xl px-5 py-4" aria-label="Workspace">
+              {statsQuery.error ? (
+                <QueryProblem
+                  compact
+                  title="Workspace summary could not be loaded"
+                  error={statsQuery.error}
+                  retry={statsQuery.refetch}
+                />
+              ) : (
+                <div className="flex flex-col gap-4 @[860px]:flex-row @[860px]:items-center">
+                  <div className="flex shrink-0 items-baseline justify-between gap-4 @[860px]:block @[860px]:w-44">
+                    <h3 className="text-h3 text-fg">Workspace</h3>
+                    {workspaceActive && !firstRun && (
+                      <button
+                        type="button"
+                        onClick={() => setShowGuide((v) => !v)}
+                        className={cn(quietLink, "mt-0.5 text-small font-normal")}
+                      >
+                        {showGuide ? "Hide setup guide" : "Show setup guide"}
+                      </button>
+                    )}
+                  </div>
+                  <dl className="-mx-3 grid flex-1 grid-cols-3 gap-x-2 gap-y-2 @[560px]:grid-cols-6 @[860px]:mx-0">
+                    {(
+                      [
+                        ["Agents", stats?.agents, "/agents"],
+                        ["Environments", stats?.environments, "/environments"],
+                        ["Vaults", stats?.vaults, "/vaults"],
+                        ["Skills", stats?.skills, "/skills"],
+                        ["Models", stats?.model_cards, "/model-cards"],
+                        ["API keys", stats?.api_keys, "/api-keys"],
+                      ] as const
+                    ).map(([label, value, to]) => (
+                      <Link key={label} to={to} className="rounded-md px-3 py-2 transition-quick hover:bg-bg-hover">
+                        <dd className="text-[1.25rem] leading-tight font-semibold tracking-tight text-fg">
+                          {value === undefined ? <Skeleton className="my-0.5 h-6 w-7" rounded="sm" /> : value}
+                        </dd>
+                        <dt className="text-xs whitespace-nowrap text-fg-subtle">{label}</dt>
+                      </Link>
+                    ))}
+                  </dl>
+                </div>
+              )}
+            </section>
+
+            <section className="surface flex flex-col gap-4 rounded-xl px-5 py-4 @[820px]:flex-row @[820px]:items-center">
+              <div className="flex min-w-0 flex-1 items-center gap-4">
+                <span className="flex size-10 shrink-0 items-center justify-center rounded-[12px] bg-bg-soft text-fg-muted">
+                  <TerminalIcon className="size-5 stroke-[1.75]" />
+                </span>
+                <div className="min-w-0 flex-1">
+                  <h3 className="text-h3 text-fg">Build agents from your terminal</h3>
+                  <p className="mt-0.5 text-small text-fg-muted">
+                    Give Claude Code or Codex the agent-builder skill to create, configure and verify {BRAND_NAME} agents.
+                  </p>
+                </div>
+              </div>
+              <div className="flex shrink-0 flex-wrap items-center gap-2">
+                <Button variant="ghost" size="sm" onClick={() => setShowSkill(true)}>
+                  Preview
+                </Button>
+                <CopyAction label="Copy starter prompt" value={HARNESS_AGENT_BUILDER_PROMPT} variant="outline" />
+                <CopyAction label="Copy skill" value={HARNESS_AGENT_BUILDER_SKILL} variant="outline" />
+              </div>
+            </section>
+          </div>
+        </div>
+      </div>
+
+      <Modal
+        open={showSkill}
+        onClose={() => setShowSkill(false)}
+        title="Agent-builder skill"
+        subtitle={`Paste it into your coding agent so it can create ${BRAND_NAME} agents, sign in through the CLI, route app OAuth, apply manifests and verify sessions.`}
+        maxWidth="max-w-3xl"
+        footer={
+          <>
+            <CopyAction label="Copy starter prompt" value={HARNESS_AGENT_BUILDER_PROMPT} variant="outline" />
+            <CopyAction label="Copy full skill" value={HARNESS_AGENT_BUILDER_SKILL} />
+          </>
+        }
+      >
+        <pre className="max-h-[52vh] overflow-auto rounded-lg bg-bg-inset p-4 font-mono text-xs leading-relaxed break-words whitespace-pre-wrap text-fg-muted">
+          {HARNESS_AGENT_BUILDER_SKILL}
+        </pre>
+      </Modal>
     </div>
+  );
+}
+
+function CopyAction({
+  label,
+  value,
+  variant = "default",
+}: {
+  label: string;
+  value: string;
+  variant?: "default" | "outline";
+}) {
+  const { copied, copy } = useCopy();
+  return (
+    <Button variant={variant} size="sm" onClick={() => void copy(value)}>
+      {copied ? <CheckIcon /> : <CopyIcon />}
+      {copied ? "Copied" : label}
+    </Button>
   );
 }

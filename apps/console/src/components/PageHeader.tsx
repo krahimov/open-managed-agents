@@ -4,33 +4,39 @@ import { useOutletContext } from "react-router";
 
 import { cn } from "@/lib/utils";
 
+import { useCrumbs } from "./AppBreadcrumb";
 import type { AppOutletContext } from "./AppShell";
+import { usePageColumn, useRegisterPageWidth, type PageWidth } from "./Page";
 
 /**
- * Page header — rendered via React portal into AppShell's
- * `pageHeaderSlot`, which sits ABOVE the scroll container as a
- * `shrink-0` sibling. The slot literally cannot scroll, so the header
- * never moves; no sticky positioning required.
+ * Page header — rendered via portal into AppShell's `pageHeaderSlot`,
+ * which sits ABOVE the scroll container. It never scrolls.
  *
- * Four slots, all optional:
- *   - `title`        → page name (usually omitted; AppBreadcrumb
- *                      already names the route at the top of the shell)
- *   - `subtitle`     → optional one-liner under the title
- *   - `actions`      → right-side button row (filters, CTAs)
- *   - `toolbar`      → second row below the title for search / chips
- *   - `tableHeader`  → bottom row for a frozen list-table header
- *                      (Excel-style). DataTable renders its `<thead>`
- *                      table here so column labels physically live
- *                      outside the scroll container and CAN'T move.
+ * Use it for LIST and INDEX pages: a title, a one-line description, the
+ * page's primary action, and (optionally) a toolbar row.
  *
- * Sections flow into each other WITHOUT internal dividers — the only
- * border is the scroll-shadow line added by AppShell's pageHeaderSlot
- * wrapper, which fades in once the user scrolls the panel content
- * under the header. Matches the LangSmith / Linear / Vercel pattern:
- * a flat header block, separator appears only when there's content
- * actually being hidden by it.
+ *   <PageHeader
+ *     title="Environments"
+ *     subtitle="Sandboxes your agents run in."
+ *     actions={<Button>New environment</Button>}
+ *     toolbar={<ListToolbar … />}
+ *   />
  *
- * Returns null when the slot isn't mounted, or when no slot has content.
+ * Detail pages do NOT use the title slot: they render <DetailHeader> in
+ * the page flow so the identity scrolls with the record.
+ *
+ * Slots, all optional:
+ *   title / subtitle   page name (text-h1) and a one-line description.
+ *                      On a top-level route `title` defaults to the route's
+ *                      breadcrumb label, so every list page has a heading.
+ *   actions            right side of the title row; the primary button is
+ *                      last (rightmost)
+ *   toolbar            second row: search, filter chips, view switch
+ *   tableHeader        used by DataTable for its pinned column header
+ *
+ * The header sits in the same column as the <Page> below it (usePageColumn):
+ * on a top-level page that is the shared left edge, so the title of
+ * Sessions, Usage and Workspace starts at the same x.
  */
 interface PageHeaderProps {
   title?: ReactNode;
@@ -38,51 +44,75 @@ interface PageHeaderProps {
   actions?: ReactNode;
   toolbar?: ReactNode;
   tableHeader?: ReactNode;
+  /** Match the <Page width> below it. */
+  width?: PageWidth;
   className?: string;
 }
 
-export function PageHeader({
-  title,
+export function PageHeader(props: PageHeaderProps) {
+  const ctx = useOutletContext<AppOutletContext | undefined>();
+  const slot = ctx?.pageHeaderSlot;
+  // No shell (unit tests, pages outside AppShell): nothing to portal into.
+  if (!slot) return null;
+  return <PageHeaderPortal {...props} slot={slot} />;
+}
+
+function PageHeaderPortal({
+  title: titleProp,
   subtitle,
   actions,
   toolbar,
   tableHeader,
+  width = "default",
   className,
-}: PageHeaderProps) {
-  const ctx = useOutletContext<AppOutletContext | undefined>();
-  const slot = ctx?.pageHeaderSlot;
-  if (!slot) return null;
+  slot,
+}: PageHeaderProps & { slot: HTMLDivElement }) {
+  useRegisterPageWidth(width);
+  const column = usePageColumn(width);
+  // A top-level page that passes no title is named by its route: the
+  // breadcrumb bar is hidden there, so the header must say where you are.
+  const crumbs = useCrumbs();
+  const title = titleProp ?? (crumbs.length === 1 ? crumbs[0].label : undefined);
 
   const hasTopRow = !!title || !!subtitle || !!actions;
   if (!hasTopRow && !toolbar && !tableHeader) return null;
 
   return createPortal(
-    <div className={cn("bg-bg/92 backdrop-blur supports-[backdrop-filter]:bg-bg/86", className)}>
+    <div data-slot="page-header" className={className}>
       {hasTopRow && (
-        <div className="flex items-start gap-4 pl-4 pr-5 pt-3">
-          <div className="min-w-0 flex-1">
-            {title && (
-              <h1 className="text-lg font-semibold truncate">
-                {title}
-              </h1>
+        <div className={column.outer}>
+          <div
+            className={cn(
+              column.inner,
+              "flex items-center gap-4 pb-3",
+              // No breadcrumb bar above (top-level page): the title needs air.
+              "pt-7 group-data-[topbar=true]/panel:pt-1.5",
             )}
-            {subtitle && (
-              <p className="text-sm text-fg-muted mt-0.5">{subtitle}</p>
-            )}
+          >
+            <div className="min-w-0 flex-1">
+              {title && <h1 className="truncate text-h1 text-fg">{title}</h1>}
+              {subtitle && <p className="mt-1 max-w-[72ch] text-sm text-fg-muted">{subtitle}</p>}
+            </div>
+            {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
           </div>
-          {actions && (
-            <div className="flex items-center gap-2 shrink-0">{actions}</div>
-          )}
         </div>
       )}
       {toolbar && (
-        <div className="flex items-center gap-2 pl-4 pr-5 py-3 overflow-x-auto">
-          {toolbar}
+        <div className={column.outer}>
+          <div
+            className={cn(
+              column.inner,
+              "flex items-center gap-2 pb-3",
+              hasTopRow ? "pt-1" : "pt-5 group-data-[topbar=true]/panel:pt-1.5",
+            )}
+          >
+            {toolbar}
+          </div>
         </div>
       )}
       {tableHeader && (
-        <div className="pl-4 pr-5">
-          {tableHeader}
+        <div className={column.outer}>
+          <div className={column.inner || undefined}>{tableHeader}</div>
         </div>
       )}
     </div>,

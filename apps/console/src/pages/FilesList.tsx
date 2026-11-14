@@ -1,336 +1,345 @@
-import { useMemo, useRef, useState } from "react";
+/**
+ * Files: everything agents wrote and everything they were given.
+ *
+ * A file browser, not a table of ids: each row leads with what the file is
+ * (a type mark and its name), says which conversation it belongs to, how
+ * big it is and when it arrived. A row opens the file beside the list with
+ * a preview; Download and Delete are in the row menu and in that panel.
+ *
+ * GET /v1/files follows the Anthropic Files API shape: `before_id` as the
+ * cursor and `has_more` on the page. The Session filter is the server's
+ * `scope_id`; the search narrows the files loaded so far, because the
+ * endpoint has no name filter.
+ */
+
+import { useCallback, useMemo, useState } from "react";
 import { Link } from "react-router";
-import { DownloadIcon, TrashIcon, UploadIcon } from "lucide-react";
-import { useApi } from "../lib/api";
-import { downloadUploadedFile } from "../lib/session-outputs";
-import { MAX_ATTACHMENT_BYTES, uploadFile } from "../lib/attachments";
-import { Button } from "@/components/ui/button";
+import { CopyIcon, DownloadIcon, EyeIcon, Trash2Icon } from "lucide-react";
 import { toast } from "sonner";
-import { DataTable, type ColumnDef } from "../components/DataTable";
-import { FacetedFilter } from "../components/FacetedFilter";
-import { FilterChip } from "../components/FilterChip";
-import { RowActionsMenu } from "../components/RowActionsMenu";
-import { useApiQuery, useInfiniteApiQuery } from "../lib/useApiQuery";
-import { PopoverContent } from "@/components/ui/popover";
 import type { FileRecord } from "@open-managed-agents/api-types";
-import type { SessionRecord as Session } from "../types/session";
+
+import { Button } from "@/components/ui/button";
+import { PopoverContent } from "@/components/ui/popover";
+import {
+  AgentAvatar,
+  ConfirmDialog,
+  DataTable,
+  EntityAvatar,
+  FacetedFilter,
+  FilterChip,
+  RelativeTime,
+  RowActionsMenu,
+  Skeleton,
+  Tip,
+  type ColumnDef,
+} from "@/components/kit";
+import { FilePanel } from "@/components/files/FilePanel";
+import { RefusalBody } from "@/components/files/RefusalBody";
+import { UPLOAD_DOCS_URL } from "@/components/files/refusal";
+import { OverflowTip } from "@/components/OverflowTip";
+import { downloadFile, fileKind } from "@/components/files/files";
+import { ResourceIdentity, formatBytes } from "@/components/resources/ResourceBits";
+import { ResourceListError } from "@/components/resources/ResourceListError";
+import { useApi } from "@/lib/api";
+import { copyText } from "@/lib/clipboard";
+import { countWords, plural, toDate } from "@/lib/format";
+import { sessionTitle } from "@/lib/sessions";
+import { useApiQuery, useInfiniteApiQuery, useQuietQuery } from "@/lib/useApiQuery";
+import type { SessionRecord as Session } from "@/types/session";
+import { withReason } from "@/lib/failure-text";
 
 interface ListResponse {
   data: FileRecord[];
   has_more?: boolean;
-  first_id?: string;
-  last_id?: string;
 }
 
-const ALL_SCOPE = "";
+const ALL_SESSIONS = "";
+const SUBTITLE = "What your agents wrote and what they were given, kept with the session it belongs to.";
+
+/**
+ * The session a file belongs to, by title, with its agent's mark. A link
+ * to that session; while the title is cut, the whole of it (and the
+ * agent's name) is shown on hover and on keyboard focus. A session the
+ * list did not include (older than the recent window, or deleted since) is
+ * looked up quietly: a file that outlived its session is normal.
+ */
+function SessionCell({ id, session }: { id: string; session?: Session }) {
+  const lookup = useQuietQuery<Session>(session ? null : `/v1/sessions/${id}`);
+  const found = session ?? lookup.data;
+  if (!found) {
+    if (lookup.isLoading) return <Skeleton className="inline-block h-4 w-36 align-middle" rounded="sm" />;
+    return <span className="text-fg-subtle">{lookup.missing ? "Session no longer exists" : "Session unavailable"}</span>;
+  }
+  const title = sessionTitle(found);
+  return (
+    <OverflowTip label={found.agent?.name ? `${title} · ${found.agent.name}` : title}>
+      <Link
+        to={`/sessions/${found.id}`}
+        className="inline-flex max-w-full min-w-0 items-center gap-2 rounded-sm align-middle font-medium text-fg decoration-border-strong underline-offset-4 hover:underline"
+      >
+        <AgentAvatar name={found.agent?.name} id={found.agent?.id} size="xs" />
+        <span className="truncate">{title}</span>
+      </Link>
+    </OverflowTip>
+  );
+}
+
+/**
+ * A file's leading mark is its type, said the way people say it: the
+ * extension ("csv", "md", "json"). Down a list it tells the rows apart at
+ * a glance, which an outline of a sheet of paper on every row does not.
+ * A file with no short extension keeps its kind's icon.
+ */
+function FileTypeTile({ file }: { file: FileRecord }) {
+  const ext = /\.([a-z0-9]{1,4})$/i.exec(file.filename)?.[1]?.toLowerCase();
+  if (!ext) return <EntityAvatar icon={fileKind(file).icon} size="md" />;
+  return (
+    <EntityAvatar size="md">
+      <span className="text-micro font-medium tracking-tight text-fg-muted">{ext}</span>
+    </EntityAvatar>
+  );
+}
 
 export function FilesList() {
   const { api } = useApi();
-  // Server-driven scope filter — `""` is the "All sessions" sentinel
-  // (FacetedFilter requires a value, server treats undefined as no
-  // filter), any other value is a real session id passed through as
-  // `scope_id`.
-  const [scopeId, setScopeId] = useState<string>(ALL_SCOPE);
+  const [sessionId, setSessionId] = useState<string>(ALL_SESSIONS);
   const [search, setSearch] = useState("");
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [deleting, setDeleting] = useState<FileRecord | null>(null);
 
-  // Files endpoint follows the Anthropic Files API shape — `before_id`
-  // for the cursor param and `last_id` (only when `has_more` is true) for
-  // the next-page cursor — instead of OMA's standard `cursor` /
-  // `next_cursor`. useInfiniteApiQuery accepts adapter overrides for both.
-  const filesParams = useMemo(
-    () => ({ scope_id: scopeId || undefined }),
-    [scopeId],
-  );
+  const params = useMemo(() => ({ scope_id: sessionId || undefined }), [sessionId]);
   const {
     items,
-    isLoading: loading,
+    isLoading,
     hasMore,
     isLoadingMore,
     loadMore,
-    refresh: refreshFiles,
+    refresh,
+    error,
   } = useInfiniteApiQuery<FileRecord>("/v1/files", {
     limit: 20,
-    params: filesParams,
+    params,
     cursorParam: "before_id",
     getNextCursor: (res) => {
-      const r = res as ListResponse;
-      return r.has_more ? r.data[r.data.length - 1]?.id : undefined;
+      const page = res as ListResponse;
+      return page.has_more ? page.data[page.data.length - 1]?.id : undefined;
     },
   });
 
-  // Sessions for the Scope chip's option list. One-shot fetch of the
-  // top 200 sessions visible to the user — same approach AgentsList
-  // takes for its callable-agents dropdown. Sessions beyond the cap
-  // aren't listed; users with a long tail still have the search box
-  // inside the FacetedFilter (cmdk type-ahead) to find what they need
-  // by id substring.
-  const { data: sessionsRes } = useApiQuery<{ data: Session[] }>(
-    "/v1/sessions",
-    { limit: "200" },
-  );
-  const sessions = sessionsRes?.data ?? [];
+  // The sessions a file can belong to: names for the Session column and the
+  // options of its filter. One read of the most recent 200.
+  const { data: sessionsRes } = useApiQuery<{ data: Session[] }>("/v1/sessions", { limit: "200" });
+  const sessions = useMemo(() => sessionsRes?.data ?? [], [sessionsRes]);
+  const sessionById = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions]);
 
-  // Scope option list — "All" maps to no filter, every other option
-  // carries the real session id and labels with the session title (or
-  // the id when the title is blank).
-  const scopeOptions = useMemo(
-    () => [
-      { value: ALL_SCOPE, label: "All sessions" },
-      ...sessions.map((s) => ({
-        value: s.id,
-        label: s.title?.trim() ? `${s.title} (${s.id})` : s.id,
-      })),
-    ],
+  const sessionOptions = useMemo(
+    () => [{ value: ALL_SESSIONS, label: "All sessions" }, ...sessions.map((s) => ({ value: s.id, label: sessionTitle(s) }))],
     [sessions],
   );
+  const pickedSession = sessionId ? sessionById.get(sessionId) : undefined;
 
-  // Pretty label for the active chip — falls back to the bare id when
-  // the session isn't in our cached list (e.g. user landed via deep
-  // link to a session beyond the 200-row cap).
-  const scopeDisplay = useMemo(() => {
-    if (!scopeId) return undefined;
-    const hit = sessions.find((s) => s.id === scopeId);
-    return hit?.title?.trim() ? hit.title : scopeId;
-  }, [scopeId, sessions]);
-
-  // Binary download — api() always parses JSON; downloadUploadedFile sends
-  // the same auth (cookie, Clerk bearer, workspace pin) and saves the blob.
-  const download = (f: FileRecord) => downloadUploadedFile(f.id, f.filename);
-
-  // Upload — same POST /v1/files the chat composer uses. Scoped to the
-  // session currently selected in the Scope filter, if any.
-  const fileInput = useRef<HTMLInputElement | null>(null);
-  const [uploading, setUploading] = useState(false);
-  const upload = async (picked: File[]) => {
-    if (picked.length === 0) return;
-    setUploading(true);
-    let ok = 0;
-    for (const file of picked) {
-      if (file.size > MAX_ATTACHMENT_BYTES) {
-        toast.error(`"${file.name}" is too large — the limit is 25 MB per file.`);
-        continue;
-      }
-      try {
-        await uploadFile(api, file, { scopeId: scopeId || undefined });
-        ok += 1;
-      } catch (e) {
-        toast.error(`Couldn't upload "${file.name}": ${e instanceof Error ? e.message : "upload failed"}`);
-      }
-    }
-    setUploading(false);
-    if (ok > 0) {
-      toast.success(ok === 1 ? "File uploaded" : `${ok} files uploaded`);
-      refreshFiles();
-    }
-  };
-
-  const remove = async (f: FileRecord) => {
-    if (!confirm(`Delete "${f.filename}"? The file will be permanently deleted.`)) return;
+  const download = useCallback(async (file: FileRecord) => {
     try {
-      await api(`/v1/files/${f.id}`, { method: "DELETE" });
-      // Invalidate every /v1/files query (any scope filter) so the page
-      // refetches — useInfiniteApiQuery exposes refresh() which bounces
-      // back to page 0. Cheaper than maintaining a local optimistic
-      // copy; the next refetch lands fresh server truth.
-      refreshFiles();
-    } catch {
-      // toasted
+      await downloadFile(file);
+    } catch (e) {
+      toast.error(withReason(`${file.filename} could not be downloaded`, e));
     }
-  };
+  }, []);
 
-  // Search is client-side over the loaded page — backend doesn't index
-  // by filename and the upload API has no name filter. Operators who
-  // need a file from the long tail filter by scope (server-side) first,
-  // then narrow further by name within the page.
-  const filtered = search
-    ? items.filter((f) => f.filename.toLowerCase().includes(search.toLowerCase()))
-    : items;
+  const query = search.trim().toLowerCase();
+  const rows = useMemo(() => (query ? items.filter((f) => f.filename.toLowerCase().includes(query)) : items), [items, query]);
+  const open = openId ? (items.find((f) => f.id === openId) ?? null) : null;
 
   const columns = useMemo<ColumnDef<FileRecord>[]>(
     () => [
       {
-        id: "filename",
+        id: "file",
         accessorKey: "filename",
-        header: "Filename",
-        cell: ({ row }) => (
-          <span title={row.original.filename} className="font-medium text-fg truncate inline-block max-w-[280px] align-bottom">
-            {row.original.filename}
-          </span>
-        ),
+        header: "File",
+        size: 360,
+        minSize: 240,
         enableHiding: false,
+        enableSorting: true,
+        cell: ({ row }) => {
+          const file = row.original;
+          const kind = fileKind(file);
+          return (
+            <ResourceIdentity
+              avatar={<FileTypeTile file={file} />}
+              name={file.filename}
+              secondary={`${kind.label}${file.downloadable === false ? " · kept for agents" : ""}`}
+              secondaryTitle={`${kind.label}${file.media_type ? ` (${file.media_type})` : ""}${file.downloadable === false ? " · kept for agents" : ""}`}
+            />
+          );
+        },
       },
       {
-        id: "id",
-        accessorKey: "id",
-        header: "ID",
-        cell: ({ row }) => (
-          <span title={row.original.id} className="font-mono text-xs text-fg-muted">
-            {row.original.id}
-          </span>
-        ),
-        enableHiding: false,
-      },
-      {
-        id: "media_type",
-        accessorKey: "media_type",
-        header: "Type",
-        cell: ({ row }) => (
-          <span className="text-fg-muted text-xs">{row.original.media_type}</span>
-        ),
-      },
-      {
-        id: "size",
-        accessorFn: (f) => f.size_bytes,
-        header: "Size",
-        cell: ({ row }) => (
-          <span className="text-fg-muted text-xs tabular-nums">
-            {formatBytes(row.original.size_bytes)}
-          </span>
-        ),
-      },
-      {
-        id: "scope",
-        accessorFn: (f) => f.scope_id ?? "",
-        header: "Scope",
+        id: "session",
+        header: "Session",
+        size: 380,
+        minSize: 200,
         cell: ({ row }) =>
           row.original.scope_id ? (
-            <Link
-              to={`/sessions/${row.original.scope_id}`}
-              onClick={(e) => e.stopPropagation()}
-              className="text-brand hover:underline text-xs font-mono"
-            >
-              {row.original.scope_id}
-            </Link>
+            <SessionCell id={row.original.scope_id} session={sessionById.get(row.original.scope_id)} />
           ) : (
-            <span className="text-fg-subtle text-xs">—</span>
+            <span className="text-fg-subtle">No session</span>
           ),
       },
       {
-        id: "created",
-        accessorFn: (f) => f.created_at,
-        header: "Created",
+        id: "size",
+        accessorKey: "size_bytes",
+        header: "Size",
+        size: 110,
+        enableSorting: true,
+        sortDescFirst: true,
+        // Also in the file's panel: it gives way before the table scrolls sideways.
+        meta: { align: "right", hideBelow: 720 },
         cell: ({ row }) => (
-          <span className="text-fg-muted text-xs whitespace-nowrap">
-            {new Date(row.original.created_at).toLocaleString()}
-          </span>
+          <Tip label={`${row.original.size_bytes.toLocaleString()} bytes`}>
+            <span className="text-fg-muted">{formatBytes(row.original.size_bytes)}</span>
+          </Tip>
         ),
+      },
+      {
+        id: "added",
+        accessorFn: (f) => toDate(f.created_at)?.getTime(),
+        header: "Added",
+        size: 130,
+        enableSorting: true,
+        sortDescFirst: true,
+        cell: ({ row }) => <RelativeTime value={row.original.created_at} className="text-fg-muted" fallback="Not recorded" />,
       },
       {
         id: "actions",
         header: "",
+        size: 56,
+        enableHiding: false,
         cell: ({ row }) => {
-          const f = row.original;
+          const file = row.original;
           return (
             <RowActionsMenu
-              label={`Actions for ${f.filename}`}
+              label={`Actions for ${file.filename}`}
               actions={[
-                ...(f.downloadable
-                  ? [
-                      {
-                        label: "Download",
-                        icon: <DownloadIcon className="size-4" />,
-                        onSelect: () => {
-                          void download(f);
-                        },
-                      },
-                    ]
-                  : []),
+                { label: "Open", icon: <EyeIcon />, onSelect: () => setOpenId(file.id) },
                 {
-                  label: "Delete",
-                  icon: <TrashIcon className="size-4" />,
-                  destructive: true,
-                  onSelect: () => {
-                    void remove(f);
-                  },
+                  label: "Download",
+                  icon: <DownloadIcon />,
+                  disabled: file.downloadable === false,
+                  onSelect: () => void download(file),
                 },
+                { label: "Copy file id", icon: <CopyIcon />, onSelect: () => void copyText(file.id) },
+                { label: "Delete", icon: <Trash2Icon />, destructive: true, onSelect: () => setDeleting(file) },
               ]}
             />
           );
         },
-        enableHiding: false,
-        size: 56,
       },
     ],
-    // `download` / `remove` close over `api` and `refreshFiles`, both
-    // stable identities (useCallback in api.ts + useApiQuery.ts) — so
-    // the first-render closures stay correct for the lifetime of the
-    // page, and an empty dep array is the right choice.
-    [],
+    [sessionById, download],
   );
+
+  if (error && items.length === 0) {
+    return <ResourceListError title="Files" subtitle={SUBTITLE} what="Files" error={error} retry={refresh} />;
+  }
+
+  const totalBytes = rows.reduce((sum, f) => sum + (f.size_bytes || 0), 0);
+  const summary = isLoading
+    ? undefined
+    : query
+      ? `${rows.length.toLocaleString()} of ${plural(items.length, "file")}${hasMore ? " loaded" : ""}`
+      : rows.length > 0
+        ? `${countWords(rows.length, hasMore, "file")} · ${formatBytes(totalBytes)}`
+        : undefined;
 
   const filters = (
     <FilterChip
-      label="Scope"
-      active={scopeId !== ALL_SCOPE}
-      display={scopeDisplay}
-      onClear={() => setScopeId(ALL_SCOPE)}
+      label="Session"
+      active={sessionId !== ALL_SESSIONS}
+      display={sessionId ? (pickedSession ? sessionTitle(pickedSession) : "One session") : undefined}
+      onClear={() => setSessionId(ALL_SESSIONS)}
     >
-      <PopoverContent
-        align="start"
-        sideOffset={4}
-        collisionPadding={8}
-        className="w-80 p-0"
-      >
-        <FacetedFilter
-          options={scopeOptions}
-          value={scopeId}
-          onValueChange={(v) => setScopeId(v)}
-          searchPlaceholder="Session id or title..."
-        />
+      <PopoverContent align="start" sideOffset={4} collisionPadding={8} className="w-96 p-0">
+        <FacetedFilter options={sessionOptions} value={sessionId} onValueChange={setSessionId} searchPlaceholder="Search sessions" />
       </PopoverContent>
     </FilterChip>
   );
 
-  const uploadButton = (
-    <>
-      <input
-        ref={fileInput}
-        type="file"
-        multiple
-        className="hidden"
-        aria-label="Upload files"
-        onChange={(e) => {
-          const picked = Array.from(e.currentTarget.files ?? []);
-          // Reset so picking the same file again still fires onChange.
-          e.currentTarget.value = "";
-          void upload(picked);
-        }}
-      />
-      <Button onClick={() => fileInput.current?.click()} disabled={uploading}>
-        <UploadIcon className="size-4" aria-hidden />
-        {uploading ? "Uploading…" : "Upload"}
-      </Button>
-    </>
-  );
+  const empty = query
+    ? {
+        title: `No files match “${search.trim()}”`,
+        body: hasMore ? "Only the files loaded so far were searched. Clear the search to keep loading." : "Check the spelling, or clear the search.",
+        action: (
+          <Button variant="outline" onClick={() => setSearch("")}>
+            Clear search
+          </Button>
+        ),
+      }
+    : sessionId
+      ? {
+          title: "No files in this session",
+          body: "This session has not saved or been given any files.",
+          action: (
+            <Button variant="outline" onClick={() => setSessionId(ALL_SESSIONS)}>
+              Clear filter
+            </Button>
+          ),
+        }
+      : {
+          title: "No files yet",
+          body: (
+            <>
+              Files show up here when an agent saves its work or someone attaches an image to a message. Any other file can be
+              uploaded (<RefusalBody body={[{ link: "how to upload a file", href: UPLOAD_DOCS_URL }]} />), then mounted in a new
+              session's Options.
+            </>
+          ),
+          action: undefined,
+        };
 
   return (
     <DataTable<FileRecord>
-      headerActions={uploadButton}
-      searchPlaceholder="Filter loaded files by name…"
+      title="Files"
+      subtitle={SUBTITLE}
+      searchPlaceholder="Search files"
       searchValue={search}
       onSearchChange={setSearch}
       filters={filters}
-      data={filtered}
-      loading={loading}
+      summary={summary}
+      columns={columns}
+      data={rows}
       getRowId={(f) => f.id}
-      hasMore={hasMore && !search}
+      onRowClick={(f) => setOpenId(f.id)}
+      loading={isLoading}
+      hasMore={hasMore && !query}
       loadingMore={isLoadingMore}
       onLoadMore={loadMore}
-      emptyTitle={scopeId ? "No files in this scope" : "No files yet"}
       emptyKind="file"
-      emptySubtitle={
-        scopeId
-          ? "Try clearing the scope filter, or check the session id."
-          : <>Use <span className="font-medium">Upload</span> above, attach a file in a session chat, or call <code className="text-xs">POST /v1/files</code> / the AMA SDK <code className="text-xs">client.beta.files.create()</code>.</>
-      }
-      columns={columns}
-    />
+      emptyTitle={empty.title}
+      emptySubtitle={empty.body}
+      emptyAction={empty.action}
+    >
+      <FilePanel
+        file={open}
+        session={open?.scope_id ? sessionById.get(open.scope_id) : undefined}
+        onClose={() => setOpenId(null)}
+        onDownload={(f) => void download(f)}
+        onDelete={setDeleting}
+      />
+      <ConfirmDialog
+        open={!!deleting}
+        onClose={() => setDeleting(null)}
+        title={`Delete ${deleting?.filename ?? "this file"}?`}
+        body="The file and its contents are removed for good. Sessions that used it keep their history, but can no longer open it. This cannot be undone."
+        confirmLabel="Delete file"
+        destructive
+        onConfirm={async () => {
+          if (!deleting) return;
+          await api(`/v1/files/${deleting.id}`, { method: "DELETE" });
+          if (openId === deleting.id) setOpenId(null);
+          toast.success("File deleted");
+          refresh();
+        }}
+      />
+    </DataTable>
   );
-}
-
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }

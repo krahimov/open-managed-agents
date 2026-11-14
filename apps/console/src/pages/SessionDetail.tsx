@@ -1,85 +1,75 @@
-import { useEffect, useState, useRef, useMemo } from "react";
-import { useParams, Link } from "react-router";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate, useParams, useSearchParams } from "react-router";
 import yaml from "js-yaml";
-import { OMA_SETUP_HARNESS } from "@open-managed-agents/api-types";
-import { useApi } from "../lib/api";
 import { toast } from "sonner";
-import { BracesIcon } from "lucide-react";
-import { Markdown } from "../components/Markdown";
-import { formatDuration, formatRelative, shortenId } from "../lib/format";
-import { Badge, StatusPill } from "../components/Badge";
-import { Modal } from "../components/Modal";
-import { AccessRequestCard } from "../components/AccessRequestCard";
-import { SavedLoginLine } from "../components/SavedLoginLine";
-import { grantedRequestIdsOf } from "./agents/SessionChat";
-import { AmbientRuleCard } from "../components/AmbientRuleCard";
-import { MemoryEnabledCard } from "../components/MemoryEnabledCard";
-import { SkillRequestCard } from "../components/SkillRequestCard";
-import { Button } from "@/components/ui/button";
-import { AgentIcon, ClockIcon, DurationIcon, EnvIcon, VaultIcon } from "../components/icons";
-import { FilesPanel, ResourcePanel } from "./session-detail/Panels";
+import { ArrowUpIcon, CornerDownRightIcon, HandIcon, HourglassIcon, SplitIcon } from "lucide-react";
+
+import { Sheet, SheetContent, SheetDescription, SheetTitle } from "@/components/ui/sheet";
+import { cn } from "@/lib/utils";
+
+import { useQuery } from "@tanstack/react-query";
+
+import { IntegrationsApi } from "../integrations/api/client";
+import { ApiError, useApi } from "../lib/api";
+import type { Event } from "../lib/events";
+import { readFailure } from "../lib/failures";
+import { quietWords, readSession, STALLED_AFTER_MS } from "../lib/session-state";
+import { missionRef, missionTitle, sessionSource, sessionTitle, useMissionGoals } from "../lib/sessions";
+import { startSession } from "../lib/shell-events";
+import type { Trajectory } from "../lib/trajectory";
+import type { SessionRecord } from "../types/session";
+import { AgentAvatar } from "../components/AgentAvatar";
+import { useCrumbLabel } from "../components/AppBreadcrumb";
+import { ConfirmDialog } from "../components/ConfirmDialog";
+import { RecordNotFound } from "../components/EmptyState";
+import { MissionBanner } from "../components/MissionBanner";
+import { Page, PAGE_GUTTER } from "../components/Page";
+import { QueryProblem } from "../components/QueryProblem";
+import { Tip } from "../components/Tip";
+import { Conversation, ConversationContent } from "../components/ai-elements/conversation";
+import { ContextPanel, type PeekTarget, type SessionState } from "../components/sessions/ContextPanel";
+import { ConversationControl, ConversationEdges, JumpToLatest, type ConversationHandle } from "../components/sessions/ConversationEdges";
+import { ConversationView, type QueuedMessage } from "../components/sessions/ConversationView";
+import { onTablistKeyDown, useMediaQuery, useMinuteClock, useSessionOperations, useStoredFlag } from "../components/sessions/hooks";
+import { buildConversation, eventText, summarizeUsage } from "../components/sessions/model";
+import { useSessionReadings } from "../components/sessions/readings";
+import { SessionComposer, type SendResult } from "../components/sessions/SessionComposer";
+import { SessionHeader, SESSION_VIEW_PANEL_ID, sessionViewTabId, type SessionView } from "../components/sessions/SessionHeader";
 import {
-  AttachButton,
-  ComposerAttachments,
-  MessageAttachmentChips,
-  TurnFiles,
-} from "../components/SessionFiles";
-import {
-  AttachmentError,
-  MAX_ATTACHMENT_BYTES,
-  MAX_ATTACHMENTS_PER_MESSAGE,
-  attachmentsLabel,
-  attachmentsOf,
-  buildUserMessageEvent,
-  prepareAttachments,
-  type MessageAttachment,
-} from "../lib/attachments";
-import {
-  outputsByTurn,
-  refreshSessionOutputs,
-  useSessionOutputs,
-  type SessionOutputFile,
-} from "../lib/session-outputs";
-import {
-  TrajectoryOutcomeChip,
-  TrajectoryRewardChip,
-  TrajectoryViewerModal,
-} from "./session-detail/Trajectory";
+  findLinearAddress,
+  linearIdentifierFromText,
+  linearIssueLink,
+  linearUrlKey,
+  type GitHubSource,
+  type LinearSource,
+  type SlackSource,
+} from "../components/sessions/source";
+import { ContextPanelSkeleton, ConversationSkeleton } from "../components/sessions/SessionSkeleton";
 import { TimelineView } from "../components/timeline/TimelineView";
 import { SaveAsEvalDialog } from "./evals/SaveAsEvalDialog";
-import type { Event } from "../lib/events";
-import { eventKey } from "../lib/event-key";
-import { buildToolCallIndex } from "../lib/tool-status";
-import type { Trajectory, TrajectoryOutcome } from "../lib/trajectory";
-import { rewardHeadline, outcomeToStatusTone } from "../lib/trajectory";
-// ai-elements primitives — used to render the chat surface (messages,
-// prompt input; tool calls + reasoning use components/tool-calls). The
-// components/ai-elements/ directory is shadcn-style copy-paste so we own +
-// customize them locally.
-import {
-  Conversation,
-  ConversationContent,
-  ConversationScrollButton,
-} from "../components/ai-elements/conversation";
-import { Message, MessageContent } from "../components/ai-elements/message";
-import {
-  PromptInput,
-  PromptInputTextarea,
-  PromptInputFooter,
-  PromptInputTools,
-  PromptInputSubmit,
-} from "../components/ai-elements/prompt-input";
-import { SessionModelPicker } from "../components/SessionModelPicker";
-import { useComposerDraft } from "../lib/composer-draft";
-import { buildTimeline } from "../components/tool-calls/model";
-import {
-  StreamingToolRow,
-  ThinkingRow,
-  WorkTimeline,
-  WorkingRow,
-} from "../components/tool-calls/ToolCalls";
+import { ResourceSheet } from "./session-detail/Panels";
+import { TrajectoryViewerModal } from "./session-detail/Trajectory";
 
-type View = "chat" | "timeline";
+/**
+ * Session detail: the centrepiece.
+ *
+ *   top bar      Sessions > {title}
+ *   session bar  identity, status, facts by name, view switch, actions   (fixed)
+ *   body         conversation column (the only thing that scrolls) | context panel
+ *
+ * This file owns the data: the session record, the event history, the live
+ * stream and the outbox. Everything on screen is derived from that state
+ * and drawn by components/sessions/* (conversation, composer, header,
+ * context panel) and components/timeline/* (the waterfall).
+ */
+
+/** A name lookup that returned no record: the record is gone, or the read failed. */
+type LookupProblem = "missing" | "failed";
+
+const PRIMARY_THREAD = "sthr_primary";
+const integrations = new IntegrationsApi();
+const COLUMN = "mx-auto w-full max-w-[720px]";
+
 
 /** A user.* event sitting in the server-side pending_events queue.
  *  Maintained client-side via system.user_message_pending /
@@ -96,19 +86,21 @@ interface PendingEntry {
 
 export function SessionDetail() {
   const { id } = useParams();
+  const navigate = useNavigate();
   const { api, streamEvents } = useApi();
+  /** The session record. `undefined` while it loads, `null` when the
+   *  session does not exist (or cannot be read), with `loadError` set for
+   *  anything other than a plain 404. */
+  const [session, setSession] = useState<SessionRecord | null | undefined>(undefined);
+  const [loadError, setLoadError] = useState<Error | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  /** True once the first page of history has been folded in, so the
+   *  conversation can tell "still loading" from "no messages yet". */
+  const [historyLoaded, setHistoryLoaded] = useState(false);
+  /** The history could not be read. With no events on screen this is an
+   *  "unavailable" state with a retry, never "nothing has been said yet". */
+  const [historyError, setHistoryError] = useState<Error | null>(null);
   const [events, setEvents] = useState<Event[]>([]);
-  // Durable grants (system.access_granted) → matching connect cards render
-  // "Connected" even after a reload; see AccessRequestCard.
-  const grantedRequestIds = useMemo(() => grantedRequestIdsOf(events), [events]);
-  // Tool calls the client owes an answer for (requires_action idle). Drives
-  // the header pill; per-card state is derived per thread at render time.
-  const awaitingActions = useMemo(() => buildToolCallIndex(events).awaiting, [events]);
-  const awaitingKind = awaitingActions.size === 0
-    ? null
-    : [...awaitingActions.values()].includes("tool_confirmation")
-      ? "tool_confirmation"
-      : "custom_tool_result";
   /** In-flight assistant streams keyed by message_id. Each entry holds
    *  the deltas accumulated so far. Wiped on the matching agent.message
    *  (same message_id), which becomes the canonical render. */
@@ -121,10 +113,24 @@ export function SessionDetail() {
    *  with the same id (toolCallId on the AI SDK side). The accumulated
    *  string is partial JSON — render as a code block, not Markdown. */
   const [toolInputStreams, setToolInputStreams] = useState<Map<string, { name?: string; partial: string }>>(new Map());
-  const [view, setView] = useState<View>("chat");
-  const [input, setInput] = useState("");
-  // Unsent text survives an update-prompt reload (lib/composer-draft).
-  const draft = useComposerDraft(id ? `session:${id}` : undefined, setInput);
+  // Which view (conversation or timeline) and which thread are part of the
+  // address, so a reload or a shared link lands where the person was.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const view: SessionView = searchParams.get("view") === "timeline" ? "timeline" : "chat";
+  const activeThreadId = searchParams.get("thread") || PRIMARY_THREAD;
+  const setParam = useCallback(
+    (name: "view" | "thread", value: string | null) => {
+      // From the address as it is now, not as it was at the last render:
+      // two changes in quick succession must not undo each other.
+      const next = new URLSearchParams(window.location.search);
+      if (value) next.set(name, value);
+      else next.delete(name);
+      setSearchParams(next, { replace: true });
+    },
+    [setSearchParams],
+  );
+  const setView = useCallback((next: SessionView) => setParam("view", next === "timeline" ? "timeline" : null), [setParam]);
+  const setActiveThreadId = useCallback((next: string) => setParam("thread", next === PRIMARY_THREAD ? null : next), [setParam]);
   const [sending, setSending] = useState(false);
   // Optimistic outbox slot — what the user typed, between hitting Send
   // and the server-side pending broadcast (system.user_message_pending)
@@ -135,37 +141,25 @@ export function SessionDetail() {
   // pending row the moment SSE delivers it. Single slot is intentional
   // (we never let two POSTs be in flight at once — Send is disabled
   // while `sending`). Set to null when SSE confirms or POST settles.
-  const [localPending, setLocalPending] = useState<string | null>(null);
+  const [localPending, setLocalPending] = useState<{ text: string; images: number } | null>(null);
   const [agentId, setAgentId] = useState("");
   const [sessionMeta, setSessionMeta] = useState<{
     environmentId?: string;
     vaultIds?: string[];
-    vaults?: Array<{ id: string; display_name?: string }>;
+    vaults?: Array<{ id: string; name?: string; problem?: LookupProblem }>;
     createdAt?: string;
     agentSnapshot?: { id?: string; name?: string; model?: string | { id: string }; description?: string; version?: number };
     envSnapshot?: { id?: string; name?: string; description?: string };
+    /** The environment's name lookup did not return a record. */
+    envProblem?: LookupProblem;
   }>({});
-  const [resourcePanel, setResourcePanel] = useState<
-    | { kind: "agent"; id: string }
-    | { kind: "environment"; id: string }
-    | { kind: "vault"; id: string }
-    | null
-  >(null);
-  const [showFiles, setShowFiles] = useState(false);
+  const [resourcePanel, setResourcePanel] = useState<PeekTarget | null>(null);
   const [showSaveAsEval, setShowSaveAsEval] = useState(false);
-  const [linear, setLinear] = useState<{
-    issueId?: string;
-    issueIdentifier?: string;
-    workspaceId?: string;
-  } | null>(null);
-  const [slack, setSlack] = useState<{
-    channelId?: string;
-    threadTs?: string;
-    workspaceId?: string;
-    eventKind?: string;
-    publicationId?: string;
-  } | null>(null);
-  const [status, setStatus] = useState("idle");
+  const [linear, setLinear] = useState<LinearSource | null>(null);
+  const [missionId, setMissionId] = useState<string | null>(null);
+  const [slack, setSlack] = useState<SlackSource | null>(null);
+  /** Live status read off the event stream; null until a status event is seen. */
+  const [status, setStatus] = useState<string | null>(null);
   /** Lazy-fetched Trajectory v1 envelope. Drives the outcome + reward
    *  chips in the header strip and the Trajectory viewer modal. We don't
    *  block initial render on this — chips render as `—` until it lands.
@@ -173,6 +167,9 @@ export function SessionDetail() {
    *  if the fetch failed (404 = trajectory not built yet, 5xx = sandbox
    *  flaky); both keep the trigger from re-firing every render. */
   const [trajectory, setTrajectory] = useState<Trajectory | "loading" | "error" | undefined>(undefined);
+  /** Why the trajectory is "error": a 404 means it has not been built yet
+   *  (a state), anything else means the read failed (a fault to retry). */
+  const [trajectoryFault, setTrajectoryFault] = useState<Error | null>(null);
   /** Sub-agent threads in this session. Primary is implicit at index 0
    *  (label "Main"). Empty when the session has only the primary thread,
    *  in which case the selector UI is hidden entirely. Refreshed on
@@ -180,23 +177,14 @@ export function SessionDetail() {
    *  parent_thread_id powers the tree view (coordinator → worker → sub-
    *  worker); missing parents fall back to the primary root. */
   const [threads, setThreads] = useState<
-    Array<{ id: string; agent_name?: string; parent_thread_id?: string | null }>
+    Array<{ id: string; agent_id?: string; agent_name?: string; parent_thread_id?: string | null }>
   >([]);
-  /** Currently-active thread id. Defaults to 'sthr_primary'. Filters
-   *  the events array at render time. SSE-driven new threads don't
-   *  auto-switch — the operator stays on whatever they're watching. */
-  const [activeThreadId, setActiveThreadId] = useState<string>("sthr_primary");
-  /** Active thread's tool-call timeline (paired calls, groups, turn folds). */
-  const timeline = useMemo(
-    () =>
-      buildTimeline(
-        events.filter(
-          (e) => ((e as { session_thread_id?: string }).session_thread_id ?? "sthr_primary") === activeThreadId,
-        ),
-        { isSilent: isSetupHarnessMarker },
-      ),
-    [events, activeThreadId],
-  );
+  /** True once the threads list has answered (or failed): only then can a
+   *  thread named in the address be called unknown. */
+  const [threadsLoaded, setThreadsLoaded] = useState(false);
+  // The active thread is `?thread=` (see above); it defaults to
+  // 'sthr_primary' and filters the events array at render time. SSE-driven
+  // new threads don't auto-switch: the operator stays on what they're watching.
   /** Server-mirrored pending queue, keyed by event_id. Populated from
    *  the initial GET /pending plus live system.user_message_pending /
    *  _promoted / _cancelled SSE frames. Pending entries render as a
@@ -208,6 +196,25 @@ export function SessionDetail() {
   const [showTrajectory, setShowTrajectory] = useState(false);
   const seenKeys = useRef(new Set<string>());
   const abortRef = useRef<AbortController | null>(null);
+
+  // Dedup key for SSE re-delivery + initial-fetch overlap. `id` is stamped
+  // on every event by the server (sevt-* for tool_results / stream events;
+  // toolCallId for tool_use overrides) so it's a uniqueness guarantee
+  // across the wire. The previous content-based key dropped legitimate
+  // distinct events whose payloads happened to be byte-identical (two
+  // back-to-back `gh repo list` calls both timing out with the same
+  // 401 stderr was the repro). Fallback only kicks in for legacy events
+  // that pre-date stamping.
+  // Node-runtime events (claude-agent-sdk / codex-sdk harnesses) are not
+  // id-stamped but do carry the persisted `seq`, which is unique per session
+  // — use it before the content fallback. Without this, four memory
+  // checkpoint Edits whose results were all "The file … has been updated
+  // successfully" collapsed to one, leaving the others stuck on "Running".
+  const eventKey = (e: Event) =>
+    (e as { id?: string }).id
+    ?? ((e as { seq?: number }).seq !== undefined
+      ? `${e.type}:seq:${(e as { seq?: number }).seq}`
+      : `${e.type}:${JSON.stringify(e.content || e.tool_use_id || e.error || "").slice(0, 120)}`);
 
   const addEvent = (e: Record<string, unknown>) => {
     const ev = e as Event;
@@ -348,6 +355,7 @@ export function SessionDetail() {
 
     if (ev.type === "session.status_running") setStatus("running");
     if (ev.type === "session.status_idle") setStatus("idle");
+    if (ev.type === "session.status_terminated") setStatus("terminated");
     // session.error → idle: defense-in-depth for the catch-all status_idle
     // emit (processUserMessage finally) in case a future code path forgets
     // to pair status_running with status_idle. Note: do NOT also map
@@ -383,7 +391,7 @@ export function SessionDetail() {
       const innerText =
         inner && (inner as { content?: Array<{ type?: string; text?: string }> }).content
           ?.find((c) => c.type === "text")?.text;
-      if (innerText) setLocalPending((cur) => (cur === innerText ? null : cur));
+      if (innerText) setLocalPending((cur) => (cur?.text === innerText ? null : cur));
       if (p.event_id) {
         setPendingByEventId((prev) => {
           const next = new Map(prev);
@@ -446,6 +454,7 @@ export function SessionDetail() {
     if (ev.type === "session.thread_created") {
       const tc = ev as {
         session_thread_id?: string;
+        agent_id?: string;
         agent_name?: string;
         parent_thread_id?: string | null;
       };
@@ -457,6 +466,7 @@ export function SessionDetail() {
                 ...prev,
                 {
                   id: tc.session_thread_id!,
+                  agent_id: tc.agent_id,
                   agent_name: tc.agent_name,
                   // SessionDO emits thread_created with parent_thread_id;
                   // older sessions (pre-Phase 1) may not — fall back to
@@ -484,6 +494,55 @@ export function SessionDetail() {
     setEvents((prev) => [...prev, ev]);
   };
 
+  // The session this page is showing right now, for lookups that finish late.
+  const currentId = useRef(id);
+  currentId.current = id;
+
+  // Names of the environment and the vaults, looked up by id (the session
+  // API returns ids only). A lookup that fails is recorded as such: the
+  // panel says "could not be loaded" with a retry, and says "deleted" only
+  // when the server answered that the record does not exist.
+  // env_local_runtime is a synthetic id minted for ambient/mission spawns:
+  // there is no environments row to resolve.
+  const lookupProblem = (err: unknown): LookupProblem => (err instanceof ApiError && err.status === 404 ? "missing" : "failed");
+  const resolveEnvironment = (sessionId: string, environmentId: string | undefined) => {
+    if (!environmentId || environmentId === "env_local_runtime") return;
+    setSessionMeta((prev) => ({ ...prev, envProblem: undefined }));
+    api<{ id: string; name?: string; description?: string }>(`/v1/environments/${environmentId}`, { silentErrors: true })
+      .then((env) => {
+        if (currentId.current === sessionId) setSessionMeta((prev) => ({ ...prev, envSnapshot: env, envProblem: undefined }));
+      })
+      .catch((err) => {
+        if (currentId.current === sessionId) setSessionMeta((prev) => ({ ...prev, envProblem: lookupProblem(err) }));
+      });
+  };
+  const resolveVaults = (sessionId: string, vaultIds: string[] | undefined) => {
+    if (!vaultIds?.length) return;
+    setSessionMeta((prev) => ({ ...prev, vaults: undefined }));
+    void Promise.all(
+      vaultIds.map((vid) =>
+        api<{ id: string; name?: string; display_name?: string }>(`/v1/vaults/${vid}`, { silentErrors: true })
+          .then((v): { id: string; name?: string; problem?: LookupProblem } => ({ id: v.id, name: v.name ?? v.display_name }))
+          .catch((err) => ({ id: vid, problem: lookupProblem(err) })),
+      ),
+    ).then((vaults) => {
+      if (currentId.current === sessionId) setSessionMeta((prev) => ({ ...prev, vaults }));
+    });
+  };
+  const loadTrajectory = (sessionId: string) => {
+    setTrajectory("loading");
+    setTrajectoryFault(null);
+    api<Trajectory>(`/v1/sessions/${sessionId}/trajectory`, { silentErrors: true })
+      .then((t) => {
+        if (currentId.current === sessionId) setTrajectory(t);
+      })
+      .catch((err) => {
+        if (currentId.current !== sessionId) return;
+        setTrajectory("error");
+        setTrajectoryFault(err instanceof ApiError && err.status === 404 ? null : err instanceof Error ? err : new Error(String(err)));
+      });
+  };
+
   useEffect(() => {
     if (!id) return;
     // Full per-session state reset before loading the new id. The
@@ -502,22 +561,25 @@ export function SessionDetail() {
     setToolInputStreams(new Map());
     setAgentId("");
     setSessionMeta({});
-    setStatus("idle");
+    setSession(undefined);
+    setLoadError(null);
+    setHistoryLoaded(false);
+    setHistoryError(null);
+    setLinear(null);
+    setSlack(null);
+    setMissionId(null);
+    setStatus(null);
     setTrajectory(undefined);
+    setTrajectoryFault(null);
     setThreads([]);
-    setActiveThreadId("sthr_primary");
+    setThreadsLoaded(false);
     setPendingByEventId(new Map());
     setLocalPending(null);
 
     // Load session info
-    api<{
-      environment_id?: string;
-      vault_ids?: string[];
-      created_at?: string;
-      agent?: { id?: string; name?: string; model?: string | { id: string }; description?: string; version?: number };
-      metadata?: Record<string, unknown>;
-    }>(`/v1/sessions/${id}`)
+    api<SessionRecord>(`/v1/sessions/${id}`, { silentErrors: true })
       .then((s) => {
+        setSession(s);
         setAgentId(s.agent?.id || "");
         setSessionMeta({
           environmentId: s.environment_id,
@@ -529,39 +591,27 @@ export function SessionDetail() {
         // Live-resolve env + vault names by id. Per the id-only ref decision
         // (memory: session-resource-refs), the session API does not pre-bake
         // display data — clients fetch resources on demand. Names appear a
-        // tick later than the badge frame; until then the badge falls back
-        // to the short-id label.
-        // env_local_runtime is a synthetic id minted for ambient/mission
-        // spawns — there is no environments row to resolve, and the lookup
-        // only produces a spurious "Environment not found" toast.
-        if (s.environment_id && s.environment_id !== "env_local_runtime") {
-          api<{ id: string; name?: string; description?: string }>(`/v1/environments/${s.environment_id}`)
-            .then((env) => setSessionMeta((prev) => ({ ...prev, envSnapshot: env })))
-            .catch(() => {});
+        // tick later than the badge frame.
+        resolveEnvironment(id, s.environment_id);
+        resolveVaults(id, s.vault_ids);
+        if (typeof s.metadata?.mission_id === "string") {
+          setMissionId(s.metadata.mission_id);
         }
-        if (s.vault_ids?.length) {
-          Promise.all(
-            s.vault_ids.map((vid) =>
-              api<{ id: string; display_name?: string }>(`/v1/vaults/${vid}`)
-                .then((v) => ({ id: v.id, display_name: v.display_name }))
-                .catch(() => ({ id: vid })),
-            ),
-          ).then((vaults) => setSessionMeta((prev) => ({ ...prev, vaults })));
-        }
-        const linearMeta = s.metadata?.linear as
-          | { issueId?: string; issueIdentifier?: string; workspaceId?: string }
-          | undefined;
+        const linearMeta = s.metadata?.linear as LinearSource | undefined;
         if (linearMeta && (linearMeta.issueId || linearMeta.issueIdentifier)) {
           setLinear(linearMeta);
         }
-        const slackMeta = s.metadata?.slack as
-          | { channelId?: string; threadTs?: string; workspaceId?: string; eventKind?: string; publicationId?: string }
-          | undefined;
+        const slackMeta = s.metadata?.slack as SlackSource | undefined;
         if (slackMeta && (slackMeta.channelId || slackMeta.threadTs)) {
           setSlack(slackMeta);
         }
       })
-      .catch(() => {});
+      .catch((err) => {
+        setSession(null);
+        if (!(err instanceof ApiError && err.status === 404)) {
+          setLoadError(err instanceof Error ? err : new Error(String(err)));
+        }
+      });
 
     // Load history. The /events endpoint wraps each event as { seq, type, ts,
     // data }; promote seq + ts onto the inner event so timeline has them.
@@ -582,13 +632,14 @@ export function SessionDetail() {
             data: Array<{ seq?: number; type: string; ts?: string; data: Event }>;
             has_more?: boolean;
             next_page?: string | null;
-          }>(`/v1/sessions/${id}/events?limit=${pageLimit}&order=asc&after_seq=${afterSeq}`);
+          }>(`/v1/sessions/${id}/events?limit=${pageLimit}&order=asc&after_seq=${afterSeq}`, { silentErrors: true });
           for (const e of res.data) {
             const inner = e.data || (e as unknown as Event);
             if (e.ts && !inner.ts) inner.ts = e.ts;
             if (e.seq !== undefined && inner.seq === undefined) inner.seq = e.seq;
             addEvent(inner);
           }
+          setHistoryLoaded(true);
           if (!res.has_more || !res.next_page) break;
           // next_page is "seq_<n>" per session-do.ts:1568.
           const m = /^seq_(\d+)$/.exec(res.next_page);
@@ -596,7 +647,9 @@ export function SessionDetail() {
           const nextAfter = parseInt(m[1], 10);
           if (!Number.isFinite(nextAfter) || nextAfter <= afterSeq) break;
           afterSeq = nextAfter;
-        } catch {
+        } catch (err) {
+          setHistoryError(err instanceof Error ? err : new Error(String(err)));
+          setHistoryLoaded(true);
           break;
         }
       }
@@ -614,23 +667,24 @@ export function SessionDetail() {
     // session id and let the user reopen the page to refresh. Live
     // sessions intentionally don't poll: trajectory.outcome === "running"
     // is fine, the StatusPill already shows the live status.
-    setTrajectory("loading");
-    api<Trajectory>(`/v1/sessions/${id}/trajectory`)
-      .then((t) => setTrajectory(t))
-      .catch(() => setTrajectory("error"));
+    loadTrajectory(id);
 
     // Threads list (primary + sub-agent). Primary is always present
     // (seeded by SessionDO on /init). Filter to non-primary so the
     // selector only renders when there's something to switch between
     // — single-thread sessions get zero UI clutter.
     api<{
-      data: Array<{ id: string; agent_name?: string; parent_thread_id?: string | null }>;
-    }>(`/v1/sessions/${id}/threads`)
+      data: Array<{ id: string; agent_id?: string; agent_name?: string; parent_thread_id?: string | null }>;
+    }>(`/v1/sessions/${id}/threads`, { silentErrors: true })
       .then((res) => {
         const subThreads = (res.data ?? []).filter((t) => t.id !== "sthr_primary");
         setThreads(subThreads);
+        setThreadsLoaded(true);
       })
-      .catch(() => setThreads([]));
+      .catch(() => {
+        setThreads([]);
+        setThreadsLoaded(true);
+      });
 
     // Initial pending queue snapshot. The SSE bridge picks up live
     // changes from system.user_message_{pending,promoted,cancelled}
@@ -648,7 +702,7 @@ export function SessionDetail() {
         cancelled_at: number | null;
         data: Event;
       }>;
-    }>(`/v1/sessions/${id}/pending`)
+    }>(`/v1/sessions/${id}/pending`, { silentErrors: true })
       .then((res) => {
         const next = new Map<string, PendingEntry>();
         for (const r of res.data ?? []) {
@@ -666,67 +720,121 @@ export function SessionDetail() {
       .catch(() => {/* leave empty */});
 
     return () => { abort.abort(); };
-  }, [id]);
+  }, [id, loadAttempt]);
 
-  // Session outputs (files the agent wrote under its outputs dir) — feeds
-  // link resolution in agent messages and the per-turn Files strip. Re-list
-  // whenever a turn ends: that's when new files exist.
-  const { outputs } = useSessionOutputs(id);
-  useEffect(() => {
-    if (id && status === "idle") void refreshSessionOutputs(id);
-  }, [id, status]);
+  // Attachments the server already holds, by File object: trying a message
+  // again uploads only what failed the first time, not a second copy of
+  // everything.
+  const uploadedFiles = useRef(new WeakMap<File, { id: string; filename: string; media_type: string }>());
 
-  // Attachments that already uploaded, keyed by the picked File — a retry
-  // after a failed send reuses them instead of uploading twice.
-  const uploadedAttachments = useRef(new WeakMap<File, MessageAttachment>());
+  /** A failure in the person's terms: the server's own sentence when it gave one. */
+  const sendFailure = (err: unknown): string => {
+    if (err instanceof ApiError) return /[.!?]$/.test(err.message) ? err.message : `${err.message}.`;
+    return "The server could not be reached. Check your connection.";
+  };
 
-  /** Resolves true once the message is accepted; false when it was not
-   *  sent (the composer then keeps the text + attachments for a retry). */
-  const send = async (overrideText?: string, files?: File[]): Promise<boolean> => {
-    const text = (overrideText ?? input).trim();
-    if (!text && !files?.length) return true;
-    if (!id) return true;
-    setInput("");
-    setLocalPending(text || (files?.length ? `📎 ${attachmentsLabel(files.length)}` : ""));
+  /**
+   * Send a message. Resolves with what happened, never throws: the composer
+   * keeps the person's words until this says `ok`, and puts them back in
+   * the box when it does not.
+   *
+   * Attachments are uploaded first so the message can reference them by
+   * file_id (scoped to this session, so they also show under Files). If ANY
+   * of them fails, nothing is sent: the person decides whether to try again
+   * or to send without it.
+   */
+  const send = async (rawText: string, files: File[] = []): Promise<SendResult> => {
+    const text = rawText.trim();
+    if (!text && !files.length) return { ok: true };
+    if (!id) return { ok: false, stage: "send", reason: "This session is not loaded yet." };
+    setLocalPending({ text, images: files.length });
     setSending(true);
-    let sent = false;
     try {
-      // Upload attachments first so the user.message can reference them.
-      // Images go inline as vision input; every other file is attached as
-      // a session resource, which the server writes into the sandbox
-      // before it answers — so the file is on disk before this turn runs.
-      // All-or-nothing: if any file fails, nothing is sent and the error
-      // names the file (no silently dropped attachments).
-      const attachments = files?.length
-        ? await prepareAttachments(api, id, files, uploadedAttachments.current)
-        : [];
+      const uploaded: Array<{ id: string; filename: string; media_type: string }> = [];
+      const failed: Array<{ file: File; reason: string }> = [];
+      for (const file of files) {
+        const have = uploadedFiles.current.get(file);
+        if (have) {
+          uploaded.push(have);
+          continue;
+        }
+        try {
+          const fd = new FormData();
+          fd.append("file", file);
+          fd.append("scope_id", id);
+          fd.append("downloadable", "true");
+          const r = await api<{ id: string; filename: string; media_type: string }>(`/v1/files`, {
+            method: "POST",
+            body: fd,
+            silentErrors: true,
+          });
+          // Only images go inline to the model. A file the server does not
+          // read as one is reported, never dropped quietly.
+          if (!r.media_type?.startsWith("image/")) {
+            failed.push({ file, reason: "The server did not read it as an image." });
+            continue;
+          }
+          const record = { id: r.id, filename: r.filename, media_type: r.media_type };
+          uploadedFiles.current.set(file, record);
+          uploaded.push(record);
+        } catch (e) {
+          failed.push({ file, reason: sendFailure(e) });
+        }
+      }
+      if (failed.length) {
+        setLocalPending(null);
+        return { ok: false, stage: "upload", failed };
+      }
 
-      await api(`/v1/sessions/${id}/events`, {
-        method: "POST",
-        body: JSON.stringify({
-          events: [buildUserMessageEvent(text, attachments)],
-        }),
-      });
-      sent = true;
+      const content: Array<
+        | { type: "text"; text: string }
+        | { type: "image"; source: { type: "file"; file_id: string } }
+      > = [];
+      if (text) content.push({ type: "text", text });
+      for (const u of uploaded) content.push({ type: "image", source: { type: "file", file_id: u.id } });
+      if (!text && uploaded.length) {
+        content.unshift({
+          type: "text",
+          text: uploaded.length === 1 ? "Attached image." : "Attached images.",
+        });
+      }
+
+      try {
+        await api(`/v1/sessions/${id}/events`, {
+          method: "POST",
+          body: JSON.stringify({
+            events: [{ type: "user.message", content }],
+          }),
+          // The composer draws the failure next to the words it belongs to.
+          silentErrors: true,
+        });
+      } catch (e) {
+        setLocalPending(null);
+        // 409: the session no longer takes messages (it ended or was
+        // archived while this page was open). Read the record again so the
+        // page says so.
+        const closed = e instanceof ApiError && e.status === 409;
+        if (closed) {
+          api<SessionRecord>(`/v1/sessions/${id}`, { silentErrors: true })
+            .then((fresh) => {
+              setSession(fresh);
+              if (fresh.status === "terminated") setStatus("terminated");
+            })
+            .catch(() => {});
+        }
+        return { ok: false, stage: "send", reason: sendFailure(e), closed };
+      }
       // POST resolved → server already inserted the row + broadcast
       // system.user_message_pending. The outbox map will pick it up
       // (and likely already has by the time await unblocks here).
       // Clear our local slot so we don't double-render with the server
       // entry — but only if the server's pending hasn't already cleared
       // it via the system.user_message_pending handler.
-      setLocalPending((cur) => (cur === text ? null : cur));
-    } catch (e) {
-      // api() already toasted request errors; attachment failures are
-      // reported here (their requests run with silentErrors so the toast
-      // can name the file). Clear the optimistic slot so the user doesn't
-      // keep seeing a "stuck" pending row that will never actually run.
-      if (e instanceof AttachmentError) {
-        toast.error(`${e.message}. Your message was not sent.`);
-      }
-      setLocalPending(null);
+      setLocalPending((cur) => (cur?.text === text ? null : cur));
+      return { ok: true };
+    } finally {
+      setSending(false);
     }
-    setSending(false);
-    return sent;
   };
 
   // Stop button — posts user.interrupt to abort whatever turn(s) are
@@ -769,926 +877,639 @@ export function SessionDetail() {
     }
   };
 
-  return (
-    <div className="flex flex-col h-full">
-      {/* Header — badges row + page-specific action buttons.
-          The redundant `← Sessions / sess-xxx` back-link + id heading
-          was removed; AppBreadcrumb above the page now carries the
-          trail and the entity id. Stop + Files actions live at the
-          right (`ml-auto`) of the badges row so the page-level chrome
-          stays one band tall. */}
-      <div className="pl-3 pr-4 py-3 flex flex-col gap-2 shrink-0">
-        <div className="flex items-center gap-2 flex-wrap">
-          {status === "idle" && awaitingKind ? (
-            // Idle on requires_action is not "done": the turn is parked on
-            // the client. Say so instead of a plain Idle pill.
-            <StatusPill
-              status="waiting"
-              label={awaitingKind === "tool_confirmation" ? "Awaiting approval" : "Awaiting client result"}
-            />
-          ) : (
-            <StatusPill status={status as "idle" | "running" | "terminated" | "error" | string} />
-          )}
-          {/* Trajectory outcome chip — only when the trajectory has actually
-              finished. While the session is still running we let StatusPill
-              carry the "Running…" signal alone (per Phase 3 spec) instead of
-              double-pilling. A turn parked on requires_action hasn't
-              finished either, whatever the (possibly stale) envelope says. */}
-          {!awaitingKind && <TrajectoryOutcomeChip trajectory={trajectory} />}
-          {/* Reward chip — final_reward + verifier_id tooltip. Hidden when
-              the verifier hasn't run (no trajectory.reward) so we don't
-              imply "no reward = score 0". */}
-          <TrajectoryRewardChip trajectory={trajectory} />
-          {/* Always render env + agent + vault badges so an operator can
-              see what makes up this session at a glance. Name falls back
-              to a short ID slice if the snapshot didn't carry one — better
-              "agent_…XYZ" than nothing. */}
-          {/* Agent name goes straight to the agent's page (a real link, so
-              cmd/middle-click open a tab); its raw config stays one click
-              away in the side panel. */}
-          {(sessionMeta.agentSnapshot?.id || agentId) && (
-            <span className="inline-flex items-center gap-0.5">
-              <Badge
-                icon={<AgentIcon />}
-                label={sessionMeta.agentSnapshot?.name || shortenId(sessionMeta.agentSnapshot?.id || agentId)}
-                to={`/agents/${encodeURIComponent(sessionMeta.agentSnapshot?.id || agentId)}`}
-              />
-              <Button
-                variant="ghost"
-                size="icon-xs"
-                className="text-fg-subtle min-w-11 min-h-11 sm:min-w-0 sm:min-h-0"
-                aria-label="View agent config"
-                title="View agent config"
-                onClick={() =>
-                  setResourcePanel({ kind: "agent", id: sessionMeta.agentSnapshot?.id || agentId })
-                }
-              >
-                <BracesIcon />
-              </Button>
-            </span>
-          )}
-          {sessionMeta.environmentId && (
-            <Badge
-              icon={<EnvIcon />}
-              label={sessionMeta.envSnapshot?.name || shortenId(sessionMeta.environmentId)}
-              onClick={() =>
-                setResourcePanel({ kind: "environment", id: sessionMeta.environmentId! })
-              }
-            />
-          )}
-          {(sessionMeta.vaults ?? sessionMeta.vaultIds?.map((id) => ({ id, display_name: undefined })) ?? []).map((v) => (
-            <Badge
-              key={v.id}
-              icon={<VaultIcon />}
-              label={v.display_name || shortenId(v.id)}
-              onClick={() => setResourcePanel({ kind: "vault", id: v.id })}
-            />
-          ))}
-          <SessionDurationBadge events={events} />
-          {sessionMeta.createdAt && <RelativeTimeBadge iso={sessionMeta.createdAt} />}
-          <div className="ml-auto flex items-center gap-2">
-            {/* Stop / Interrupt — only while the session is actively running.
-                Posts user.interrupt scoped to the active thread; server fires
-                thread AbortController + flushes pending events + emits
-                status_idle. Recovery path for stuck-Running sessions where a
-                DO eviction killed the stream and no clean status_idle ever
-                landed. */}
-            {status === "running" && (
-              <button
-                onClick={() => void interrupt()}
-                disabled={interrupting}
-                className="inline-flex items-center justify-center px-2.5 py-1 min-h-11 sm:min-h-0 rounded-md text-xs font-medium bg-bg-surface/60 text-fg-muted hover:bg-bg-surface hover:text-fg disabled:opacity-50 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-                title="Interrupt the active turn on this thread"
-              >
-                {interrupting ? "Stopping…" : "Stop"}
-              </button>
-            )}
-            {/* Save as eval (§8 save-as-eval) — snapshot this session's
-                user messages + a judge-drafted rubric into a suite task. */}
-            <button
-              onClick={() => setShowSaveAsEval(true)}
-              className="inline-flex items-center justify-center px-2.5 py-1 min-h-11 sm:min-h-0 rounded-md text-xs font-medium bg-bg-surface/60 text-fg-muted hover:bg-bg-surface hover:text-fg transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)]"
-              title="Snapshot this session into an eval suite task"
-            >
-              Save as eval
-            </button>
-            <button
-              onClick={() => setShowFiles((v) => !v)}
-              className={`inline-flex items-center justify-center px-2.5 py-1 min-h-11 sm:min-h-0 rounded-md text-xs font-medium transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
-                showFiles
-                  ? "bg-bg-surface text-fg"
-                  : "bg-bg-surface/60 text-fg-muted hover:bg-bg-surface hover:text-fg"
-              }`}
-              title="Files the agent wrote to /mnt/session/outputs/"
-            >
-              Files
-            </button>
-          </div>
-        </div>
-      </div>
+  const reloadTrajectory = () => {
+    if (id) loadTrajectory(id);
+  };
 
-      {/* Thread selector — only when sub-agent threads exist. Primary
-          is implicit at index 0 ("Main"); sub-agent tabs appear as new
-          threads spawn (live-updated by session.thread_created handler).
-          Selecting a thread filters both Conversation and Timeline views.
-          Renders as a depth-indented tree when sub-agents themselves
-          spawn sub-workers — flat horizontal row for the common case
-          (single layer of workers under primary). */}
-      {threads.length > 0 && (
-        <ThreadTree
-          threads={threads}
-          activeThreadId={activeThreadId}
-          onSelect={setActiveThreadId}
-        />
-      )}
+  // ── What a person can do when the session is waiting on them ──
+  const ops = useSessionOperations(id);
 
-      {/* View tabs */}
-      <div role="tablist" aria-label="Session view" className="pl-3 pr-4 flex items-center gap-1 shrink-0">
-        <ViewTab label="Conversation" active={view === "chat"} onClick={() => setView("chat")} />
-        <ViewTab label="Timeline" active={view === "timeline"} onClick={() => setView("timeline")} />
-        {view === "timeline" && (
-          <span className="ml-auto text-xs text-fg-subtle font-mono">{events.length} events</span>
+  // ── Layout state ──
+  // The details panel sits beside the conversation from 1280px. It opens by
+  // itself only where the conversation keeps its full 720px column beside it
+  // (1400px and up); on a narrower screen it starts closed. Either way the
+  // person's own choice is remembered, separately for each kind of screen,
+  // so opening it on a laptop does not close it on the big monitor.
+  const isWide = useMediaQuery("(min-width: 1280px)");
+  const isRoomy = useMediaQuery("(min-width: 1400px)");
+  const [panelPref, setPanelPref] = useStoredFlag(isRoomy ? "muse:session:panel" : "muse:session:panel:compact", isRoomy);
+  const [panelSheet, setPanelSheet] = useState(false);
+  const [timelineInspecting, setTimelineInspecting] = useState(false);
+  const [filesNonce, setFilesNonce] = useState(0);
+  const [confirm, setConfirm] = useState<"archive" | "delete" | null>(null);
+  const panelOpen = isWide ? panelPref : panelSheet;
+  const togglePanel = () => (isWide ? setPanelPref(!panelPref) : setPanelSheet(!panelSheet));
+  const toggleRef = useRef(togglePanel);
+  toggleRef.current = togglePanel;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "." && (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
+        e.preventDefault();
+        toggleRef.current();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  // ── Derived ──
+  // Untagged events (legacy, spans not yet thread-stamped) belong to the
+  // primary thread, matching the bridge filter on the server.
+  // A sub-agent's `thread_created` is stamped with the NEW thread's id; it
+  // belongs in the conversation of the thread that started it ("Handed work
+  // to …"), so it is shown there, by parent.
+  const threadEvents = useMemo(
+    () =>
+      events.filter((e) => {
+        const t = e as { session_thread_id?: string; parent_thread_id?: string | null };
+        if (e.type === "session.thread_created" && t.session_thread_id && t.session_thread_id !== PRIMARY_THREAD) {
+          return (t.parent_thread_id ?? PRIMARY_THREAD) === activeThreadId;
+        }
+        return (t.session_thread_id ?? PRIMARY_THREAD) === activeThreadId;
+      }),
+    [events, activeThreadId],
+  );
+  // The record knows about endings and reschedules the replayed stream can
+  // miss; the stream knows about "running" before the record does.
+  const streamStatus = status ?? session?.status ?? "idle";
+  const lifecycle =
+    (session?.status === "terminated" || session?.status === "rescheduling") && streamStatus === "idle"
+      ? session.status
+      : streamStatus;
+  const running = lifecycle === "running";
+  const usage = useMemo(() => summarizeUsage(events), [events]);
+  // "Running" is a claim about now. A session that makes it and has
+  // recorded nothing for half an hour is stalled (lib/session-state.ts):
+  // it can still be stopped, but nothing on the page spins or says "is
+  // working" on its behalf.
+  const now = useMinuteClock();
+  const stalled =
+    (lifecycle === "running" || lifecycle === "rescheduling") && usage.lastEventAt != null && now - usage.lastEventAt > STALLED_AFTER_MS;
+  const live = running && !stalled;
+  const conversation = useMemo(() => buildConversation(threadEvents, { running: live }), [threadEvents, live]);
+
+  // The identifier people use for a Linear issue ("ENG-142") is often only in
+  // the webhook's opening message, not in the session's metadata.
+  const needsLinearIdentifier = !!linear && !linear.issueIdentifier;
+  const linearIdentifier = useMemo(() => {
+    if (!needsLinearIdentifier) return undefined;
+    for (const e of events) {
+      if (e.type !== "user.message") continue;
+      const found = linearIdentifierFromText(eventText(e));
+      if (found) return found;
+    }
+    return undefined;
+  }, [needsLinearIdentifier, events]);
+
+  // The issue's address in Linear (see source.ts): from the log when it is
+  // there, else from the connected workspace the console can read.
+  const linearIdent = linear?.issueIdentifier ?? linearIdentifier;
+  const linearFound = useMemo(() => {
+    if (!linear) return {};
+    const texts: string[] = [];
+    for (const e of events) {
+      if (e.type === "user.message") texts.push(eventText(e));
+      else if (e.type === "agent.tool_result" || e.type === "agent.mcp_tool_result") {
+        const c = (e as { content?: unknown }).content;
+        texts.push(typeof c === "string" ? c : JSON.stringify(c ?? ""));
+      }
+    }
+    return findLinearAddress(texts, linearIdent);
+  }, [linear, linearIdent, events]);
+  const needsWorkspaceKey = !!linear && !!linearIdent && !linearFound.issueUrl && !linearFound.urlKey;
+  const linearWorkspaces = useQuery({
+    queryKey: ["integrations", "linear", "installations"],
+    queryFn: () => integrations.linear.listInstallations(),
+    enabled: needsWorkspaceKey,
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+  const linearWorkspaceKey = useMemo(() => {
+    if (!needsWorkspaceKey) return undefined;
+    const all = linearWorkspaces.data ?? [];
+    const mine = all.find((w) => w.workspace_id === linear?.workspaceId) ?? (all.length === 1 ? all[0] : undefined);
+    return linearUrlKey(mine?.workspace_id);
+  }, [needsWorkspaceKey, linearWorkspaces.data, linear?.workspaceId]);
+  const linearUrl = linearIssueLink(linear && linearIdent ? { ...linear, issueIdentifier: linearIdent } : linear, {
+    ...linearFound,
+    workspaceKey: linearWorkspaceKey,
+  });
+  // What GitHub started this from: the session names the repository, the
+  // webhook's opening message the pull request or issue and its address.
+  const github = useMemo<GitHubSource | null>(() => {
+    const onSession = session?.metadata?.github as GitHubSource | undefined;
+    const opening = events.find((e) => e.type === "user.message" && (e.metadata as { github?: unknown } | undefined)?.github);
+    const onEvent = (opening?.metadata as { github?: GitHubSource } | undefined)?.github;
+    if (!onSession && !onEvent) return null;
+    return { ...onSession, ...onEvent, repository: onEvent?.repository ?? onSession?.repository };
+  }, [session?.metadata, events]);
+
+  const agent = sessionMeta.agentSnapshot ?? session?.agent ?? (agentId ? { id: agentId } : {});
+  const activeThread = threads.find((t) => t.id === activeThreadId);
+  // A sub-agent wears its own face: the agent it is, not the thread it runs in.
+  const speaker = activeThread
+    ? { id: activeThread.agent_id ?? activeThread.id, name: activeThread.agent_name ?? "Sub-agent" }
+    : { id: agent.id, name: agent.name };
+  // In a sub-agent's thread the opening message came from the agent that
+  // handed it the work (the main agent, or another sub-agent one level up).
+  const parentThread = activeThread ? threads.find((t) => t.id === activeThread.parent_thread_id) : undefined;
+  const asker = activeThread
+    ? parentThread
+      ? { id: parentThread.agent_id ?? parentThread.id, name: parentThread.agent_name ?? "Another agent" }
+      : { id: agent.id, name: agent.name }
+    : undefined;
+  // A run's sessions are titled by the run's goal, which may be learned
+  // after the record loads: re-read the title when it is.
+  useMissionGoals();
+  const title = sessionTitle(session ?? null, agent.name);
+  // In the bar, a run's title is two parts, so that when it has to be cut
+  // it is the goal that gives way and never the iteration.
+  const iterationOf = missionRef(session?.title);
+  const titleParts = iterationOf
+    ? { main: missionTitle(iterationOf.missionId, null), suffix: `iteration ${iterationOf.iteration}` }
+    : null;
+  // The breadcrumb and the tab take their words from the same rule; telling
+  // them the title makes them read it again when it changes.
+  const location = useLocation();
+  useCrumbLabel(session ? title : null, location.pathname);
+  // The session's state is the main thread's, whichever thread is being read.
+  const mainConversation = useMemo(
+    () =>
+      activeThreadId === PRIMARY_THREAD
+        ? conversation
+        : buildConversation(
+            events.filter((e) => ((e as { session_thread_id?: string }).session_thread_id ?? PRIMARY_THREAD) === PRIMARY_THREAD),
+            { running: live },
+          ),
+    [activeThreadId, conversation, events, live],
+  );
+  // A link can name a thread that does not exist (any more): once the
+  // threads are known, such an address falls back to the main thread.
+  useEffect(() => {
+    if (activeThreadId !== PRIMARY_THREAD && threadsLoaded && !threads.some((t) => t.id === activeThreadId)) {
+      setActiveThreadId(PRIMARY_THREAD);
+    }
+  }, [activeThreadId, threadsLoaded, threads, setActiveThreadId]);
+
+  // ── The one reading of this session (lib/session-state.ts) ──
+  // The page has the whole log and the live stream, so here the reading is
+  // made from them; until the history has loaded it is the same reading
+  // every list shows, from the operations report and the newest events.
+  const readings = useSessionReadings();
+  const listReading = id ? readings.read({ id, status: lifecycle, updated_at: session?.updated_at }, { now }) : null;
+  const reading = useMemo(
+    () =>
+      historyLoaded || !listReading
+        ? readSession({
+            status: lifecycle,
+            approvals: mainConversation.pendingApprovals.length,
+            requests: mainConversation.openRequests,
+            // The cause in the error card's words, as every list says it.
+            error: mainConversation.failed ? (readFailure(mainConversation.failure).cause ?? true) : null,
+            lastEventAt: usage.lastEventAt,
+            now,
+          })
+        : listReading,
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [historyLoaded, lifecycle, mainConversation, usage.lastEventAt, now, listReading?.label, listReading?.detail],
+  );
+  const waiting = reading.waiting;
+  /** Bring the first thing that is waiting on a person into view. */
+  const conversationRef = useRef<ConversationHandle>(null);
+  const jumpToWaiting = useCallback(() => {
+    const show = () => {
+      const first = document.querySelector<HTMLElement>("[data-needs-you]");
+      if (!first) return;
+      // Through the scroller's own handle, so it does not pull back to the latest message.
+      if (conversationRef.current) conversationRef.current.reveal(first);
+      else first.scrollIntoView({ block: "center", behavior: "smooth" });
+      first.querySelector<HTMLElement>("button:not([disabled]), input, a[href]")?.focus({ preventScroll: true });
+    };
+    // The cards are in the main thread's conversation: go there first.
+    if (view !== "chat" || activeThreadId !== PRIMARY_THREAD) {
+      const next = new URLSearchParams(window.location.search);
+      next.delete("view");
+      next.delete("thread");
+      setSearchParams(next, { replace: true });
+      window.setTimeout(show, 160);
+    } else show();
+  }, [view, activeThreadId, setSearchParams]);
+
+  // A link from Home or Operations to "the thing that is waiting" ends in
+  // #needs-you: once the conversation is drawn, go to the first request.
+  const jumpedFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!id || !historyLoaded || !waiting || window.location.hash !== "#needs-you" || jumpedFor.current === id) return;
+    const t = window.setTimeout(() => {
+      jumpedFor.current = id;
+      jumpToWaiting();
+    }, 350);
+    return () => window.clearTimeout(t);
+  }, [id, historyLoaded, waiting, jumpToWaiting]);
+  const ready = trajectory && trajectory !== "loading" && trajectory !== "error" ? trajectory : null;
+  const durationMs = ready?.summary?.duration_ms ?? usage.durationMs;
+
+  const queued: QueuedMessage[] = [
+    ...(localPending && activeThreadId === PRIMARY_THREAD
+      ? [{ key: "local", text: localPending.text, images: localPending.images, sending: true }]
+      : []),
+    ...Array.from(pendingByEventId.values())
+      .filter((p) => p.session_thread_id === activeThreadId)
+      .sort((a, b) => a.pending_seq - b.pending_seq)
+      .map((p) => ({
+        key: `pending-${p.event_id}`,
+        text: eventText(p.event),
+        images: Array.isArray(p.event.content) ? p.event.content.filter((c) => c.type === "image").length : 0,
+      })),
+  ];
+  const liveStreams = {
+    thinking: Array.from(thinkingStreams.entries()),
+    toolInputs: Array.from(toolInputStreams.entries()),
+    messages: Array.from(streams.entries()),
+  };
+
+  // ── The session could not be opened ──
+  if (session === null) {
+    return (
+      <Page width="default" className="pt-10">
+        {loadError ? (
+          <QueryProblem title="This session could not be loaded" error={loadError} retry={() => setLoadAttempt((n) => n + 1)} />
+        ) : (
+          <RecordNotFound thing="session" kind="session" back={{ to: "/sessions", label: "sessions" }} />
         )}
-        {/* Trajectory viewer trigger — pushed to the right edge of the tab
-            row. Disabled until the lazy fetch resolves so the click never
-            opens an empty modal. Errors keep the button enabled (the modal
-            shows the error). */}
+      </Page>
+    );
+  }
+
+  const loading = session === undefined;
+  const conversationLoading = loading || !historyLoaded;
+  // The history read failed and the live stream has delivered nothing
+  // either: there is no conversation to show, and that is not "empty".
+  const historyUnavailable = !conversationLoading && !!historyError && events.length === 0;
+  const isEmpty = !conversationLoading && !historyUnavailable && conversation.items.length === 0 && queued.length === 0 && !running;
+  const showInlinePanel = isWide && panelPref && !(view === "timeline" && timelineInspecting);
+
+  const sourceInfo = {
+    kind: session ? sessionSource(session) : "console",
+    linear: linear && !linear.issueIdentifier && linearIdentifier ? { ...linear, issueIdentifier: linearIdentifier } : linear,
+    linearUrl,
+    slack,
+    github,
+    evalRunId: (session?.metadata?.eval as { run_id?: string } | undefined)?.run_id,
+  };
+  const panelProps = {
+    sessionId: id ?? "",
+    agent,
+    environmentId: sessionMeta.environmentId,
+    environmentName: sessionMeta.envSnapshot?.name,
+    environmentProblem: sessionMeta.envProblem,
+    onRetryEnvironment: () => id && resolveEnvironment(id, sessionMeta.environmentId),
+    vaults: sessionMeta.vaults ?? sessionMeta.vaultIds?.map((vid) => ({ id: vid })) ?? [],
+    vaultsResolved: !!sessionMeta.vaults || !sessionMeta.vaultIds?.length,
+    onRetryVaults: () => id && resolveVaults(id, sessionMeta.vaultIds),
+    source: sourceInfo,
+    usage,
+    trajectory,
+    trajectoryFault,
+    onRetryTrajectory: reloadTrajectory,
+    startedAt: session?.created_at ?? sessionMeta.createdAt,
+    lastActivityAt: usage.lastEventAt ?? session?.updated_at,
+    onPeek: setResourcePanel,
+    filesNonce,
+    reading,
+    state: (!historyLoaded
+      ? "settled"
+      : waiting && !running
+        ? "approval"
+        : running
+          ? "running"
+          : mainConversation.failed
+            ? "failed"
+            : mainConversation.items.length === 0
+              ? "empty"
+              : "settled") as SessionState,
+  };
+
+  const archived = !!session?.archived_at;
+  // A session that has ended or been archived takes no more messages (the
+  // API answers 409), so it has no box to type in: the composer says why
+  // and offers a new session with the same agent instead.
+  const composerClosed = archived ? "archived" : lifecycle === "terminated" ? "ended" : null;
+  const composerFooter =
+    waiting && !activeThread ? (
+      // Whatever the agent asked for (approval, access to an app, a skill),
+      // the box says how many things are waiting and takes the person to
+      // the first one.
+      <span className="flex items-center gap-2">
+        <HandIcon className="size-3.5 shrink-0 text-warning" />
+        <span className="min-w-0 flex-1">
+          <span className="font-medium text-fg">Waiting on you: {waiting.summary}.</span> You can still send a message.
+        </span>
         <button
-          onClick={() => setShowTrajectory(true)}
-          disabled={trajectory === undefined || trajectory === "loading"}
-          className={`${view === "timeline" ? "ml-3" : "ml-auto"} inline-flex items-center min-h-11 sm:min-h-0 text-xs text-fg-muted hover:text-fg disabled:opacity-40 disabled:cursor-not-allowed bg-bg-surface/60 hover:bg-bg-surface rounded px-2 py-1 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] my-1.5`}
-          title={
-            trajectory === "loading"
-              ? "Loading trajectory…"
-              : trajectory === "error"
-              ? "Trajectory unavailable — click to inspect error"
-              : "View raw Trajectory v1 envelope"
-          }
+          type="button"
+          onClick={jumpToWaiting}
+          className="-my-1 inline-flex h-7 shrink-0 items-center gap-1 rounded-full bg-bg-soft px-2.5 font-medium text-fg transition-quick hover:bg-bg-hover"
         >
-          Trajectory
+          {waiting.count === 1 ? "Show it" : "Show the first"}
+          <ArrowUpIcon className="size-3" />
         </button>
-      </div>
+      </span>
+    ) : stalled && usage.lastEventAt != null ? (
+      // The header says "Stalled"; here is what that means and what can be done.
+      <span className="flex items-center gap-2">
+        <HourglassIcon className="size-3.5 shrink-0 text-warning" />
+        <span className="min-w-0 flex-1">
+          <span className="font-medium text-fg">{quietWords(now - usage.lastEventAt)}.</span> It still reports as{" "}
+          {lifecycle === "rescheduling" ? "retrying" : "running"}: it may be on a long job, or stuck.
+          {running ? " Stop it to free the session." : ""}
+        </span>
+      </span>
+    ) : activeThread ? (
+      <span className="flex items-center gap-2">
+        <SplitIcon className="size-3.5 shrink-0 text-fg-subtle" />
+        You are reading {speaker.name}&rsquo;s thread. Messages go to the main thread.
+      </span>
+    ) : undefined;
 
-      {/* Linear context (when triggered by a Linear webhook) */}
-      {linear && (
-        <div className="pl-3 pr-4 py-2 bg-info-subtle text-xs flex items-center gap-2 text-info">
-          <span>🔗</span>
-          <span className="font-medium">Linear</span>
-          <span className="opacity-60">·</span>
-          <span>
-            issue{" "}
-            <span className="font-mono">{linear.issueIdentifier ?? linear.issueId}</span>
-          </span>
-          {linear.workspaceId && (
-            <a
-              href={`https://linear.app`}
-              target="_blank"
-              rel="noreferrer"
-              className="ml-auto hover:underline"
-            >
-              Open in Linear ↗
-            </a>
-          )}
-        </div>
-      )}
-
-      {/* Slack context (when triggered by a Slack event) */}
-      {slack && (
-        <div className="pl-3 pr-4 py-2 bg-accent-violet-subtle text-xs flex items-center gap-2 text-accent-violet flex-wrap">
-          <span>💬</span>
-          <span className="font-medium">Slack</span>
-          <span className="opacity-60">·</span>
-          <span>
-            {slack.channelId ? (
-              slack.workspaceId ? (
-                <a
-                  href={`slack://channel?team=${slack.workspaceId}&id=${slack.channelId}`}
-                  className="font-mono underline hover:no-underline"
-                  title="Open in Slack desktop"
-                >
-                  channel {slack.channelId} ↗
-                </a>
-              ) : (
-                <>
-                  channel <span className="font-mono">{slack.channelId}</span>
-                </>
-              )
-            ) : (
-              "—"
-            )}
-            {slack.threadTs && (
-              <>
-                {" "}thread{" "}
-                <span className="font-mono">{slack.threadTs}</span>
-              </>
-            )}
-          </span>
-          {slack.eventKind && (
-            <span className="opacity-60 font-mono uppercase text-[10px]">
-              {slack.eventKind}
-            </span>
-          )}
-          {slack.publicationId && (
-            <>
-              <span className="opacity-60">·</span>
-              <Link
-                to={`/integrations/slack/publish?pub=${slack.publicationId}`}
-                className="underline hover:no-underline"
-                title="Open the Slack publication this session is bound to"
-              >
-                publication →
-              </Link>
-            </>
-          )}
-        </div>
-      )}
-
-      {/* Filter by selected thread. Untagged events (legacy + spans
-          that haven't been thread-stamped yet) are treated as primary —
-          matches the bridge filter in handleSSEStream. */}
-      {(() => null)()}
-      <div className="flex-1 flex min-h-0">
-        <div className="flex-1 flex flex-col min-w-0">
-      {view === "chat" ? (
-        <>
-          {/* Conversation surface. ai-elements <Conversation> wraps
-              StickToBottom, which auto-pins to the latest message while
-              the user is at the bottom and surfaces a "jump to latest"
-              affordance via <ConversationScrollButton> the moment they
-              scroll up — replaces the hand-rolled scrollTo effect.
-
-              Render order intentionally mirrors the pre-migration layout:
-                1) canonical events (filtered to the active thread)
-                2) optimistic outbox slot (instant feedback on Send)
-                3) server-mirrored pending outbox (queued user.* events)
-                4) in-flight thinking streams
-                5) in-flight tool-input streams
-                6) in-flight assistant text streams
-                7) typing dots when only the agent is "thinking" with
-                   nothing else streaming yet */}
-          <Conversation className="flex-1 min-h-0">
-            <ConversationContent className="pl-3 pr-4 py-6 gap-4">
-              {(() => {
-                // Server-returned events are now in canonical drain order
-                // (events.seq = INSERT order = what the model saw). The
-                // pre-3a3e7ec client-side sort by processed_at_ms is
-                // retired; pending events live in a separate outbox below
-                // and never mix into this seq-ordered timeline.
-                const filtered = events.filter((e) => {
-                  const tid = (e as { session_thread_id?: string }).session_thread_id ?? "sthr_primary";
-                  return tid === activeThreadId;
-                });
-                const turnFiles = outputsByTurn(filtered, outputs);
-                // Tool uses pair with their results (tool_use_id /
-                // mcp_tool_use_id) inside buildTimeline, which also groups
-                // consecutive calls and folds finished turns.
-                //
-                // session.error → upstream model_request_end error_message
-                // map. session.error's payload from SSE only carries the
-                // generic "No output generated. Check the stream for errors."
-                // — the actionable cause (e.g. "usage limit exceeded (2056)",
-                // "context length", "401 from upstream") is on the preceding
-                // span.model_request_end with is_error=true. Walk forward
-                // remembering the last failed model end and attach it to the
-                // next session.error we hit. Cleared by any model_request_end
-                // with finish_reason!=error (succeeded → previous failure is
-                // no longer the immediate cause). Keyed by stable event id
-                // so EventRender can look it up at render time.
-                const sessionErrorCause = new Map<string, { error: string; model?: string }>();
-                let pendingModelErr: { error: string; model?: string } | null = null;
-                for (const ev of filtered) {
-                  if (ev.type === "span.model_request_end") {
-                    const d = (ev as { data?: { finish_reason?: string; error_message?: string; model?: string }; finish_reason?: string; error_message?: string; model?: string });
-                    const finish = d.data?.finish_reason ?? d.finish_reason;
-                    const errMsg = d.data?.error_message ?? d.error_message;
-                    const model = d.data?.model ?? d.model;
-                    if (finish === "error" && errMsg) {
-                      pendingModelErr = { error: errMsg, model };
-                    } else if (finish && finish !== "error") {
-                      pendingModelErr = null;
-                    }
-                  } else if (ev.type === "session.error") {
-                    const id = (ev as { id?: string }).id;
-                    if (id && pendingModelErr) {
-                      sessionErrorCause.set(id, pendingModelErr);
-                      pendingModelErr = null;
-                    }
-                  }
-                }
-                return (
-                  <WorkTimeline
-                    items={timeline.items}
-                    sessionId={id}
-                    threadId={activeThreadId}
-                    renderEvent={(e, key) => (
-                      // Stable React key — `e.id` (sevt_*) lives on every
-                      // event server-side via the stamp callback in
-                      // session-do.ts; seq / type+index are fallbacks.
-                      <EventRender
-                        grantedRequestIds={grantedRequestIds}
-                        key={key}
-                        event={e}
-                        sessionId={id}
-                        turnFiles={turnFiles.get(e)}
-                        livePending={false}
-                        modelErrorCause={
-                          e.type === "session.error"
-                            ? sessionErrorCause.get((e as { id?: string }).id ?? "")
-                            : undefined
-                        }
-                        onApproveEnvironmentYaml={approveEnvironmentYaml}
-                      />
-                    )}
-                  />
-                );
-              })()}
-              {/* Optimistic outbox slot — what the user just typed before
-                  the server's system.user_message_pending broadcast lands.
-                  Rendered above the server-mirrored outbox so the typed
-                  text appears INSTANTLY (no 100-500ms void after Send).
-                  Cleared by the SSE handler the moment the server picks it
-                  up; rendered with the same hourglass treatment as the
-                  server-side rows so the UI is visually consistent. */}
-              {localPending && activeThreadId === "sthr_primary" && (
-                <EventRender
-                      grantedRequestIds={grantedRequestIds}
-                  key="local-pending"
-                  event={{ type: "user.message", content: [{ type: "text", text: localPending }] } as Event}
-                  livePending={true}
-                  onApproveEnvironmentYaml={approveEnvironmentYaml}
+  return (
+    <div className="flex h-full min-h-0">
+      <SessionHeader
+        loading={loading}
+        title={title}
+        titleParts={titleParts}
+        agent={agent}
+        reading={reading}
+        onShowWaiting={waiting ? jumpToWaiting : undefined}
+        archived={archived}
+        source={sourceInfo}
+        environmentId={sessionMeta.environmentId ?? session?.environment_id}
+        environmentName={sessionMeta.envSnapshot?.name}
+        startedAt={session?.created_at ?? sessionMeta.createdAt}
+        durationMs={durationMs}
+        view={view}
+        onViewChange={setView}
+        eventCount={events.length}
+        // A run's session has two things that can be stopped (this turn, the
+        // whole run). Both are in the run's band, named for their scope, so
+        // the bar does not add a third "Stop" beside them.
+        running={running && !missionId}
+        stopping={interrupting}
+        onStop={() => void interrupt()}
+        onSaveAsEval={() => setShowSaveAsEval(true)}
+        onOpenTrajectory={() => setShowTrajectory(true)}
+        trajectoryDisabled={trajectory === undefined || trajectory === "loading"}
+        onShowFiles={() => {
+          if (isWide) setPanelPref(true);
+          else setPanelSheet(true);
+          setFilesNonce((n) => n + 1);
+        }}
+        onArchive={() => setConfirm("archive")}
+        onDelete={() => setConfirm("delete")}
+        sessionId={id ?? ""}
+        panelOpen={panelOpen}
+        onTogglePanel={togglePanel}
+        below={
+          (threads.length > 0 || (missionId && id)) && (
+            <div className={cn("space-y-3 pb-3.5", PAGE_GUTTER)}>
+              {/* Sub-agent threads: Main plus one tab per thread, live as they spawn. */}
+              {threads.length > 0 && (
+                <ThreadTabs threads={threads} mainName={agent.name} mainId={agent.id} activeThreadId={activeThreadId} onSelect={setActiveThreadId} />
+              )}
+              {missionId && id && (
+                <MissionBanner
+                  missionId={missionId}
+                  currentSessionId={id}
+                  turn={{ running, stopping: interrupting, onStop: () => void interrupt() }}
                 />
               )}
-              {/* Pending outbox — server-mirrored queue rows that haven't
-                  been drained yet. Keyed by event_id; rendered below the
-                  timeline, never inline. The hourglass treatment is the
-                  visual tell ("queued, not yet ingested by the agent").
-                  Filtered to the active thread. */}
-              {(() => {
-                const outbox = Array.from(pendingByEventId.values())
-                  .filter((p) => p.session_thread_id === activeThreadId)
-                  .sort((a, b) => a.pending_seq - b.pending_seq);
-                return outbox.map((p) => (
-                  <EventRender
-                      grantedRequestIds={grantedRequestIds}
-                    key={`pending-${p.event_id}`}
-                    event={p.event}
-                    livePending={true}
-                    onApproveEnvironmentYaml={approveEnvironmentYaml}
-                  />
-                ));
-              })()}
-              {/* In-flight thinking streams, then tool inputs still
-                  streaming in — live rows in the same shape as the
-                  committed ones, replaced when the canonical
-                  agent.thinking / tool_use lands. */}
-              {Array.from(thinkingStreams.entries()).map(([tid, text]) => (
-                <div key={`think-${tid}`} className="flex max-w-2xl flex-col">
-                  <ThinkingRow text={text} active />
-                </div>
-              ))}
-              {Array.from(toolInputStreams.entries()).map(([tid, { name, partial }]) => (
-                <StreamingToolRow key={`tin-${tid}`} toolUseId={tid} name={name ?? "tool"} partial={partial ?? ""} />
-              ))}
-              {/* In-flight assistant message text streams — rendered as a
-                  regular assistant Message whose body grows as chunks
-                  arrive. Cursor block keeps the "still writing" cue from
-                  the old StreamingBubble. */}
-              {Array.from(streams.entries()).map(([mid, text]) => (
-                <Message key={`stream-${mid}`} from="assistant">
-                  <MessageContent>
-                    <Markdown sessionId={id}>{text}</Markdown>
-                    <span className="inline-block w-1.5 h-3.5 bg-fg-subtle/50 align-middle ml-0.5 animate-pulse" />
-                  </MessageContent>
-                </Message>
-              ))}
-              {/* "Working for …" only when the agent is running and nothing
-                  else is streaming — avoids duplicate activity indicators. */}
-              {status === "running"
-                && streams.size === 0
-                && thinkingStreams.size === 0
-                && toolInputStreams.size === 0 && (
-                <WorkingRow sinceMs={timeline.openTurnStartMs} />
-              )}
-            </ConversationContent>
-            <ConversationScrollButton />
-          </Conversation>
+            </div>
+          )
+        }
+      />
 
-          {/* Prompt input. ai-elements <PromptInput> wraps a <form> with
-              an InputGroup-based textarea + attachment lifecycle; we
-              hand it our own onSubmit so the existing send() (POST
-              /events) stays the source of truth. The + button (and
-              drag-and-drop / paste) accepts any file: images go inline
-              to the model as vision inputs, everything else is attached
-              as a session file resource and written into the sandbox.
-
-              Wireless treatment: composer sits flush against the
-              conversation above on a `bg-bg` (white) surface — no
-              line, no top padding, just `pb-4` for breathing room
-              below. */}
-          <div className="pl-3 pr-4 pb-4 bg-bg shrink-0">
-            <PromptInput
-              multiple
-              maxFiles={MAX_ATTACHMENTS_PER_MESSAGE}
-              maxFileSize={MAX_ATTACHMENT_BYTES}
-              onError={(err) =>
-                toast.error(
-                  err.code === "max_file_size"
-                    ? "That file is too large — the limit is 25 MB per file."
-                    : err.message,
-                )
-              }
-              globalDrop
-              onSubmit={async ({ text, files }, event) => {
-                // PromptInput captured the textarea's value into `text`
-                // and the picked/dropped files into `files`, then
-                // form.reset() before this handler runs. send() owns
-                // clearing the mirrored `input` state, the optimistic
-                // outbox slot, and the file uploads.
-                // (event.target, not currentTarget — React nulls the
-                // latter once PromptInput's own async submit work yields.)
-                const form = event.target instanceof HTMLFormElement ? event.target : null;
-                const rawFiles = files
-                  .map((f) => (f as { file?: File }).file)
-                  .filter((f): f is File => f instanceof File);
-                if (await send(text, rawFiles)) return;
-                // Not sent: put the text back and reject so PromptInput
-                // keeps the attachments — nothing the user composed is lost.
-                const box = form?.elements.namedItem("message");
-                if (box instanceof HTMLTextAreaElement && !box.value) {
-                  box.value = text;
-                  setInput(text);
-                }
-                throw new Error("message not sent");
-              }}
-            >
-              <ComposerAttachments />
-              <PromptInputTextarea
-                {...draft}
-                placeholder="Send a message…  (drag a file in or click ＋)"
-                disabled={sending}
-                onChange={(e) => setInput(e.currentTarget.value)}
-              />
-              <PromptInputFooter>
-                <PromptInputTools>
-                  <AttachButton />
-                </PromptInputTools>
-                <div className="flex items-center gap-1">
-                  {id && <SessionModelPicker sessionId={id} />}
-                  <PromptInputSubmit
-                    status={sending ? "submitted" : undefined}
-                    disabled={sending}
-                  />
-                </div>
-              </PromptInputFooter>
-            </PromptInput>
+      <div
+        role="tabpanel"
+        id={SESSION_VIEW_PANEL_ID}
+        aria-labelledby={sessionViewTabId(view)}
+        className="flex min-w-0 flex-1 flex-col"
+      >
+        {historyUnavailable ? (
+          <div className="min-h-0 flex-1 overflow-y-auto px-6 pt-8">
+            <QueryProblem
+              className={COLUMN}
+              title="This session's history could not be loaded"
+              error={historyError}
+              retry={() => setLoadAttempt((n) => n + 1)}
+            />
           </div>
-        </>
-      ) : (
-        <TimelineView
-          events={events.filter((e) => {
-            const tid = (e as { session_thread_id?: string }).session_thread_id ?? "sthr_primary";
-            return tid === activeThreadId;
-          })}
-        />
-      )}
-        </div>
-        {resourcePanel && (
-          <ResourcePanel
-            panel={resourcePanel}
-            onClose={() => setResourcePanel(null)}
-          />
-        )}
-        {showFiles && id && (
-          <FilesPanel sessionId={id} onClose={() => setShowFiles(false)} />
+        ) : view === "chat" ? (
+          <>
+            {/* The conversation. <Conversation> pins to the latest message
+                while you are at the bottom and offers "jump to latest" the
+                moment you scroll up. */}
+            <Conversation className="min-h-0 flex-1" initial="instant">
+              <ConversationContent className={cn("block px-6 pt-8 pb-12", isEmpty && "flex min-h-full items-center justify-center")}>
+                {conversationLoading ? (
+                  <ConversationSkeleton />
+                ) : isEmpty ? (
+                  <div className="flex max-w-[440px] animate-rise-in flex-col items-center text-center">
+                    <AgentAvatar name={speaker.name} id={speaker.id} size="xl" />
+                    <h2 className="mt-4 text-h2 text-fg">{speaker.name ?? "This agent"}</h2>
+                    <p className="mt-1.5 text-sm text-fg-muted">
+                      {activeThread
+                        ? "Nothing has happened in this thread yet. Its work appears here as it runs."
+                        : agent.description?.trim() || "Nothing has been said yet. Send the first message to get it started."}
+                    </p>
+                  </div>
+                ) : (
+                  <ConversationView
+                    items={conversation.items}
+                    agent={speaker}
+                    sessionId={id ?? ""}
+                    running={live}
+                    streams={liveStreams}
+                    queued={queued}
+                    ops={ops}
+                    onApproveEnvironmentYaml={approveEnvironmentYaml}
+                    findEnvironmentYaml={findEnvironmentYaml}
+                    onSelectThread={setActiveThreadId}
+                    asker={asker}
+                  />
+                )}
+              </ConversationContent>
+              <ConversationEdges />
+              <ConversationControl ref={conversationRef} />
+              <JumpToLatest />
+            </Conversation>
+
+            {/* No rule above the composer: the conversation fades out before
+                it (ConversationEdges masks the scroller's last lines). */}
+            <div className="relative shrink-0 px-6 pb-5">
+              <SessionComposer
+                key={id}
+                sessionId={id}
+                className={COLUMN}
+                agentName={agent.name}
+                model={agent.model}
+                running={running}
+                stalled={stalled}
+                sending={sending}
+                onSend={send}
+                onStop={() => void interrupt()}
+                footer={composerFooter}
+                // Only a brand-new session takes the caret by itself. An empty
+                // sub-agent thread must not: it would pull focus out of the
+                // thread tabs on every arrow key.
+                autoFocus={isEmpty && !composerClosed && activeThreadId === PRIMARY_THREAD}
+                empty={isEmpty}
+                closed={loading ? null : composerClosed}
+                onNewSession={agent.id ? () => startSession({ agentId: agent.id }) : undefined}
+              />
+            </div>
+          </>
+        ) : (
+          <TimelineView events={threadEvents} loading={conversationLoading} onInspect={setTimelineInspecting} />
         )}
       </div>
+
+      {showInlinePanel && (loading ? <ContextPanelSkeleton /> : <ContextPanel {...panelProps} />)}
+      {!isWide && (
+        <Sheet open={panelSheet} onOpenChange={setPanelSheet}>
+          <SheetContent className="gap-0 p-0 sm:max-w-[360px]">
+            <SheetTitle className="px-5 pt-5">Session details</SheetTitle>
+            <SheetDescription className="sr-only">The agent, environment, vaults, files and usage of this session.</SheetDescription>
+            {loading ? (
+              <ContextPanelSkeleton className="w-full border-l-0" />
+            ) : (
+              <ContextPanel {...panelProps} className="w-full flex-1 border-l-0" />
+            )}
+          </SheetContent>
+        </Sheet>
+      )}
+
+      <ResourceSheet target={resourcePanel} onClose={() => setResourcePanel(null)} />
       <TrajectoryViewerModal
         open={showTrajectory}
         onClose={() => setShowTrajectory(false)}
         sessionId={id ?? ""}
+        sessionTitle={title}
         trajectory={trajectory}
+        onRetry={reloadTrajectory}
       />
       {id && (
         <SaveAsEvalDialog
           open={showSaveAsEval}
           onClose={() => setShowSaveAsEval(false)}
           sessionId={id}
-          agentId={sessionMeta.agentSnapshot?.id || agentId || undefined}
-          agentName={sessionMeta.agentSnapshot?.name}
+          agentId={agent.id || agentId || undefined}
+          agentName={agent.name}
           environmentId={sessionMeta.environmentId}
         />
       )}
+      <ConfirmDialog
+        open={confirm !== null}
+        onClose={() => setConfirm(null)}
+        destructive={confirm === "delete"}
+        title={confirm === "delete" ? "Delete this session?" : "Archive this session?"}
+        body={
+          confirm === "delete"
+            ? `“${title}” and its whole history are removed. This cannot be undone.`
+            : `“${title}” moves out of the sessions list. Its history is kept.`
+        }
+        confirmLabel={confirm === "delete" ? "Delete session" : "Archive session"}
+        onConfirm={async () => {
+          if (!id) return;
+          if (confirm === "delete") {
+            await api(`/v1/sessions/${id}`, { method: "DELETE" });
+            toast.success("Session deleted");
+            navigate("/sessions");
+          } else {
+            await api(`/v1/sessions/${id}/archive`, { method: "POST", body: "{}" });
+            toast.success("Session archived");
+            setSession((prev) => (prev ? { ...prev, archived_at: new Date().toISOString() } : prev));
+          }
+        }}
+      />
     </div>
   );
 }
 
-/** Outcome chip rendered in the session header strip. Hidden while
- *  the trajectory is loading / errored / still running so we never
- *  paint an inaccurate state. The "running" outcome is intentionally
- *  squelched here — StatusPill already renders the live status. */
-
-function ViewTab({ label, active, onClick }: { label: string; active: boolean; onClick: () => void }) {
-  // Wireless tab marker: picked the ghost-pill option (bg-bg-surface)
-  // over an underline or accent dot because the entire session-detail
-  // surface drops outer dividers in this refactor — leaving a per-tab
-  // underline behind would have re-introduced exactly the stacked-lines
-  // look the page is trying to escape. Bold + brand text + a subtle
-  // surface fill keeps the active state clearly distinguishable without
-  // any line at all.
-  return (
-    <button
-      onClick={onClick}
-      role="tab"
-      aria-selected={active}
-      tabIndex={active ? 0 : -1}
-      className={`inline-flex items-center justify-center px-3 py-2 min-h-11 sm:min-h-0 text-sm rounded-md my-1.5 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] ${
-        active
-          ? "bg-bg-surface text-brand font-semibold"
-          : "text-fg-subtle hover:text-fg-muted hover:bg-bg-surface/60"
-      }`}
-    >
-      {label}
-    </button>
-  );
-}
-
-/** Tighter visual than ViewTab — sub-agent tabs typically need to fit
- *  more than the 2-3 view options. Smaller padding + horizontal scroll
- *  in the parent keeps long sub-agent rosters readable. */
-function ThreadTab({
-  label,
-  active,
-  onClick,
-  depth = 0,
-}: {
-  label: string;
-  active: boolean;
-  onClick: () => void;
-  depth?: number;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      role="tab"
-      aria-selected={active}
-      tabIndex={active ? 0 : -1}
-      className={`py-1 min-h-11 sm:min-h-0 text-xs whitespace-nowrap rounded-md my-1 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] flex items-center gap-1 ${
-        active
-          ? "bg-bg-surface text-info font-semibold"
-          : "text-fg-subtle hover:text-fg-muted hover:bg-bg-surface/60"
-      }`}
-      style={{ paddingLeft: `${0.75 + depth * 0.75}rem`, paddingRight: "0.75rem" }}
-    >
-      {/* Tree branch glyph for depth>0 — visual cue that this thread
-          was spawned by another (rather than being a sibling of Main).
-          Plain text (not a unicode-only flair) so it survives in both
-          dark and light themes without needing a separate icon. */}
-      {depth > 0 && <span className="text-fg-subtle">└</span>}
-      <span>{label}</span>
-    </button>
-  );
-}
-
 /**
- * Depth-indented thread tree. Root = sthr_primary (rendered as "Main");
- * children indented by parent_thread_id. DFS pre-order so the tree
- * reads top-to-bottom like a stack trace: parents above their children.
- *
- * Orphans (parent_thread_id pointing at a thread we don't know about
- * — possible mid-spawn race or stale snapshot) get re-parented to
- * sthr_primary so they stay visible instead of being hidden in a
- * dangling subtree.
+ * Thread tabs, shown only when sub-agent threads exist. "Main" is the
+ * primary thread; each sub-agent gets a tab as it spawns. Tabs are in
+ * depth-first order, so a worker's own sub-workers follow it and carry a
+ * small "started by" mark. Orphans (a parent we have not seen yet) hang off
+ * Main so they are never hidden.
  */
-function ThreadTree({
+function ThreadTabs({
   threads,
+  mainName,
+  mainId,
   activeThreadId,
   onSelect,
 }: {
-  threads: Array<{ id: string; agent_name?: string; parent_thread_id?: string | null }>;
+  threads: Array<{ id: string; agent_id?: string; agent_name?: string; parent_thread_id?: string | null }>;
+  mainName?: string;
+  mainId?: string;
   activeThreadId: string;
   onSelect: (id: string) => void;
 }) {
-  const knownIds = new Set<string>(["sthr_primary", ...threads.map((t) => t.id)]);
+  const knownIds = new Set<string>([PRIMARY_THREAD, ...threads.map((t) => t.id)]);
   const childrenOf = new Map<string, typeof threads>();
   for (const t of threads) {
-    const parent =
-      t.parent_thread_id && knownIds.has(t.parent_thread_id)
-        ? t.parent_thread_id
-        : "sthr_primary";
-    const arr = childrenOf.get(parent) ?? [];
-    arr.push(t);
-    childrenOf.set(parent, arr);
+    const parent = t.parent_thread_id && knownIds.has(t.parent_thread_id) ? t.parent_thread_id : PRIMARY_THREAD;
+    childrenOf.set(parent, [...(childrenOf.get(parent) ?? []), t]);
   }
-  const flat: Array<{ id: string; label: string; depth: number }> = [
-    { id: "sthr_primary", label: "Main", depth: 0 },
+  const flat: Array<{ id: string; label: string; depth: number; parent?: string; agentId?: string }> = [
+    { id: PRIMARY_THREAD, label: "Main", depth: 0 },
   ];
-  const walk = (parentId: string, depth: number) => {
-    const kids = childrenOf.get(parentId) ?? [];
-    for (const k of kids) {
-      flat.push({ id: k.id, label: k.agent_name ?? k.id.slice(0, 12), depth });
-      walk(k.id, depth + 1);
+  const walk = (parentId: string, parentLabel: string, depth: number) => {
+    for (const k of childrenOf.get(parentId) ?? []) {
+      const label = k.agent_name ?? "Sub-agent";
+      flat.push({ id: k.id, label, depth, parent: parentLabel, agentId: k.agent_id });
+      walk(k.id, label, depth + 1);
     }
   };
-  walk("sthr_primary", 1);
-  const maxDepth = flat.reduce((m, n) => Math.max(m, n.depth), 0);
-  // When the tree is shallow (one layer of workers under Main), keep
-  // the original horizontal row for zero visual change vs Phase 3.
-  // Deeper trees switch to a vertical stacked layout so the indentation
-  // is actually readable.
-  const isFlat = maxDepth <= 1;
-  const containerClass = isFlat
-    ? "pl-3 pr-4 flex items-center gap-1 shrink-0 overflow-x-auto"
-    : "pl-3 pr-4 py-1 flex flex-col items-stretch gap-0 shrink-0 overflow-y-auto max-h-40";
+  walk(PRIMARY_THREAD, "Main", 1);
   return (
-    <div role="tablist" aria-label="Threads" className={containerClass}>
-      {flat.map((n) => (
-        <ThreadTab
-          key={n.id}
-          label={n.label}
-          depth={isFlat ? 0 : n.depth}
-          active={activeThreadId === n.id}
-          onClick={() => onSelect(n.id)}
-        />
-      ))}
+    <div
+      role="tablist"
+      aria-label="Threads"
+      onKeyDown={onTablistKeyDown}
+      className="no-scrollbar -mx-1 flex items-center gap-1 overflow-x-auto px-1"
+    >
+      {flat.map((n) => {
+        const active = activeThreadId === n.id;
+        const tab = (
+          <button
+            key={n.id}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            tabIndex={active ? 0 : -1}
+            onClick={() => onSelect(n.id)}
+            className={cn(
+              // The row scrolls sideways, which would clip an outset ring: the focus ring is drawn inside the tab.
+              "inline-flex h-8 shrink-0 items-center gap-1.5 rounded-full pr-3 pl-1.5 text-small font-medium whitespace-nowrap transition-quick focus-visible:outline-offset-[-2px]",
+              active ? "bg-bg-soft text-fg" : "text-fg-muted hover:bg-bg-hover hover:text-fg",
+            )}
+          >
+            {n.depth > 1 && <CornerDownRightIcon className="ml-1 size-3.5 text-fg-faint" />}
+            <AgentAvatar name={n.id === PRIMARY_THREAD ? mainName : n.label} id={n.id === PRIMARY_THREAD ? mainId : (n.agentId ?? n.id)} size="xs" />
+            {n.label}
+          </button>
+        );
+        return n.depth > 1 ? (
+          <Tip key={n.id} label={`Started by ${n.parent}`}>
+            {tab}
+          </Tip>
+        ) : (
+          tab
+        );
+      })}
     </div>
   );
 }
-
-function SessionDurationBadge({ events }: { events: Event[] }) {
-  if (events.length === 0) return null;
-  let first = Infinity;
-  let last = -Infinity;
-  for (const e of events) {
-    const ts = (e as { processed_at?: string }).processed_at;
-    if (typeof ts !== "string") continue;
-    const t = new Date(ts).getTime();
-    if (!Number.isFinite(t)) continue;
-    if (t < first) first = t;
-    if (t > last) last = t;
-  }
-  if (!Number.isFinite(first) || last <= first) return null;
-  return (
-    <Badge
-      icon={<DurationIcon />}
-      label={formatDuration(last - first)}
-      title="Wall-clock from first to last event"
-    />
-  );
-}
-
-function RelativeTimeBadge({ iso }: { iso: string }) {
-  const t = new Date(iso).getTime();
-  if (!Number.isFinite(t)) return null;
-  return (
-    <Badge
-      icon={<ClockIcon />}
-      label={formatRelative(Date.now() - t)}
-      title={new Date(iso).toLocaleString()}
-    />
-  );
-}
-
-
-/**
- * Renders a single canonical event using ai-elements primitives. Replaces
- * the pre-migration EventBubble + StreamingBubble + ThinkingStreamingBubble
- * + ToolInputStreamingBubble quartet. Tool calls, tool results and
- * thinking never reach it: buildTimeline turns those into the shared
- * tool-call rows (components/tool-calls), so this handles messages,
- * errors and the system.* cards.
- *
- * Type mapping:
- *   user.message              → <Message from="user|system">  (system for wakeups)
- *   agent.message             → <Message from="assistant"> + <Markdown>
- *   session.error             → red alert div  (no ai-elements equivalent)
- *   session.warning           → amber alert div  (same)
- *   anything else             → null  (timeline-only events that shouldn't appear in chat)
- */
-
-function EventRender({
-  event,
-  sessionId,
-  turnFiles,
-  livePending = false,
-  modelErrorCause,
-  onApproveEnvironmentYaml,
-  grantedRequestIds,
-}: {
-  event: Event;
-  /** Session the event belongs to — lets agent-message links to output
-   *  files download them. */
-  sessionId?: string;
-  /** Outputs written during the turn this agent.message closes. */
-  turnFiles?: SessionOutputFile[];
-  /** request_ids with a server-recorded system.access_granted. */
-  grantedRequestIds?: Set<string>;
-  /**
-   * Caller-derived "no agent.* event has followed this user.* event
-   * yet on the same thread" hint. The wire-level processed_at_ms
-   * doesn't update live (no SSE re-broadcast on server UPDATE), so
-   * we combine: pending iff (livePending AND wire-level says NULL)
-   * OR (livePending true and we have no wire info yet). When livePending
-   * is false we KNOW the agent has responded — drop the hourglass
-   * regardless of wire state, otherwise the bubble would stay pending
-   * for the entire turn even while the agent is mid-stream.
-   */
-  livePending?: boolean;
-  /**
-   * Upstream model error context for `session.error` events. The
-   * SSE-delivered session.error payload only carries a generic
-   * "No output generated. Check the stream for errors." message; the
-   * actionable cause (rate limit, billing, model 4xx, etc.) lives on
-   * the preceding `span.model_request_end` with `is_error=true`. Caller
-   * walks the events array and pairs them, passing the looked-up cause
-   * here so operators see the real reason inline without diving into
-   * the timeline tab. Only meaningful when `event.type === "session.error"`.
-   */
-  modelErrorCause?: { error: string; model?: string };
-  onApproveEnvironmentYaml?: (source: string) => void;
-}) {
-  // AMA pending lifecycle (set by event-log adapter from row.processed_at /
-  // row.cancelled_at). Cancelled events stay in the log for audit but
-  // the LLM never sees them (eventsToMessages skips); show them with
-  // strikethrough so operators know the user retracted them.
-  const meta = event as { processed_at_ms?: number | null; cancelled_at_ms?: number | null };
-  // The hourglass shows when BOTH conditions hold:
-  //   1. Caller says no later non-user event has arrived (livePending)
-  //   2. Wire-level processed_at_ms agrees (still null)
-  // Either condition flipping → no longer pending.
-  const isPending =
-    livePending &&
-    meta.processed_at_ms == null &&
-    meta.cancelled_at_ms == null;
-  const isCancelled = meta.cancelled_at_ms != null;
-
-  switch (event.type) {
-    case "user.message": {
-      // Wakeups synthesized by the schedule tool's onScheduledWakeup callback
-      // also wire-type as user.message (per EventBase metadata convention),
-      // but the user did NOT send them — visually distinguish so operators
-      // don't get confused. metadata.harness === "schedule" + kind === "wakeup"
-      // is the contract: see apps/agent/src/runtime/session-do.ts:onScheduledWakeup.
-      const metadata = (event as { metadata?: { harness?: string; kind?: string; scheduled_at?: string } }).metadata;
-      const isWakeup = metadata?.harness === "schedule" && metadata?.kind === "wakeup";
-      const text = Array.isArray(event.content) ? event.content[0]?.text ?? "" : "";
-
-      if (isWakeup) {
-        // System-origin: left-aligned via from="system" (Message only
-        // applies its right-aligned brand bubble for from="user"; anything
-        // else lays out as plain assistant text). Layered on top is a
-        // small info chip identifying the wakeup + the scheduled time
-        // tooltip for traceability.
-        const scheduledAt = metadata?.scheduled_at;
-        return (
-          <Message from="system">
-            <div className="flex items-center gap-1.5 text-xs text-fg-subtle mb-1">
-              <span
-                className="inline-flex items-center gap-1 rounded-full bg-info-subtle text-info px-2 py-0.5 font-medium text-[11px]"
-                title={scheduledAt ? `Scheduled at ${scheduledAt}` : undefined}
-              >
-                <span aria-hidden>🕒</span>
-                Scheduled wakeup
-              </span>
-            </div>
-            <MessageContent className="rounded-2xl rounded-bl-sm px-4 py-3 bg-info-subtle text-info">
-              {text}
-            </MessageContent>
-          </Message>
-        );
-      }
-
-      // Cancelled: render strikethrough + muted so the audit trail is
-      // visible without competing with live messages. Pending: dotted
-      // border + hourglass label since drainEventQueue hasn't picked it
-      // up yet. Live: default ai-elements user bubble (right-aligned,
-      // bg-secondary which we've aliased to OMA's bg-surface).
-      // Wireless: dropped the border-border-strong outline on both
-      // override states — line-through + opacity (cancelled) and the
-      // ⏳/Pending label above the bubble (pending) carry the signal
-      // without a per-bubble outline competing with the surrounding
-      // air.
-      const cancelledOverride = "line-through opacity-70";
-      const pendingOverride = "opacity-80";
-      return (
-        <Message from="user">
-          {(isPending || isCancelled) && (
-            <div className="text-xs text-fg-subtle text-right flex items-center justify-end gap-1">
-              {isPending && <span aria-hidden>⏳</span>}
-              {isCancelled && <span aria-hidden>✗</span>}
-              <span>{isCancelled ? "Retracted" : "Pending…"}</span>
-            </div>
-          )}
-          <MessageContent
-            className={isCancelled ? cancelledOverride : isPending ? pendingOverride : undefined}
-          >
-            {text}
-          </MessageContent>
-          {/* Files sent with the message. The model-readable path note
-              rides in a later text block, which this bubble never shows. */}
-          <MessageAttachmentChips attachments={attachmentsOf(event)} />
-        </Message>
-      );
-    }
-
-    case "agent.message": {
-      // Agent setup harness markers ride on agent.message (empty content +
-      // metadata.harness) per the EventBase metadata convention. They're
-      // consumed by the setup view's harness pane — skip them here so the raw
-      // session viewer doesn't render empty bubbles.
-      if (
-        (event.metadata as { harness?: string } | undefined)?.harness ===
-        OMA_SETUP_HARNESS
-      ) {
-        return null;
-      }
-      const text = (Array.isArray(event.content) ? event.content : [])
-        .map((b) => b.text)
-        .join("");
-      const environmentYaml = findEnvironmentYaml(text);
-      return (
-        <Message from="assistant">
-          <MessageContent>
-            <Markdown sessionId={sessionId}>{text}</Markdown>
-            {environmentYaml && onApproveEnvironmentYaml && (
-              <div className="mt-3">
-                <Button
-                  type="button"
-                  size="sm"
-                  onClick={() => onApproveEnvironmentYaml(environmentYaml)}
-                >
-                  Approve environment
-                </Button>
-              </div>
-            )}
-            {sessionId && turnFiles && turnFiles.length > 0 && (
-              <TurnFiles sessionId={sessionId} files={turnFiles} />
-            )}
-          </MessageContent>
-        </Message>
-      );
-    }
-
-    case "session.error":
-      return (
-        <div className="max-w-2xl bg-danger-subtle rounded-lg px-4 py-2.5 text-sm text-danger">
-          <div>Error: {event.error}</div>
-          {/* Server attaches the underlying failure as `message` (real DB /
-              provider error) — surface it so turns are debuggable from the
-              UI instead of server logs. */}
-          {(event as { message?: string }).message && (
-            <div className="mt-1.5 pt-1.5 text-[12px] opacity-90 font-mono break-all">
-              {(event as { message?: string }).message}
-            </div>
-          )}
-          {modelErrorCause && (
-            <div className="mt-1.5 pt-1.5 text-[12px] opacity-90">
-              <span className="font-medium">Cause</span>
-              {modelErrorCause.model && (
-                <span className="ml-1 font-mono opacity-75">({modelErrorCause.model})</span>
-              )}
-              : {modelErrorCause.error}
-            </div>
-          )}
-        </div>
-      );
-
-    case "session.warning":
-      return (
-        <div className="max-w-2xl bg-warning-subtle rounded-lg px-4 py-2.5 text-sm text-warning">
-          <div className="font-medium mb-0.5">Warning ({String(event.source ?? "")})</div>
-          <div>{String(event.message ?? "")}</div>
-        </div>
-      );
-
-    case "system.access_request":
-      return (
-        <AccessRequestCard
-          event={event}
-          granted={grantedRequestIds?.has(String(event.request_id ?? "")) === true}
-        />
-      );
-
-    case "system.saved_login_attached":
-      return (
-        <SavedLoginLine
-          event={event}
-          switched={grantedRequestIds?.has(String(event.request_id ?? "")) === true}
-        />
-      );
-
-    case "system.ambient_rule_created":
-      return <AmbientRuleCard event={event} />;
-    case "system.memory_enabled":
-      return <MemoryEnabledCard event={event} />;
-
-    case "system.skill_request":
-      return <SkillRequestCard event={event} />;
-
-    default:
-      return null;
-  }
-}
-
 
 interface EnvironmentApprovalPayload {
   name: string;
@@ -1763,11 +1584,4 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-/** Agent setup harness markers ride on agent.message (empty content +
- *  metadata.harness) — never drawn, so they mustn't split tool groups. */
-function isSetupHarnessMarker(ev: Event): boolean {
-  return ev.type === "agent.message"
-    && (ev.metadata as { harness?: string } | undefined)?.harness === OMA_SETUP_HARNESS;
 }

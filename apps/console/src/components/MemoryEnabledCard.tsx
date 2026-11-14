@@ -1,65 +1,27 @@
-import { Link } from "react-router";
 import type { Event } from "../lib/events";
 
 /**
- * Renders a system.memory_enabled event — memory was just switched on for
- * the agent, either by its enable_memory setup tool or automatically with a
- * new schedule. Same card family as AmbientRuleCard (it usually lands right
- * under one) and the same entrance choreography (.harness-diff-card /
- * .harness-diff-row in index.css, reduced-motion safe).
+ * CONTRACT (step 0 baseline). Owner: C6b. Rendered by C3 (ConversationView,
+ * card kind `memory_enabled`) and C6b (SessionChat). Renders nothing yet.
+ *
+ * Port of main's components/MemoryEnabledCard.tsx in Muse's card family
+ * (the same EventCard family as the ambient-rule card it usually lands
+ * under). For a `system.memory_enabled` event: memory was just switched on
+ * for the agent, by its enable_memory setup tool or automatically with a
+ * new schedule. Shows the store (link to /memory/:store_id by name), what
+ * it applies to (`per_user`: "every new session, one store per user";
+ * otherwise "every new session of this agent, scheduled runs included"),
+ * and, when `source === "ambient_rule"`, why ("turned on with the
+ * schedule, each run is a fresh session"). Ends with a plain sentence that
+ * it can be turned off on the agent page.
+ *
+ * Event fields read: mode, store_id, store_name, source.
  */
-export function MemoryEnabledCard({ event }: { event: Event }) {
-  const ev = event as unknown as {
-    mode?: string;
-    store_id?: string;
-    store_name?: string;
-    source?: string;
-  };
-  const perUser = ev.mode === "per_user";
+export interface MemoryEnabledCardProps {
+  /** The `system.memory_enabled` event. */
+  event: Event;
+}
 
-  let rowIndex = 0;
-  const delayFor = () => `${rowIndex++ * 60}ms`;
-
-  return (
-    <div className="harness-diff-card max-w-2xl border border-border rounded-lg bg-bg-surface overflow-hidden">
-      <div className="flex items-center justify-between gap-3 px-4 py-2.5 border-b border-border">
-        <div className="text-sm font-medium min-w-0">Memory enabled</div>
-        <span className="text-[10px] font-semibold tracking-wider uppercase text-accent whitespace-nowrap">
-          on
-        </span>
-      </div>
-      <div className="px-4 py-2.5 text-xs flex flex-col gap-1.5">
-        {ev.store_name && (
-          <div className="harness-diff-row flex items-baseline gap-2" style={{ animationDelay: delayFor() }}>
-            <span className="text-fg-subtle w-20 shrink-0">store</span>
-            {ev.store_id ? (
-              <Link to={`/memory/${ev.store_id}`} className="font-mono text-fg hover:underline break-all min-w-0">
-                {ev.store_name}
-              </Link>
-            ) : (
-              <span className="font-mono break-all min-w-0">{ev.store_name}</span>
-            )}
-          </div>
-        )}
-        <div className="harness-diff-row flex items-baseline gap-2" style={{ animationDelay: delayFor() }}>
-          <span className="text-fg-subtle w-20 shrink-0">applies to</span>
-          <span>
-            {perUser
-              ? "every new session, one store per user"
-              : "every new session of this agent, scheduled runs included"}
-          </span>
-        </div>
-        {ev.source === "ambient_rule" && (
-          <div className="harness-diff-row flex items-baseline gap-2" style={{ animationDelay: delayFor() }}>
-            <span className="text-fg-subtle w-20 shrink-0">why</span>
-            <span>turned on with the schedule — each run is a fresh session</span>
-          </div>
-        )}
-        <div className="harness-diff-row text-[11px] text-fg-subtle mt-1" style={{ animationDelay: delayFor() }}>
-          The agent reads its saved notes at the start of a session and writes new ones as it works. Turn it off
-          on the agent page.
-        </div>
-      </div>
-    </div>
-  );
+export function MemoryEnabledCard(_props: MemoryEnabledCardProps) {
+  return null;
 }

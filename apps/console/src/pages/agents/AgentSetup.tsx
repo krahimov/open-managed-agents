@@ -1,43 +1,36 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router";
-import { useQueryClient } from "@tanstack/react-query";
-import yaml from "js-yaml";
-import {
-  OMA_SETUP_HARNESS,
-  OMA_SETUP_KIND_HARNESS_UPDATED,
-} from "@open-managed-agents/api-types";
+import { Navigate, useNavigate, useParams, useSearchParams } from "react-router";
+import { CheckIcon, SlidersHorizontalIcon } from "lucide-react";
+import { OMA_SETUP_HARNESS, OMA_SETUP_KIND_HARNESS_UPDATED } from "@open-managed-agents/api-types";
+
 import { Button } from "@/components/ui/button";
-import { useApi } from "../../lib/api";
+import { Sheet, SheetContent, SheetDescription, SheetTitle } from "@/components/ui/sheet";
+
+import { ApiError } from "../../lib/api";
 import type { Event } from "../../lib/events";
-import { CodeBlock } from "../../components/ai-elements/code-block";
+import { useApiQuery } from "../../lib/useApiQuery";
+import { AgentAvatar, RecordNotFound, ErrorState, Page, Skeleton } from "../../components/kit";
+import { ConfigPanel, type Harness } from "./setup/ConfigPanel";
 import { SessionChat } from "./SessionChat";
 
 /**
- * Agent setup view. Spawned right after an agent is created from the form: the
- * agent's FIRST session runs in setup mode, reading its own harness and
- * interviewing the user to refine it. Left = that conversation; right = the
- * live harness YAML (seeded from the agent's current config, updated as the
- * agent edits itself).
+ * Agent setup. Opens right after an agent is created: the agent's FIRST
+ * session runs in setup mode, reading its own configuration and
+ * interviewing the person to refine it.
+ *
+ * The conversation is the page. Beside it, a panel shows the agent's
+ * configuration as it stands (seeded from the agent, then replaced each
+ * time the agent edits itself), so every change the agent makes is
+ * visible the moment it lands. One primary action: finish, which opens
+ * the agent's profile. Below `lg` the panel moves into a sheet.
  */
-type Harness = Record<string, unknown>;
 
-const DISPLAY_FIELDS = [
-  "name",
-  "description",
-  "model",
-  "system",
-  "mcp_servers",
-  "tools",
-  "skills",
-] as const;
+const DISPLAY_FIELDS = ["name", "description", "model", "system", "mcp_servers", "tools", "skills"] as const;
 
-function toHarnessView(agent: Record<string, unknown> | null): Harness {
+function toHarnessView(agent: Record<string, unknown> | null | undefined): Harness {
   if (!agent) return {};
   const view: Harness = {};
-  const model =
-    typeof agent.model === "string"
-      ? agent.model
-      : (agent.model as { id?: string } | undefined)?.id;
+  const model = typeof agent.model === "string" ? agent.model : (agent.model as { id?: string } | undefined)?.id;
   for (const key of DISPLAY_FIELDS) {
     if (key === "model") {
       if (model) view.model = model;
@@ -48,22 +41,25 @@ function toHarnessView(agent: Record<string, unknown> | null): Harness {
     if (Array.isArray(value) && value.length === 0) continue;
     view[key] = value;
   }
-  // Memory rides the `_oma` envelope; shown only when on, matching the
-  // server's harness view.
-  const memory = (agent._oma as { memory?: { mode?: string } } | undefined)?.memory;
-  if (memory?.mode && memory.mode !== "off") view.memory = memory;
   return view;
 }
 
-function harnessToYaml(harness: Harness): string {
-  if (!harness || Object.keys(harness).length === 0) {
-    return "# Your harness will appear here as the agent refines it.";
-  }
-  try {
-    return yaml.dump(harness, { lineWidth: 80, noRefs: true });
-  } catch {
-    return JSON.stringify(harness, null, 2);
-  }
+/** True from the `lg` breakpoint up, where the panel fits beside the chat. */
+function useWide(): boolean {
+  const [wide, setWide] = useState(() =>
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia("(min-width: 1024px)").matches
+      : true,
+  );
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") return;
+    const mq = window.matchMedia("(min-width: 1024px)");
+    const onChange = () => setWide(mq.matches);
+    onChange();
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+  return wide;
 }
 
 export function AgentSetup() {
@@ -71,118 +67,106 @@ export function AgentSetup() {
   const [searchParams] = useSearchParams();
   const sessionId = searchParams.get("session");
   const nav = useNavigate();
-  const qc = useQueryClient();
-  const { api } = useApi();
-  const [harness, setHarness] = useState<Harness>({});
-  const [agentName, setAgentName] = useState("");
+  const wide = useWide();
+  const [panelOpen, setPanelOpen] = useState(false);
 
-  // Seed the harness pane from the agent's current config.
-  useEffect(() => {
-    if (!id) return;
-    let cancelled = false;
-    api<Record<string, unknown>>(`/v1/agents/${id}`)
-      .then((a) => {
-        if (cancelled) return;
-        setHarness(toHarnessView(a));
-        setAgentName((a.name as string) || "");
-      })
-      .catch(() => {
-        /* api() surfaces the error */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [id, api]);
+  // The agent seeds the panel; the setup session's markers then replace it.
+  const agentQuery = useApiQuery<Record<string, unknown>>(id ? `/v1/agents/${id}` : null);
+  const [live, setLive] = useState<{ harness: Harness; changed: string[]; at: number } | null>(null);
+  const seeded = useMemo(() => toHarnessView(agentQuery.data), [agentQuery.data]);
+  const harness = live?.harness ?? seeded;
+  const agentName = (typeof harness.name === "string" && harness.name) || (agentQuery.data?.name as string) || "";
 
-  // Capture live harness refinements off the setup session's markers.
+  // Capture live refinements off the setup session's markers.
   const handleEvent = useCallback((ev: Event) => {
-    const m = ev.metadata as
-      | { harness?: string; kind?: string; harness_config?: Harness }
-      | undefined;
-    if (
-      m?.harness === OMA_SETUP_HARNESS &&
-      m.kind === OMA_SETUP_KIND_HARNESS_UPDATED &&
-      m.harness_config
-    ) {
-      setHarness(m.harness_config);
-    }
-    // enable_memory / a new schedule switched memory on: no harness marker
-    // rides with it, so fold it into the pane here.
-    if (ev.type === "system.memory_enabled") {
-      const e = ev as unknown as { mode?: string; store_id?: string };
-      setHarness((h) => ({
-        ...h,
-        memory: { mode: e.mode ?? "shared", ...(e.store_id ? { store_id: e.store_id } : {}) },
-      }));
+    const m = ev.metadata as { harness?: string; kind?: string; harness_config?: Harness; changed?: string[] } | undefined;
+    if (m?.harness === OMA_SETUP_HARNESS && m.kind === OMA_SETUP_KIND_HARNESS_UPDATED && m.harness_config) {
+      const at = Date.parse(String((ev as { processed_at?: string; created_at?: string }).processed_at ?? (ev as { created_at?: string }).created_at ?? ""));
+      setLive({ harness: m.harness_config, changed: m.changed ?? [], at: Number.isFinite(at) ? at : Date.now() });
     }
   }, []);
 
-  // The setup chat edits the agent server-side; drop cached agent-page data
-  // so it shows the refined config on the way back.
-  const refreshAgent = () => {
-    void qc.invalidateQueries({ queryKey: [`/v1/agents/${id}`] });
-    void qc.invalidateQueries({ queryKey: [`/v1/agents/${id}/versions`] });
-    void qc.invalidateQueries({ queryKey: [`/v1/agents/${id}/memory`] });
-    void qc.invalidateQueries({ queryKey: [`/v1/agents/${id}/ambient-rules`] });
-  };
-
-  const yamlText = useMemo(() => harnessToYaml(harness), [harness]);
-
   if (!id) return null;
-  if (!sessionId) {
-    nav(`/agents/${id}`, { replace: true });
-    return null;
+  // Setup only exists inside its session: without one, show the agent.
+  if (!sessionId) return <Navigate to={`/agents/${id}`} replace />;
+
+  if (agentQuery.error) {
+    const missing = agentQuery.error instanceof ApiError && agentQuery.error.status === 404;
+    return (
+      <Page width="default">
+        <div className="pt-6">
+          {missing ? (
+            <RecordNotFound thing="agent" kind="agent" back={{ to: "/agents", label: "agents" }} />
+          ) : (
+            <ErrorState title="This agent could not be loaded" error={agentQuery.error} retry={() => void agentQuery.refetch()} />
+          )}
+        </div>
+      </Page>
+    );
   }
+
+  const panel = (
+    <ConfigPanel
+      harness={harness}
+      loading={agentQuery.isLoading}
+      error={null}
+      retry={() => void agentQuery.refetch()}
+      changed={live?.changed ?? []}
+      changedAt={live?.at ?? null}
+      className="h-full"
+    />
+  );
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex shrink-0 items-center gap-3 border-b border-border px-4 py-2.5">
-        <div className="min-w-0">
-          <div className="truncate text-sm font-medium text-fg">{agentName || "New agent"}</div>
-          <div className="text-xs text-fg-muted">
-            Setup — refine the harness together with the agent, or edit settings directly
-          </div>
+      <header className="flex shrink-0 items-center gap-3.5 border-b border-border px-5 pt-1 pb-3.5 lg:px-8">
+        {agentQuery.isLoading ? (
+          <Skeleton className="size-10" rounded="lg" />
+        ) : (
+          <AgentAvatar name={agentName} id={id} size="lg" />
+        )}
+        <div className="min-w-0 flex-1">
+          <h1 className="truncate text-h2 text-fg" title={agentName ? `Setting up ${agentName}` : undefined}>
+            {agentQuery.isLoading ? <Skeleton className="my-1 h-5 w-56" rounded="sm" /> : `Setting up ${agentName || "your agent"}`}
+          </h1>
+          <p className="truncate text-small text-fg-muted">
+            Answer its questions. It rewrites its own configuration as you go.
+          </p>
         </div>
-        <Button
-          size="sm"
-          variant="outline"
-          className="ml-auto"
-          onClick={() => {
-            refreshAgent();
-            nav(`/agents/${id}?edit=1`);
-          }}
-        >
-          Edit settings
+        {!wide && (
+          <Button variant="outline" onClick={() => setPanelOpen(true)}>
+            <SlidersHorizontalIcon data-icon="inline-start" />
+            Configuration
+          </Button>
+        )}
+        <Button onClick={() => nav(`/agents/${id}`)}>
+          <CheckIcon data-icon="inline-start" />
+          Finish setup
         </Button>
-        <Button
-          size="sm"
-          onClick={() => {
-            refreshAgent();
-            nav(`/agents/${id}`);
-          }}
-        >
-          Done
-        </Button>
-      </div>
+      </header>
+
       <div className="flex min-h-0 flex-1">
-        <div className="flex w-1/2 min-w-0 flex-col border-r border-border">
+        <div className="flex min-w-0 flex-1 flex-col">
           <SessionChat
             sessionId={sessionId}
             onEvent={handleEvent}
-            placeholder="Answer the agent…  (it refines its harness as you go)"
-            emptyTitle="Setting up…"
-            emptyDescription="The agent will ask what you want it to do."
+            placeholder="Answer the agent"
+            emptyTitle="Getting ready"
+            emptyDescription="The agent is reading its configuration. It will ask what you want it to do."
           />
         </div>
-        <div className="flex w-1/2 min-w-0 flex-col">
-          <div className="flex shrink-0 items-center border-b border-border px-3 py-2 text-xs font-medium text-fg-muted">
-            Harness
-          </div>
-          <div className="min-h-0 flex-1 overflow-auto p-3">
-            <CodeBlock code={yamlText} language="yaml" />
-          </div>
-        </div>
+        {wide && <div className="w-[380px] shrink-0 border-l border-border xl:w-[440px]">{panel}</div>}
       </div>
+
+      {!wide && (
+        <Sheet open={panelOpen} onOpenChange={setPanelOpen}>
+          <SheetContent className="gap-0 p-0 sm:max-w-[440px]">
+            <SheetTitle className="sr-only">Configuration</SheetTitle>
+            <SheetDescription className="sr-only">The agent's configuration as it stands now.</SheetDescription>
+            <div className="min-h-0 flex-1 pt-8">{panel}</div>
+          </SheetContent>
+        </Sheet>
+      )}
     </div>
   );
 }

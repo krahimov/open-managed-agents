@@ -1,5 +1,3 @@
-import { CheckIcon } from "lucide-react";
-
 import {
   Command,
   CommandEmpty,
@@ -18,8 +16,7 @@ import { cn } from "@/lib/utils";
  *
  * Built on cmdk Command so the popover always gives type-ahead search,
  * even when the option list is short. Visual recipe mirrors the
- * official example: a small square indicator that fills with the brand
- * color when the row is selected, label to its right.
+ * rest of the menus: the selected option carries a check on the right.
  *
  * Designed to be dropped inside a shadcn `<PopoverContent>` from the
  * caller (so the caller owns the trigger / chip / outer chrome and we
@@ -56,19 +53,10 @@ export function FacetedFilter({
               <CommandItem
                 key={opt.value}
                 value={opt.label}
+                data-checked={selected}
                 onSelect={() => onValueChange(opt.value)}
               >
-                <div
-                  className={cn(
-                    "mr-2 flex size-4 items-center justify-center rounded-sm border",
-                    selected
-                      ? "bg-brand border-brand text-bg"
-                      : "border-border opacity-50 [&_svg]:invisible",
-                  )}
-                >
-                  <CheckIcon className="size-3.5" />
-                </div>
-                <span>{opt.label}</span>
+                <span className={cn("flex-1", selected && "font-medium")}>{opt.label}</span>
               </CommandItem>
             );
           })}

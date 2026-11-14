@@ -1,318 +1,499 @@
 import { useMemo, useState } from "react";
-import { useNavigate } from "react-router";
-import { TrashIcon, XCircleIcon } from "lucide-react";
+import { Link, useSearchParams } from "react-router";
+import { CircleXIcon, CopyIcon, DramaIcon, LinkIcon, RotateCwIcon, Trash2Icon } from "lucide-react";
+import { toast } from "sonner";
 
-import { useApi } from "../lib/api";
-import { useApiQuery } from "../lib/useApiQuery";
+import { Button } from "@/components/ui/button";
+import { PopoverContent } from "@/components/ui/popover";
+
+import { ConfirmDialog } from "../components/ConfirmDialog";
 import { DataTable, type ColumnDef } from "../components/DataTable";
+import { EntityRef } from "../components/EntityRef";
 import { FacetedFilter } from "../components/FacetedFilter";
 import { FilterChip } from "../components/FilterChip";
-import { RowActionsMenu } from "../components/RowActionsMenu";
-import { PopoverContent } from "@/components/ui/popover";
-import { Button } from "@/components/ui/button";
+import { Page } from "../components/Page";
+import { PageHeader } from "../components/PageHeader";
+import { ErrorState } from "../components/QueryProblem";
+import { RelativeTime } from "../components/RelativeTime";
+import { RowActionsMenu, type RowAction } from "../components/RowActionsMenu";
+import { SegmentedControl } from "../components/SegmentedControl";
+import { Tip } from "../components/Tip";
+import { RUNS_KEY, SUITES_KEY, suiteHistory, useEvalRuns, useEvalSuites, type RunWithSummary } from "../components/evals/data";
+import { RUN_KIND_ICON, TaskStrip, VerdictBadge } from "../components/evals/parts";
+import { RunDialog, type RunTarget } from "../components/evals/RunDialog";
+import { SuiteCard, SuiteSheet } from "../components/evals/Suites";
+import { ResourceIdentity } from "../components/resources/ResourceBits";
+import { useApi } from "../lib/api";
+import { copyText } from "../lib/clipboard";
+import { useAgents } from "../lib/directory";
+import {
+  percent,
+  runName,
+  runShape,
+  runSummary,
+  type EvalRun,
+  type EvalSuiteSummary,
+  type RunSummary,
+} from "../lib/evals";
+import { formatSpan, plural, toDate } from "../lib/format";
+import { useQueryClient } from "../lib/useApiQuery";
 import { NewEvalRunDialog } from "./evals/NewEvalRunDialog";
-import { SuitesSection } from "./evals/SuitesSection";
+import { NewSimulationDialog } from "./evals/NewSimulationDialog";
 
-interface EvalRunSummary {
-  id: string;
-  agent_id: string;
-  environment_id: string;
-  status: "pending" | "running" | "completed" | "failed";
-  started_at: string;
-  ended_at?: string;
-  error?: string;
-  task_count: number;
-  completed_count: number;
-  failed_count: number;
-  tasks: Array<{
-    id: string;
-    status: string;
-    trial_pass_count?: number;
-    trial_total?: number;
-  }>;
-}
+/**
+ * Evals: is each agent still doing its job?
+ *
+ * Two views of one page:
+ *   Runs    every run, newest first, named for its suite (or for what it
+ *           is: a simulation, a one-off). A row reads left to right as
+ *           what ran, on which agent, how it went (pass rate, and one
+ *           small bar per task), the verdict, how long it took, when.
+ *   Suites  the saved sets of tasks, as cards: the last result of each,
+ *           whether it moved, and a Run button.
+ *
+ * The two ways to start something new are in the header: "New eval run"
+ * (the primary) and "New simulation".
+ */
 
+const SUBTITLE = "Run your agents on saved tasks and simulated users. A judge model grades every attempt.";
+
+type View = "runs" | "suites";
 type StatusValue = "any" | "pending" | "running" | "completed" | "failed";
 
+// The server filters on the state of a run, not on how it scored.
 const STATUS_OPTIONS: { value: StatusValue; label: string }[] = [
   { value: "any", label: "All" },
-  { value: "pending", label: "Pending" },
+  { value: "pending", label: "Queued" },
   { value: "running", label: "Running" },
-  { value: "completed", label: "Completed" },
-  { value: "failed", label: "Failed" },
+  { value: "completed", label: "Finished" },
+  { value: "failed", label: "Stopped by an error" },
 ];
 
-function statusCls(s: string): string {
-  switch (s) {
-    case "completed": return "bg-success-subtle text-success";
-    case "failed":    return "bg-danger-subtle text-danger";
-    case "running":   return "bg-info-subtle text-info";
-    default:          return "bg-bg-surface text-fg-muted";
+/** The quiet line under a run's name: what it is made of, or why it stopped. */
+function runCaption(run: EvalRun, summary: RunSummary): string {
+  if (summary.verdict === "error" && run.error) return run.error;
+  const shape = runShape(summary);
+  if (summary.kind === "suite") return `Suite · ${shape}`;
+  if (summary.kind === "comparison") {
+    return `${run.comparison_role === "candidate" ? "Candidate" : "Baseline"} · ${shape}`;
   }
+  const ids = run.tasks.map((t) => t.id);
+  if (ids.length === 0) return shape;
+  const listed = ids.slice(0, 2).join(", ") + (ids.length > 2 ? ` and ${ids.length - 2} more` : "");
+  return `${shape} · ${listed}`;
 }
 
-function timeAgo(iso?: string): string {
-  if (!iso) return "—";
-  const ms = Date.now() - new Date(iso).getTime();
-  if (ms < 60_000) return `${Math.round(ms / 1000)}s ago`;
-  if (ms < 3_600_000) return `${Math.round(ms / 60_000)}m ago`;
-  if (ms < 86_400_000) return `${Math.round(ms / 3_600_000)}h ago`;
-  return `${Math.round(ms / 86_400_000)}d ago`;
+function RunIdentity({ run, summary, agentName }: RunWithSummary & { agentName?: string }) {
+  // On a narrow table the agent has no column of its own, so it leads the caption.
+  const caption = [summary.verdict !== "error" && agentName, runCaption(run, summary)].filter(Boolean).join(" · ");
+  // The mark says what kind of run it is: a suite, a simulation, a one-off.
+  return <ResourceIdentity icon={RUN_KIND_ICON[summary.kind]} name={runName(run)} secondary={caption} />;
 }
 
-function durationStr(start?: string, end?: string): string {
-  if (!start) return "—";
-  const s = new Date(start).getTime();
-  const e = end ? new Date(end).getTime() : Date.now();
-  const sec = Math.round((e - s) / 1000);
-  if (sec < 60) return `${sec}s`;
-  if (sec < 3600) return `${Math.floor(sec / 60)}m ${sec % 60}s`;
-  return `${Math.floor(sec / 3600)}h ${Math.floor((sec % 3600) / 60)}m`;
-}
-
-function passRateStr(r: EvalRunSummary): string {
-  let pass = 0;
-  let total = 0;
-  for (const t of r.tasks) {
-    pass += t.trial_pass_count ?? 0;
-    total += t.trial_total ?? 0;
+function RunResult({ run, summary }: RunWithSummary) {
+  const { trials, taskCounts: c } = summary;
+  if (summary.verdict === "queued") return <span className="text-fg-subtle">Waiting to start</span>;
+  if (summary.verdict === "error") return <span className="text-fg-subtle">No result</span>;
+  if (summary.verdict === "running") {
+    return (
+      <div className="min-w-0 leading-tight">
+        <div className="flex items-center gap-3">
+          <span className="font-medium text-fg tabular-nums">
+            {c.total - c.active} of {c.total}
+          </span>
+          <TaskStrip summary={summary} size="sm" />
+        </div>
+        <div className="mt-1 truncate text-xs text-fg-subtle">{run.tasks.length === 1 ? "task" : "tasks"} finished</div>
+      </div>
+    );
   }
-  if (total === 0) return "—";
-  return `${pass}/${total}`;
+  if (summary.passRate === null) return <span className="text-fg-subtle">Not graded</span>;
+  return (
+    <div className="min-w-0 leading-tight">
+      <div className="flex items-center gap-3">
+        <span className="w-9 shrink-0 font-medium text-fg tabular-nums">{percent(summary.passRate)}</span>
+        <TaskStrip summary={summary} size="sm" />
+      </div>
+      <div className="mt-1 truncate text-xs text-fg-subtle">
+        {trials.passed} of {trials.graded} trials passed
+      </div>
+    </div>
+  );
 }
 
 export function EvalRunsList() {
-  const nav = useNavigate();
   const { api } = useApi();
+  const queryClient = useQueryClient();
+  const { agents, byId: agentsById } = useAgents();
+
+  // The view and the open suite live in the URL, so both can be linked to.
+  const [params, setParams] = useSearchParams();
+  const view: View = params.get("view") === "suites" ? "suites" : "runs";
+  const openSuiteId = params.get("suite");
+  const patchParams = (patch: Record<string, string | null>) => {
+    const sp = new URLSearchParams(params);
+    for (const [k, v] of Object.entries(patch)) {
+      if (v === null) sp.delete(k);
+      else sp.set(k, v);
+    }
+    setParams(sp, { replace: true });
+  };
+
+  // Filters map to the list endpoint's own query params, and live in the
+  // address like the view, so a filtered list survives a reload and can be linked.
+  const statusParam = params.get("status");
+  const status: StatusValue = STATUS_OPTIONS.some((o) => o.value === statusParam && o.value !== "any") ? (statusParam as StatusValue) : "any";
+  const agentId = params.get("agent_id") ?? "";
+  const setStatus = (v: StatusValue) => patchParams({ status: v === "any" ? null : v });
+  const setAgentId = (v: string) => patchParams({ agent_id: v || null });
+  const filtered = status !== "any" || !!agentId;
+  const clearFilters = () => patchParams({ status: null, agent_id: null });
+
+  const { runs, isLoading, error, refetch } = useEvalRuns({ status: status === "any" ? undefined : status, agent_id: agentId || undefined });
+  // Suite cards read their history from the unfiltered list (the same request when no filter is set).
+  const all = useEvalRuns();
+  const suitesQuery = useEvalSuites();
+  const { suites } = suitesQuery;
+
+  const rows = useMemo<RunWithSummary[]>(() => runs.map((run) => ({ run, summary: runSummary(run) })), [runs]);
+  const history = useMemo(() => suiteHistory(all.runs), [all.runs]);
+  const openSuite = openSuiteId ? (suites.find((s) => s.id === openSuiteId) ?? null) : null;
+
   const [showCreate, setShowCreate] = useState(false);
+  const [showSimulation, setShowSimulation] = useState(false);
+  const [runTarget, setRunTarget] = useState<RunTarget | null>(null);
+  const [confirm, setConfirm] = useState<
+    { kind: "cancel" | "delete"; run: EvalRun } | { kind: "suite"; suite: EvalSuiteSummary } | null
+  >(null);
 
-  // Server-driven status filter. "any" → omit the param entirely so the
-  // server returns all runs; anything else is whitelisted by the route's
-  // strict enum validator (400 on typo).
-  const [status, setStatus] = useState<StatusValue>("any");
-
-  const params = useMemo(
-    () => ({
-      limit: "100",
-      ...(status !== "any" ? { status } : {}),
-    }),
-    [status],
-  );
-
-  // Auto-poll every 5s only while at least one run is still pending or
-  // running. TQ inspects the cached `data` on each tick to decide, so a
-  // run reaching a terminal state pauses the poll on its own — matches
-  // the previous `anyActive` guard without the manual setInterval +
-  // cancelled flag dance.
-  const { data: runsRes, isLoading: loading, refetch } = useApiQuery<{ data: EvalRunSummary[] }>(
-    "/v1/evals/runs",
-    params,
+  const actionsFor = ({ run, summary }: RunWithSummary): RowAction[] => [
     {
-      refetchInterval: (query) => {
-        const data = query.state.data as { data: EvalRunSummary[] } | undefined;
-        const anyActive = !!data?.data.some(
-          (r) => r.status === "pending" || r.status === "running",
-        );
-        return anyActive ? 5_000 : false;
-      },
+      label: "Run again",
+      icon: <RotateCwIcon />,
+      disabled: run.tasks.length === 0 || summary.active,
+      onSelect: () => setRunTarget({ kind: "rerun", run }),
     },
-  );
-  const runs = runsRes?.data ?? [];
+    { label: "Copy link", icon: <LinkIcon />, onSelect: () => void copyText(`${window.location.origin}/evals/${run.id}`) },
+    { label: "Copy run id", icon: <CopyIcon />, onSelect: () => void copyText(run.id) },
+    ...(summary.active
+      ? [{ label: "Cancel run", icon: <CircleXIcon />, onSelect: () => setConfirm({ kind: "cancel", run }) }]
+      : []),
+    { label: "Delete", icon: <Trash2Icon />, destructive: true, onSelect: () => setConfirm({ kind: "delete", run }) },
+  ];
 
-  // TanStack column defs. Order, filtering, and search all flow through
-  // server params — no per-column sort/filter UI. Required columns (id,
-  // status) opt out of the Columns hide menu so the user can't end up
-  // with a table that has nothing identifying.
-  const columns = useMemo<ColumnDef<EvalRunSummary>[]>(
-    () => [
-      {
-        id: "id",
-        accessorKey: "id",
-        header: "ID",
-        cell: ({ row }) => (
-          <span title={row.original.id} className="font-mono text-xs text-fg-muted">
-            {row.original.id}
-          </span>
-        ),
-        enableHiding: false,
-      },
-      {
-        id: "status",
-        accessorKey: "status",
-        header: "Status",
-        cell: ({ row }) => (
-          <span
-            className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${statusCls(row.original.status)}`}
-          >
-            {row.original.status}
-          </span>
-        ),
-        enableHiding: false,
-      },
-      {
-        id: "pass_rate",
-        accessorFn: (r) => passRateStr(r),
-        header: "Pass rate",
-        cell: ({ row }) => (
-          <span className="text-fg font-medium">{passRateStr(row.original)}</span>
-        ),
-      },
-      {
-        id: "tasks",
-        accessorFn: (r) => `${r.completed_count}/${r.task_count}`,
-        header: "Tasks",
-        cell: ({ row }) => (
-          <span className="text-fg-muted">
-            {row.original.completed_count}/{row.original.task_count}
-            {row.original.failed_count > 0 && (
-              <span className="text-danger ml-1">({row.original.failed_count} fail)</span>
-            )}
-          </span>
-        ),
-      },
-      {
-        id: "duration",
-        accessorFn: (r) => durationStr(r.started_at, r.ended_at),
-        header: "Duration",
-        cell: ({ row }) => (
-          <span className="text-fg-muted">
-            {durationStr(row.original.started_at, row.original.ended_at)}
-          </span>
-        ),
-      },
-      {
-        id: "started",
-        accessorFn: (r) => r.started_at,
-        header: "Started",
-        cell: ({ row }) => (
-          <span title={row.original.started_at} className="text-fg-muted">
-            {timeAgo(row.original.started_at)}
-          </span>
-        ),
-      },
-      {
-        id: "agent",
-        accessorKey: "agent_id",
-        header: "Agent",
-        cell: ({ row }) => (
-          <span className="font-mono text-xs text-fg-muted">{row.original.agent_id}</span>
-        ),
-      },
-      {
-        id: "actions",
-        header: "",
-        cell: ({ row }) => {
-          const r = row.original;
-          const isActive = r.status === "pending" || r.status === "running";
-          return (
-            <RowActionsMenu
-              label={`Actions for ${r.id}`}
-              actions={[
-                {
-                  label: "Cancel",
-                  icon: <XCircleIcon className="size-4" />,
-                  // Cancel and Delete both hit the same DELETE endpoint
-                  // (it cancels in-flight runs by flipping status to
-                  // failed, then deletes the row). The two menu items
-                  // give the user the right verb for the row's state.
-                  disabled: !isActive,
-                  onSelect: async () => {
-                    if (!confirm(`Cancel eval run ${r.id}? In-flight tasks will be marked failed.`)) return;
-                    try {
-                      await api(`/v1/evals/runs/${r.id}`, { method: "DELETE" });
-                      void refetch();
-                    } catch {}
-                  },
-                },
-                {
-                  label: "Delete",
-                  icon: <TrashIcon className="size-4" />,
-                  destructive: true,
-                  onSelect: async () => {
-                    if (!confirm(`Delete eval run ${r.id}? This can't be undone.`)) return;
-                    try {
-                      await api(`/v1/evals/runs/${r.id}`, { method: "DELETE" });
-                      void refetch();
-                    } catch {}
-                  },
-                },
-              ]}
-            />
-          );
-        },
-        enableHiding: false,
-        size: 56,
-      },
-    ],
-    [api, refetch],
-  );
-
-  // Active-filter chip display — kept null when matching the default so
-  // the chip reads "Status ▾" rather than "Status: All ▾". The clear-X
-  // only renders when the chip is in non-default state.
-  const statusDisplay =
-    status === "any" ? undefined : STATUS_OPTIONS.find((o) => o.value === status)?.label;
-
-  const filters = (
-    <FilterChip
-      label="Status"
-      active={status !== "any"}
-      display={statusDisplay}
-      onClear={() => setStatus("any")}
-    >
-      <PopoverContent
-        align="start"
-        sideOffset={4}
-        collisionPadding={8}
-        className="w-48 p-0"
-      >
-        <FacetedFilter
-          options={STATUS_OPTIONS}
-          value={status}
-          onValueChange={(v) => setStatus(v as StatusValue)}
-          searchPlaceholder="Status..."
+  // On a table narrower than 1000px (a 1280 window with the sidebar open)
+  // the list keeps what answers "how did it go": the agent moves into the
+  // run's caption and the duration is left to the run page. It is the
+  // table's own width that decides, so closing the sidebar brings both back.
+  const columns = useMemo<ColumnDef<RunWithSummary>[]>(() => [
+    {
+      id: "run",
+      accessorFn: (r) => runName(r.run),
+      header: "Run",
+      size: 290,
+      minSize: 240,
+      enableHiding: false,
+      cell: ({ row, table }) => (
+        <RunIdentity
+          {...row.original}
+          agentName={table.options.meta?.hiddenByWidth.has("agent") ? agentsById.get(row.original.run.agent_id)?.name : undefined}
         />
-      </PopoverContent>
-    </FilterChip>
+      ),
+    },
+    {
+      id: "agent",
+      header: "Agent",
+      size: 230,
+      meta: { hideBelow: 1000 },
+      cell: ({ row }) => (
+        <span className="flex min-w-0 items-center gap-2">
+          <EntityRef kind="agent" id={row.original.run.agent_id} className="font-normal" />
+          {row.original.run.agent_version !== undefined && (
+            <Tip label={`Ran against version ${row.original.run.agent_version} of the agent`}>
+              <span className="shrink-0 font-mono text-micro text-fg-subtle">v{row.original.run.agent_version}</span>
+            </Tip>
+          )}
+        </span>
+      ),
+    },
+    {
+      id: "result",
+      accessorFn: (r) => r.summary.passRate ?? undefined,
+      header: "Result",
+      size: 205,
+      enableSorting: true,
+      sortDescFirst: true,
+      cell: ({ row }) => <RunResult {...row.original} />,
+    },
+    {
+      id: "verdict",
+      header: "Verdict",
+      size: 135,
+      enableHiding: false,
+      cell: ({ row }) => <VerdictBadge verdict={row.original.summary.verdict} />,
+    },
+    {
+      id: "duration",
+      accessorFn: (r) => r.summary.durationSeconds ?? undefined,
+      header: "Duration",
+      size: 104,
+      enableSorting: true,
+      sortDescFirst: true,
+      meta: { align: "right", hideBelow: 1000 },
+      cell: ({ row }) =>
+        row.original.summary.durationSeconds === null ? (
+          <Tip label={row.original.summary.verdict === "queued" ? "It has not started yet" : "No end time was recorded"}>
+            <span className="text-fg-faint">
+              <span aria-hidden="true">—</span>
+              <span className="sr-only">Not recorded</span>
+            </span>
+          </Tip>
+        ) : (
+          <span className="text-fg-muted tabular-nums">{formatSpan(row.original.summary.durationSeconds)}</span>
+        ),
+    },
+    {
+      id: "started",
+      accessorFn: (r) => toDate(r.run.started_at ?? r.run.created_at)?.getTime(),
+      header: "Started",
+      size: 118,
+      enableSorting: true,
+      sortDescFirst: true,
+      cell: ({ row }) => (
+        <RelativeTime value={row.original.run.started_at ?? row.original.run.created_at} className="text-fg-muted" fallback="Not started" />
+      ),
+    },
+    {
+      id: "actions",
+      header: "",
+      size: 56,
+      enableHiding: false,
+      cell: ({ row }) => <RowActionsMenu label={`Actions for ${runName(row.original.run)}`} actions={actionsFor(row.original)} />,
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  ], [agentsById]);
+
+  const viewSwitch = (
+    <SegmentedControl<View>
+      label="Show"
+      value={view}
+      onChange={(v) => patchParams({ view: v === "runs" ? null : v, suite: null })}
+      options={[
+        { value: "runs", label: "Runs" },
+        { value: "suites", label: "Suites" },
+      ]}
+    />
   );
 
-  return (
+  const agentOptions = useMemo(
+    () => agents.map((a) => ({ value: a.id, label: a.archived_at ? `${a.name} (archived)` : a.name })),
+    [agents],
+  );
+
+  const headerActions = (
+    <Button variant="outline" onClick={() => setShowSimulation(true)}>
+      <DramaIcon data-icon="inline-start" />
+      New simulation
+    </Button>
+  );
+
+  const dialogs = (
     <>
-      {/* Saved suites strip (§8 save-as-eval) — sits between the frozen
-          header and the runs rows, inside the scroll container. Renders
-          nothing when the tenant has no suites. */}
-      <SuitesSection />
-      <DataTable<EvalRunSummary>
-      createLabel="+ New eval run"
-      onCreate={() => setShowCreate(true)}
-      filters={filters}
-      data={runs}
-      loading={loading}
-      getRowId={(r) => r.id}
-      onRowClick={(r) => nav(`/evals/${r.id}`)}
-      columns={columns}
-      emptyTitle={status === "any" ? "No eval runs yet" : "No matching eval runs"}
-      emptyKind="eval"
-      emptyAction={
-        status === "any" && (
-          <Button onClick={() => setShowCreate(true)}>+ New eval run</Button>
-        )
-      }
-      emptySubtitle={
-        status === "any" ? (
-          <p>
-            Or submit one with{" "}
-            <code className="px-1 py-0.5 bg-bg-surface rounded text-fg-muted">POST /v1/evals/runs</code>{" "}
-            or{" "}
-            <code className="px-1 py-0.5 bg-bg-surface rounded text-fg-muted">npx tsx rl/tasks/terminal-bench/run-cloud.ts</code>.
-          </p>
-        ) : (
-          "Try clearing the status filter."
-        )
-      }
-    >
-        <NewEvalRunDialog open={showCreate} onClose={() => setShowCreate(false)} />
-      </DataTable>
+      <NewEvalRunDialog open={showCreate} onClose={() => setShowCreate(false)} />
+      <NewSimulationDialog open={showSimulation} onClose={() => setShowSimulation(false)} />
+      <RunDialog target={runTarget} onClose={() => setRunTarget(null)} />
+      <SuiteSheet
+        suite={openSuite}
+        history={openSuite ? history.get(openSuite.id) : undefined}
+        onClose={() => patchParams({ suite: null })}
+        onRun={(suite) => setRunTarget({ kind: "suite", suite })}
+        onDelete={(suite) => setConfirm({ kind: "suite", suite })}
+      />
+      <ConfirmDialog
+        open={!!confirm}
+        onClose={() => setConfirm(null)}
+        destructive={confirm?.kind !== "cancel"}
+        title={
+          confirm?.kind === "suite"
+            ? `Delete ${confirm.suite.name}?`
+            : confirm?.kind === "cancel"
+              ? `Cancel this run of ${runName(confirm.run)}?`
+              : confirm
+                ? `Delete this run of ${runName(confirm.run)}?`
+                : ""
+        }
+        body={
+          confirm?.kind === "suite"
+            ? `The suite and its ${plural(confirm.suite.task_count, "task")} are removed. Runs it already produced stay in the list. This cannot be undone.`
+            : confirm?.kind === "cancel"
+              ? "Trials that are still going are stopped, and the run is removed from the list. This cannot be undone."
+              : "The run and its results are removed. The sessions its trials recorded are kept. This cannot be undone."
+        }
+        confirmLabel={confirm?.kind === "suite" ? "Delete suite" : confirm?.kind === "cancel" ? "Cancel run" : "Delete run"}
+        cancelLabel={confirm?.kind === "cancel" ? "Keep running" : "Cancel"}
+        onConfirm={async () => {
+          if (!confirm) return;
+          if (confirm.kind === "suite") {
+            await api(`${SUITES_KEY}/${confirm.suite.id}`, { method: "DELETE" });
+            toast.success(`Deleted ${confirm.suite.name}`);
+            if (openSuiteId === confirm.suite.id) patchParams({ suite: null });
+            void queryClient.invalidateQueries({ queryKey: [SUITES_KEY] });
+            return;
+          }
+          // One endpoint does both: it stops a run that is still going, then removes it.
+          await api(`${RUNS_KEY}/${confirm.run.id}`, { method: "DELETE" });
+          void queryClient.invalidateQueries({ queryKey: [RUNS_KEY] });
+        }}
+      />
     </>
   );
+
+  // ── Suites ─────────────────────────────────────────────────────────────
+  if (view === "suites") {
+    if (suitesQuery.error && !suitesQuery.unsupported && suites.length === 0) {
+      return (
+        <Page width="wide" header={<PageHeader title="Evals" subtitle={SUBTITLE} width="wide" actions={headerActions} toolbar={viewSwitch} />}>
+          <ErrorState title="Suites could not be loaded" error={suitesQuery.error} retry={() => void suitesQuery.refetch()} />
+          {dialogs}
+        </Page>
+      );
+    }
+    return (
+      <DataTable<EvalSuiteSummary>
+        title="Evals"
+        subtitle={SUBTITLE}
+        createLabel="+ New eval run"
+        onCreate={() => setShowCreate(true)}
+        headerActions={headerActions}
+        filters={viewSwitch}
+        summary={suitesQuery.isLoading || suites.length === 0 ? undefined : plural(suites.length, "suite")}
+        layout="grid"
+        gridClassName="grid gap-4 sm:grid-cols-2 xl:grid-cols-3"
+        columns={SUITE_COLUMNS}
+        data={suites}
+        loading={suitesQuery.isLoading}
+        getRowId={(s) => s.id}
+        renderCard={(suite, i) => (
+          <SuiteCard
+            key={suite.id}
+            suite={suite}
+            index={i}
+            history={history.get(suite.id)}
+            onOpen={() => patchParams({ suite: suite.id })}
+            onRun={() => setRunTarget({ kind: "suite", suite })}
+            onDelete={() => setConfirm({ kind: "suite", suite })}
+          />
+        )}
+        emptyKind="eval"
+        emptyTitle={suitesQuery.unsupported ? "Suites are not available on this server" : "No suites yet"}
+        emptySubtitle={
+          suitesQuery.unsupported
+            ? "This server has nowhere to keep them. You can still start a run with its tasks written out."
+            : "A suite is a saved set of tasks you run again after every change, to see whether the agent got better or worse. Open a session that went well and choose Save as eval, or save the scenarios of a simulation."
+        }
+        emptyAction={
+          suitesQuery.unsupported ? (
+            <Button variant="outline" onClick={() => setShowCreate(true)}>
+              New eval run
+            </Button>
+          ) : (
+            <>
+              <Button variant="outline" asChild>
+                <Link to="/sessions">Choose a session</Link>
+              </Button>
+              <Button variant="ghost" onClick={() => setShowSimulation(true)}>
+                New simulation
+              </Button>
+            </>
+          )
+        }
+      >
+        {dialogs}
+      </DataTable>
+    );
+  }
+
+  // ── Runs ───────────────────────────────────────────────────────────────
+  if (error && runs.length === 0) {
+    return (
+      <Page width="wide" header={<PageHeader title="Evals" subtitle={SUBTITLE} width="wide" actions={headerActions} toolbar={viewSwitch} />}>
+        <ErrorState title="Eval runs could not be loaded" error={error} retry={() => void refetch()} />
+        {dialogs}
+      </Page>
+    );
+  }
+
+  return (
+    <DataTable<RunWithSummary>
+      title="Evals"
+      subtitle={SUBTITLE}
+      createLabel="+ New eval run"
+      onCreate={() => setShowCreate(true)}
+      headerActions={headerActions}
+      filters={
+        <>
+          {viewSwitch}
+          <FilterChip
+            label="Agent"
+            active={!!agentId}
+            display={agentId ? (agentsById.get(agentId)?.name ?? "1 agent") : undefined}
+            onClear={() => setAgentId("")}
+          >
+            <PopoverContent align="start" sideOffset={6} collisionPadding={8} className="w-72 gap-0 p-0">
+              <FacetedFilter options={agentOptions} value={agentId} onValueChange={setAgentId} searchPlaceholder="Agent" />
+            </PopoverContent>
+          </FilterChip>
+          <FilterChip
+            label="Status"
+            active={status !== "any"}
+            display={status === "any" ? undefined : STATUS_OPTIONS.find((o) => o.value === status)?.label}
+            onClear={() => setStatus("any")}
+          >
+            <PopoverContent align="start" sideOffset={6} collisionPadding={8} className="w-56 gap-0 p-0">
+              <FacetedFilter options={STATUS_OPTIONS} value={status} onValueChange={(v) => setStatus(v as StatusValue)} searchPlaceholder="Status" />
+            </PopoverContent>
+          </FilterChip>
+        </>
+      }
+      summary={isLoading || rows.length === 0 ? undefined : plural(rows.length, "run")}
+      columns={columns}
+      data={rows}
+      loading={isLoading}
+      getRowId={(r) => r.run.id}
+      rowHref={(r) => `/evals/${r.run.id}`}
+      emptyKind="eval"
+      emptyTitle={filtered ? "No runs match" : "No eval runs yet"}
+      emptySubtitle={
+        filtered ? (
+          "Nothing matches the filters you chose."
+        ) : (
+          <>
+            An eval gives your agent a set of tasks, runs each one a few times, and has a judge model grade every attempt, so
+            you can tell whether a change made the agent better or worse. Runs can also be started over the API with{" "}
+            <code className="rounded-sm bg-bg-soft px-1 py-0.5 font-mono text-xs text-fg">POST /v1/evals/runs</code>.
+          </>
+        )
+      }
+      filtered={filtered}
+      emptyAction={
+        filtered ? (
+          <Button variant="outline" onClick={clearFilters}>
+            Clear filters
+          </Button>
+        ) : (
+          <>
+            <Button onClick={() => setShowCreate(true)}>New eval run</Button>
+            <Button variant="outline" onClick={() => setShowSimulation(true)}>
+              New simulation
+            </Button>
+          </>
+        )
+      }
+    >
+      {dialogs}
+    </DataTable>
+  );
 }
+
+// The gallery draws cards; the table columns are never shown.
+const SUITE_COLUMNS: ColumnDef<EvalSuiteSummary>[] = [{ id: "name", header: "Suite", accessorKey: "name" }];

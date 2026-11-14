@@ -69,10 +69,9 @@ export function RowActionsMenu({ actions, label = "Row actions" }: RowActionsMen
             aria-label={label}
             onClick={(e) => e.stopPropagation()}
             className={cn(
-              "inline-flex items-center justify-center size-7 rounded-md",
-              "text-fg-subtle hover:text-fg hover:bg-bg-surface",
-              "transition-colors outline-none",
-              "focus-visible:bg-bg-surface",
+              "inline-flex size-8 items-center justify-center rounded-full",
+              "text-fg-subtle transition-quick hover:bg-bg-hover hover:text-fg",
+              "aria-expanded:bg-bg-hover aria-expanded:text-fg",
             )}
           >
             <MoreHorizontalIcon className="size-4" />
@@ -85,7 +84,7 @@ export function RowActionsMenu({ actions, label = "Row actions" }: RowActionsMen
           // Stop propagation on the content so the row-click handler
           // never fires when the user clicks inside the open menu.
           onClick={(e) => e.stopPropagation()}
-          className="w-40"
+          className="w-48"
         >
           {items.map((item, i) => {
             if (item === "separator") return <DropdownMenuSeparator key={`sep-${i}`} />;
@@ -94,9 +93,7 @@ export function RowActionsMenu({ actions, label = "Row actions" }: RowActionsMen
                 key={i}
                 disabled={item.disabled}
                 onSelect={() => item.onSelect()}
-                className={cn(
-                  item.destructive && "text-danger focus:text-danger focus:bg-danger-subtle",
-                )}
+                variant={item.destructive ? "destructive" : "default"}
               >
                 {item.icon}
                 {item.label}

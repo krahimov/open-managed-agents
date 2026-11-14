@@ -5,31 +5,32 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Orrery</title>
 
-    <!-- Favicon variants. SVG is the primary mark; modern browsers prefer
-         it. apple-touch-icon is an opaque rounded SVG so the iOS install
-         animation doesn't flash the wallpaper through transparent corners.
-         mask-icon is for older Safari pinned-tab rendering, which paints a
-         monochrome stencil tinted to the supplied color. -->
+    <!-- Favicon variants, all carrying the Muse mark (cream ring on an ink
+         tile, the orbiting body lit by the wash). SVG is the primary icon;
+         favicon.png is the 32px fallback for browsers that want a raster.
+         apple-touch-icon is full-bleed and opaque, because iOS applies its
+         own corner mask and would show the wallpaper through transparency.
+         (No mask-icon: the mark is a filled tile, which a monochrome stencil
+         would reduce to a blank square; Safari uses the icon above.) -->
     <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+    <link rel="alternate icon" type="image/png" sizes="32x32" href="/favicon.png" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.svg" />
-    <link rel="mask-icon" href="/logo.svg" color="#d9564a" />
 
-    <!-- Browser-chrome tint. Light value matches --bg in :root; dark value
-         matches --bg in .dark — keeps the address bar reading the same
-         tone as the page itself. -->
-    <meta name="theme-color" content="#fbfbfc" media="(prefers-color-scheme: light)" />
-    <meta name="theme-color" content="#111113" media="(prefers-color-scheme: dark)" />
+    <!-- Browser-chrome tint. Matches --bg-sidebar (the stage behind the
+         sidebar and panel) in each theme. -->
+    <meta name="theme-color" content="#f7f1f0" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#130e11" media="(prefers-color-scheme: dark)" />
 
     <!-- SEO: short description + canonical. The console is a single-page
          app behind auth, so canonical is the production app root — every
          in-app route shares the same indexable surface. -->
-    <meta name="description" content="Orrery console for managing agents, sessions, and infrastructure." />
+    <meta name="description" content="Orrery: build, run and supervise AI agents." />
     <link rel="canonical" href="https://app.openma.dev/" />
 
     <!-- Open Graph (Facebook, LinkedIn, Slack, Discord). -->
     <meta property="og:type" content="website" />
     <meta property="og:title" content="Orrery" />
-    <meta property="og:description" content="Manage agents, sessions, and infrastructure." />
+    <meta property="og:description" content="Build, run and supervise AI agents." />
     <meta property="og:url" content="https://app.openma.dev/" />
     <meta property="og:image" content="https://app.openma.dev/og.svg" />
     <meta property="og:image:width" content="1200" />
@@ -39,7 +40,7 @@
     <!-- Twitter / X large image card. -->
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="Orrery" />
-    <meta name="twitter:description" content="Manage agents, sessions, and infrastructure." />
+    <meta name="twitter:description" content="Build, run and supervise AI agents." />
     <meta name="twitter:image" content="https://app.openma.dev/og.svg" />
 
     <!-- Turnstile is loaded on the Login page only. preconnect opens the
@@ -58,7 +59,7 @@
       }
     </script>
   </head>
-  <body class="bg-bg text-fg antialiased">
+  <body class="bg-bg-sidebar text-fg antialiased">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

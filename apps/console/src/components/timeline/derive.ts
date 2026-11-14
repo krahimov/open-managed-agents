@@ -1,7 +1,7 @@
-import { formatDuration } from "../../lib/format";
+import { formatCompact } from "../../lib/format";
 import type { Event } from "../../lib/events";
-import { buildToolCallIndex, TOOL_STATUS_LABEL } from "../../lib/tool-status";
-import { parseSearchMcpTools, unwrapCallMcpTool } from "../../lib/deferred-mcp";
+import { eventTime, formatElapsed, handoffKey, handoffKeyOf } from "../sessions/model";
+import { serverInfo } from "../sessions/tools";
 import type { Span, Turn, TurnTriggerKind } from "./types";
 
 /**
@@ -18,31 +18,10 @@ import type { Span, Turn, TurnTriggerKind } from "./types";
  * collapses sub-second events together — only used as a fallback for
  * very old sessions that predate processed_at.
  */
-export function deriveSpans(
-  events: Event[],
-  /** Wider event context (e.g. the whole thread) used only to resolve
-   *  tool-call status. A call made in one turn is often answered in the
-   *  next (tool confirmation, custom tool result), so the turn's own
-   *  events can't tell "awaiting approval" from "denied". Defaults to
-   *  `events`. Bar durations always come from `events` alone. */
-  statusContext: Event[] = events,
-): { spans: Span[]; totalMs: number } {
-  const tsMs = (e: Event): number | null => {
-    const pa = (e.data as { processed_at?: string } | undefined)?.processed_at
-      ?? (e as { processed_at?: string }).processed_at;
-    if (typeof pa === "string") {
-      const t = Date.parse(pa);
-      if (Number.isFinite(t)) return t;
-    }
-    if (typeof e.ts === "number") {
-      // CF emits epoch seconds (~1.8e9); Node's event log emits epoch
-      // MILLISECONDS (~1.8e12). Blindly multiplying by 1000 inflated every
-      // Node span 1000× (2.7s TTFT rendered as "45m18s"). Anything past
-      // 1e12 is already milliseconds.
-      return e.ts > 1e12 ? e.ts : e.ts * 1000;
-    }
-    return null;
-  };
+export function deriveSpans(events: Event[]): { spans: Span[]; totalMs: number } {
+  // One clock for the whole session view: `processed_at` (ms ISO) first,
+  // then the numeric `ts` (ms on Node, seconds on Cloudflare).
+  const tsMs = eventTime;
 
   const timed = events.map((e) => ({ e, t: tsMs(e) })).filter((x): x is { e: Event; t: number } => x.t !== null);
   if (timed.length === 0) return { spans: [], totalMs: 0 };
@@ -59,7 +38,6 @@ export function deriveSpans(
   const toolResults = new Map<string, { t: number; e: Event }>();
   const mcpResults = new Map<string, { t: number; e: Event }>();
   const customResults = new Map<string, { t: number; e: Event }>();
-  const toolIndex = buildToolCallIndex(statusContext);
   // model_request_start_id → end's timestamp + usage. Anthropic's wire
   // format pairs the per-call span pair this way (rather than positional
   // FIFO), so multiple parallel or nested model calls stay correctly
@@ -79,14 +57,13 @@ export function deriveSpans(
   // schedule→fire / outcome→eval / etc. causal pair without needing
   // custom id fields per kind.
   const childByParent = new Map<string, { t: number; e: Event }>();
+  // tool_use_id → the person's decision, for calls that had to ask first.
+  const confirmations = new Map<string, { t: number; e: Event }>();
   for (const { e, t } of timed) {
+    if (e.type === "user.tool_confirmation" && e.tool_use_id) confirmations.set(e.tool_use_id, { t, e });
     if (e.type === "agent.tool_result" && e.tool_use_id) toolResults.set(e.tool_use_id, { t, e });
     else if (e.type === "agent.mcp_tool_result" && e.mcp_tool_use_id) mcpResults.set(e.mcp_tool_use_id, { t, e });
-    else if (e.type === "user.custom_tool_result") {
-      // Keyed by the call it answers (custom_tool_use_id), not its own id.
-      const cid = (e as { custom_tool_use_id?: unknown }).custom_tool_use_id;
-      if (typeof cid === "string") customResults.set(cid, { t, e });
-    }
+    else if (e.type === "user.custom_tool_result" && (e as Event).id) customResults.set(String(e.id), { t, e });
     else if (e.type === "span.model_request_end") {
       const data = (e.data as { model_request_start_id?: string; model_usage?: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }; finish_reason?: string } | undefined);
       const sid = (e as { model_request_start_id?: string }).model_request_start_id ?? data?.model_request_start_id;
@@ -105,6 +82,16 @@ export function deriveSpans(
     const pid = (e as { parent_event_id?: string }).parent_event_id
       ?? (e.data as { parent_event_id?: string } | undefined)?.parent_event_id;
     if (pid) childByParent.set(pid, { t, e });
+  }
+
+  // Who a hand-off went to: the runtime names the tool after the agent's id
+  // (`call_agent_agent_rrtc…`); the thread it starts carries the name.
+  const handoffNames = new Map<string, string>();
+  for (const { e } of timed) {
+    const started = e as { agent_id?: unknown; agent_name?: unknown };
+    if (e.type === "session.thread_created" && typeof started.agent_id === "string" && typeof started.agent_name === "string") {
+      handoffNames.set(handoffKeyOf(started.agent_id), started.agent_name);
+    }
   }
 
   // FIFO fallback indices for events that lack id-based pairing.
@@ -138,41 +125,54 @@ export function deriveSpans(
     const pushSpan = (span: Omit<Span, "events">) => spans.push({ ...span, events: sourceEvents });
 
     if (e.type === "agent.tool_use" || e.type === "agent.custom_tool_use") {
-      // Custom tools are closed by an agent.tool_result too (the runtime
-      // materializes the client's answer); the raw user.custom_tool_result
-      // is the fallback for logs that only have the client input.
-      const result = toolResults.get(String(e.id))
-        ?? (e.type === "agent.custom_tool_use" ? customResults.get(String(e.id)) : undefined);
-      const endMs = result ? result.t - t0 : startMs;
+      const result = e.type === "agent.tool_use"
+        ? toolResults.get(String(e.id))
+        : customResults.get(String(e.id));
+      // A call that had to ask first: the wait for a person is its own
+      // span, and the tool only starts running once they answered.
+      const asked = (e as { evaluated_permission?: string }).evaluated_permission === "ask";
+      const decision = confirmations.get(String(e.id));
+      let runStartMs = startMs;
+      if (asked && (decision || !result)) {
+        const decidedMs = decision ? decision.t - t0 : startMs;
+        const denied = (decision?.e as { result?: string } | undefined)?.result === "deny";
+        spans.push({
+          key: `approval-${e.id ?? i}`,
+          family: "approval",
+          label: "Waiting for approval",
+          detail: decision ? (denied ? "denied" : "allowed") : "still waiting",
+          startMs,
+          durationMs: Math.max(0, decidedMs - startMs),
+          events: decision ? [e, decision.e] : [e],
+        });
+        runStartMs = decidedMs;
+      }
+      const endMs = result ? result.t - t0 : runStartMs;
       if (result) sourceEvents.push(result.e);
-      const status = toolIndex.info(typeof e.id === "string" ? e.id : undefined).status;
-      // Deferred MCP meta tools: call_mcp_tool reads like a direct MCP span.
-      const deferred = e.type === "agent.tool_use" ? unwrapCallMcpTool(e.name, e.input) : null;
-      const search = e.type === "agent.tool_use" ? parseSearchMcpTools(e.name, e.input) : null;
+      const failed = !!result && Boolean((result.e as { is_error?: boolean }).is_error);
+      const handoff = handoffKey(String(e.name ?? ""));
       pushSpan({
         key: `tool-${e.id ?? i}`,
-        family: deferred ? "mcp" : e.type === "agent.tool_use" ? "tool" : "custom_tool",
-        label: deferred
-          ? `${deferred.server}:${deferred.tool}`
-          : search
-            ? `Searched ${search.server ?? "all"} tools for "${search.query}"`
-            : String(e.name ?? "tool"),
-        detail: TOOL_STATUS_LABEL[status],
-        ...(status === "failed" || status === "denied" ? { isError: true } : {}),
-        startMs,
-        durationMs: Math.max(0, endMs - startMs),
+        family: e.type === "agent.tool_use" ? "tool" : "custom_tool",
+        label: handoff ? `Asked ${handoffNames.get(handoff) ?? "another agent"}` : String(e.name ?? "tool"),
+        plain: !!handoff || undefined,
+        detail: result ? (failed ? "failed" : undefined) : asked && !decision ? "not run yet" : "no result",
+        failed,
+        startMs: runStartMs,
+        durationMs: Math.max(0, endMs - runStartMs),
       });
     } else if (e.type === "agent.mcp_tool_use") {
       const result = mcpResults.get(String(e.id));
       const endMs = result ? result.t - t0 : startMs;
       if (result) sourceEvents.push(result.e);
-      const status = toolIndex.info(typeof e.id === "string" ? e.id : undefined).status;
+      const failed = !!result && Boolean((result.e as { is_error?: boolean }).is_error);
       pushSpan({
         key: `mcp-${e.id ?? i}`,
         family: "mcp",
-        label: `${String(e.mcp_server_name ?? "mcp")}:${String(e.name ?? "?")}`,
-        detail: TOOL_STATUS_LABEL[status],
-        ...(status === "failed" || status === "denied" ? { isError: true } : {}),
+        source: serverInfo(typeof e.mcp_server_name === "string" ? e.mcp_server_name : undefined).label,
+        label: String(e.name ?? "tool"),
+        detail: result ? (failed ? "failed" : undefined) : "no result",
+        failed,
         startMs,
         durationMs: Math.max(0, endMs - startMs),
       });
@@ -194,15 +194,17 @@ export function deriveSpans(
       if (matched?.e) sourceEvents.push(matched.e);
       if (ftMatch?.e) sourceEvents.push(ftMatch.e);
       const tokSummary = usage
-        ? `${usage.input_tokens}↓ ${usage.output_tokens}↑${usage.cache_read_input_tokens ? ` ⚡${usage.cache_read_input_tokens}` : ""}`
+        ? `${formatCompact(usage.input_tokens + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0))} in · ${formatCompact(usage.output_tokens)} out`
         : undefined;
       const ttftMs = ftMatch ? Math.max(0, ftMatch.t - t) : undefined;
-      const ttftSummary = typeof ttftMs === "number" ? `TTFT ${formatDuration(ttftMs)}` : undefined;
+      const ttftSummary = typeof ttftMs === "number" ? `first token ${formatElapsed(ttftMs)}` : undefined;
+      const modelFailed = matched?.finishReason === "error";
       pushSpan({
         key: `model-${sid || i}`,
         family: "model",
-        label: "model call",
-        detail: [matched?.finishReason, ttftSummary, tokSummary].filter(Boolean).join(" · ") || undefined,
+        label: "Model call",
+        detail: [modelFailed ? "failed" : undefined, tokSummary, ttftSummary].filter(Boolean).join(" · ") || undefined,
+        failed: modelFailed,
         startMs,
         durationMs: Math.max(0, end - t0 - startMs),
         ttftMs,
@@ -214,7 +216,7 @@ export function deriveSpans(
       pushSpan({
         key: `compact-${i}`,
         family: "compaction",
-        label: "compaction",
+        label: "Context compaction",
         startMs,
         durationMs: Math.max(0, end - t0 - startMs),
       });
@@ -225,10 +227,14 @@ export function deriveSpans(
       pushSpan({
         key: `outcome-${i}`,
         family: "outcome",
-        label: "outcome eval",
+        label: "Outcome evaluation",
         startMs,
         durationMs: Math.max(0, end - t0 - startMs),
       });
+    } else if (e.type === "user.tool_confirmation") {
+      continue; // folded into the approval span
+    } else if (e.type === "user.interrupt") {
+      pushSpan({ key: `stop-${i}`, family: "system", label: "Stopped by you", startMs, durationMs: 0 });
     } else if (
       e.type === "span.model_request_end" ||
       e.type === "span.model_first_token" ||
@@ -248,11 +254,20 @@ export function deriveSpans(
       const fired = sid ? childByParent.get(sid) : undefined;
       const endMs = fired ? fired.t - t0 : startMs;
       if (fired?.e) sourceEvents.push(fired.e);
+      // A turn's own events rarely contain the wake-up it scheduled (that
+      // message opens the NEXT turn, after the idle gap the view shows
+      // between cards), so an unpaired schedule reads as what it is: the
+      // moment the agent set an alarm, and for when.
+      const due = (e as { scheduled_at?: string }).scheduled_at ?? (e.data as { scheduled_at?: string } | undefined)?.scheduled_at;
+      const dueAt = due ? new Date(due) : null;
       pushSpan({
         key: `sched-${sid || i}`,
         family: "schedule",
-        label: "schedule waiting",
-        detail: fired ? "fired" : "pending",
+        label: fired ? "Asleep until wake-up" : "Scheduled a wake-up",
+        detail:
+          fired || !dueAt || Number.isNaN(dueAt.getTime())
+            ? undefined
+            : `for ${dueAt.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })}`,
         startMs,
         durationMs: Math.max(0, endMs - startMs),
       });
@@ -262,16 +277,16 @@ export function deriveSpans(
       pushSpan({
         key: `u-${i}`,
         family: isWakeup ? "wakeup" : "user",
-        label: isWakeup ? "user.message (wakeup)" : "user.message",
+        label: isWakeup ? "Woke up on schedule" : "Message from you",
         startMs,
         durationMs: 0,
       });
     } else if (e.type === "agent.message") {
-      pushSpan({ key: `a-${i}`, family: "agent", label: "agent.message", startMs, durationMs: 0 });
+      pushSpan({ key: `a-${i}`, family: "agent", label: "Agent reply", startMs, durationMs: 0 });
     } else if (e.type === "agent.thinking") {
-      pushSpan({ key: `think-${i}`, family: "thinking", label: "agent.thinking", startMs, durationMs: 0 });
+      pushSpan({ key: `think-${i}`, family: "thinking", label: "Thinking", startMs, durationMs: 0 });
     } else if (e.type === "aux.model_call") {
-      pushSpan({ key: `aux-${i}`, family: "aux", label: "aux.model_call", startMs, durationMs: 0 });
+      pushSpan({ key: `aux-${i}`, family: "aux", label: "Helper model call", startMs, durationMs: 0 });
     } else if (
       e.type === "agent.thread_message_sent" ||
       e.type === "agent.thread_message_received" ||
@@ -279,15 +294,23 @@ export function deriveSpans(
       e.type === "session.thread_created" ||
       e.type === "session.thread_idle"
     ) {
-      pushSpan({ key: `thread-${i}`, family: "thread", label: e.type.replace(/^.*\./, ""), startMs, durationMs: 0 });
+      const who = e.type === "session.thread_created" && typeof (e as { agent_name?: unknown }).agent_name === "string" ? String((e as { agent_name?: unknown }).agent_name) : null;
+      pushSpan({
+        key: `thread-${i}`,
+        family: "thread",
+        label: who ? `${who} started` : (SYSTEM_LABEL[e.type] ?? e.type.replace(/^.*\./, "").replace(/_/g, " ")),
+        startMs,
+        durationMs: 0,
+      });
     } else if (e.type === "agent.thread_context_compacted") {
-      pushSpan({ key: `compact-marker-${i}`, family: "compaction", label: "thread compacted", startMs, durationMs: 0 });
+      pushSpan({ key: `compact-marker-${i}`, family: "compaction", label: "Context compacted", startMs, durationMs: 0 });
     } else if (e.type === "session.error") {
       pushSpan({
         key: `err-${i}`,
         family: "error",
-        label: "session.error",
-        detail: typeof e.error === "string" ? e.error : JSON.stringify(e.error),
+        label: "Turn failed",
+        detail: typeof e.message === "string" && e.message ? e.message : typeof e.error === "string" ? e.error.replace(/_/g, " ") : undefined,
+        failed: true,
         startMs,
         durationMs: 0,
       });
@@ -295,31 +318,49 @@ export function deriveSpans(
       pushSpan({
         key: `warn-${i}`,
         family: "warn",
-        label: `warning:${String(e.source ?? "")}`,
+        label: e.source ? `Warning from ${String(e.source).replace(/_/g, " ")}` : "Warning",
         detail: String(e.message ?? ""),
         startMs,
         durationMs: 0,
       });
     } else if (e.type.startsWith("session.")) {
-      pushSpan({ key: `s-${i}`, family: "system", label: e.type, startMs, durationMs: 0 });
+      pushSpan({ key: `s-${i}`, family: "system", label: SYSTEM_LABEL[e.type] ?? humanizeType(e.type), startMs, durationMs: 0 });
     } else {
       // Catch-all: surface unknown types as instant markers rather than
       // silently dropping. New event types added later show up immediately
       // and the operator can decide whether to give them dedicated visuals.
-      pushSpan({ key: `mk-${i}`, family: "marker", label: e.type, startMs, durationMs: 0 });
+      pushSpan({ key: `mk-${i}`, family: "marker", label: SYSTEM_LABEL[e.type] ?? humanizeType(e.type), startMs, durationMs: 0 });
     }
   }
 
   return { spans, totalMs };
 }
 
+/** Plain words for lifecycle events that have no dedicated visual. */
+const SYSTEM_LABEL: Record<string, string> = {
+  "session.status_running": "Started working",
+  "session.status_idle": "Went idle",
+  "session.status_terminated": "Session ended",
+  "session.status_rescheduled": "Retry scheduled",
+  "session.thread_created": "Sub-agent started",
+  "session.thread_idle": "Sub-agent went idle",
+  "agent.thread_message_sent": "Message to sub-agent",
+  "agent.thread_message_received": "Message from sub-agent",
+  "agent.thread_message": "Thread message",
+  "system.access_request": "Asked for access",
+  "system.skill_request": "Asked for a skill",
+  "system.mission_verdict": "Verifier verdict",
+  "system.ambient_rule_created": "Created a trigger",
+};
+
+/** "system.some_new_event" → "Some new event": a readable name for types with no label yet. */
+function humanizeType(type: string): string {
+  const tail = type.replace(/^.*\./, "").replace(/_/g, " ").trim();
+  return tail ? tail[0].toUpperCase() + tail.slice(1) : type;
+}
+
 function parseEventTs(e: Event): number {
-  const ts = (e as { processed_at?: string }).processed_at;
-  if (typeof ts === "string") {
-    const t = new Date(ts).getTime();
-    if (Number.isFinite(t)) return t;
-  }
-  return 0;
+  return eventTime(e) ?? 0;
 }
 
 /**
@@ -351,6 +392,8 @@ export function bucketIntoTurns(events: Event[]): Turn[] {
   for (const e of events) {
     const k = triggerKindOf(e);
     if (k) {
+      // Someone answered (or moved on): the turn that asked is settled.
+      if (current?.status === "approval") current.status = "completed";
       current = {
         id: `turn-${turns.length}`,
         triggerKind: k,
@@ -378,10 +421,8 @@ export function bucketIntoTurns(events: Event[]): Turn[] {
     }
     current.events.push(e);
     if (e.type === "session.status_idle") {
-      // Idle on requires_action parks the turn on the client; it hasn't
-      // completed (the next turn starts with the confirmation / result).
-      const stop = (e as { stop_reason?: { type?: string } }).stop_reason;
-      current.status = stop?.type === "requires_action" ? "awaiting_action" : "completed";
+      const stop = (e as { stop_reason?: { action_type?: string } }).stop_reason;
+      current.status = stop?.action_type === "tool_confirmation" ? "approval" : "completed";
       current.endedAt = parseEventTs(e);
     } else if (e.type === "session.status_terminated") {
       current.status = "terminated";

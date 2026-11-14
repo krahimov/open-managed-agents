@@ -1,1366 +1,743 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router";
-import { Controller, useFieldArray, useForm, type Resolver } from "react-hook-form";
-import { zodResolver } from "@hookform/resolvers/zod";
-import { z } from "zod";
-import { ArchiveIcon, TrashIcon } from "lucide-react";
-import { useApi, ApiError } from "../lib/api";
-import { useInfiniteApiQuery } from "../lib/useApiQuery";
-import { Modal } from "../components/Modal";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { Link, useSearchParams } from "react-router";
+import { useQueries, useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { ArchiveIcon, BoxIcon, CodeXmlIcon, CopyIcon, FlaskConicalIcon, LinkIcon, SparklesIcon, Trash2Icon } from "lucide-react";
+
 import { Button } from "@/components/ui/button";
 import { PopoverContent } from "@/components/ui/popover";
-import { Combobox } from "../components/Combobox";
-import { DataTable, type ColumnDef } from "../components/DataTable";
+import { cn } from "@/lib/utils";
+import { linkHitArea } from "@/lib/links";
+
+import { useApi } from "../lib/api";
+import { copyText } from "../lib/clipboard";
+import { useAgents, useEntityName } from "../lib/directory";
+import { formatSpan, plural, toDate } from "../lib/format";
+import { sessionSource, sessionTitle } from "../lib/sessions";
+import { startSession } from "../lib/shell-events";
+import { useApiQuery, useInfiniteApiQuery } from "../lib/useApiQuery";
+import { AgentAvatar } from "../components/AgentAvatar";
+import { Chip } from "../components/Badge";
+import { ConfirmDialog } from "../components/ConfirmDialog";
+import { DataTable, RowLink, type ColumnDef, type DataTableSort } from "../components/DataTable";
+import { EntityRef } from "../components/EntityRef";
 import { FacetedFilter } from "../components/FacetedFilter";
-import { FilterChip, CreatedFilterChip } from "../components/FilterChip";
-import { RowActionsMenu } from "../components/RowActionsMenu";
-
+import { CreatedFilterChip, FilterChip } from "../components/FilterChip";
+import { GitHubIcon, LinearIcon, SlackIcon } from "../components/icons";
+import { RelativeTime } from "../components/RelativeTime";
+import { RowActionsMenu, type RowAction } from "../components/RowActionsMenu";
+import { OverflowTip } from "../components/OverflowTip";
+import { useMinuteClock } from "../components/sessions/hooks";
+import { REQUEST_WINDOW, useSessionReadings } from "../components/sessions/readings";
+import { SessionStatus } from "../components/sessions/SessionStatus";
+import { Tip } from "../components/Tip";
 import type { SessionRecord as Session } from "../types/session";
-import {
-  AGENT_COMPUTER_LABEL,
-  isAgentComputerEnvironment,
-  pickDefaultEnvironmentId,
-  type EnvironmentChoice,
-} from "../lib/default-environment";
 
-interface Vault { id: string; name: string; }
-interface FilePick { id: string; filename: string; size_bytes: number; }
-interface MemoryStorePick { id: string; name: string; }
-type EnvironmentPick = EnvironmentChoice & { name: string };
+/**
+ * Sessions: every conversation the workspace's agents have had.
+ *
+ * A row is a session by NAME: the agent's avatar, the title (or
+ * "Conversation with <agent>"), who it is with and where it came from.
+ * Then its state, where it ran, how long it took and when it was last
+ * active. The id is one click away in the row menu.
+ *
+ * The state is the one reading every screen shows (lib/session-state.ts):
+ * the server's status, raised to "Needs approval", "Needs access" or
+ * "Needs a skill" while a person is waited on, to "Failed" after a failed
+ * turn, and to "Stalled" when a session that claims to be working has gone
+ * silent.
+ *
+ * The Status filter offers the states the Status column shows:
+ *
+ *   Running, Retrying, Idle, Ended   the server filters by lifecycle
+ *     (`?status=`), across the whole list. A row the column reads
+ *     differently (an idle session waiting for approval) is left out, so
+ *     the filter and the column never disagree.
+ *   Waiting on you, Failed, Stalled  are not lifecycle states. They are
+ *     read from the operations report and the newest events of each
+ *     session, and those cover the 100 most recently active sessions that
+ *     are not archived, no more. The sessions they name are fetched by id.
+ *     The result says what it covers, in the summary and when it is empty:
+ *     "none among the 100 most recently active" is not "none".
+ *
+ * Search, Agent and Archived are server-side query params. The order is
+ * the server's (newest started first) until a column is sorted, and a
+ * sort is always over the whole list: see <DataTable>.
+ */
 
-/** "name (id)", plus the agent-computer tag — same wording as the New
- *  agent form, so the billable choice reads the same in both pickers. */
-function environmentTextLabel(env: EnvironmentPick): string {
-  return `${env.name} (${env.id})${isAgentComputerEnvironment(env) ? ` · ${AGENT_COMPUTER_LABEL}` : ""}`;
-}
+type Lifecycle = "idle" | "running" | "rescheduling" | "terminated";
+/** `approval` (waiting on a person), `errored` and `stalled` are read, not stored: see `readSession`. */
+type Derived = "approval" | "errored" | "stalled";
+type StatusValue = "any" | Derived | Lifecycle;
 
-type AgentLite = {
-  id: string;
-  name: string;
-  // Present iff the agent is bound to a user-registered runtime
-  // (acp-proxy harness). The New Session dialog reads this to decide
-  // whether to show the Environment picker — local-runtime sessions
-  // don't run a sandbox container so there's nothing to pick.
-  runtime_binding?: { runtime_id: string; acp_agent_id: string };
-  // List rows carry the agent's own defaults too, which lets the modal
-  // preselect its environment without waiting for the detail fetch.
-  _oma?: { default_environment_id?: string };
-};
-
-// Session status options for the toolbar status chip. "any" maps to no
-// server filter; the other four match the SessionStatus union in
-// @open-managed-agents/api-types (idle | running | rescheduling | terminated).
-type StatusValue = "any" | "idle" | "running" | "rescheduling" | "terminated";
-
+// What matters to a person first, then the lifecycle.
 const STATUS_OPTIONS: { value: StatusValue; label: string }[] = [
   { value: "any", label: "All" },
-  { value: "idle", label: "Idle" },
+  { value: "approval", label: "Waiting on you" },
+  { value: "errored", label: "Failed" },
+  { value: "stalled", label: "Stalled" },
   { value: "running", label: "Running" },
-  { value: "rescheduling", label: "Rescheduling" },
-  { value: "terminated", label: "Terminated" },
+  { value: "rescheduling", label: "Retrying" },
+  { value: "idle", label: "Idle" },
+  { value: "terminated", label: "Ended" },
+];
+const isStatus = (v: string | null): v is StatusValue => !!v && STATUS_OPTIONS.some((o) => o.value === v);
+const isDerived = (v: StatusValue): v is Derived => v === "approval" || v === "errored" || v === "stalled";
+
+/** `?sort=-activity` (descending) or `?sort=activity`. */
+const SORTABLE = ["session", "duration", "activity"];
+function parseSort(raw: string | null): DataTableSort | null {
+  if (!raw) return null;
+  const desc = raw.startsWith("-");
+  const id = desc ? raw.slice(1) : raw;
+  return SORTABLE.includes(id) ? { id, desc } : null;
+}
+
+const ARCHIVED_OPTIONS = [
+  { value: "hide", label: "Hidden" },
+  { value: "show", label: "Included" },
 ];
 
-// ────────────────────────────────────────────────────────────────────────
-// Form schema (zod)
-// ────────────────────────────────────────────────────────────────────────
+/**
+ * How long the session ran: start to end for a session that ended, start
+ * to its last activity otherwise. Null when nothing was recorded after it
+ * started (the API then only knows how long ago it was created, which is
+ * not a duration anyone asked for).
+ */
+function sessionSeconds(s: Session): number | null {
+  const start = toDate(s.created_at)?.getTime();
+  if (start == null) return null;
+  if (s.status === "terminated" && typeof s.stats?.duration_seconds === "number") return s.stats.duration_seconds;
+  const end = toDate(s.terminated_at ?? s.updated_at)?.getTime();
+  if (end == null || end < start) return null;
+  return (end - start) / 1000;
+}
 
-/** GitHub repo resource. URL + token are required; the rest are optional
- *  knobs that submit() either passes through or computes a sensible
- *  default for (mount_path → /workspace/<repo-name>). */
-const GithubResourceSchema = z.object({
-  kind: z.literal("github"),
-  url: z.string().min(1, "Repository URL is required"),
-  token: z.string().min(1, "Authorization token is required"),
-  checkout_type: z.enum(["none", "branch", "commit"]),
-  checkout_name: z.string(),
-  mount_path: z.string(),
-});
-
-const FileResourceSchema = z.object({
-  kind: z.literal("file"),
-  file_id: z.string(),
-  mount_path: z.string(),
-});
-
-const MemoryStoreResourceSchema = z.object({
-  kind: z.literal("memory_store"),
-  memory_store_id: z.string(),
-  mount_path: z.string(),
-  access: z.enum(["read_write", "read_only"]),
-});
-
-const EnvResourceSchema = z.object({
-  kind: z.literal("env"),
-  name: z.string(),
-  value: z.string(),
-});
-
-/** Discriminated union — `kind` selects which fields apply. Mapped to the
- *  wire `{type, ...}` resource object at submit time (see `onSubmit`). */
-const ResourceSchema = z.discriminatedUnion("kind", [
-  GithubResourceSchema,
-  FileResourceSchema,
-  MemoryStoreResourceSchema,
-  EnvResourceSchema,
-]);
-
-/** Base form schema. `environment_id` is conditionally required at runtime
- *  (only when the picked agent is NOT a local-runtime agent) — see the
- *  superRefine wired up in the component, which reads a ref kept in sync
- *  with the live `isLocalRuntime` derivation. */
-const FormSchema = z.object({
-  agent: z.string().min(1, "Select an agent"),
-  environment_id: z.string(),
-  title: z.string(),
-  vault_ids: z.array(z.string()),
-  resources: z.array(ResourceSchema),
-});
-
-type FormValues = z.infer<typeof FormSchema>;
-type ResourceRow = z.infer<typeof ResourceSchema>;
-
-const INITIAL_FORM_VALUES: FormValues = {
-  agent: "",
-  environment_id: "",
-  title: "",
-  vault_ids: [],
-  resources: [],
-};
-
-function blankResource(kind: ResourceRow["kind"]): ResourceRow {
-  switch (kind) {
-    case "github": return { kind, url: "", token: "", checkout_type: "none", checkout_name: "", mount_path: "" };
-    case "file": return { kind, file_id: "", mount_path: "" };
-    case "memory_store": return { kind, memory_store_id: "", mount_path: "", access: "read_write" };
-    case "env": return { kind, name: "", value: "" };
+/** Where the session came from, as a small mark after the agent's name. Console sessions say nothing. */
+function SourceMark({ session }: { session: Session }) {
+  const source = sessionSource(session);
+  const m = session.metadata ?? {};
+  const wrap = (icon: ReactNode, label: string, tip?: string) => {
+    const mark = (
+      <span className="inline-flex min-w-0 items-center gap-1">
+        {icon}
+        <span className="truncate">{label}</span>
+      </span>
+    );
+    return tip ? <Tip label={tip}>{mark}</Tip> : mark;
+  };
+  const icon = "size-3 shrink-0";
+  if (source === "linear") {
+    const linear = m.linear as { issueIdentifier?: string; issueId?: string } | undefined;
+    const ident = linear?.issueIdentifier ?? linear?.issueId;
+    return wrap(<LinearIcon className={icon} />, ident ? `Linear ${ident}` : "Linear", ident ? `Started from Linear issue ${ident}` : "Started from a Linear issue");
   }
-}
-
-function kindLabel(kind: ResourceRow["kind"]): string {
-  switch (kind) {
-    case "github": return "GitHub repository";
-    case "file": return "File";
-    case "memory_store": return "Memory store";
-    case "env": return "Environment variable";
+  if (source === "slack") {
+    const slack = m.slack as { channelId?: string } | undefined;
+    return wrap(
+      <SlackIcon className={icon} />,
+      slack?.channelId?.startsWith("D") ? "Slack DM" : "Slack thread",
+      "Started from a Slack message",
+    );
   }
-}
-
-/** Best-effort `<repo-name>` extraction from GitHub URL forms. Used to
- *  derive the default mount path /workspace/<repo-name>. Returns null when
- *  the URL doesn't look like GitHub (caller falls back to /workspace). */
-function parseGitHubRepoName(url: string): string | null {
-  const trimmed = url.trim().replace(/\.git$/, "");
-  if (!trimmed) return null;
-  // Full URL: https://github.com/owner/repo
-  try {
-    const u = new URL(trimmed);
-    if (u.hostname !== "github.com" && u.hostname !== "www.github.com") return null;
-    const parts = u.pathname.replace(/^\/+/, "").split("/").filter(Boolean);
-    return parts[1] || null;
-  } catch {
-    // SSH: git@github.com:owner/repo
-    const ssh = trimmed.match(/^git@github\.com:[^/]+\/([^/]+)$/);
-    if (ssh) return ssh[1];
-    // Bare: owner/repo
-    const bare = trimmed.match(/^[^/]+\/([^/]+)$/);
-    if (bare) return bare[1];
-    return null;
+  if (source === "github") return wrap(<GitHubIcon className={icon} />, "GitHub", "Started from GitHub");
+  if (source === "eval") {
+    const ev = m.eval as { run_id?: string; task_id?: string } | undefined;
+    const mark = wrap(<FlaskConicalIcon className={icon} />, ev?.task_id ? `Eval · ${ev.task_id}` : "Eval run", ev?.task_id ? `Started by an eval run, for the task ${ev.task_id}` : "Started by an eval run");
+    return ev?.run_id ? (
+      <Link
+        to={`/evals/${ev.run_id}`}
+        onClick={(e) => e.stopPropagation()}
+        className={cn("inline-flex min-w-0 rounded-sm decoration-border-strong underline-offset-3 hover:text-fg hover:underline", linkHitArea)}
+      >
+        {mark}
+      </Link>
+    ) : (
+      mark
+    );
   }
-}
-
-function defaultMountPath(githubUrl: string): string {
-  const name = parseGitHubRepoName(githubUrl);
-  return name ? `/workspace/${name}` : "/workspace";
-}
-
-/** Tiny "🔗 Linear" pill shown when a session was triggered by a Linear webhook. */
-function LinearBadge({ metadata }: { metadata?: Record<string, unknown> }) {
-  const linear = metadata?.linear as
-    | { issueIdentifier?: string; issueId?: string; workspaceId?: string }
-    | undefined;
-  if (!linear || (!linear.issueId && !linear.issueIdentifier)) return null;
-  return (
-    <span
-      className="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded bg-info-subtle text-info"
-      title={`Linear issue ${linear.issueIdentifier ?? linear.issueId}`}
-    >
-      🔗 {linear.issueIdentifier ?? "Linear"}
-    </span>
-  );
-}
-
-/** Tiny "💬 Slack" pill shown when a session was triggered by a Slack event. */
-function SlackBadge({ metadata }: { metadata?: Record<string, unknown> }) {
-  const slack = metadata?.slack as
-    | { channelId?: string; threadTs?: string; workspaceId?: string }
-    | undefined;
-  if (!slack || (!slack.channelId && !slack.threadTs)) return null;
-  const label = slack.channelId
-    ? slack.channelId.startsWith("D")
-      ? "DM"
-      : slack.channelId
-    : "Slack";
-  return (
-    <span
-      className="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded bg-accent-violet-subtle text-accent-violet"
-      title={`Slack channel ${slack.channelId}${slack.threadTs ? ` thread ${slack.threadTs}` : ""}`}
-    >
-      💬 {label}
-    </span>
-  );
-}
-
-/** Tiny "🧪 Eval" pill shown when a session was spawned by an eval-runner trial. */
-function EvalBadge({ metadata }: { metadata?: Record<string, unknown> }) {
-  const ev = metadata?.eval as { run_id?: string; task_id?: string } | undefined;
-  if (!ev?.run_id) return null;
-  return (
-    <a
-      href={`/evals/${ev.run_id}`}
-      onClick={(e) => e.stopPropagation()}
-      className="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded bg-info-subtle text-info hover:opacity-80 transition-opacity"
-      title={`Eval run ${ev.run_id}${ev.task_id ? ` · task ${ev.task_id}` : ""}`}
-    >
-      🧪 {ev.task_id ?? "Eval"}
-    </a>
-  );
+  if (source === "setup") return wrap(<SparklesIcon className={icon} />, "Agent setup", "The agent's own setup conversation");
+  if (source === "api") return wrap(<CodeXmlIcon className={icon} />, "API", "Started over the API");
+  return null;
 }
 
 export function SessionsList() {
   const { api } = useApi();
-  const nav = useNavigate();
+  const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [agents, setAgents] = useState<AgentLite[]>([]);
-  // Set by the agent Combobox when the user picks an agent. Carries the
-  // full row so we can read `runtime_binding` without keeping every agent
-  // preloaded in `agents[]`.
-  const [selectedAgentDetail, setSelectedAgentDetail] = useState<AgentLite | null>(null);
-  // Agent's MCP servers (from /v1/agents/{id} fetched on pick). Used to
-  // warn the user when their selected vaults don't carry credentials for
-  // a server the agent is configured to use — agent will hit those MCP
-  // endpoints unauthenticated and fail mid-conversation.
-  const [agentMcpUrls, setAgentMcpUrls] = useState<string[]>([]);
-  // Per-vault credential hostnames cache. Populated lazily as the user
-  // toggles vaults. Lookups are by hostname (matches outbound proxy logic
-  // in apps/main/src/routes/mcp-proxy.ts:resolveOutboundCredentialByHost).
-  const [vaultCredHosts, setVaultCredHosts] = useState<Record<string, Set<string>>>({});
-  const [envs, setEnvs] = useState<EnvironmentPick[]>([]);
-  // The picked agent's own default environment ("" = it has none), keyed
-  // by agent id so a late answer for a previously picked agent is ignored.
-  // Unset while that agent's details are still loading.
-  const [agentDefaultEnv, setAgentDefaultEnv] = useState<
-    { agentId: string; environmentId: string } | null
-  >(null);
-  // Set when the user picks an environment themselves, remembering which
-  // agent was picked at the time. Automatic defaults never overwrite that
-  // pick for the same agent (see the effect that applies them).
-  const envUserPickRef = useRef<{ agentId: string } | null>(null);
-  const [vaults, setVaults] = useState<Vault[]>([]);
-  const [files, setFiles] = useState<FilePick[]>([]);
-  const [memoryStores, setMemoryStores] = useState<MemoryStorePick[]>([]);
-  const [, setAuxLoading] = useState(true);
-  const [showCreate, setShowCreate] = useState(false);
-  // Per-field reveal toggle for any masked input (env value, github token).
-  // Keyed by `${idx}:${field}`. We intentionally don't try to keep stale
-  // entries valid across resource list mutations — adding/removing a row
-  // just clears the set, which costs at worst one re-click.
-  const [revealedSecrets, setRevealedSecrets] = useState<Set<string>>(new Set());
-  const toggleReveal = (key: string) => setRevealedSecrets((prev) => {
-    const next = new Set(prev);
-    if (next.has(key)) next.delete(key); else next.add(key);
-    return next;
+  const { agents, byId: agentsById } = useAgents();
+  // The one reading of every session: the operations report plus the
+  // newest events of the sessions that can still be answered.
+  const readings = useSessionReadings();
+  const { ops, read } = readings;
+  const now = useMinuteClock();
+  /** Which filter value a row belongs under: the status its reading draws. */
+  // A session whose requests could not be read is at rest on the server: it
+  // stays under Idle (its row says "State unknown"), rather than vanish from
+  // every filter but All.
+  const statusOf = (s: { id: string; status?: string | null; updated_at?: string | number | null }): StatusValue => {
+    const st = read(s, { now }).status;
+    return st === "unknown" ? "idle" : st;
+  };
+
+  // ── `?new=1`, `&agent_id=` and `&environment_id=` are links that open
+  //    the session starter with that choice made (the shell owns the dialog) ──
+  useEffect(() => {
+    if (searchParams.get("new") !== "1") return;
+    startSession({
+      agentId: searchParams.get("agent_id") || undefined,
+      environmentId: searchParams.get("environment_id") || undefined,
+    });
+    const next = new URLSearchParams(searchParams);
+    next.delete("new");
+    next.delete("agent_id");
+    next.delete("environment_id");
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
+
+  // ── filters. `?agent_id=`, `?status=`, `?sort=`, `?q=` and `?archived=` deep-link into a
+  // filtered, sorted list (an agent's "All sessions"). ──
+  const [search, setSearch] = useState(() => searchParams.get("q") ?? "");
+  const [filterAgent, setFilterAgent] = useState(() => (searchParams.get("new") === "1" ? "" : (searchParams.get("agent_id") ?? "")));
+  const [status, setStatus] = useState<StatusValue>(() => {
+    const s = searchParams.get("status");
+    return isStatus(s) ? s : "any";
   });
-
-  const inputCls = "w-full border border-border rounded-md px-3 py-2 min-h-11 sm:min-h-0 text-sm bg-bg text-fg outline-none focus:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] placeholder:text-fg-subtle";
-
-  // Server-driven filter state. Each piece flows into sessionsParams below
-  // → useInfiniteApiQuery resets to page 1 on params change → the list
-  // reflects exactly what the server returned (no client-side faking).
-  const [search, setSearch] = useState("");
-  const [filterAgent, setFilterAgent] = useState("");
-  const [status, setStatus] = useState<StatusValue>("any");
   const [created, setCreated] = useState<{ after?: number; before?: number }>({});
+  const [archived, setArchived] = useState<"hide" | "show">(() => (searchParams.get("archived") === "show" ? "show" : "hide"));
+  const [sort, setSort] = useState<DataTableSort | null>(() => parseSort(searchParams.get("sort")));
 
-  // Sessions table — cursor-paginated, server-side filtered. Any change to
-  // these params resets to page 0 automatically (paramsKey is part of the
-  // query key).
+  // Keep the linkable choices in the address bar.
+  useEffect(() => {
+    if (searchParams.get("new") === "1") return;
+    const next = new URLSearchParams(searchParams);
+    if (filterAgent) next.set("agent_id", filterAgent);
+    else next.delete("agent_id");
+    if (status !== "any") next.set("status", status);
+    else next.delete("status");
+    if (sort) next.set("sort", `${sort.desc ? "-" : ""}${sort.id}`);
+    else next.delete("sort");
+    if (search.trim()) next.set("q", search);
+    else next.delete("q");
+    if (archived === "show") next.set("archived", "show");
+    else next.delete("archived");
+    if (next.toString() !== searchParams.toString()) setSearchParams(next, { replace: true });
+  }, [filterAgent, status, sort, search, archived]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const derived = isDerived(status);
+  // A link to "Waiting on you" on a runtime that keeps no operations
+  // report cannot be honoured: show the whole list rather than an error.
+  useEffect(() => {
+    if (derived && ops.unsupported) setStatus("any");
+  }, [derived, ops.unsupported]);
+  const inRange = (s: Session) => {
+    if (created.after === undefined && created.before === undefined) return true;
+    const t = toDate(s.created_at)?.getTime();
+    if (t == null) return true;
+    return (created.after === undefined || t >= created.after) && (created.before === undefined || t < created.before);
+  };
+
+  // ── the paged list: every lifecycle filter is the server's ──
   const sessionsParams = useMemo(
     () => ({
       ...(filterAgent ? { agent_id: filterAgent } : {}),
-      ...(status !== "any" ? { status } : {}),
+      ...(status !== "any" && !isDerived(status) ? { status } : {}),
       ...(search ? { q: search } : {}),
-      ...(created.after !== undefined
-        ? { created_after: new Date(created.after).toISOString() }
-        : {}),
-      ...(created.before !== undefined
-        ? { created_before: new Date(created.before).toISOString() }
-        : {}),
+      ...(created.after !== undefined ? { created_after: new Date(created.after).toISOString() } : {}),
+      ...(created.before !== undefined ? { created_before: new Date(created.before).toISOString() } : {}),
+      ...(archived === "show" ? { include_archived: "true" } : {}),
     }),
-    [filterAgent, status, search, created.after, created.before],
+    [filterAgent, status, search, created.after, created.before, archived],
   );
-  const {
-    items: sessions,
-    isLoading: loading,
-    hasMore,
-    isLoadingMore,
-    loadMore,
-    refresh: refreshSessions,
-  } = useInfiniteApiQuery<Session>("/v1/sessions", { limit: 20, params: sessionsParams });
-
-  // ── Form (react-hook-form + zod) ──
-  // The schema's `environment_id` requirement depends on whether the
-  // currently picked agent is a local-runtime agent — a runtime fact the
-  // schema can't see on its own. We close over a ref that the component
-  // keeps in sync with the live `isLocalRuntime` derivation (see below).
-  // Stable resolver = stable useForm config; we call `trigger()` from a
-  // useEffect when isLocalRuntime flips to refresh the conditional error.
-  const isLocalRuntimeRef = useRef(false);
-  const resolver = useMemo(
-    () =>
-      // Cast addresses a workspace zod version skew: the resolver's bundled
-      // .d.ts resolves `zod/v4/core` to the root install (currently 4.3.x,
-      // version.minor=3) while console's own zod is 4.4.x (minor=4). Both
-      // are wire-compatible at runtime; only the structural type guard on
-      // _zod.version trips. No behavior change.
-      zodResolver(
-        FormSchema.superRefine((data, ctx) => {
-          if (!isLocalRuntimeRef.current && !data.environment_id) {
-            ctx.addIssue({
-              code: "custom",
-              path: ["environment_id"],
-              message: "Select an environment",
-            });
-          }
-        }) as never,
-      ) as Resolver<FormValues>,
-    [],
-  );
-
-  const form = useForm<FormValues>({
-    resolver,
-    defaultValues: INITIAL_FORM_VALUES,
-    mode: "onChange",
+  const paged = useInfiniteApiQuery<Session>("/v1/sessions", {
+    // A sort reads the whole list first, so it asks for bigger pages.
+    limit: sort ? 100 : 20,
+    params: sessionsParams,
+    enabled: !derived,
   });
-  const {
-    control,
-    register,
-    handleSubmit,
-    getValues,
-    setValue,
-    reset,
-    trigger,
-    watch,
-    formState,
-  } = form;
 
-  // useFieldArray manages the dynamic resources list (append/remove/etc.).
-  // Each `field` carries an `id` we use as React key — never index, since
-  // remove() shifts indices and would break input identity otherwise.
-  const {
-    fields: resourceFields,
-    append: appendResource,
-    remove: removeResourceAt,
-  } = useFieldArray({ control, name: "resources" });
-
-  // ── Watch form values that drive side-effects / conditional UI ──
-  const watchedAgentId = watch("agent");
-  const watchedVaultIds = watch("vault_ids");
-  const watchedResources = watch("resources");
-
-  // Fetch the picked agent's mcp_servers list. Combobox only carries the
-  // light row (id/name/runtime_binding); we need the full row to know
-  // which MCP endpoints the agent will dial. Refetch on agent change;
-  // clear on unselect.
-  useEffect(() => {
-    if (!watchedAgentId) {
-      setAgentMcpUrls([]);
-      return;
+  // ── the derived list: the sessions the operations report says need a
+  // person, each read by id. Complete by construction. ──
+  const derivedIds = useMemo(() => {
+    if (!derived) return [];
+    const ids = new Set<string>();
+    for (const row of ops.report?.sessions ?? []) {
+      if (statusOf(row) === status) ids.add(row.id);
     }
-    let cancelled = false;
-    api<{
-      mcp_servers?: Array<{ url?: string }>;
-      _oma?: { default_environment_id?: string; default_vault_ids?: string[] };
-    }>(`/v1/agents/${watchedAgentId}`)
-      .then((row) => {
-        if (cancelled) return;
-        const urls = (row.mcp_servers ?? [])
-          .map((s) => s.url)
-          .filter((u): u is string => typeof u === "string" && u.length > 0);
-        setAgentMcpUrls(urls);
-        setAgentDefaultEnv({
-          agentId: watchedAgentId,
-          environmentId: row._oma?.default_environment_id ?? "",
-        });
-        if (row._oma?.default_vault_ids?.length) {
-          const current = getValues("vault_ids");
-          setValue("vault_ids", Array.from(new Set([...current, ...row._oma.default_vault_ids])), {
-            shouldValidate: true,
-            shouldDirty: true,
-          });
-        }
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setAgentMcpUrls([]);
-        // Unknown default: fall back like an agent without one.
-        setAgentDefaultEnv({ agentId: watchedAgentId, environmentId: "" });
-      });
-    return () => { cancelled = true; };
-  }, [watchedAgentId, api, getValues, setValue]);
+    // A session can be waiting on a request without being in the report.
+    if (status === "approval") for (const id of readings.requests.keys()) ids.add(id);
+    return [...ids];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [derived, status, ops.report, read, readings.requests, now]);
+  const byId = useQueries({
+    queries: derivedIds.map((id) => ({
+      // The session page reads the same entry.
+      queryKey: [`/v1/sessions/${id}`, {}],
+      queryFn: ({ signal }: { signal: AbortSignal }) => api<Session>(`/v1/sessions/${id}`, { signal, quietNotFound: true }),
+      staleTime: 20_000,
+      retry: false,
+    })),
+  });
+  const derivedLoading = derived && (ops.isLoading || (status === "approval" && readings.requestsLoading) || byId.some((q) => q.isLoading));
+  const derivedError = derived ? (ops.error ?? (byId.length > 0 && byId.every((q) => q.error) ? byId[0].error : null)) : null;
+  const derivedKey = byId.map((q) => q.dataUpdatedAt).join(",");
+  const derivedSessions = useMemo(() => {
+    if (!derived) return [];
+    const q = search.trim().toLowerCase();
+    return byId
+      .map((query) => query.data)
+      .filter((s): s is Session => !!s)
+      // The report can be a moment older than the session: trust the row.
+      .filter((s) => statusOf(s) === status)
+      .filter((s) => !filterAgent || s.agent?.id === filterAgent)
+      .filter((s) => !q || (s.title ?? "").toLowerCase().includes(q))
+      .filter((s) => archived === "show" || !s.archived_at)
+      .filter(inRange)
+      // The server's order: newest started first.
+      .sort((a, b) => (toDate(b.created_at)?.getTime() ?? 0) - (toDate(a.created_at)?.getTime() ?? 0));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [derived, derivedKey, status, read, now, filterAgent, search, archived, created.after, created.before]);
 
-  // Keep the Environment field on the right default while the modal is
-  // open. Driven by state rather than by when each fetch lands, so the
-  // order of the agent detail, the environment list and openModal() can't
-  // change the outcome:
-  //   - the picked agent's own default wins, replacing whatever an earlier
-  //     agent's default or the fallback put there — but not a pick the
-  //     user made while this agent was selected;
-  //   - an agent without one gets the first ordinary environment (never a
-  //     persistent agent computer), unless the user already picked one;
-  //     a previous agent's default does not stick around.
-  useEffect(() => {
-    if (!showCreate) return;
-    const own =
-      agentDefaultEnv?.agentId === watchedAgentId ? agentDefaultEnv.environmentId : undefined;
-    // Picked agent's details still loading — wait for its own default.
-    if (watchedAgentId && own === undefined) return;
-    const userPick = envUserPickRef.current;
-    if (own) {
-      if (userPick?.agentId === watchedAgentId) return;
-      envUserPickRef.current = null;
-    } else if (userPick) {
-      return;
-    }
-    const next = own || pickDefaultEnvironmentId(envs);
-    if (getValues("environment_id") !== next) {
-      setValue("environment_id", next, { shouldValidate: true, shouldDirty: true });
-    }
-  }, [showCreate, watchedAgentId, agentDefaultEnv, envs, getValues, setValue]);
-
-  // Lazy-load credential hostnames for any newly-selected vault. Cache
-  // forever within this modal lifetime — credential rotation mid-form is
-  // not a real workflow.
-  useEffect(() => {
-    const missing = watchedVaultIds.filter((vid) => !(vid in vaultCredHosts));
-    if (missing.length === 0) return;
-    let cancelled = false;
-    Promise.all(
-      missing.map(async (vid) => {
-        try {
-          const r = await api<{ data: Array<{ auth?: { mcp_server_url?: string } }> }>(
-            `/v1/vaults/${vid}/credentials`,
-          );
-          const hosts = new Set<string>();
-          for (const cred of r.data) {
-            const u = cred.auth?.mcp_server_url;
-            if (!u) continue;
-            try { hosts.add(new URL(u).hostname); } catch { /* ignore malformed */ }
-          }
-          return [vid, hosts] as const;
-        } catch {
-          return [vid, new Set<string>()] as const;
-        }
-      }),
-    ).then((entries) => {
-      if (cancelled) return;
-      setVaultCredHosts((prev) => {
-        const next = { ...prev };
-        for (const [vid, hosts] of entries) next[vid] = hosts;
-        return next;
-      });
-    });
-    return () => { cancelled = true; };
-  }, [watchedVaultIds, vaultCredHosts, api]);
-
-  // Compute MCP servers the agent uses but no selected vault has credentials for.
-  // Empty when: no agent picked, or agent has no MCP servers, or every server
-  // is covered by at least one selected vault. The proxy resolver matches by
-  // hostname (not full URL), so we compare hostnames here.
-  const unauthedMcpServers = useMemo(() => {
-    if (agentMcpUrls.length === 0) return [];
-    const coveredHosts = new Set<string>();
-    for (const vid of watchedVaultIds) {
-      const hosts = vaultCredHosts[vid];
-      if (hosts) for (const h of hosts) coveredHosts.add(h);
-    }
-    const missing: Array<{ url: string; host: string }> = [];
-    for (const url of agentMcpUrls) {
-      let host: string;
-      try { host = new URL(url).hostname; } catch { continue; }
-      if (!coveredHosts.has(host)) missing.push({ url, host });
-    }
-    return missing;
-  }, [agentMcpUrls, watchedVaultIds, vaultCredHosts]);
-
-  // Computed: which agent is selected, and is it bound to a local runtime?
-  // The Environment picker, the schema's env_id requirement, and the
-  // request body all key off this single source of truth.
-  // Prefer the full row captured by the Combobox onValueChange callback,
-  // but only when its id matches the form's current value (otherwise we'd
-  // hold a stale row across resets / programmatic agent changes). Fall
-  // back to the preloaded `agents` array, then to undefined while either
-  // resolves.
-  const selectedAgent = useMemo(() => {
-    if (selectedAgentDetail && selectedAgentDetail.id === watchedAgentId) {
-      return selectedAgentDetail;
-    }
-    return agents.find((a) => a.id === watchedAgentId);
-  }, [selectedAgentDetail, agents, watchedAgentId]);
-  const isLocalRuntime = !!selectedAgent?.runtime_binding;
-
-  // Keep the resolver's closed-over ref aligned with the current render's
-  // value, then trigger a revalidation pass so formState.isValid reflects
-  // the new conditional rule immediately. Writing to a ref during render
-  // is safe (React docs: refs don't drive renders).
-  isLocalRuntimeRef.current = isLocalRuntime;
-  useEffect(() => {
-    void trigger();
-  }, [isLocalRuntime, trigger]);
-
-  const loadAux = async () => {
-    setAuxLoading(true);
-    try {
-      const [a, e, v, f, m] = await Promise.all([
-        api<{ data: AgentLite[] }>("/v1/agents?limit=200&status=any"),
-        api<{ data: EnvironmentPick[] }>("/v1/environments?limit=200"),
-        api<{ data: Vault[] }>("/v1/vaults?limit=200").catch(() => ({ data: [] })),
-        api<{ data: FilePick[] }>("/v1/files?limit=200").catch(() => ({ data: [] })),
-        api<{ data: MemoryStorePick[] }>("/v1/memory_stores").catch(() => ({ data: [] })),
-      ]);
-      setAgents(a.data);
-      setEnvs(e.data);
-      setVaults(v.data);
-      setFiles(f.data);
-      setMemoryStores(m.data);
-    } catch { /* surfaced by the api wrapper as a toast */ }
-    setAuxLoading(false);
-  };
-
-  useEffect(() => { loadAux(); }, []);
-
-  // Reset the form to its initial state and clear modal-scoped derived
-  // state (agent detail / MCP URLs / vault cred cache / reveal toggles).
-  // Called from Modal onClose (X button, click-away, Esc, Cancel).
-  const closeModal = useCallback(() => {
-    setShowCreate(false);
-    reset(INITIAL_FORM_VALUES);
-    setSelectedAgentDetail(null);
-    setAgentDefaultEnv(null);
-    envUserPickRef.current = null;
-    setAgentMcpUrls([]);
-    setVaultCredHosts({});
-    setRevealedSecrets(new Set());
-  }, [reset]);
-
-  // Open the modal with sensible defaults populated. Reset first so any
-  // residual state from a prior open (e.g. a successful create that closed
-  // the modal) doesn't leak across opens.
-  const openModal = useCallback((agentId?: string) => {
-    const selectedAgentId = agentId || agents[0]?.id || "";
-    const selected = agents.find((a) => a.id === selectedAgentId) ?? null;
-    const ownDefault = selected?._oma ? selected._oma.default_environment_id ?? "" : undefined;
-    reset({
-      ...INITIAL_FORM_VALUES,
-      agent: selectedAgentId,
-      // The agent's own default when its list row already says; otherwise
-      // the effect above fills it in once the agent's details load. Without
-      // one, never preselect a persistent agent computer.
-      environment_id: ownDefault || pickDefaultEnvironmentId(envs),
-    });
-    setSelectedAgentDetail(selected);
-    if (ownDefault !== undefined) {
-      setAgentDefaultEnv({ agentId: selectedAgentId, environmentId: ownDefault });
-    }
-    envUserPickRef.current = null;
-    setAgentMcpUrls([]);
-    setVaultCredHosts({});
-    setRevealedSecrets(new Set());
-    setShowCreate(true);
-  }, [reset, agents, envs]);
-
-  useEffect(() => {
-    if (searchParams.get("new") !== "1" || showCreate) return;
-    openModal(searchParams.get("agent_id") || undefined);
-    const next = new URLSearchParams(searchParams);
-    next.delete("new");
-    setSearchParams(next, { replace: true });
-  }, [openModal, searchParams, setSearchParams, showCreate]);
-
-  const onSubmit = async (data: FormValues) => {
-    try {
-      const resources: Array<Record<string, unknown>> = [];
-      for (const r of data.resources) {
-        if (r.kind === "github") {
-          // Token is required — schema gates the Create button on this,
-          // but we double-check so a stale row from a previous validation
-          // pass can't slip through.
-          if (!r.url || !r.token) continue;
-          const res: Record<string, unknown> = {
-            type: "github_repository",
-            url: r.url,
-            authorization_token: r.token,
-            // Always send mount_path: derive /workspace/<repo-name> from the
-            // URL when the user left it blank. Mirrors the in-form preview.
-            mount_path: r.mount_path || defaultMountPath(r.url),
-          };
-          if (r.checkout_type === "branch" && r.checkout_name) {
-            res.checkout = { type: "branch", name: r.checkout_name };
-          } else if (r.checkout_type === "commit" && r.checkout_name) {
-            res.checkout = { type: "commit", sha: r.checkout_name };
-          }
-          resources.push(res);
-        } else if (r.kind === "file") {
-          if (!r.file_id) continue;
-          const res: Record<string, unknown> = { type: "file", file_id: r.file_id };
-          if (r.mount_path) res.mount_path = r.mount_path;
-          resources.push(res);
-        } else if (r.kind === "memory_store") {
-          if (!r.memory_store_id) continue;
-          const res: Record<string, unknown> = {
-            type: "memory_store",
-            memory_store_id: r.memory_store_id,
-            access: r.access,
-          };
-          if (r.mount_path) res.mount_path = r.mount_path;
-          resources.push(res);
-        } else if (r.kind === "env") {
-          if (!r.name || !r.value) continue;
-          // type=env (was env_secret pre-rename). Server still accepts the
-          // legacy alias so older console builds keep working — see
-          // sessions.ts:262.
-          resources.push({ type: "env", name: r.name, value: r.value });
-        }
-      }
-
-      const body: Record<string, unknown> = {
-        agent: data.agent,
-        title: data.title || undefined,
-      };
-      // Only send environment_id when the user actually picked one. For
-      // local-runtime agents the picker is hidden and the server picks a
-      // tenant fallback (sessions.ts requires a NOT NULL env_id today).
-      if (data.environment_id) body.environment_id = data.environment_id;
-      if (data.vault_ids.length > 0) body.vault_ids = data.vault_ids;
-      if (resources.length > 0) body.resources = resources;
-
-      const session = await api<Session>("/v1/sessions", {
-        method: "POST",
-        body: JSON.stringify(body),
-      });
-      closeModal();
-      nav(`/sessions/${session.id}`);
-    } catch (err) {
-      // 402 = no balance for cloud sandbox. Toast with the server's
-      // "Insufficient balance" message has already shown; close the
-      // modal and surface the Billing page so the user can top up
-      // without hunting in the sidebar.
-      if (err instanceof ApiError && err.status === 402) {
-        closeModal();
-        nav("/billing");
-      }
-      // Other failures: leave modal open so the user can adjust + retry.
-    }
-  };
-
-  const toggleVault = (id: string) => {
-    const current = getValues("vault_ids");
-    const next = current.includes(id)
-      ? current.filter((v) => v !== id)
-      : [...current, id];
-    setValue("vault_ids", next, { shouldValidate: true, shouldDirty: true });
-  };
-
-  const addResource = (kind: ResourceRow["kind"]) => {
-    appendResource(blankResource(kind));
-    setRevealedSecrets(new Set());
-  };
-
-  const removeResource = (idx: number) => {
-    removeResourceAt(idx);
-    setRevealedSecrets(new Set());
-  };
-
-  const statusCls = (status?: string) => {
-    switch (status) {
-      case "idle": return "bg-success-subtle text-success";
-      case "running": return "bg-info-subtle text-info";
-      default: return "bg-bg-surface text-fg-muted";
-    }
-  };
-
-  const displayed = sessions;
-
-  // Active-filter chip displays — kept undefined when matching the
-  // default so the chip reads "Status ▾" rather than "Status: All ▾".
-  // The clear-X only renders when the chip is in non-default state.
-  const statusDisplay =
-    status === "any" ? undefined : STATUS_OPTIONS.find((o) => o.value === status)?.label;
-
-  // Agent picker — preloaded options from the same /v1/agents fetch the
-  // create-modal Combobox uses (aux loadAux above). Single-select via
-  // FacetedFilter, server-side via `agent_id` query param.
-  const agentOptions = useMemo(
+  // Some runtimes ignore the created_* params, and a lifecycle filter must
+  // not show a row the column words differently. Both are decided row by
+  // row, so they hold on every page.
+  const pagedSessions = useMemo(
     () =>
-      agents.map((a) => ({
-        value: a.id,
-        label: `${a.name} (${a.id})`,
-      })),
-    [agents],
-  );
-  const agentDisplay = filterAgent
-    ? agentOptions.find((o) => o.value === filterAgent)?.label ?? filterAgent
-    : undefined;
-
-  const filters = (
-    <>
-      <FilterChip
-        label="Agent"
-        active={!!filterAgent}
-        display={agentDisplay}
-        onClear={() => setFilterAgent("")}
-      >
-        <PopoverContent
-          align="start"
-          sideOffset={4}
-          collisionPadding={8}
-          className="w-72 p-0"
-        >
-          <FacetedFilter
-            options={agentOptions}
-            value={filterAgent}
-            onValueChange={(v) => setFilterAgent(v)}
-            searchPlaceholder="Agent..."
-          />
-        </PopoverContent>
-      </FilterChip>
-
-      <FilterChip
-        label="Status"
-        active={status !== "any"}
-        display={statusDisplay}
-        onClear={() => setStatus("any")}
-      >
-        <PopoverContent
-          align="start"
-          sideOffset={4}
-          collisionPadding={8}
-          className="w-48 p-0"
-        >
-          <FacetedFilter
-            options={STATUS_OPTIONS}
-            value={status}
-            onValueChange={(v) => setStatus(v as StatusValue)}
-            searchPlaceholder="Status..."
-          />
-        </PopoverContent>
-      </FilterChip>
-
-      <CreatedFilterChip value={created} onChange={setCreated} />
-    </>
+      paged.items.filter((s) => inRange(s) && (status === "any" || statusOf(s) === status)),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [paged.items, created.after, created.before, status, read, now],
   );
 
-  // First github row index + total count, computed once per render so the
-  // "primary" pill on the first GitHub row stays in sync with reorders.
-  // The proxy resolver uses the first declared github_repository's token
-  // for any request whose URL doesn't carry an owner/repo slug (graphql,
-  // /user, /search, …). Only show the hint when there are 2+ github
-  // resources — for a single repo the "first" semantics aren't meaningful.
-  const githubIdxs = resourceFields
-    .map((r, i) => (r.kind === "github" ? i : -1))
-    .filter((i) => i >= 0);
-  const firstGithubIdx = githubIdxs[0] ?? -1;
-  const showPrimaryHint = githubIdxs.length > 1;
-
-  // Show validation errors only after the field has been touched (or after
-  // submit), so the form doesn't render with errors visible on first open.
-  const showError = (touched: boolean | undefined, msg: string | undefined) =>
-    msg && (touched || formState.isSubmitted) ? msg : undefined;
-
-  // Resource row error / touched lookups. The schema's discriminated union
-  // means TypeScript narrows `formState.errors.resources[i]` to the
-  // intersection of all variants — i.e. nothing — so accessing per-kind
-  // fields like `.url` requires a runtime-friendly cast. Same for
-  // touchedFields. Both helpers return undefined when nothing matches so
-  // callers can compose with `showError` cleanly.
-  const resourceFieldError = (idx: number, key: string): string | undefined => {
-    const row = formState.errors.resources?.[idx] as
-      | Record<string, { message?: string } | undefined>
-      | undefined;
-    return row?.[key]?.message;
-  };
-  const resourceFieldTouched = (idx: number, key: string): boolean => {
-    const row = formState.touchedFields.resources?.[idx] as
-      | Record<string, boolean | undefined>
-      | undefined;
-    return !!row?.[key];
+  const sessions = derived ? derivedSessions : pagedSessions;
+  const loading = derived ? derivedLoading : paged.isLoading;
+  const hasMore = derived ? false : paged.hasMore;
+  const loadError = derived ? derivedError : paged.error;
+  const refreshSessions = () => {
+    if (derived) {
+      void ops.refetch();
+      for (const q of byId) void q.refetch();
+    } else paged.refresh();
   };
 
-  // TanStack column defs. Order, filtering, and search all flow through
-  // server params now — no per-column sort/filter UI. Required columns
-  // (id, name) opt out of the Columns hide menu so the user can't end
-  // up with a table that has nothing identifying.
+  // ── row actions ──
+  const [confirm, setConfirm] = useState<{ kind: "archive" | "delete"; session: Session } | null>(null);
+  const afterChange = () => {
+    refreshSessions();
+    // The sidebar's Recents and Home read the same collection.
+    void queryClient.invalidateQueries({ queryKey: ["/v1/sessions"] });
+    void queryClient.invalidateQueries({ queryKey: ["/v1/operations"] });
+  };
+
+  const actionsFor = (s: Session): RowAction[] => [
+    { label: "Copy link", icon: <LinkIcon />, onSelect: () => void copyText(`${window.location.origin}/sessions/${s.id}`) },
+    { label: "Copy session id", icon: <CopyIcon />, onSelect: () => void copyText(s.id) },
+    {
+      label: s.archived_at ? "Archived" : "Archive",
+      icon: <ArchiveIcon />,
+      disabled: !!s.archived_at,
+      onSelect: () => setConfirm({ kind: "archive", session: s }),
+    },
+    { label: "Delete", icon: <Trash2Icon />, destructive: true, onSelect: () => setConfirm({ kind: "delete", session: s }) },
+  ];
+
   const columns = useMemo<ColumnDef<Session>[]>(
     () => [
       {
-        id: "id",
-        accessorKey: "id",
-        header: "ID",
-        cell: ({ row }) => (
-          <span title={row.original.id} className="font-mono text-xs text-fg-muted">
-            {row.original.id}
-          </span>
-        ),
+        id: "session",
+        accessorFn: (s) => sessionTitle(s),
+        header: "Session",
+        // The title is what a person scans for: it takes the room, and it
+        // is the last thing to give it up on a narrow panel.
+        size: 520,
+        minSize: 240,
         enableHiding: false,
-      },
-      {
-        id: "name",
-        accessorFn: (s) => s.title ?? "",
-        header: "Name",
-        cell: ({ row }) => (
-          <span className="inline-flex items-center gap-2 font-medium text-fg">
-            {row.original.title || "Untitled"}
-            <LinearBadge metadata={row.original.metadata} />
-            <SlackBadge metadata={row.original.metadata} />
-            <EvalBadge metadata={row.original.metadata} />
-          </span>
-        ),
-        enableHiding: false,
+        enableSorting: true,
+        cell: ({ row, table }) => {
+          const s = row.original;
+          const agentName = s.agent?.name ?? agentsById.get(s.agent?.id)?.name;
+          // On a table too narrow for the Environment column, the
+          // environment rides here instead, where there is a whole line.
+          // (On a panel so narrow that the line has no room either, it is
+          // left to the session's own page.)
+          const meta = table.options.meta;
+          const environmentHere = !!meta && meta.hiddenByWidth.has("environment") && meta.width >= 760;
+          // On a panel too narrow for a Status column beside a whole title
+          // (1024 wide), the column's room goes to the title and the state
+          // is said here, at the head of the second line.
+          const statusHere = !!meta && meta.hiddenByWidth.has("status");
+          return (
+            <div className="flex min-w-0 items-center gap-3">
+              <AgentAvatar name={agentName} id={s.agent?.id} size="md" archived={!!s.archived_at} />
+              <div className="min-w-0 flex-1">
+                <div className="flex min-w-0 items-center gap-2">
+                  {/* A title takes a second line before it is cut. */}
+                  <RowLink className={cn("line-clamp-2 font-medium text-pretty whitespace-normal", s.archived_at ? "text-fg-muted" : "text-fg")}>
+                    {sessionTitle(s)}
+                  </RowLink>
+                  {s.archived_at && <Chip className="shrink-0">Archived</Chip>}
+                </div>
+                <div className="flex min-w-0 items-center gap-1.5 text-xs text-fg-subtle">
+                  {statusHere && (
+                    <>
+                      <SessionStatus reading={read(s, { now })} className="text-xs" />
+                      {DOT}
+                    </>
+                  )}
+                  <span className={cn(statusHere ? "min-w-0 truncate" : "shrink-0")}>{agentName ?? "Unknown agent"}</span>
+                  <SourceSuffix session={s} />
+                  {environmentHere && <EnvironmentSuffix id={s.environment_id} />}
+                </div>
+              </div>
+            </div>
+          );
+        },
       },
       {
         id: "status",
         accessorFn: (s) => s.status ?? "idle",
         header: "Status",
-        cell: ({ row }) => (
-          <span
-            className={`inline-flex items-center gap-1 text-xs px-2 py-0.5 rounded-full ${statusCls(row.original.status)}`}
-          >
-            {row.original.status || "idle"}
-          </span>
-        ),
+        size: 150,
+        // Below this the title needs the room more than a column does: the
+        // state moves under the title (see the Session cell).
+        meta: { hideBelow: 760 },
+        cell: ({ row }) => <SessionStatus reading={read(row.original, { now })} />,
       },
       {
-        id: "agent",
-        accessorFn: (s) => s.agent.id,
-        header: "Agent",
-        cell: ({ row }) => (
-          <span className="text-fg-muted font-mono text-xs">{row.original.agent.id}</span>
-        ),
+        id: "environment",
+        accessorFn: (s) => s.environment_id,
+        header: "Environment",
+        size: 300,
+        // A handful of names repeated down the list. It gets a column
+        // only where one fits beside a whole title; below that it moves
+        // under the title (see the Session cell).
+        meta: { hideBelow: 1220 },
+        cell: ({ row }) =>
+          row.original.environment_id === "env_local_runtime" ? (
+            <span className="text-fg-muted">Local runtime</span>
+          ) : (
+            <EntityRef kind="environment" id={row.original.environment_id} avatar={false} className="font-normal text-fg-muted" />
+          ),
       },
       {
-        id: "created",
-        accessorFn: (s) => s.created_at,
-        header: "Created",
-        cell: ({ row }) => (
-          <span className="text-fg-muted">
-            {new Date(row.original.created_at).toLocaleDateString()}
-          </span>
-        ),
+        id: "duration",
+        accessorFn: (s) => sessionSeconds(s) ?? undefined,
+        header: "Duration",
+        size: 100,
+        enableSorting: true,
+        sortDescFirst: true,
+        meta: { align: "right" },
+        cell: ({ row }) => {
+          const seconds = sessionSeconds(row.original);
+          if (seconds == null) {
+            return (
+              <Tip label="Nothing was recorded after this session started">
+                <span className="text-fg-faint">
+                  <span aria-hidden="true">–</span>
+                  <span className="sr-only">Not recorded</span>
+                </span>
+              </Tip>
+            );
+          }
+          return <span className="text-fg-muted tabular-nums">{seconds < 1 ? "<1s" : formatSpan(seconds)}</span>;
+        },
+      },
+      {
+        id: "activity",
+        accessorFn: (s) => toDate(s.updated_at || s.created_at)?.getTime(),
+        header: "Last activity",
+        size: 124,
+        enableSorting: true,
+        sortDescFirst: true,
+        cell: ({ row }) => <RelativeTime value={row.original.updated_at || row.original.created_at} className="text-fg-muted" />,
       },
       {
         id: "actions",
         header: "",
-        cell: ({ row }) => {
-          const s = row.original;
-          const archived = !!s.archived_at;
-          const label = s.title?.trim() || s.id;
-          return (
-            <RowActionsMenu
-              label={`Actions for ${label}`}
-              actions={[
-                {
-                  label: archived ? "Unarchive" : "Archive",
-                  icon: <ArchiveIcon className="size-4" />,
-                  disabled: archived,
-                  onSelect: async () => {
-                    try {
-                      await api(`/v1/sessions/${s.id}/archive`, {
-                        method: "POST",
-                        body: "{}",
-                      });
-                      refreshSessions();
-                    } catch {}
-                  },
-                },
-                {
-                  label: "Delete",
-                  icon: <TrashIcon className="size-4" />,
-                  destructive: true,
-                  onSelect: async () => {
-                    if (!confirm(`Delete session "${label}"? This can't be undone.`)) return;
-                    try {
-                      await api(`/v1/sessions/${s.id}`, { method: "DELETE" });
-                      refreshSessions();
-                    } catch {}
-                  },
-                },
-              ]}
-            />
-          );
-        },
-        enableHiding: false,
         size: 56,
+        enableHiding: false,
+        cell: ({ row }) => <RowActionsMenu label={`Actions for ${sessionTitle(row.original)}`} actions={actionsFor(row.original)} />,
       },
     ],
-    [api, refreshSessions],
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [agentsById, read, now],
   );
 
-  const hasActiveFilter = !!search || !!filterAgent || status !== "any" || created.after !== undefined || created.before !== undefined;
+  // ── filter chips ──
+  const agentOptions = useMemo(
+    () =>
+      agents.map((a) => ({
+        value: a.id,
+        label: a.archived_at ? `${a.name} (archived)` : a.name,
+      })),
+    [agents],
+  );
+  // The two derived states only exist where the operations report does.
+  const statusOptions = useMemo(
+    () => (ops.unsupported ? STATUS_OPTIONS.filter((o) => !isDerived(o.value)) : STATUS_OPTIONS),
+    [ops.unsupported],
+  );
+  const agentDisplay = filterAgent ? (agentsById.get(filterAgent)?.name ?? "1 agent") : undefined;
+  const statusDisplay = status === "any" ? undefined : STATUS_OPTIONS.find((o) => o.value === status)?.label;
+  const filtered =
+    !!search || !!filterAgent || status !== "any" || created.after !== undefined || created.before !== undefined;
+  const clearFilters = () => {
+    setSearch("");
+    setFilterAgent("");
+    setStatus("any");
+    setCreated({});
+  };
+
+  const filters = (
+    <>
+      <FilterChip label="Agent" active={!!filterAgent} display={agentDisplay} onClear={() => setFilterAgent("")}>
+        <PopoverContent align="start" sideOffset={6} collisionPadding={8} className="w-72 gap-0 p-0">
+          <FacetedFilter options={agentOptions} value={filterAgent} onValueChange={setFilterAgent} searchPlaceholder="Agent" />
+        </PopoverContent>
+      </FilterChip>
+
+      <FilterChip label="Status" active={status !== "any"} display={statusDisplay} onClear={() => setStatus("any")}>
+        <PopoverContent align="start" sideOffset={6} collisionPadding={8} className="w-52 gap-0 p-0">
+          <FacetedFilter options={statusOptions} value={status} onValueChange={(v) => setStatus(v as StatusValue)} searchPlaceholder="Status" />
+        </PopoverContent>
+      </FilterChip>
+
+      <CreatedFilterChip label="Started" value={created} onChange={setCreated} />
+
+      <FilterChip
+        label="Archived"
+        active={archived === "show"}
+        display={archived === "show" ? "Included" : undefined}
+        onClear={() => setArchived("hide")}
+      >
+        <PopoverContent align="start" sideOffset={6} collisionPadding={8} className="w-48 gap-0 p-0">
+          <FacetedFilter
+            options={ARCHIVED_OPTIONS}
+            value={archived}
+            onValueChange={(v) => setArchived(v === "show" ? "show" : "hide")}
+            searchPlaceholder="Archived sessions"
+          />
+        </PopoverContent>
+      </FilterChip>
+    </>
+  );
+
+  const failed = !!loadError && sessions.length === 0;
+
+  // How many sessions there are, exactly. The list loads a page at a time,
+  // so while more remain the count comes from one wider read of the same
+  // filters (the unfiltered one is the read the sidebar already made).
+  const counting = useApiQuery<{ data: Session[]; next_cursor?: string | null; next_page?: string | null }>(
+    !derived && paged.hasMore ? "/v1/sessions" : null,
+    useMemo(() => ({ ...sessionsParams, limit: "100" }), [sessionsParams]),
+    { staleTime: 20_000 },
+  );
+  const total = (() => {
+    if (derived || !hasMore) return { n: sessions.length, more: false };
+    const page = counting.data;
+    if (!page) return null;
+    // Counted row by row, as the list is, so the two can never disagree.
+    const n = page.data.filter((s) => inRange(s) && (status === "any" || statusOf(s) === status)).length;
+    return { n: Math.max(n, sessions.length), more: !!(page.next_cursor ?? page.next_page) };
+  })();
+
+  // What a derived filter can see: the report and the request reader cover
+  // the most recently active sessions that are not archived, and no others.
+  const partial = derived && (!!ops.report?.truncated || archived === "show");
+  const coverage = !derived
+    ? null
+    : ops.report?.truncated
+      ? `the ${REQUEST_WINDOW} most recently active sessions${archived === "show" ? ", archived ones excluded" : ""}`
+      : archived === "show"
+        ? "sessions that are not archived"
+        : null;
+  const derivedName = status === "approval" ? "Waiting on you" : status === "errored" ? "Failed" : "Stalled";
+
+  // The count, and a nudge when someone is being waited on.
+  const waiting = readings.counts.waiting;
+  const summary = loading || failed || sessions.length === 0 ? undefined : (
+    <span className="inline-flex items-center gap-2">
+      {waiting > 0 && !filtered && (
+        <Tip label={`${waitingWords(readings.counts.approvals, readings.counts.requests)}. Show the sessions.`}>
+          <button
+            type="button"
+            onClick={() => setStatus("approval")}
+            className="inline-flex items-center gap-1.5 rounded-full bg-warning-subtle px-2 py-0.5 text-xs font-medium text-warning transition-quick hover:brightness-95 dark:hover:brightness-110"
+          >
+            <span aria-hidden="true" className="size-1.5 rounded-full bg-warning-solid" />
+            {waiting} waiting on you
+          </button>
+        </Tip>
+      )}
+      {readings.counts.unknown > 0 && !filtered && (
+        // Not counted as waiting, and not left out in silence either.
+        <Tip label={`${plural(readings.counts.unknown, "session")} could not be checked for access or skill requests, so ${readings.counts.unknown === 1 ? "it is" : "they are"} not counted as waiting. Try again.`}>
+          <button
+            type="button"
+            onClick={readings.retryRequests}
+            className="inline-flex items-center gap-1.5 rounded-full bg-bg-soft px-2 py-0.5 text-xs font-medium text-fg-muted transition-quick hover:bg-bg-hover hover:text-fg"
+          >
+            <span aria-hidden="true" className="size-1.5 rounded-full bg-fg-faint" />
+            {readings.counts.unknown} not checked
+          </button>
+        </Tip>
+      )}
+      {coverage ? (
+        // Said in the open, not in a tooltip: this is not a count of every session.
+        <span>
+          {plural(sessions.length, "session")} <span className="text-fg-subtle">among {coverage}</span>
+        </span>
+      ) : total ? (
+        <span>{total.more ? `More than ${total.n} sessions` : plural(total.n, "session")}</span>
+      ) : null}
+    </span>
+  );
 
   return (
     <DataTable<Session>
+      title="Sessions"
+      subtitle="Every conversation your agents have had."
       createLabel="+ New session"
-      onCreate={() => openModal()}
-      searchPlaceholder="Search sessions..."
+      onCreate={() => startSession()}
+      searchPlaceholder="Search sessions"
       searchValue={search}
       onSearchChange={setSearch}
       filters={filters}
-      data={displayed}
+      summary={summary}
+      data={sessions}
       loading={loading}
       getRowId={(s) => s.id}
-      onRowClick={(s) => nav(`/sessions/${s.id}`)}
+      rowHref={(s) => `/sessions/${s.id}`}
+      sort={sort}
+      onSortChange={setSort}
       hasMore={hasMore}
-      loadingMore={isLoadingMore}
-      onLoadMore={loadMore}
-      emptyTitle={hasActiveFilter ? "No matching sessions" : "No sessions yet"}
+      loadingMore={paged.isLoadingMore}
+      onLoadMore={paged.loadMore}
+      // A failed read is said as a failure, never as "no sessions".
+      error={loadError}
+      onRetry={refreshSessions}
       emptyKind="session"
-      emptyAction={!hasActiveFilter && (
-        <Button onClick={() => openModal()}>+ New session</Button>
-      )}
+      emptyTitle={
+        derived
+          ? `${status === "approval" ? "Nothing is waiting on you" : status === "errored" ? "No failed sessions" : "No stalled sessions"}${
+              partial && ops.report?.truncated ? `, among the ${REQUEST_WINDOW} most recently active` : ""
+            }`
+          : filtered
+            ? "No sessions match"
+            : "No sessions yet"
+      }
       emptySubtitle={
-        hasActiveFilter
-          ? "Try different filters."
-          : "Sessions will appear here once created through the API."
+        derived
+          ? `${
+              search || filterAgent || created.after !== undefined || created.before !== undefined
+                ? "None with these filters. Widen them to see the rest."
+                : status === "approval"
+                  ? "A session is listed here while an agent waits for you to approve a tool call, connect an app or attach a skill."
+                  : status === "errored"
+                    ? "Sessions whose last turn failed are listed here."
+                    : "A session is listed here when it reports as running or retrying and has recorded nothing for half an hour."
+            } ${
+              // What was looked at, so "none" is never read as more than it is.
+              ops.report?.truncated
+                ? `${derivedName} is read from the ${REQUEST_WINDOW} most recently active sessions${archived === "show" ? " that are not archived" : ""}: older ones are not checked. Search by title or filter by agent to find one of those.`
+                : archived === "show"
+                  ? `${derivedName} is not read for archived sessions: every other session was checked.`
+                  : "Every session that is not archived was checked."
+            }`
+          : filtered
+            ? "Try a different title, or widen the filters."
+            : "A session is one conversation with an agent. Start one from Home, or let a trigger, Slack or the API start them for you."
+      }
+      filtered={filtered}
+      emptyAction={
+        filtered ? (
+          <Button variant="outline" onClick={clearFilters}>
+            Clear filters
+          </Button>
+        ) : (
+          <Button onClick={() => startSession()} aria-label="Start a session">
+            New session
+          </Button>
+        )
       }
       columns={columns}
     >
-      <Modal
-        open={showCreate}
-        onClose={closeModal}
-        title="New Session"
-        subtitle="Start a conversation with an agent."
-        maxWidth="max-w-2xl"
-        footer={
-          <>
-            <Button variant="ghost" onClick={closeModal}>Cancel</Button>
-            <Button
-              onClick={handleSubmit(onSubmit)}
-              disabled={!formState.isValid || formState.isSubmitting}
-              loading={formState.isSubmitting}
-            >
-              Create
-            </Button>
-          </>
+      <ConfirmDialog
+        open={!!confirm}
+        onClose={() => setConfirm(null)}
+        destructive={confirm?.kind === "delete"}
+        title={confirm?.kind === "delete" ? "Delete this session?" : "Archive this session?"}
+        body={
+          confirm
+            ? confirm.kind === "delete"
+              ? `“${sessionTitle(confirm.session)}” and its whole history are removed. This cannot be undone.`
+              : `“${sessionTitle(confirm.session)}” moves out of this list. Its history is kept, and you can still open it from a link.`
+            : undefined
         }
-      >
-        <div className="space-y-4">
-          <div>
-            <div className="flex items-center justify-between mb-1">
-              <label className="text-sm text-fg-muted">Agent</label>
-              <a href="/agents" className="text-xs text-brand hover:underline">Manage agents →</a>
-            </div>
-            <Controller
-              control={control}
-              name="agent"
-              render={({ field, fieldState }) => (
-                <>
-                  <Combobox<AgentLite>
-                    value={field.value}
-                    onValueChange={(v, item) => {
-                      field.onChange(v);
-                      if (item) setSelectedAgentDetail(item);
-                      if (item?._oma) {
-                        setAgentDefaultEnv({
-                          agentId: v,
-                          environmentId: item._oma.default_environment_id ?? "",
-                        });
-                      }
-                    }}
-                    endpoint="/v1/agents"
-                    getValue={(a) => a.id}
-                    getLabel={(a) => (
-                      <span>
-                        {a.name} <span className="text-fg-subtle text-[12px]">({a.id})</span>
-                      </span>
-                    )}
-                    getTextLabel={(a) => `${a.name} (${a.id})`}
-                    placeholder="Select agent..."
-                  />
-                  {showError(fieldState.isTouched, fieldState.error?.message) && (
-                    <p className="text-xs text-danger mt-1">{fieldState.error?.message}</p>
-                  )}
-                </>
-              )}
-            />
-          </div>
-          {/* Environment picker is for cloud sandbox lanes — local-runtime
-              agents (acp-proxy harness) run on the user's daemon and
-              never touch a cloud sandbox, so the picker is hidden in
-              that mode. Server picks a tenant fallback when env_id is
-              omitted; see sessions.ts:resolvedEnvId. */}
-          {!isLocalRuntime && (
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label className="text-sm text-fg-muted">Environment</label>
-                <a href="/environments" className="text-xs text-brand hover:underline">Manage environments →</a>
-              </div>
-              <Controller
-                control={control}
-                name="environment_id"
-                render={({ field, fieldState }) => (
-                  <>
-                    <Combobox<EnvironmentPick>
-                      value={field.value}
-                      onValueChange={(v) => {
-                        envUserPickRef.current = { agentId: getValues("agent") };
-                        field.onChange(v);
-                      }}
-                      endpoint="/v1/environments"
-                      getValue={(e) => e.id}
-                      getLabel={(e) => (
-                        <span>
-                          {e.name} <span className="text-fg-subtle text-[12px]">({e.id})</span>
-                          {isAgentComputerEnvironment(e) && (
-                            <span className="text-fg-subtle text-[12px]"> · {AGENT_COMPUTER_LABEL}</span>
-                          )}
-                        </span>
-                      )}
-                      getTextLabel={environmentTextLabel}
-                      placeholder="Select environment..."
-                    />
-                    {showError(fieldState.isTouched, fieldState.error?.message) && (
-                      <p className="text-xs text-danger mt-1">{fieldState.error?.message}</p>
-                    )}
-                  </>
-                )}
-              />
-            </div>
-          )}
-          {isLocalRuntime && (
-            <p className="text-xs text-fg-subtle bg-bg-surface px-3 py-2 rounded-lg">
-              Local runtime agents use the runtime machine's filesystem — no cloud environment needed.
-            </p>
-          )}
-          <div>
-            <label htmlFor="session-title" className="text-sm text-fg-muted block mb-1">Title <span className="text-fg-subtle">(optional)</span></label>
-            {/* autoComplete=off + an unrecognised name to defeat Chrome /
-                Safari email autofill — first text input in the dialog
-                got pre-filled with the user's saved email otherwise.
-                Spread register() first, then override name so the input
-                renders the autofill-defeating attribute while RHF still
-                tracks the field by its registered name internally. */}
-            <input
-              id="session-title"
-              {...register("title")}
-              name="oma-session-title"
-              className={inputCls}
-              placeholder="My conversation"
-              autoComplete="off"
-            />
-          </div>
-
-          {vaults.length > 0 && (
-            <div>
-            <div className="flex items-center justify-between mb-1">
-              <label className="text-sm text-fg-muted">Credential Vaults <span className="text-fg-subtle">(optional)</span></label>
-              <a href="/vaults" className="text-xs text-brand hover:underline">Manage vaults →</a>
-            </div>
-              <div className="space-y-1">
-                {vaults.map((v) => (
-                  <label key={v.id} className="flex items-center gap-2 text-sm cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={watchedVaultIds.includes(v.id)}
-                      onChange={() => toggleVault(v.id)}
-                      className="rounded accent-brand"
-                    />
-                    <span className="text-fg">{v.name}</span>
-                    <span className="text-fg-subtle font-mono text-xs">{v.id}</span>
-                  </label>
-                ))}
-              </div>
-              {unauthedMcpServers.length > 0 && (
-                <div className="mt-2 px-3 py-2 rounded-md border border-warning/40 bg-warning/5 text-xs text-warning">
-                  <div className="font-medium mb-1">
-                    {unauthedMcpServers.length === 1
-                      ? "1 MCP server has no matching credential in selected vaults:"
-                      : `${unauthedMcpServers.length} MCP servers have no matching credentials in selected vaults:`}
-                  </div>
-                  <ul className="space-y-0.5 font-mono">
-                    {unauthedMcpServers.map((s) => (
-                      <li key={s.url}>· {s.host}</li>
-                    ))}
-                  </ul>
-                  <div className="mt-1 text-fg-muted font-sans">
-                    Agent will dial these endpoints unauthenticated. Add a vault credential for each, or expect the agent to see 401s mid-conversation.
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          <div>
-            <div className="flex items-center justify-between mb-1">
-              <label className="text-sm text-fg-muted">Resources <span className="text-fg-subtle">(optional)</span></label>
-            </div>
-            <p className="text-xs text-fg-subtle mb-2">
-              Mount files, GitHub repositories, memory stores, or pass environment variables into the session.
-            </p>
-            {resourceFields.length === 0 ? (
-              <div className="text-xs text-fg-subtle border border-dashed border-border rounded-lg px-3 py-3 text-center">
-                No resources added.
-              </div>
-            ) : (
-              <div className="space-y-2">
-                {resourceFields.map((field, i) => {
-                  // Live values for the current row — register() drives
-                  // input state, but conditional rendering (kind-specific
-                  // blocks, mount-path placeholder, reveal toggles) reads
-                  // the watched copy so changes reflect immediately.
-                  const live = watchedResources[i];
-                  if (!live) return null;
-                  return (
-                    <div key={field.id} className="border border-border rounded-lg bg-bg-surface p-3">
-                      <div className="flex items-center justify-between mb-2">
-                        <span className="text-xs font-medium text-fg inline-flex items-center gap-2">
-                          {kindLabel(live.kind)}
-                          {showPrimaryHint && live.kind === "github" && i === firstGithubIdx && (
-                            <span
-                              className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-brand/10 border border-brand/30 text-brand"
-                              title="This repo's token is used for GitHub API calls that don't target a specific repo (GraphQL, Search, /user, …)"
-                            >
-                              primary
-                            </span>
-                          )}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => removeResource(i)}
-                          className="inline-flex items-center justify-center min-w-11 min-h-11 sm:min-w-0 sm:min-h-0 px-2 text-fg-subtle hover:text-danger text-xs"
-                          aria-label="Remove resource"
-                        >
-                          Remove
-                        </button>
-                      </div>
-                      {live.kind === "github" && (
-                        <div className="space-y-2">
-                          <div>
-                            <label htmlFor={`session-resource-${i}-url`} className="text-xs text-fg-muted block mb-0.5">Repository URL <span className="text-danger">*</span></label>
-                            <input
-                              id={`session-resource-${i}-url`}
-                              {...register(`resources.${i}.url`)}
-                              className={inputCls}
-                              placeholder="https://github.com/owner/repo"
-                            />
-                            {showError(
-                              resourceFieldTouched(i, "url"),
-                              resourceFieldError(i, "url"),
-                            ) && (
-                              <p className="text-xs text-danger mt-1">
-                                {resourceFieldError(i, "url")}
-                              </p>
-                            )}
-                          </div>
-                          <div>
-                            <label htmlFor={`session-resource-${i}-token`} className="text-xs text-fg-muted block mb-0.5">
-                              Authorization Token <span className="text-danger">*</span>
-                            </label>
-                            <div className="relative">
-                              <input
-                                id={`session-resource-${i}-token`}
-                                type={revealedSecrets.has(`${i}:token`) ? "text" : "password"}
-                                {...register(`resources.${i}.token`)}
-                                className={`${inputCls} pr-12`}
-                                placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
-                              />
-                              {live.token && (
-                                <button
-                                  type="button"
-                                  onClick={() => toggleReveal(`${i}:token`)}
-                                  className="absolute right-2 top-1/2 -translate-y-1/2 inline-flex items-center justify-center min-w-11 min-h-11 sm:min-w-0 sm:min-h-0 px-1 text-xs text-fg-subtle hover:text-fg"
-                                  aria-label="Toggle token visibility"
-                                >
-                                  {revealedSecrets.has(`${i}:token`) ? "hide" : "show"}
-                                </button>
-                              )}
-                            </div>
-                            {showError(
-                              resourceFieldTouched(i, "token"),
-                              resourceFieldError(i, "token"),
-                            ) && (
-                              <p className="text-xs text-danger mt-1">
-                                {resourceFieldError(i, "token")}
-                              </p>
-                            )}
-                          </div>
-                          <div className="grid grid-cols-2 gap-2">
-                            <div>
-                              <label htmlFor={`session-resource-${i}-checkout-type`} className="text-xs text-fg-muted block mb-0.5">Checkout</label>
-                              <select
-                                id={`session-resource-${i}-checkout-type`}
-                                {...register(`resources.${i}.checkout_type`, {
-                                  // Switching the checkout kind clears the
-                                  // companion name so the placeholder hint
-                                  // doesn't lie about commit-vs-branch.
-                                  onChange: () => setValue(`resources.${i}.checkout_name`, ""),
-                                })}
-                                className={inputCls}
-                              >
-                                <option value="none">None</option>
-                                <option value="branch">Branch</option>
-                                <option value="commit">Commit</option>
-                              </select>
-                            </div>
-                            <div>
-                              <label htmlFor={`session-resource-${i}-checkout-name`} className="text-xs text-fg-muted block mb-0.5">
-                                {live.checkout_type === "commit" ? "Commit SHA" : "Name"}
-                              </label>
-                              <input
-                                id={`session-resource-${i}-checkout-name`}
-                                {...register(`resources.${i}.checkout_name`)}
-                                className={inputCls}
-                                disabled={live.checkout_type === "none"}
-                                placeholder={live.checkout_type === "commit" ? "abc123..." : "main"}
-                              />
-                            </div>
-                          </div>
-                          <div>
-                            <label htmlFor={`session-resource-${i}-mount`} className="text-xs text-fg-muted block mb-0.5">Mount Path <span className="text-fg-subtle">(optional)</span></label>
-                            <input
-                              id={`session-resource-${i}-mount`}
-                              {...register(`resources.${i}.mount_path`)}
-                              className={inputCls}
-                              placeholder={`${defaultMountPath(live.url)} (default)`}
-                            />
-                          </div>
-                        </div>
-                      )}
-                      {live.kind === "file" && (
-                        <div className="space-y-2">
-                          <div>
-                            <div className="flex items-center justify-between mb-0.5">
-                              <label htmlFor={`session-resource-${i}-file`} className="text-xs text-fg-muted">File <span className="text-danger">*</span></label>
-                              <a href="/files" className="inline-flex items-center min-h-11 sm:min-h-0 text-xs text-brand hover:underline">Manage files →</a>
-                            </div>
-                            <select
-                              id={`session-resource-${i}-file`}
-                              {...register(`resources.${i}.file_id`)}
-                              className={inputCls}
-                            >
-                              <option value="">Select file...</option>
-                              {files.map((f) => (
-                                <option key={f.id} value={f.id}>
-                                  {f.filename} ({f.id})
-                                </option>
-                              ))}
-                            </select>
-                            {files.length === 0 && (
-                              <p className="text-xs text-fg-subtle mt-1">No files yet — upload via the AMA SDK or POST /v1/files.</p>
-                            )}
-                          </div>
-                          <div>
-                            <label htmlFor={`session-resource-${i}-file-mount`} className="text-xs text-fg-muted block mb-0.5">Mount Path <span className="text-fg-subtle">(optional)</span></label>
-                            <input
-                              id={`session-resource-${i}-file-mount`}
-                              {...register(`resources.${i}.mount_path`)}
-                              className={inputCls}
-                              placeholder="/mnt/session/uploads/<file_id> (default)"
-                            />
-                          </div>
-                        </div>
-                      )}
-                      {live.kind === "memory_store" && (
-                        <div className="space-y-2">
-                          <div>
-                            <div className="flex items-center justify-between mb-0.5">
-                              <label htmlFor={`session-resource-${i}-store`} className="text-xs text-fg-muted">Store <span className="text-danger">*</span></label>
-                              <a href="/memory" className="inline-flex items-center min-h-11 sm:min-h-0 text-xs text-brand hover:underline">Manage stores →</a>
-                            </div>
-                            <select
-                              id={`session-resource-${i}-store`}
-                              {...register(`resources.${i}.memory_store_id`)}
-                              className={inputCls}
-                            >
-                              <option value="">Select store...</option>
-                              {memoryStores.map((m) => (
-                                <option key={m.id} value={m.id}>
-                                  {m.name} ({m.id})
-                                </option>
-                              ))}
-                            </select>
-                          </div>
-                          <div className="grid grid-cols-2 gap-2">
-                            <div>
-                              <label htmlFor={`session-resource-${i}-access`} className="text-xs text-fg-muted block mb-0.5">Access</label>
-                              <select
-                                id={`session-resource-${i}-access`}
-                                {...register(`resources.${i}.access`)}
-                                className={inputCls}
-                              >
-                                <option value="read_write">Read / Write</option>
-                                <option value="read_only">Read only</option>
-                              </select>
-                            </div>
-                            <div>
-                              <label htmlFor={`session-resource-${i}-store-mount`} className="text-xs text-fg-muted block mb-0.5">Mount Path <span className="text-fg-subtle">(optional)</span></label>
-                              <input
-                                id={`session-resource-${i}-store-mount`}
-                                {...register(`resources.${i}.mount_path`)}
-                                className={inputCls}
-                                placeholder="/mnt/memory/<name>/ (default)"
-                              />
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                      {live.kind === "env" && (
-                        <div className="grid grid-cols-2 gap-2">
-                          <div>
-                            <label htmlFor={`session-resource-${i}-env-name`} className="text-xs text-fg-muted block mb-0.5">Name <span className="text-danger">*</span></label>
-                            <input
-                              id={`session-resource-${i}-env-name`}
-                              {...register(`resources.${i}.name`)}
-                              className={inputCls}
-                              placeholder="ENV_VAR_NAME"
-                            />
-                          </div>
-                          <div>
-                            <label htmlFor={`session-resource-${i}-env-value`} className="text-xs text-fg-muted block mb-0.5">Value <span className="text-danger">*</span></label>
-                            <div className="relative">
-                              <input
-                                id={`session-resource-${i}-env-value`}
-                                type={revealedSecrets.has(`${i}:value`) ? "text" : "password"}
-                                {...register(`resources.${i}.value`)}
-                                className={`${inputCls} pr-12`}
-                                placeholder="value"
-                              />
-                              {live.value && (
-                                <button
-                                  type="button"
-                                  onClick={() => toggleReveal(`${i}:value`)}
-                                  className="absolute right-2 top-1/2 -translate-y-1/2 inline-flex items-center justify-center min-w-11 min-h-11 sm:min-w-0 sm:min-h-0 px-1 text-xs text-fg-subtle hover:text-fg"
-                                  aria-label="Toggle value visibility"
-                                >
-                                  {revealedSecrets.has(`${i}:value`) ? "hide" : "show"}
-                                </button>
-                              )}
-                            </div>
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-            <div className="flex flex-wrap gap-2 mt-2">
-              <button type="button" onClick={() => addResource("github")} className="inline-flex items-center justify-center min-h-11 sm:min-h-0 text-xs px-2.5 py-1.5 border border-border rounded-md hover:bg-bg-surface text-fg-muted hover:text-fg">+ GitHub repo</button>
-              <button type="button" onClick={() => addResource("file")} className="inline-flex items-center justify-center min-h-11 sm:min-h-0 text-xs px-2.5 py-1.5 border border-border rounded-md hover:bg-bg-surface text-fg-muted hover:text-fg">+ File</button>
-              <button type="button" onClick={() => addResource("memory_store")} className="inline-flex items-center justify-center min-h-11 sm:min-h-0 text-xs px-2.5 py-1.5 border border-border rounded-md hover:bg-bg-surface text-fg-muted hover:text-fg">+ Memory store</button>
-              <button type="button" onClick={() => addResource("env")} className="inline-flex items-center justify-center min-h-11 sm:min-h-0 text-xs px-2.5 py-1.5 border border-border rounded-md hover:bg-bg-surface text-fg-muted hover:text-fg">+ Env var</button>
-            </div>
-          </div>
-        </div>
-      </Modal>
+        confirmLabel={confirm?.kind === "delete" ? "Delete session" : "Archive session"}
+        onConfirm={async () => {
+          if (!confirm) return;
+          if (confirm.kind === "delete") {
+            await api(`/v1/sessions/${confirm.session.id}`, { method: "DELETE" });
+            toast.success("Session deleted");
+          } else {
+            await api(`/v1/sessions/${confirm.session.id}/archive`, { method: "POST", body: "{}" });
+            toast.success("Session archived");
+          }
+          afterChange();
+        }}
+      />
     </DataTable>
+  );
+}
+
+/** "1 approval and 2 requests are waiting" */
+function waitingWords(approvals: number, requests: number): string {
+  const parts = [approvals > 0 ? plural(approvals, "approval") : "", requests > 0 ? plural(requests, "request") : ""].filter(Boolean);
+  const n = approvals + requests;
+  return `${parts.join(" and ")} ${n === 1 ? "is" : "are"} waiting on you`;
+}
+
+const DOT = (
+  <span aria-hidden="true" className="shrink-0 text-fg-faint">
+    ·
+  </span>
+);
+
+/** " · Linear SUP-482" after the agent's name; nothing for a console session. */
+function SourceSuffix({ session }: { session: Session }) {
+  if (sessionSource(session) === "console") return null;
+  return (
+    <>
+      {DOT}
+      {/* Gives way after the environment does, and ends in an ellipsis rather than a hard edge. */}
+      <span className="inline-flex min-w-0">
+        <SourceMark session={session} />
+      </span>
+    </>
+  );
+}
+
+/**
+ * " · ▫ Cloud sandbox" after the source, while the Environment column is
+ * dropped. Plain text, not a second link in the row; it is the first
+ * thing on the line to give way, and when it is cut the whole name can be
+ * read on hover and on keyboard focus.
+ */
+function EnvironmentSuffix({ id }: { id: string }) {
+  const local = id === "env_local_runtime";
+  const { name, isLoading } = useEntityName("environment", local ? null : id);
+  if (!local && isLoading) return null;
+  const label = local ? "Local runtime" : (name ?? "Deleted environment");
+  return (
+    <>
+      {DOT}
+      <OverflowTip label={label} focusable>
+        <span data-truncate="" className="min-w-0 shrink-[1000] truncate rounded-sm">
+          <BoxIcon aria-hidden="true" className="mr-1 inline size-3 align-[-1.5px]" />
+          <span className="sr-only">Runs in </span>
+          {label}
+        </span>
+      </OverflowTip>
+    </>
   );
 }

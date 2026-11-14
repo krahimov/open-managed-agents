@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { CheckIcon, ChevronDownIcon, XIcon } from "lucide-react";
 
 import {
@@ -6,24 +6,23 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "@/components/ui/popover";
-import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 
+import { DateField } from "./DateField";
+
 /**
- * Compact chip-style filter trigger used by every list page's toolbar.
+ * Filter chip — one structured filter in a list toolbar.
  *
- * Decoration follows selection: nothing visible at rest (just `Label ▾`
- * text on transparent), only the actually-selected chip shows the
- * brand pill outline + bg + clear-X. Same principle as the sidebar
- * nav — an empty filter row visually weighs nothing.
+ *   <FilterChip label="Status" active={status !== "any"} display={statusLabel} onClear={() => setStatus("any")}>
+ *     <PopoverContent align="start" className="w-52 p-0">
+ *       <FacetedFilter options={…} value={status} onValueChange={setStatus} />
+ *     </PopoverContent>
+ *   </FilterChip>
  *
- * Built on shadcn Popover (Radix + Floating UI). PopoverContent hosts
- * whatever the caller wants — `<FacetedFilter>` for enum search-and-
- * pick, a hand-rolled preset list for time buckets, etc. Earlier
- * iteration used DropdownMenu but cmdk Command nested inside Radix
- * Menu fights for focus / keyboard control. Popover has identical
- * collision avoidance + auto-flip via the same Floating-UI primitive,
- * just without the menu semantics in the way.
+ * At rest it is a dashed pill ("Status ⌄"): an invitation, not a value.
+ * Once a value is chosen it becomes a solid pill that reads as a sentence
+ * ("Status  Active ×"); the × clears just this filter. Every chip maps to
+ * a real server query param — never filter loaded rows on the client.
  */
 export function FilterChip({
   label,
@@ -42,28 +41,20 @@ export function FilterChip({
     <Popover>
       <div
         className={cn(
-          "inline-flex items-center gap-1 h-8 text-sm shrink-0 transition-colors",
+          "inline-flex h-9 shrink-0 items-center rounded-full border text-small-size font-medium transition-quick",
           active
-            ? "rounded-full border border-brand text-brand bg-brand-subtle"
-            : "text-fg-muted hover:text-fg",
+            ? "border-border-strong bg-bg-surface text-fg shadow-[var(--shadow-xs)] dark:bg-bg-soft"
+            : "border-dashed border-border-strong text-fg-muted hover:border-fg-faint hover:bg-bg-hover hover:text-fg has-[[aria-expanded=true]]:bg-bg-hover has-[[aria-expanded=true]]:text-fg",
         )}
       >
         <PopoverTrigger asChild>
           <button
             type="button"
-            className={cn(
-              "inline-flex items-center gap-1 h-full outline-none",
-              active ? "pl-3 pr-2" : "px-2",
-            )}
+            className={cn("inline-flex h-full items-center gap-1.5 rounded-full", active ? "pr-1.5 pl-3" : "pr-2.5 pl-3")}
           >
-            <span className="font-medium">{label}</span>
-            {display && (
-              <>
-                <span className="text-fg-subtle">:</span>
-                <span>{display}</span>
-              </>
-            )}
-            {!active && <ChevronDownIcon className="size-3.5 opacity-60" />}
+            <span className={cn(active && "font-normal text-fg-muted")}>{label}</span>
+            {display && <span>{display}</span>}
+            {!active && <ChevronDownIcon className="size-3.5 text-fg-subtle" />}
           </button>
         </PopoverTrigger>
         {active && onClear && (
@@ -73,10 +64,10 @@ export function FilterChip({
               e.stopPropagation();
               onClear();
             }}
-            className="inline-flex items-center justify-center size-5 mr-1.5 rounded-full hover:bg-brand/10"
+            className="mr-1 inline-flex size-6 items-center justify-center rounded-full text-fg-subtle transition-quick hover:bg-bg-hover hover:text-fg"
             aria-label={`Clear ${label} filter`}
           >
-            <XIcon className="size-3" />
+            <XIcon className="size-3.5" />
           </button>
         )}
       </div>
@@ -131,11 +122,8 @@ function computePresetRange(
   }
 }
 
-/** Format epoch ms → YYYY-MM-DD for the native `<input type="date">`
- *  value attribute. Date pickers store local-tz dates as strings; we
- *  convert back to ms via `new Date(str).getTime()` (also local). The
- *  precision mismatch (day vs ms) is fine because the chip presets
- *  themselves resolve to coarse boundaries (today 00:00, etc). */
+/** Epoch ms → the local calendar day as YYYY-MM-DD, the value a
+ *  <DateField> holds. `dateInputToMs` is its inverse (local midnight). */
 export function msToDateInput(ms: number | undefined): string {
   if (ms === undefined) return "";
   const d = new Date(ms);
@@ -143,6 +131,13 @@ export function msToDateInput(ms: number | undefined): string {
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const dd = String(d.getDate()).padStart(2, "0");
   return `${yyyy}-${mm}-${dd}`;
+}
+
+/** YYYY-MM-DD → epoch ms at local midnight of that day. "" → undefined. */
+export function dateInputToMs(day: string): number | undefined {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(day);
+  if (!m) return undefined;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime();
 }
 
 /**
@@ -170,6 +165,19 @@ export function CreatedFilterChip({
 
   const active = value.after !== undefined || value.before !== undefined;
   const display = preset === "any" ? undefined : CREATED_PRESET_LABELS[preset];
+
+  // The page cleared the filter from outside ("Clear filters"): forget the
+  // choice made here too. (A custom range with no dates yet is not that:
+  // it is a person about to pick them.)
+  const cleared = value.after === undefined && value.before === undefined;
+  useEffect(() => {
+    if (!cleared || preset === "any") return;
+    if (preset === "custom" && customAfter === undefined && customBefore === undefined) return;
+    setPreset("any");
+    setCustomAfter(undefined);
+    setCustomBefore(undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cleared]);
 
   const apply = (next: CreatedPreset, opts?: { after?: number; before?: number }) => {
     setPreset(next);
@@ -200,7 +208,7 @@ export function CreatedFilterChip({
         align="start"
         sideOffset={4}
         collisionPadding={8}
-        className="w-60 p-1"
+        className="w-60 gap-0.5 p-1.5"
       >
         {(Object.keys(CREATED_PRESET_LABELS) as CreatedPreset[]).map((p) => (
           <button
@@ -208,43 +216,46 @@ export function CreatedFilterChip({
             type="button"
             onClick={() => apply(p)}
             className={cn(
-              "w-full flex items-center justify-between gap-2 px-2 py-1.5 rounded text-sm",
-              "hover:bg-bg-surface",
-              preset === p && "text-fg font-medium",
+              "flex min-h-8 w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-small-size text-fg transition-colors duration-75",
+              "hover:bg-bg-hover",
+              preset === p && "font-medium",
             )}
           >
             {CREATED_PRESET_LABELS[p]}
-            {preset === p && <CheckIcon className="size-3.5 text-brand" />}
+            {preset === p && <CheckIcon className="size-4 text-fg" />}
           </button>
         ))}
         {preset === "custom" && (
-          <div className="mt-1 pt-2 border-t border-border space-y-2 px-1 pb-1">
-            <label className="block">
-              <span className="text-xs text-fg-muted mb-1 block">From</span>
-              <Input
-                type="date"
+          <div className="mt-1.5 space-y-2.5 border-t border-border px-1 pt-2.5 pb-1">
+            <div>
+              <span className="mb-1 block text-xs font-medium text-fg-muted">From</span>
+              <DateField
+                aria-label={`${label} from`}
+                placeholder="Any time"
                 value={msToDateInput(customAfter)}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  const next = v ? new Date(v).getTime() : undefined;
+                // "To" holds the start of the day after the one chosen.
+                max={customBefore !== undefined ? msToDateInput(customBefore - 1) : undefined}
+                onChange={(v) => {
+                  const next = dateInputToMs(v);
                   setCustomAfter(next);
                   apply("custom", { after: next, before: customBefore });
                 }}
               />
-            </label>
-            <label className="block">
-              <span className="text-xs text-fg-muted mb-1 block">To</span>
-              <Input
-                type="date"
-                value={msToDateInput(customBefore)}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  // End of selected day so "<= that day" works as the
-                  // user expects (otherwise picking 2026-05-24 would
-                  // exclude that whole day since the filter is `<`).
+            </div>
+            <div>
+              <span className="mb-1 block text-xs font-medium text-fg-muted">To</span>
+              <DateField
+                aria-label={`${label} to`}
+                placeholder="Now"
+                value={customBefore !== undefined ? msToDateInput(customBefore - 1) : ""}
+                min={msToDateInput(customAfter) || undefined}
+                onChange={(v) => {
+                  // The start of the next day, so the chosen day is included
+                  // whole (the filter is "before", not "up to").
+                  const day = dateInputToMs(v);
                   let next: number | undefined;
-                  if (v) {
-                    const d = new Date(v);
+                  if (day !== undefined) {
+                    const d = new Date(day);
                     d.setDate(d.getDate() + 1);
                     next = d.getTime();
                   }
@@ -252,7 +263,7 @@ export function CreatedFilterChip({
                   apply("custom", { after: customAfter, before: next });
                 }}
               />
-            </label>
+            </div>
           </div>
         )}
       </PopoverContent>

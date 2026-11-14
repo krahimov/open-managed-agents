@@ -32,19 +32,17 @@ export interface AgentRecord {
   _oma?: {
     aux_model?: { id: string; speed?: string };
     harness?: string;
-    reasoning_level?: import("@open-managed-agents/api-types").ReasoningLevel;
-    /** Cross-session memory. Absent = off (and still eligible for the
-     *  automatic enable that comes with a first ambient rule). */
-    memory?: import("@open-managed-agents/api-types").AgentMemoryConfig;
-    /** MCP tool-definition loading. Absent = auto. */
-    mcp_tool_loading?: import("@open-managed-agents/api-types").McpToolLoading;
-    /** "all" = every MCP credential in the session's vaults also becomes a
-     *  session server (legacy). Absent = "declared": vaults only
-     *  authenticate the agent's own mcp_servers. */
-    vault_mcp_servers?: import("@open-managed-agents/api-types").VaultMcpServersMode;
     runtime_binding?: { runtime_id: string; acp_agent_id: string };
     appendable_prompts?: string[];
     default_environment_id?: string;
     default_vault_ids?: string[];
+    reasoning_level?: string;
+    /** Cross-session memory. Absent/null = off (amnesiac by design). */
+    memory?: {
+      mode: "off" | "shared" | "per_user";
+      store_id?: string;
+      extract?: boolean;
+      push?: boolean;
+    } | null;
   };
 }

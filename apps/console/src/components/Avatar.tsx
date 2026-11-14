@@ -3,58 +3,52 @@ import {
   AvatarFallback,
   AvatarImage,
 } from "@/components/ui/avatar";
+import { initials } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 /**
- * Initial-circle avatar. Image when present, falls back to a brand-tinted
- * circle with the entity's first letter (uppercase). Used for tenants,
- * users, and bot personas — anywhere a visual id sits next to a name.
- *
- * Wraps shadcn `Avatar` so AvatarPrimitive's image-error fallback handling
- * (auto-shows the fallback if the URL 404s) replaces the previous
- * onError style:none hack. Sizes are pinned manually because shadcn
- * only ships sm / default (size-8) / lg — we still need xs for dense
- * rows. squared is preserved for tenant avatars (read as "workspace"
- * rather than "person").
+ * Initials avatar for PEOPLE (round) and WORKSPACES (`squared`). Image when
+ * present, otherwise up to two initials, at every size, so a name reads
+ * the same wherever it is drawn. Agents wear a face instead (a glyph and a
+ * tint, <AgentAvatar>); other resources use <EntityAvatar>.
  */
 const SIZE: Record<"xs" | "sm" | "md" | "lg", string> = {
-  xs: "size-5 text-[10px]",
-  sm: "size-6 text-[11px]",
-  md: "size-7 text-[12px]",
-  lg: "size-8 text-[13px]",
+  xs: "size-5 text-[0.53125rem]",
+  sm: "size-6 text-[0.625rem]",
+  md: "size-7 text-micro-size",
+  lg: "size-9 text-small-size",
 };
 
 interface AvatarProps {
-  /** Display name; first character is used for the fallback initial. */
+  /** Display name; up to two initials are used for the fallback. */
   name: string;
   /** Optional image url (e.g. persona avatar from an integration). */
   src?: string | null;
   size?: keyof typeof SIZE;
-  /** Use rounded-md (square-ish) instead of rounded-full. Tenant avatars
-   *  use this so they read as "workspace" not "person". */
+  /** Rounded square instead of a circle: reads as "workspace", not "person". */
   squared?: boolean;
   className?: string;
 }
 
 export function Avatar({ name, src, size = "md", squared, className = "" }: AvatarProps) {
-  const initial = (name?.trim().charAt(0) || "?").toUpperCase();
-  const shape = squared ? "rounded-md after:rounded-md *:rounded-md" : "rounded-full";
+  const initial = initials(name);
+  const shape = squared ? "rounded-[30%] after:rounded-[30%] *:rounded-[30%]" : "rounded-full";
 
   return (
-    <ShadcnAvatar className={cn(SIZE[size], shape, "shrink-0", className)}>
+    <ShadcnAvatar className={cn(SIZE[size], shape, "shrink-0 after:hidden", className)}>
       {src && (
         <AvatarImage
           src={src}
           alt=""
           loading="lazy"
           decoding="async"
-          className={squared ? "rounded-md" : undefined}
+          className={squared ? "rounded-[30%]" : undefined}
         />
       )}
       <AvatarFallback
         className={cn(
-          "bg-brand-subtle text-brand font-mono font-bold",
-          squared ? "rounded-md" : "rounded-full",
+          "font-semibold tracking-tight",
+          squared ? "rounded-[30%] bg-bg-pressed text-fg" : "rounded-full bg-ink text-on-ink",
         )}
       >
         {initial}

@@ -5,34 +5,47 @@ import { Slot } from "radix-ui"
 import { cn } from "@/lib/utils"
 import { BrandLoader } from "@/components/BrandLoader"
 
+/**
+ * Button — Muse.
+ *
+ * Shape: a full pill. Icon-only sizes are circles.
+ * Variants (pick by role, not by look):
+ *   default      ink fill. THE primary action; one per view.
+ *   outline      white surface + hairline. Secondary actions beside a primary.
+ *   secondary    soft fill, no border. Tertiary / in-card actions.
+ *   ghost        text only until hovered. Toolbars, icon buttons, row actions.
+ *   destructive  soft red. Confirm steps of destructive flows only.
+ *   link         inline plum text link.
+ * Sizes: default 36px · sm 32px · lg 40px · xs 28px (dense, inside cards only).
+ */
 const buttonVariants = cva(
-  "group/button inline-flex shrink-0 items-center justify-center rounded-md border border-transparent bg-clip-padding text-sm font-medium whitespace-nowrap transition-all outline-none select-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/25 active:not-aria-[haspopup]:translate-y-px disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-2 aria-invalid:ring-destructive/20 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
+  "group/button inline-flex shrink-0 items-center justify-center rounded-full border border-transparent bg-clip-padding text-small leading-none font-medium whitespace-nowrap select-none transition-quick active:not-aria-[haspopup]:scale-[0.97] disabled:pointer-events-none disabled:opacity-45 aria-invalid:border-danger [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-4",
   {
     variants: {
       variant: {
-        default: "bg-primary text-primary-foreground shadow-[var(--shadow-sm)] hover:bg-brand-hover",
+        // Disabled is a quiet neutral pill, not ink at half strength (which
+        // reads as a muddy mauve on the warm canvas).
+        default:
+          "bg-ink text-on-ink shadow-[var(--shadow-xs)] hover:bg-ink-hover disabled:bg-bg-pressed disabled:text-fg-subtle disabled:opacity-100 disabled:shadow-none",
         outline:
-          "border-border bg-bg-surface text-fg shadow-[var(--shadow-sm)] hover:border-border-strong hover:bg-bg aria-expanded:border-border-strong aria-expanded:bg-bg dark:border-input dark:bg-input/30 dark:hover:bg-input/50",
+          "border-border-strong bg-bg-surface text-fg shadow-[var(--shadow-xs)] hover:bg-bg-inset hover:border-fg-faint aria-expanded:bg-bg-inset dark:bg-bg-soft dark:hover:bg-bg-hover",
         secondary:
-          "bg-secondary text-secondary-foreground hover:bg-muted aria-expanded:bg-muted aria-expanded:text-secondary-foreground",
+          "bg-bg-soft text-fg hover:bg-bg-pressed aria-expanded:bg-bg-pressed",
         ghost:
-          "text-fg-muted hover:bg-muted hover:text-foreground aria-expanded:bg-muted aria-expanded:text-foreground dark:hover:bg-muted/50",
+          "text-fg-muted hover:bg-bg-hover hover:text-fg aria-expanded:bg-bg-hover aria-expanded:text-fg",
         destructive:
-          "bg-destructive/10 text-destructive hover:bg-destructive/20 focus-visible:border-destructive/40 focus-visible:ring-destructive/20 dark:bg-destructive/20 dark:hover:bg-destructive/30 dark:focus-visible:ring-destructive/40",
-        link: "text-primary underline-offset-4 hover:underline",
+          "border-danger/20 bg-danger-subtle text-danger hover:border-danger/45",
+        link: "relative h-auto! rounded-sm px-0! text-plum underline-offset-4 after:absolute after:-inset-1 hover:text-plum-hover hover:underline",
       },
       size: {
-        default:
-          "h-8 gap-1.5 px-2.5 has-data-[icon=inline-end]:pr-2 has-data-[icon=inline-start]:pl-2",
-        xs: "h-6 gap-1 rounded-[min(var(--radius-md),10px)] px-2 text-xs in-data-[slot=button-group]:rounded-lg has-data-[icon=inline-end]:pr-1.5 has-data-[icon=inline-start]:pl-1.5 [&_svg:not([class*='size-'])]:size-3",
-        sm: "h-7 gap-1 rounded-[min(var(--radius-md),12px)] px-2.5 text-[0.8rem] in-data-[slot=button-group]:rounded-lg has-data-[icon=inline-end]:pr-1.5 has-data-[icon=inline-start]:pl-1.5 [&_svg:not([class*='size-'])]:size-3.5",
-        lg: "h-9 gap-1.5 px-2.5 has-data-[icon=inline-end]:pr-2 has-data-[icon=inline-start]:pl-2",
-        icon: "size-8",
-        "icon-xs":
-          "size-6 rounded-[min(var(--radius-md),10px)] in-data-[slot=button-group]:rounded-lg [&_svg:not([class*='size-'])]:size-3",
-        "icon-sm":
-          "size-7 rounded-[min(var(--radius-md),12px)] in-data-[slot=button-group]:rounded-lg",
-        "icon-lg": "size-9",
+        default: "h-9 gap-1.5 px-4 has-data-[icon=inline-end]:pr-3 has-data-[icon=inline-start]:pl-3",
+        xs: "h-7 gap-1 px-2.5 text-xs [&_svg:not([class*='size-'])]:size-3.5",
+        sm: "h-8 gap-1.5 px-3 [&_svg:not([class*='size-'])]:size-3.5",
+        lg: "h-10 gap-2 px-5 text-sm",
+        icon: "size-9",
+        "icon-xs": "size-7 [&_svg:not([class*='size-'])]:size-3.5",
+        "icon-sm": "size-8",
+        "icon-lg": "size-10",
       },
     },
     defaultVariants: {

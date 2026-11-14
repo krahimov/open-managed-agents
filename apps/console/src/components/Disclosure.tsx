@@ -49,7 +49,7 @@ export function Disclosure({
     onOpenChange?.(next);
   };
 
-  const wrapperCls = variant === "border" ? "border border-border rounded-md" : "";
+  const wrapperCls = variant === "border" ? "rounded-lg border border-border bg-bg-surface" : "";
 
   return (
     <Collapsible
@@ -60,20 +60,20 @@ export function Disclosure({
       <CollapsibleTrigger asChild>
         <button
           type="button"
-          className="w-full flex items-center gap-2 px-3 py-2.5 min-h-11 sm:min-h-0 text-left"
+          className="flex min-h-10 w-full items-center gap-2 rounded-lg px-3.5 py-2.5 text-left transition-quick hover:bg-bg-hover"
         >
           <ChevronRightIcon
             aria-hidden="true"
-            className={`size-4 text-fg-muted transition-transform duration-[var(--dur-base)] ease-[var(--ease-soft)] ${
+            className={`size-4 text-fg-subtle transition-transform duration-[var(--dur-base)] ease-[var(--ease-rise)] ${
               open ? "rotate-90" : ""
             }`}
           />
-          <span className="text-sm font-medium text-fg flex-1 min-w-0">{title}</span>
-          {meta && <span className="text-xs text-fg-muted shrink-0">{meta}</span>}
+          <span className="min-w-0 flex-1 text-small-size font-medium text-fg">{title}</span>
+          {meta && <span className="shrink-0 text-xs text-fg-subtle">{meta}</span>}
         </button>
       </CollapsibleTrigger>
       <CollapsibleContent className="collapsible-content overflow-hidden">
-        <div className="px-3 pb-3">{children}</div>
+        <div className="px-3.5 pt-1 pb-3.5">{children}</div>
       </CollapsibleContent>
     </Collapsible>
   );

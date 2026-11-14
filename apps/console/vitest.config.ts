@@ -20,6 +20,10 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: ["./src/test/setup.ts"],
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
+    // Port staging: main's console tests that Muse lacks wait here until a
+    // slice ports them next to the code they test. The folder must be empty
+    // (and this exclude removed) at integration. See PORT-NOTES.md.
+    exclude: ["**/node_modules/**", "**/dist/**", "src/__main_tests__/**"],
     globals: false,
     css: false,
   },

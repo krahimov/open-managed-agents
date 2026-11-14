@@ -36,6 +36,10 @@ import { cn } from "@/lib/utils";
  */
 export interface LocalComboboxProps<T> {
   value: string;
+  /** What the input shows while it does not have focus, when the value
+   *  has a better name than itself (a model id → "Opus 4.8"). Focusing
+   *  the input shows the value itself, to edit. */
+  displayValue?: string;
   onChange: (text: string) => void;
   onPick?: (item: T) => void;
   options: T[];
@@ -53,13 +57,21 @@ export interface LocalComboboxProps<T> {
   maxHeight?: string;
   disabled?: boolean;
   autoFocus?: boolean;
+  /** id of the text input, so a `<label htmlFor>` (or `<Field>`) can name it. */
+  id?: string;
+  /** Accessible name of the text input when there is no visible label. */
+  ariaLabel?: string;
+  "aria-labelledby"?: string;
+  "aria-describedby"?: string;
+  "aria-invalid"?: boolean;
 }
 
 const DEFAULT_INPUT_CLS =
-  "w-full rounded-md border border-border bg-bg px-3 py-2 min-h-11 sm:min-h-0 text-sm text-fg outline-none focus-within:border-brand transition-colors duration-[var(--dur-quick)] ease-[var(--ease-soft)] flex items-center gap-2";
+  "flex h-9 w-full items-center gap-2 rounded-md border border-border-strong bg-bg-surface pr-1.5 pl-3 text-sm text-fg shadow-[var(--shadow-xs)] transition-quick outline-none hover:border-fg-faint focus-within:border-plum focus-within:shadow-[var(--shadow-focus)] has-[input[aria-invalid=true]]:border-danger dark:bg-bg-soft";
 
 export function LocalCombobox<T>({
   value,
+  displayValue,
   onChange,
   onPick,
   options,
@@ -73,8 +85,14 @@ export function LocalCombobox<T>({
   maxHeight = "18rem",
   disabled,
   autoFocus,
+  id,
+  ariaLabel,
+  "aria-labelledby": labelledBy,
+  "aria-describedby": describedBy,
+  "aria-invalid": invalid,
 }: LocalComboboxProps<T>) {
   const [open, setOpen] = useState(false);
+  const [focused, setFocused] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   // Esc closes — Popover normally handles this, but our trigger isn't the
@@ -105,9 +123,18 @@ export function LocalCombobox<T>({
           {prefix}
           <input
             ref={inputRef}
-            value={value}
+            id={id}
+            aria-label={ariaLabel}
+            aria-labelledby={labelledBy}
+            aria-describedby={describedBy}
+            aria-invalid={invalid || undefined}
+            value={!focused && displayValue ? displayValue : value}
             onChange={(e) => onChange(e.target.value)}
-            onFocus={() => setOpen(true)}
+            onFocus={() => {
+              setFocused(true);
+              setOpen(true);
+            }}
+            onBlur={() => setFocused(false)}
             placeholder={placeholder}
             disabled={disabled}
             autoFocus={autoFocus}
@@ -153,11 +180,11 @@ export function LocalCombobox<T>({
         align="start"
         sideOffset={4}
         onOpenAutoFocus={(e) => e.preventDefault()}
-        className="p-0 w-[var(--radix-popover-trigger-width)] overflow-y-auto"
+        className="w-[var(--radix-popover-trigger-width)] gap-0.5 overflow-y-auto p-1.5"
         style={{ maxHeight }}
       >
         {matches.length === 0 ? (
-          <div className="px-3 py-4 text-center text-fg-subtle text-xs">
+          <div className="px-3 py-5 text-center text-small text-fg-subtle">
             {emptyHint ?? "No matches"}
           </div>
         ) : (
@@ -171,7 +198,7 @@ export function LocalCombobox<T>({
                 onPick?.(item);
                 setOpen(false);
               }}
-              className="w-full text-left min-h-11 sm:min-h-0 hover:bg-bg-surface cursor-pointer"
+              className="min-h-8 w-full cursor-pointer rounded-md text-left transition-colors duration-75 hover:bg-bg-hover"
             >
               {renderItem(item)}
             </button>

@@ -64,7 +64,9 @@ async function request<T = unknown>(
     else if (body.error && typeof body.error === "object" && body.error.message)
       msg = body.error.message;
     else msg = `HTTP ${res.status}`;
-    throw new Error(msg);
+    // The status rides along so the console can say what kind of failure it
+    // was when the server sent only a word (lib/failure-text.ts).
+    throw Object.assign(new Error(msg), { status: res.status });
   }
   return (await res.json()) as T;
 }

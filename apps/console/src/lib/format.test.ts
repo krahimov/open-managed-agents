@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatDuration, formatRelative, pickTickStep, shortenId } from "./format";
+import { countWords, formatDuration, formatRelative, pickTickStep, shortenId } from "./format";
 
 describe("formatDuration", () => {
   it("returns em-dash for non-finite or negative input", () => {
@@ -55,5 +55,15 @@ describe("pickTickStep", () => {
   });
   it("falls back to the largest candidate when nothing fits", () => {
     expect(pickTickStep(Number.MAX_SAFE_INTEGER)).toBe(600_000);
+  });
+});
+
+describe("countWords", () => {
+  it("counts exactly when the list is whole", () => {
+    expect(countWords(1, false, "vault")).toBe("1 vault");
+    expect(countWords(12, false, "vault")).toBe("12 vaults");
+  });
+  it("says 'more than' in words when another page exists, never '200+'", () => {
+    expect(countWords(200, true, "agent")).toBe("More than 200 agents");
   });
 });

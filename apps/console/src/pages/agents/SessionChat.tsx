@@ -1,53 +1,41 @@
-import { useCallback, useEffect, useRef, useState, useMemo } from "react";
-import {
-  OMA_SETUP_HARNESS,
-  OMA_SETUP_KIND_HARNESS_UPDATED,
-} from "@open-managed-agents/api-types";
-import { useApi } from "../../lib/api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { OMA_SETUP_HARNESS, OMA_SETUP_KIND_HARNESS_UPDATED } from "@open-managed-agents/api-types";
+
+import { Button } from "@/components/ui/button";
+
+import { ApiError, useApi } from "../../lib/api";
 import type { Event } from "../../lib/events";
-import { unwrapCallMcpTool } from "../../lib/deferred-mcp";
-import { Markdown } from "../../components/Markdown";
-import {
-  Conversation,
-  ConversationContent,
-  ConversationEmptyState,
-  ConversationScrollButton,
-} from "../../components/ai-elements/conversation";
-import { Message, MessageContent } from "../../components/ai-elements/message";
 import { AccessRequestCard } from "../../components/AccessRequestCard";
-import { SavedLoginLine } from "../../components/SavedLoginLine";
-import { HarnessDiffCard } from "../../components/HarnessDiffCard";
+import { Conversation, ConversationContent, ConversationScrollButton } from "../../components/ai-elements/conversation";
 import { AmbientRuleCard } from "../../components/AmbientRuleCard";
-import { MemoryEnabledCard } from "../../components/MemoryEnabledCard";
+import { BrandLoader } from "../../components/BrandLoader";
+import { Composer, ComposerNotice } from "../../components/Composer";
+import { EmptyState } from "../../components/EmptyState";
+import { CodeWell, EventCard } from "../../components/EventCard";
+import { HarnessDiffCard } from "../../components/HarnessDiffCard";
+import { ConversationEdges } from "../../components/sessions/ConversationEdges";
+import { BUBBLE, Prose } from "../../components/sessions/ConversationView";
+import { presentTool } from "../../components/sessions/tools";
 import { SkillRequestCard } from "../../components/SkillRequestCard";
-import { buildTimeline } from "../../components/tool-calls/model";
-import { WorkTimeline, WorkingRow } from "../../components/tool-calls/ToolCalls";
-import {
-  PromptInput,
-  PromptInputFooter,
-  PromptInputSubmit,
-  PromptInputTextarea,
-  PromptInputTools,
-} from "../../components/ai-elements/prompt-input";
-import { SessionModelPicker } from "../../components/SessionModelPicker";
-import { useComposerDraft } from "../../lib/composer-draft";
+import { cn } from "@/lib/utils";
 
 /**
- * Lightweight, session-id-driven chat surface. Reuses the same ai-elements
- * primitives + SSE client as SessionDetail, but without the full-page chrome
- * (trajectory chips, panels, timeline) — so it can be embedded twice in the
- * Agent Builder: once for the builder interview, once for the test-run preview.
+ * A compact, session-id-driven chat, for places that embed a conversation
+ * beside something else (the agent setup view puts it next to the live
+ * harness). It speaks the same language as the session page: a person's
+ * messages in a soft bubble on the right, the agent's prose with no bubble,
+ * what the agent did as quiet tool rows, and the shared composer.
  *
- * It deliberately renders only the canonical events (user/assistant text +
- * non-setup tool calls, as the shared tool-call rows). Setup harness markers ride on `agent.message`
- * tagged `metadata.harness === OMA_SETUP_HARNESS` (per the EventBase metadata
- * convention) — those are surfaced to the parent via `onEvent` and never shown
- * as chat bubbles.
+ * It deliberately renders only the canonical events (user/assistant text
+ * and non-setup tool calls). Setup harness markers ride on `agent.message`
+ * tagged `metadata.harness === OMA_SETUP_HARNESS`: those go to the parent
+ * through `onEvent` and are never shown as messages, except harness updates,
+ * which appear as a diff card.
  */
 interface SessionChatProps {
   sessionId: string;
-  /** Fires for every event (replayed history + live). The builder page uses it
-   *  to capture draft_updated / finalized markers for the Config pane. */
+  /** Fires for every event (replayed history + live). The setup page uses it
+   *  to capture draft_updated / finalized markers for the harness pane. */
   onEvent?: (ev: Event) => void;
   placeholder?: string;
   emptyTitle?: string;
@@ -64,94 +52,50 @@ function isSetupMarker(ev: Event): boolean {
   return (ev.metadata as { harness?: string } | undefined)?.harness === OMA_SETUP_HARNESS;
 }
 
-/** update_harness markers carry a before/after harness view — these render
- *  as an animated diff card instead of being hidden like other markers. */
+/** update_harness markers carry a before/after harness view: these render
+ *  as a diff card instead of being hidden like other markers. */
 function isHarnessUpdate(ev: Event): boolean {
-  return (
-    isSetupMarker(ev) &&
-    (ev.metadata as { kind?: string } | undefined)?.kind === OMA_SETUP_KIND_HARNESS_UPDATED
-  );
+  return isSetupMarker(ev) && (ev.metadata as { kind?: string } | undefined)?.kind === OMA_SETUP_KIND_HARNESS_UPDATED;
 }
 
-/** Setup harness tools (the builder editing its own draft) stay hidden. */
-function isSetupTool(ev: Event): boolean {
-  return (
-    (typeof ev.name === "string" && ev.name.startsWith("mcp__oma_setup__")) ||
-    ev.mcp_server_name === "oma_setup" ||
-    unwrapCallMcpTool(ev.name, ev.input)?.server === "oma_setup"
-  );
-}
-
-/** Tool calls/results, thinking and the turn-boundary events the tool-call
- *  timeline needs to pair results, derive status and fold finished turns. */
-const WORK_TYPES = new Set([
-  "agent.tool_use",
-  "agent.custom_tool_use",
-  "agent.mcp_tool_use",
-  "agent.tool_result",
-  "agent.mcp_tool_result",
-  "agent.thinking",
-  "user.tool_confirmation",
-  "user.custom_tool_result",
-  "user.interrupt",
-  "session.status_running",
-  "session.status_idle",
-  "session.status_terminated",
-  "session.error",
-]);
-
-/** Events kept in state (everything else — stream deltas, spans, builder
- *  markers — is filtered out). */
+/** Events worth showing (everything else, such as stream deltas, status,
+ *  spans, results and builder markers, is filtered out). */
 function isRenderable(ev: Event): boolean {
   if (isHarnessUpdate(ev)) return true;
   if (isSetupMarker(ev)) return false;
   if (ev.type === "user.message") return eventText(ev).length > 0;
   if (ev.type === "agent.message") return eventText(ev).trim().length > 0;
-  if (WORK_TYPES.has(ev.type)) return true;
-  // Agent-initiated credential requests render as a connect card — during
-  // setup this is how the agent hands the user the OAuth popups for the
-  // servers it just added to its own harness.
+  if (ev.type === "agent.tool_use") {
+    return typeof ev.name === "string" && !ev.name.startsWith("mcp__oma_setup__");
+  }
+  // Agent-initiated credential requests render as a connect card: during
+  // setup this is how the agent hands over the sign-ins for the apps it
+  // just added to its own harness.
   if (ev.type === "system.access_request") return true;
-  if (ev.type === "system.saved_login_attached") return true;
-  // Not drawn itself, but kept in state so the matching request card can
-  // read the durable grant (grantedRequestIdsOf).
-  if (ev.type === "system.access_granted") return true;
   if (ev.type === "system.ambient_rule_created") return true;
-  if (ev.type === "system.memory_enabled") return true;
   if (ev.type === "system.skill_request") return true;
   return false;
 }
 
-/** request_ids the server has durably marked granted (system.access_granted). */
-export function grantedRequestIdsOf(events: Event[]): Set<string> {
-  const out = new Set<string>();
-  for (const ev of events) {
-    if (ev.type !== "system.access_granted") continue;
-    const rid = (ev as { request_id?: unknown }).request_id;
-    if (typeof rid === "string" && rid) out.add(rid);
-  }
-  return out;
+/** The readable head of a provider error: drop the JSON tail. */
+function headline(raw: string): string {
+  const head = raw.split(/\s\{"/)[0].trim();
+  return head.length > 180 ? `${head.slice(0, 179)}…` : head;
 }
 
-export function SessionChat({
-  sessionId,
-  onEvent,
-  placeholder,
-  emptyTitle,
-  emptyDescription,
-}: SessionChatProps) {
+export function SessionChat({ sessionId, onEvent, placeholder, emptyTitle, emptyDescription }: SessionChatProps) {
   const { api, streamEvents } = useApi();
-  // Unsent text survives an update-prompt reload (lib/composer-draft).
-  const draft = useComposerDraft(`session:${sessionId}`);
   const [events, setEvents] = useState<Event[]>([]);
   const [pending, setPending] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
+  const [draft, setDraft] = useState("");
+  /** Why the last message did not go out. Its text is back in the box. */
+  const [sendError, setSendError] = useState<string | null>(null);
   const [status, setStatus] = useState<"idle" | "running">("idle");
-  /** Last turn failure, rendered as an inline banner. session.error's own
-   *  message is the generic "No output generated…"; the actionable cause
-   *  (401 bad api_key, rate limit, …) rides on the preceding
-   *  span.model_request_end with is_error — pair them like SessionDetail
-   *  does. Cleared when a later turn produces output. */
+  /** Last turn failure. session.error's own message is generic; the
+   *  actionable cause (a rejected key, a rate limit) rides on the preceding
+   *  span.model_request_end with is_error, so the two are paired here as on
+   *  the session page. Cleared when a later turn produces output. */
   const [turnError, setTurnError] = useState<{ error: string; cause?: string } | null>(null);
   const pendingCauseRef = useRef<string | null>(null);
   /** In-flight token streams keyed by message_id. An entry appears on
@@ -199,7 +143,7 @@ export function SessionChat({
         if (ev.type === "agent.message") setTurnError(null);
         if (ev.type === "user.message") setPending(null);
 
-        // Live token streaming — broadcast-only events, never in history.
+        // Live token streaming: broadcast-only events, never in history.
         if (ev.type === "agent.message_stream_start") {
           const mid = (ev as { message_id?: string }).message_id;
           if (mid) setStreams((s) => ({ ...s, [mid]: s[mid] ?? "" }));
@@ -212,8 +156,8 @@ export function SessionChat({
         }
         if (ev.type === "agent.message_stream_end") {
           const { message_id: mid, status: st } = ev as { message_id?: string; status?: string };
-          // completed streams stay visible until the canonical agent.message
-          // (same id) replaces them a beat later — no flicker.
+          // Completed streams stay visible until the canonical agent.message
+          // (same id) replaces them a beat later, so nothing flickers.
           if (mid && st !== "completed") {
             setStreams((s) => {
               if (!(mid in s)) return s;
@@ -224,7 +168,7 @@ export function SessionChat({
           return;
         }
         if (ev.type === "agent.message") {
-          // Canonical message replaces its stream bubble (ids match).
+          // The canonical message replaces its stream (ids match).
           const mid = (ev as { message_id?: string }).message_id ?? ev.id;
           if (mid) {
             setStreams((s) => {
@@ -248,10 +192,14 @@ export function SessionChat({
     return () => abort.abort();
   }, [sessionId, streamEvents]);
 
+  /** Send `text`. The box is emptied now; if the server does not take the
+   *  message, the words go back into it under a notice that says why. */
   const send = useCallback(
     async (text: string) => {
       const trimmed = text.trim();
       if (!trimmed) return;
+      setDraft("");
+      setSendError(null);
       setSending(true);
       setPending(trimmed);
       try {
@@ -260,139 +208,124 @@ export function SessionChat({
           body: JSON.stringify({
             events: [{ type: "user.message", content: [{ type: "text", text: trimmed }] }],
           }),
+          // Drawn next to the words it belongs to, below.
+          silentErrors: true,
         });
-      } catch {
-        // api() surfaces the error toast; drop the optimistic bubble.
+      } catch (err) {
         setPending(null);
+        setDraft((typed) => (typed.trim() ? `${text}\n${typed}` : text));
+        setSendError(
+          err instanceof ApiError
+            ? /[.!?]$/.test(err.message)
+              ? err.message
+              : `${err.message}.`
+            : "The server could not be reached. Check your connection.",
+        );
       }
       setSending(false);
     },
     [api, sessionId],
   );
 
-  const grantedRequestIds = useMemo(() => grantedRequestIdsOf(events), [events]);
-  const timeline = useMemo(() => buildTimeline(events, { hideTool: isSetupTool }), [events]);
-  // Status/bookkeeping events live in state too; only drawn items count.
-  const isEmpty = timeline.items.length === 0 && !pending;
+  const streaming = Object.values(streams).some(Boolean);
+  const isEmpty = events.length === 0 && !pending && !streaming && !turnError;
+  const working = status === "running" && !streaming;
 
   return (
-    <div className="flex flex-col h-full min-h-0">
-      <Conversation className="flex-1 min-h-0">
-        <ConversationContent className="gap-4">
-          {isEmpty && (
-            <ConversationEmptyState
+    <div className="flex h-full min-h-0 flex-col">
+      <Conversation className="min-h-0 flex-1" initial="instant">
+        <ConversationContent className={cn("block px-5 pt-6 pb-10", isEmpty && "flex min-h-full items-center justify-center")}>
+          {isEmpty ? (
+            <EmptyState
+              variant="plain"
+              size="md"
+              kind="session"
+              loading={status === "running"}
               title={emptyTitle ?? "No messages yet"}
-              description={emptyDescription ?? "Send a message to get started."}
+              body={emptyDescription ?? "Send a message to get started."}
             />
-          )}
-          <WorkTimeline
-            items={timeline.items}
-            sessionId={sessionId}
-            renderEvent={(ev, key) => {
-              if (ev.type === "user.message") {
-                return (
-                  <Message from="user" key={key}>
-                    <MessageContent>{eventText(ev)}</MessageContent>
-                  </Message>
-                );
-              }
-              if (ev.type === "agent.message") {
-                if (isHarnessUpdate(ev)) {
-                  return <HarnessDiffCard key={key} event={ev} />;
+          ) : (
+            <div className="mx-auto w-full max-w-[720px] space-y-4">
+              {events.map((ev, i) => {
+                const key = ev.seq != null ? `seq:${ev.seq}` : (ev.id ?? `i${i}`);
+                if (ev.type === "user.message") {
+                  return (
+                    <div key={key} className="flex justify-end pt-2 first:pt-0">
+                      <div className={BUBBLE}>
+                        <p className="break-words whitespace-pre-wrap">{eventText(ev)}</p>
+                      </div>
+                    </div>
+                  );
                 }
-                return (
-                  <Message from="assistant" key={key}>
-                    <MessageContent>
-                      <Markdown sessionId={sessionId}>{eventText(ev)}</Markdown>
-                    </MessageContent>
-                  </Message>
-                );
-              }
-              if (ev.type === "system.access_request") {
-                return (
-                  <AccessRequestCard
-                    key={key}
-                    event={ev}
-                    sessionId={sessionId}
-                    granted={grantedRequestIds.has(String(ev.request_id ?? ""))}
-                  />
-                );
-              }
-              if (ev.type === "system.saved_login_attached") {
-                return (
-                  <SavedLoginLine
-                    key={key}
-                    event={ev}
-                    sessionId={sessionId}
-                    switched={grantedRequestIds.has(String(ev.request_id ?? ""))}
-                  />
-                );
-              }
-              if (ev.type === "system.ambient_rule_created") {
-                return <AmbientRuleCard key={key} event={ev} />;
-              }
-              if (ev.type === "system.memory_enabled") {
-                return <MemoryEnabledCard key={key} event={ev} />;
-              }
-              if (ev.type === "system.skill_request") {
-                return <SkillRequestCard key={key} event={ev} sessionId={sessionId} />;
-              }
-              // session.error renders as the turn-failed banner below;
-              // system.access_granted is state for the request cards.
-              return null;
-            }}
-          />
-          {pending && (
-            <Message from="user">
-              <MessageContent className="opacity-70">{pending}</MessageContent>
-            </Message>
-          )}
-          {Object.entries(streams).map(([mid, text]) =>
-            text ? (
-              <Message from="assistant" key={`stream:${mid}`}>
-                <MessageContent>
-                  <Markdown>{text}</Markdown>
-                  <span className="inline-block w-2 h-4 align-text-bottom bg-fg-subtle/60 animate-pulse" aria-hidden />
-                </MessageContent>
-              </Message>
-            ) : null,
-          )}
-          {turnError && (
-            <div className="max-w-2xl bg-danger-subtle rounded-lg px-4 py-2.5 text-sm text-danger">
-              <div className="font-medium">Turn failed</div>
-              <div className="mt-0.5 text-[12px] opacity-90">{turnError.error}</div>
-              {turnError.cause && (
-                <div className="mt-1.5 pt-1.5 border-t border-danger/20 text-[12px] font-mono break-all opacity-90">
-                  {turnError.cause}
+                if (ev.type === "agent.message") {
+                  if (isHarnessUpdate(ev)) return <HarnessDiffCard key={key} event={ev} />;
+                  return <Prose key={key}>{eventText(ev)}</Prose>;
+                }
+                if (ev.type === "system.access_request") return <AccessRequestCard key={key} event={ev} sessionId={sessionId} />;
+                if (ev.type === "system.ambient_rule_created") return <AmbientRuleCard key={key} event={ev} />;
+                if (ev.type === "system.skill_request") return <SkillRequestCard key={key} event={ev} sessionId={sessionId} />;
+                // agent.tool_use: a quiet row naming the tool and what it was asked to do.
+                const input = (ev.input && typeof ev.input === "object" ? ev.input : {}) as Record<string, unknown>;
+                const p = presentTool({ name: String(ev.name ?? "tool"), flavor: "tool", input });
+                return <EventCard key={key} kind={p.kind} icon={p.icon} source={p.source} title={p.title} subtitle={p.preview} />;
+              })}
+              {pending && (
+                <div className="flex flex-col items-end gap-1 pt-2">
+                  <div className={cn(BUBBLE, "opacity-60")}>
+                    <p className="break-words whitespace-pre-wrap">{pending}</p>
+                  </div>
+                  <span className="pr-1 text-xs text-fg-subtle">Sending…</span>
                 </div>
               )}
+              {Object.entries(streams).map(([mid, text]) =>
+                text ? (
+                  <div key={`stream:${mid}`}>
+                    <Prose>{text}</Prose>
+                    <BrandLoader size="sm" label="Writing" className="mt-2" />
+                  </div>
+                ) : null,
+              )}
+              {turnError && (
+                <EventCard kind="error" title="This turn failed" subtitle={headline(turnError.cause ?? turnError.error)}>
+                  {turnError.cause && turnError.cause !== headline(turnError.cause) ? <CodeWell tone="danger">{turnError.cause}</CodeWell> : undefined}
+                </EventCard>
+              )}
+              {working && <BrandLoader size="md" label="Working" className="h-6" />}
             </div>
-          )}
-          {status === "running" && Object.keys(streams).length === 0 && (
-            <WorkingRow sinceMs={timeline.openTurnStartMs} />
           )}
         </ConversationContent>
+        <ConversationEdges />
         <ConversationScrollButton />
       </Conversation>
-      <div className="border-t border-border p-3 bg-bg shrink-0">
-        <PromptInput
-          onSubmit={async ({ text }) => {
-            await send(text);
-          }}
-        >
-          <PromptInputTextarea
-            {...draft}
-            placeholder={placeholder ?? "Send a message…"}
-            disabled={sending}
-          />
-          <PromptInputFooter>
-            <PromptInputTools />
-            <div className="flex items-center gap-1">
-              <SessionModelPicker sessionId={sessionId} />
-              <PromptInputSubmit status={sending ? "submitted" : undefined} disabled={sending} />
+
+      <div className="relative shrink-0 px-5 pb-4 before:pointer-events-none before:absolute before:inset-x-0 before:-top-8 before:h-8 before:bg-gradient-to-t before:from-bg before:to-transparent">
+        <div className="mx-auto w-full max-w-[720px]">
+          {sendError && (
+            <div className="mb-2">
+              <ComposerNotice
+                tone="danger"
+                title="Your message was not sent"
+                onDismiss={() => setSendError(null)}
+                actions={
+                  <Button size="sm" variant="outline" onClick={() => void send(draft)} disabled={sending}>
+                    Try again
+                  </Button>
+                }
+              >
+                {sendError} Your message is back in the box below. Edit it or try again.
+              </ComposerNotice>
             </div>
-          </PromptInputFooter>
-        </PromptInput>
+          )}
+          <Composer
+            size="md"
+            value={draft}
+            onChange={setDraft}
+            onSubmit={() => void send(draft)}
+            submitting={sending}
+            placeholder={placeholder ?? "Send a message…"}
+            aria-label="Message the agent"
+          />
+        </div>
       </div>
     </div>
   );

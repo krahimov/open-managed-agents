@@ -11,13 +11,18 @@ interface BrandLoaderProps {
   className?: string;
 }
 
+/**
+ * Three dots in a soft wave — the one loading indicator for "something is
+ * on its way" (buttons, inline waits, full-page boot). For content that
+ * has a shape, use a Skeleton instead.
+ */
 export function BrandLoader({ size = "md", label = "Loading", className = "" }: BrandLoaderProps) {
   const s = SIZE[size];
   return (
     <span
       role="status"
       aria-label={label}
-      className={`inline-flex items-center ${s.gap} text-brand select-none ${className}`.trim()}
+      className={`inline-flex items-center ${s.gap} text-fg-subtle select-none ${className}`.trim()}
     >
       <span className={`brand-loader-dot rounded-full bg-current ${s.dot}`} style={{ animationDelay: "0ms" }} />
       <span className={`brand-loader-dot rounded-full bg-current ${s.dot}`} style={{ animationDelay: "160ms" }} />

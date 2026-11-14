@@ -1,11 +1,17 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams, Link } from "react-router";
 import { toast } from "sonner";
-import { useApi } from "../lib/api";
+import { KeyRoundIcon } from "lucide-react";
+
 import { Button } from "@/components/ui/button";
+
+import { useApi } from "../lib/api";
 import type { Event } from "../lib/events";
-import { openOAuthPopup, subscribeOAuthMessages } from "../lib/oauth-popup";
-import { OAuthAppSetupPanel, type OAuthAppRequirement } from "./OAuthAppSetupPanel";
+import { EventCard } from "./EventCard";
+import { SecretInput } from "./Input";
+import { AnsweredRequest, NEEDS_YOU_CARD, PassedRequest } from "./sessions/RequestParts";
+import { serverInfo } from "./sessions/tools";
+import { withReason } from "@/lib/failure-text";
 
 /**
  * Agent-initiated credential request — rendered when the agent calls its
@@ -24,25 +30,41 @@ import { OAuthAppSetupPanel, type OAuthAppRequirement } from "./OAuthAppSetupPan
  * Secrets never appear in the conversation; credentials land in the
  * "Connected Apps" vault either way. Shared by SessionDetail (working
  * sessions) and SessionChat (agent setup panel).
+ *
+ * Whether the request is still waiting on a person is read from the
+ * session's log (`state`, see sessions/requests.ts), so the card looks the
+ * same after a reload as it did when it was answered:
+ *
+ *   open       amber, with the way to answer it. It counts as "waiting on you".
+ *   answered   one quiet line: the app is connected.
+ *   passed     the person replied without connecting. A neutral row that can
+ *              still be used, but nothing is waiting on it.
  */
 export function AccessRequestCard({
   event,
   sessionId: sessionIdProp,
-  vaultId,
-  granted = false,
+  state = "open",
 }: {
   event: Event;
-  /** True when the session's event log already holds a
-   *  system.access_granted for this request — the server recorded the
-   *  grant, so the card renders "Connected" regardless of popup state or
-   *  page reloads. */
+  /** What the log says became of this request. */
+  state?: "open" | "answered" | "passed";
+  /** CONTRACT (step 0 baseline; C5 implements, C3 computes it in the
+   *  access_granted fold). True when the session's event log holds a
+   *  `system.access_granted` for this request: the server recorded the
+   *  grant, so the card reads as connected regardless of popup state or a
+   *  reload, and it never posts its own "[access granted]" nudge. C5 must
+   *  also skip the nudge when the popup's `oauth_complete` message carries
+   *  `grant_recorded: true` (the start-token path, where the OAuth callback
+   *  already appended the grant and the nudge server-side). */
   granted?: boolean;
+  /** CONTRACT (step 0 baseline; C5 implements, C1's TelegramConnect passes
+   *  it). The vault the signed-in user explicitly chose on the Telegram
+   *  connection page; credentials go there instead of the default. */
+  vaultId?: string;
   /** Session to notify on completion. Defaults to the :id route param
    *  (SessionDetail); SessionChat must pass it explicitly — its route
    *  param is the AGENT id. */
   sessionId?: string;
-  /** Explicitly selected by the signed-in user on the Telegram connection page. */
-  vaultId?: string;
 }) {
   const { api } = useApi();
   const { id: routeId } = useParams();
@@ -57,10 +79,10 @@ export function AccessRequestCard({
      *  actually authenticates. Absent on events from older deploys —
      *  fall back to the pre-classification behavior then. */
     auth_kind?: "mcp_oauth" | "mcp_api_key" | "llm_provider" | "composio";
-    /** Server-side discovery: provider needs a one-time OAuth app first. */
-    oauth_app?: OAuthAppRequirement;
   };
   const service = (ev.service ?? "service").toLowerCase();
+  /** The app as people say it ("GitHub"), for everything a person reads. */
+  const serviceLabel = serverInfo(service).label;
   const isMcpOauth =
     typeof ev.mcp_server_url === "string" &&
     ev.mcp_server_url.length > 0 &&
@@ -68,39 +90,28 @@ export function AccessRequestCard({
   const isApiKeyMcp = ev.auth_kind === "mcp_api_key" && !!ev.mcp_server_url;
   const isLlmProvider = ev.auth_kind === "llm_provider";
   const [status, setStatus] = useState<"pending" | "connecting" | "connected" | "error">(
-    granted ? "connected" : "pending",
+    "pending",
   );
   const [error, setError] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState("");
-  // One-time OAuth-app requirement (Slack, GitHub…). Seeded from the event
-  // (postAccessRequest discovers it up front); also learned late from the
-  // popup's `oauth_app_required` error for events from older deploys.
-  const [appReq, setAppReq] = useState<OAuthAppRequirement | null>(
-    ev.oauth_app && ev.oauth_app.required ? ev.oauth_app : null,
-  );
-  const [savingApp, setSavingApp] = useState(false);
-  const notifiedRef = useRef(granted);
+  /** A passed-over request opened again to be answered after all. */
+  const [reopened, setReopened] = useState(false);
+  const notifiedRef = useRef(false);
+  /** Vault the Composio account landed in — needed post-OAuth to graft the
+   *  connection onto the session's agent (tool-router server + vault link). */
   const vaultIdRef = useRef<string | null>(null);
-
-  // Durable state wins over local popup bookkeeping: once the server has
-  // written system.access_granted for this request, flip to Connected even
-  // if this card never saw the popup finish (reload / re-render / other tab).
-  useEffect(() => {
-    if (!granted) return;
-    notifiedRef.current = true;
-    setStatus("connected");
-  }, [granted]);
 
   useEffect(() => {
     if (status !== "connecting") return;
-    const complete = async (opts: { grantRecorded?: boolean } = {}) => {
+    const complete = async () => {
       if (notifiedRef.current) return;
       notifiedRef.current = true;
+      setStatus("connected");
       // Graft the connection onto the session's AGENT (tool-router
       // mcp_server + vault link + toolkit list). Without this, an agent
       // created with no Composio wiring never sees the toolkit's tools —
       // in this session or any future one, scheduled sessions included.
-      // Verify the active provider account before reporting the connection.
+      // Best-effort: the OAuth grant itself already succeeded.
       let attachedServer = false;
       if (!isMcpOauth && vaultIdRef.current) {
         try {
@@ -113,20 +124,9 @@ export function AccessRequestCard({
             },
           );
           attachedServer = graft.attached_server === true;
-        } catch (err) {
-          notifiedRef.current = false;
-          setStatus("error");
-          setError(err instanceof Error ? err.message : "Connection could not be verified. Please retry.");
-          return;
+        } catch {
+          // agent stays unwired; the message below falls back to the nudge
         }
-      }
-      setStatus("connected");
-      if (opts.grantRecorded) {
-        // The OAuth callback already appended system.access_granted + the
-        // "[access granted]" nudge server-side — posting again would wake
-        // the agent twice with a duplicate message.
-        toast.success(`${service} connected.`);
-        return;
       }
       // Tell the agent — a plain user.message wakes the turn loop the same
       // way a typed reply would, so it picks the task back up.
@@ -156,54 +156,47 @@ export function AccessRequestCard({
           ],
         }),
       }).catch(() => {
-        toast.error("Connected, but failed to notify the agent — send it a message to continue.");
+        toast.error("Connected, but the agent could not be told. Send it a message to continue.");
       });
-      toast.success(`${service} connected.`);
+      toast.success(`${serviceLabel} connected`);
     };
     const handle = (e: MessageEvent) => {
-      if (e.origin && e.origin !== window.location.origin) return;
       const data = (
         e as MessageEvent<{ type?: string; toolkit?: string; service?: string }>
       ).data;
       if (data?.type === "composio_auth_complete") {
         if (data.toolkit && data.toolkit.toLowerCase() !== service) return;
-        const providerError = (data as { error?: string }).error;
-        if (providerError) { setStatus("error"); setError(providerError); return; }
         void complete();
       } else if (data?.type === "oauth_complete") {
-        // Only THIS request's completion. Older callback pages carry no
-        // request_id; accept those to stay compatible. Without this check
-        // every connecting card completed on ANY popup finishing (seen live:
-        // one GitHub popup → linear + github + github grants in one second).
-        const done = data as { request_id?: string | null; grant_recorded?: boolean };
-        if (done.request_id && ev.request_id && done.request_id !== ev.request_id) return;
-        void complete({ grantRecorded: done.grant_recorded === true });
+        // MCP OAuth callback reports the provider's display name — accept any
+        // completion that lands while THIS card is the one connecting.
+        void complete();
       } else if (data?.type === "oauth_error") {
-        const err = data as {
-          message?: string;
-          code?: string;
-          provider?: OAuthAppRequirement;
-        };
-        if (err.code === "oauth_app_required" && err.provider) {
-          // Not a failure the user can retry — switch the card into the
-          // guided one-time app setup.
-          setAppReq(err.provider);
-          setError(null);
-          setStatus("pending");
-          return;
-        }
-        // Popup-side failure (discovery, token exchange, provider proxy
-        // state) — surface it on the card instead of leaving "Waiting for
-        // provider…" forever.
+        // Popup-side failure (discovery, missing preset app, token exchange,
+        // provider proxy state) — surface it on the card instead of leaving
+        // "Waiting for provider…" forever.
         setStatus("error");
-        setError(err.message ?? "Provider authentication failed");
+        setError((data as { message?: string }).message ?? `${serviceLabel} did not complete the sign-in. Try again.`);
       }
     };
-    return subscribeOAuthMessages(handle);
-  }, [status, service, sessionId, api, isMcpOauth]);
+    window.addEventListener("message", handle);
+    let bc: BroadcastChannel | null = null;
+    try {
+      bc = new BroadcastChannel("openma-oauth");
+      bc.addEventListener("message", handle);
+    } catch {
+      // BroadcastChannel is best effort for browsers without support.
+    }
+    return () => {
+      window.removeEventListener("message", handle);
+      if (bc) {
+        bc.removeEventListener("message", handle);
+        bc.close();
+      }
+    };
+  }, [status, service, sessionId, api]);
 
   const ensureVault = async (): Promise<{ id: string }> => {
-    if (vaultId) return { id: vaultId };
     const vaultsRes = await api<{
       data: Array<{ id: string; name: string; archived_at?: string | null }>;
     }>("/v1/vaults?status=active&limit=100");
@@ -237,14 +230,6 @@ export function AccessRequestCard({
         }),
       });
       setApiKey("");
-      // Attach the vault to this session's agent and declare the server on
-      // it — vault credentials only authenticate declared servers. Best
-      // effort: the key is saved either way.
-      await api(`/v1/sessions/${sessionId}/access/attach`, {
-        method: "POST",
-        body: JSON.stringify({ service, vault_id: vault.id, mcp_server_url: ev.mcp_server_url }),
-        silentErrors: true,
-      }).catch(() => {});
       notifiedRef.current = true;
       setStatus("connected");
       await api(`/v1/sessions/${sessionId}/events`, {
@@ -263,12 +248,12 @@ export function AccessRequestCard({
           ],
         }),
       }).catch(() => {
-        toast.error("Key saved, but failed to notify the agent — send it a message to continue.");
+        toast.error("Key saved, but the agent could not be told. Send it a message to continue.");
       });
-      toast.success(`${service} key saved to the vault.`);
+      toast.success(`${serviceLabel} key saved to the vault`);
     } catch (err) {
       setStatus("error");
-      setError(err instanceof Error ? err.message : "Failed to save the key");
+      setError(withReason("The key could not be saved", err));
     }
   };
 
@@ -284,14 +269,12 @@ export function AccessRequestCard({
           mcp_server_url: ev.mcp_server_url!,
           vault_id: vault.id,
           redirect_uri: window.location.href,
-          service,
         });
-        // Let the callback record the grant on the session itself (and
-        // graft the vault onto the agent) — the browser handoff below is
-        // then only cosmetic.
-        if (sessionId) params.set("session_id", sessionId);
-        if (ev.request_id) params.set("request_id", ev.request_id);
-        openOAuthPopup(params, `oauth-${service}`);
+        window.open(
+          `/v1/oauth/authorize?${params.toString()}`,
+          `oauth-${service}`,
+          "width=600,height=700,popup=yes",
+        );
         return;
       }
       // Composio path. Open the popup synchronously (popup blockers) and
@@ -316,92 +299,123 @@ export function AccessRequestCard({
       }
     } catch (err) {
       setStatus("error");
-      setError(err instanceof Error ? err.message : "Failed to start provider OAuth");
+      setError(withReason(`The ${serviceLabel} sign-in could not be started`, err));
     }
   };
 
   const composioUnavailable = !isMcpOauth && ev.composio_configured === false;
-  const needsAppSetup =
-    isMcpOauth && status !== "connected" && !!appReq?.required && !appReq.configured;
+  const app = serverInfo(service);
+  const connecting = status === "connecting";
 
-  const saveOAuthApp = async (clientId: string, clientSecret: string) => {
-    if (!appReq) return;
-    setSavingApp(true);
-    setError(null);
-    try {
-      await api("/v1/oauth/apps", {
-        method: "PUT",
-        body: JSON.stringify({ issuer: appReq.issuer, client_id: clientId, client_secret: clientSecret }),
-      });
-      setAppReq({ ...appReq, configured: true, source: "tenant" });
-      toast.success(`${appReq.label} app saved — continuing to ${appReq.label}…`);
-      await connect();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : `Failed to save the ${appReq.label} app`);
-    } finally {
-      setSavingApp(false);
-    }
-  };
+  // Done: the card relaxes into one quiet line, like a finished tool call.
+  if (status === "connected" || state === "answered") {
+    return (
+      <AnsweredRequest>
+        <span className="font-medium text-fg">{app.label} connected.</span>{" "}
+        {status !== "connected"
+          ? "The agent was told and carried on."
+          : isApiKeyMcp
+            ? "The key is in your vault and the agent has been told."
+            : "The agent has been told and is picking the task back up."}
+      </AnsweredRequest>
+    );
+  }
+
+  // The person answered in words instead: nothing waits on this any more,
+  // but it can still be done from here.
+  if (state === "passed" && !reopened && status === "pending") {
+    return (
+      <PassedRequest
+        icon={isLlmProvider || isApiKeyMcp ? KeyRoundIcon : app.icon}
+        title={`The agent asked for access to ${app.label}`}
+        note={ev.reason}
+        action={
+          isLlmProvider ? (
+            <Button asChild variant="outline" size="sm">
+              <Link to="/model-cards">Add the key in Models</Link>
+            </Button>
+          ) : composioUnavailable ? (
+            <Button asChild variant="outline" size="sm">
+              <Link to="/integrations/apps">Connect Composio first</Link>
+            </Button>
+          ) : (
+            // A key is typed into the card, so the card opens again; a sign-in starts at once.
+            <Button variant="outline" size="sm" onClick={isApiKeyMcp ? () => setReopened(true) : connect}>
+              {isApiKeyMcp ? "Add the key" : `Connect ${app.label}`}
+            </Button>
+          )
+        }
+      />
+    );
+  }
+
+  const note = isLlmProvider
+    ? "Model-provider keys live in Models, not in connected apps. Add the key there and the agent's model calls use it automatically."
+    : isApiKeyMcp
+      ? `${app.label} signs requests with an API key, not a sign-in. The key is stored in your vault for ${hostOf(ev.mcp_server_url)} and added to each call; it never enters this conversation.`
+      : `You sign in with ${app.label} directly. The credential is saved to your Connected Apps vault and never enters this conversation.`;
 
   return (
-    <div className="max-w-2xl border border-border rounded-lg bg-bg-surface px-4 py-3">
-      <div className="flex items-center justify-between gap-3">
-        <div className="min-w-0">
-          <div className="text-sm font-medium">
-            Agent requests access to <span className="font-mono">{service}</span>
-          </div>
-          {ev.reason && <div className="text-xs text-fg-subtle mt-0.5">{ev.reason}</div>}
-        </div>
-        {status === "connected" ? (
-          <span className="text-xs font-medium text-success whitespace-nowrap">Connected ✓</span>
-        ) : isLlmProvider ? (
+    <div data-needs-you={state === "open" ? "access" : undefined} className="scroll-my-24">
+    <EventCard
+      kind="approval"
+      className={NEEDS_YOU_CARD}
+      icon={isLlmProvider || isApiKeyMcp ? KeyRoundIcon : app.icon}
+      title={`The agent needs access to ${app.label}`}
+      subtitle={ev.reason || "It cannot continue this task without it."}
+      actions={
+        isLlmProvider ? (
           <Button asChild variant="outline" size="sm">
-            <Link to="/model-cards">Add key in Model Cards</Link>
+            <Link to="/model-cards">Add the key in Models</Link>
           </Button>
-        ) : isApiKeyMcp ? null : composioUnavailable ? (
+        ) : isApiKeyMcp ? undefined : composioUnavailable ? (
           <Button asChild variant="outline" size="sm">
             <Link to="/integrations/apps">Connect Composio first</Link>
           </Button>
-        ) : needsAppSetup ? (
-          <span className="text-xs font-medium text-warning whitespace-nowrap">Setup required</span>
         ) : (
-          <Button size="sm" onClick={connect} disabled={status === "connecting"}>
-            {status === "connecting" ? "Waiting for provider…" : `Connect ${service}`}
+          <Button size="sm" onClick={connect} loading={connecting} loadingLabel={`Waiting for ${app.label}…`}>
+            Connect {app.label}
           </Button>
-        )}
-      </div>
-      {isApiKeyMcp && status !== "connected" && (
+        )
+      }
+    >
+      {isApiKeyMcp && (
         <form
-          className="mt-2 flex items-center gap-2"
+          className="flex items-center gap-2"
           onSubmit={(e) => {
             e.preventDefault();
             void saveApiKey();
           }}
         >
-          <input
-            type="password"
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
-            placeholder={`${service} API key`}
-            autoComplete="off"
-            className="flex-1 min-w-0 h-8 rounded-md border border-border bg-bg px-2 text-xs font-mono focus:outline-none focus:ring-1 focus:ring-brand"
-          />
-          <Button size="sm" type="submit" disabled={status === "connecting" || !apiKey.trim()}>
-            {status === "connecting" ? "Saving…" : "Save to vault"}
+          <div className="min-w-0 flex-1">
+            <SecretInput
+              value={apiKey}
+              onChange={(e) => setApiKey(e.target.value)}
+              placeholder={`${app.label} API key`}
+              aria-label={`${app.label} API key`}
+            />
+          </div>
+          <Button type="submit" disabled={!apiKey.trim()} loading={connecting} loadingLabel="Saving…">
+            Save to vault
           </Button>
         </form>
       )}
-      {needsAppSetup && appReq && (
-        <OAuthAppSetupPanel requirement={appReq} saving={savingApp} onSave={saveOAuthApp} />
+      {error && (
+        <p role="alert" className="text-small text-danger">
+          {error}
+        </p>
       )}
-      {error && <div className="mt-2 text-xs text-danger">{error}</div>}
-      <div className="mt-2 text-[11px] text-fg-subtle">
-        {isLlmProvider
-          ? "Model-provider keys are managed in Model Cards, not as connected apps — add the key there and the agent's model calls use it automatically."
-          : isApiKeyMcp
-            ? `This server authenticates with an API key (no OAuth). The key is stored as a vault credential bound to ${ev.mcp_server_url} — the proxy injects it per call; it never enters this conversation.`
-            : "Authentication happens with the provider directly; the credential lands in your Connected Apps vault — never in this conversation."}
-      </div>
+      <p className="text-xs leading-relaxed text-fg-muted">{note}</p>
+    </EventCard>
     </div>
   );
+}
+
+function hostOf(url: string | undefined): string {
+  if (!url) return "this server";
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return url;
+  }
 }
