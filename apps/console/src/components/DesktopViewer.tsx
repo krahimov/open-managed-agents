@@ -82,18 +82,20 @@ export function DesktopViewer({ agentId }: { agentId: string }) {
       </div>
       {open && (
         <>
-          <p role="status" className={cn("mt-3 text-xs", state === "disconnected" ? "text-fg-muted" : "text-fg-subtle")}>
-            {STATE_WORDS[state]}
-          </p>
-          {error && (
-            <p role="alert" className="mt-1 text-small text-danger">
+          {error ? (
+            <p role="alert" className="mt-3 text-small text-danger">
               {error}
             </p>
+          ) : (
+            <p role="status" className={cn("mt-3 text-xs", state === "disconnected" ? "text-fg-muted" : "text-fg-subtle")}>
+              {STATE_WORDS[state]}
+            </p>
           )}
+          {/* Kept mounted while the viewer is open: noVNC draws into it. */}
           <div
             ref={target}
             aria-label="The agent's Linux desktop"
-            className="mt-3 h-[600px] w-full overflow-hidden rounded-lg bg-bg-inset ring-1 ring-border"
+            className={cn("mt-3 h-[600px] w-full overflow-hidden rounded-lg bg-bg-inset ring-1 ring-border", error && "hidden")}
           />
         </>
       )}

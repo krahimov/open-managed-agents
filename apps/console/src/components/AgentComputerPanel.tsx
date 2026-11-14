@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
-import { PencilIcon, PlayIcon, RefreshCwIcon, SquareIcon } from "lucide-react";
+import { PlayIcon, RefreshCwIcon, SquareIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { ApiError, getActiveTenantId, isNotOnServer, readApiError, useApi } from "@/lib/api";
@@ -12,6 +12,7 @@ import { useApiQuery } from "@/lib/useApiQuery";
 
 import { Callout } from "./Callout";
 import { DesktopViewer } from "./DesktopViewer";
+import { OverflowTip } from "./OverflowTip";
 import { Property, PropertyList } from "./PropertyList";
 import { QueryProblem } from "./QueryProblem";
 import { RelativeTime } from "./RelativeTime";
@@ -319,7 +320,6 @@ export function AgentComputerPanel({ agentId, localRuntime = false, defaultEnvir
               <>
                 {" "}
                 <button type="button" onClick={onEdit} className={inlineLink}>
-                  <PencilIcon className="mr-1 inline size-3.5 align-[-2px]" aria-hidden="true" />
                   Edit agent
                 </button>
               </>
@@ -337,9 +337,9 @@ export function AgentComputerPanel({ agentId, localRuntime = false, defaultEnvir
                 {machine && (
                   <>
                     <Property label="Files">
-                      <span className="block truncate font-mono text-xs text-fg" title={machine.workdir}>
-                        {machine.workdir}
-                      </span>
+                      <OverflowTip label={machine.workdir} focusable>
+                        <span className="block truncate font-mono text-xs text-fg">{machine.workdir}</span>
+                      </OverflowTip>
                     </Property>
                     <Property label="Browser">
                       {machine.browserEnabled ? "Chromium" : <span className="text-fg-muted">Not turned on</span>}

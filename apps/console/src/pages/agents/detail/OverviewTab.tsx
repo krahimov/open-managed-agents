@@ -172,7 +172,7 @@ export function OverviewTab({
         </SectionCard>
 
         <AgentComputerPanel
-          key={agent.id}
+          key={`computer-${agent.id}`}
           agentId={agent.id}
           localRuntime={!!binding}
           defaultEnvironment={defaultEnvironment}
@@ -282,7 +282,7 @@ export function OverviewTab({
           </SectionCard>
         )}
 
-        <AgentMemoryPanel key={agent.id} agentId={agent.id} />
+        <AgentMemoryPanel key={`memory-${agent.id}`} agentId={agent.id} />
 
         <SectionCard title="Integrations" description="Where people can reach this agent outside the console." flush>
           <PublicationRow kind="linear" label="Linear" icon={LinearIcon} agentId={agent.id} archived={archived} />

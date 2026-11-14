@@ -19,6 +19,7 @@ import { useSessionReadings } from "../../../components/sessions/readings";
 import {
   EmptyState,
   ErrorState,
+  OverflowTip,
   RelativeTime,
   SectionCard,
   Skeleton,
@@ -189,12 +190,11 @@ export function ActivityTab({
                   {/* The detail is written under the badge, so the badge needs no tooltip. */}
                   <SessionStatus reading={reading} tip={!outcome} />
                   {outcome && (
-                    <div
-                      className={cn("truncate text-xs", reading.tone === "danger" ? "text-danger" : "text-fg-subtle")}
-                      title={outcome}
-                    >
-                      {outcome}
-                    </div>
+                    <OverflowTip label={outcome} focusable>
+                      <div className={cn("truncate text-xs", reading.tone === "danger" ? "text-danger" : "text-fg-subtle")}>
+                        {outcome}
+                      </div>
+                    </OverflowTip>
                   )}
                 </TableCell>
                 <TableCell className="hidden px-4 text-right sm:table-cell">
