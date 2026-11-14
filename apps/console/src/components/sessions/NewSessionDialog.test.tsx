@@ -32,7 +32,8 @@ const agents = [
   { id: "agent_other", name: "Data agent", model: "claude-sonnet-4-6", created_at: "2026-11-01T00:00:00Z", _oma: { default_environment_id: "env_other" } },
 ];
 
-let envs: Array<typeof computer> = [];
+type Env = { id: string; name: string; config: { type: string; sandbox: { provider: string; scope?: string } } };
+let envs: Env[] = [];
 let created: Array<Record<string, unknown>> = [];
 
 beforeEach(() => {
