@@ -7,11 +7,14 @@ import { ArrowUpIcon, CornerDownRightIcon, HandIcon, HourglassIcon, SplitIcon } 
 import { Sheet, SheetContent, SheetDescription, SheetTitle } from "@/components/ui/sheet";
 import { cn } from "@/lib/utils";
 
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { IntegrationsApi } from "../integrations/api/client";
 import { ApiError, useApi } from "../lib/api";
+import { attachmentsLabel, attachmentsOf, buildUserMessageEvent } from "../lib/attachments";
+import { eventKey } from "../lib/event-key";
 import type { Event } from "../lib/events";
+import { refreshSessionOutputs } from "../lib/session-outputs";
 import { readFailure } from "../lib/failures";
 import { quietWords, readSession, STALLED_AFTER_MS } from "../lib/session-state";
 import { missionRef, missionTitle, sessionSource, sessionTitle, useMissionGoals } from "../lib/sessions";
@@ -27,9 +30,12 @@ import { Page, PAGE_GUTTER } from "../components/Page";
 import { QueryProblem } from "../components/QueryProblem";
 import { Tip } from "../components/Tip";
 import { Conversation, ConversationContent } from "../components/ai-elements/conversation";
-import { ContextPanel, type PeekTarget, type SessionState } from "../components/sessions/ContextPanel";
+import { ContextPanel, sessionUploadsPath, type PeekTarget, type SessionState } from "../components/sessions/ContextPanel";
 import { ConversationControl, ConversationEdges, JumpToLatest, type ConversationHandle } from "../components/sessions/ConversationEdges";
 import { ConversationView, type QueuedMessage } from "../components/sessions/ConversationView";
+import { attachToSession, newAttachmentCache } from "../components/files/attach";
+import { OutputLinks } from "../components/Markdown";
+import { TurnFilesProvider } from "../components/sessions/TurnFiles";
 import { onTablistKeyDown, useMediaQuery, useMinuteClock, useSessionOperations, useStoredFlag } from "../components/sessions/hooks";
 import { buildConversation, eventText, summarizeUsage } from "../components/sessions/model";
 import { useSessionReadings } from "../components/sessions/readings";
@@ -88,6 +94,7 @@ export function SessionDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const { api, streamEvents } = useApi();
+  const queryClient = useQueryClient();
   /** The session record. `undefined` while it loads, `null` when the
    *  session does not exist (or cannot be read), with `loadError` set for
    *  anything other than a plain 404. */
@@ -197,24 +204,10 @@ export function SessionDetail() {
   const seenKeys = useRef(new Set<string>());
   const abortRef = useRef<AbortController | null>(null);
 
-  // Dedup key for SSE re-delivery + initial-fetch overlap. `id` is stamped
-  // on every event by the server (sevt-* for tool_results / stream events;
-  // toolCallId for tool_use overrides) so it's a uniqueness guarantee
-  // across the wire. The previous content-based key dropped legitimate
-  // distinct events whose payloads happened to be byte-identical (two
-  // back-to-back `gh repo list` calls both timing out with the same
-  // 401 stderr was the repro). Fallback only kicks in for legacy events
-  // that pre-date stamping.
-  // Node-runtime events (claude-agent-sdk / codex-sdk harnesses) are not
-  // id-stamped but do carry the persisted `seq`, which is unique per session
-  // — use it before the content fallback. Without this, four memory
-  // checkpoint Edits whose results were all "The file … has been updated
-  // successfully" collapsed to one, leaving the others stuck on "Running".
-  const eventKey = (e: Event) =>
-    (e as { id?: string }).id
-    ?? ((e as { seq?: number }).seq !== undefined
-      ? `${e.type}:seq:${(e as { seq?: number }).seq}`
-      : `${e.type}:${JSON.stringify(e.content || e.tool_use_id || e.error || "").slice(0, 120)}`);
+  // Dedup key for SSE re-delivery + initial-fetch overlap: lib/event-key.
+  // `id` first; Node events without one use their tool call id or `seq`;
+  // pending-queue frames use the queued event's id, never the promoted
+  // row's seq (which is the user event's own).
 
   const addEvent = (e: Record<string, unknown>) => {
     const ev = e as Event;
@@ -723,9 +716,9 @@ export function SessionDetail() {
   }, [id, loadAttempt]);
 
   // Attachments the server already holds, by File object: trying a message
-  // again uploads only what failed the first time, not a second copy of
-  // everything.
-  const uploadedFiles = useRef(new WeakMap<File, { id: string; filename: string; media_type: string }>());
+  // again uploads (and attaches) only what failed the first time, not a
+  // second copy of everything.
+  const attachmentCache = useRef(newAttachmentCache());
 
   /** A failure in the person's terms: the server's own sentence when it gave one. */
   const sendFailure = (err: unknown): string => {
@@ -738,73 +731,33 @@ export function SessionDetail() {
    * keeps the person's words until this says `ok`, and puts them back in
    * the box when it does not.
    *
-   * Attachments are uploaded first so the message can reference them by
-   * file_id (scoped to this session, so they also show under Files). If ANY
-   * of them fails, nothing is sent: the person decides whether to try again
+   * Attachments go first (components/files/attach): every file is uploaded
+   * to this session; an image then rides in the message as a picture, any
+   * other file is attached to the session, which writes it into the
+   * agent's sandbox before the message that names it is sent. If ANY of
+   * them fails, nothing is sent: the person decides whether to try again
    * or to send without it.
    */
   const send = async (rawText: string, files: File[] = []): Promise<SendResult> => {
     const text = rawText.trim();
     if (!text && !files.length) return { ok: true };
     if (!id) return { ok: false, stage: "send", reason: "This session is not loaded yet." };
-    setLocalPending({ text, images: files.length });
+    const pendingText = text || attachmentsLabel(files.length);
+    setLocalPending({ text: pendingText, images: files.filter((f) => f.type.startsWith("image/")).length });
     setSending(true);
     try {
-      const uploaded: Array<{ id: string; filename: string; media_type: string }> = [];
-      const failed: Array<{ file: File; reason: string }> = [];
-      for (const file of files) {
-        const have = uploadedFiles.current.get(file);
-        if (have) {
-          uploaded.push(have);
-          continue;
-        }
-        try {
-          const fd = new FormData();
-          fd.append("file", file);
-          fd.append("scope_id", id);
-          fd.append("downloadable", "true");
-          const r = await api<{ id: string; filename: string; media_type: string }>(`/v1/files`, {
-            method: "POST",
-            body: fd,
-            silentErrors: true,
-          });
-          // Only images go inline to the model. A file the server does not
-          // read as one is reported, never dropped quietly.
-          if (!r.media_type?.startsWith("image/")) {
-            failed.push({ file, reason: "The server did not read it as an image." });
-            continue;
-          }
-          const record = { id: r.id, filename: r.filename, media_type: r.media_type };
-          uploadedFiles.current.set(file, record);
-          uploaded.push(record);
-        } catch (e) {
-          failed.push({ file, reason: sendFailure(e) });
-        }
-      }
+      const { attachments, failed } = await attachToSession(api, id, files, attachmentCache.current, sendFailure);
+      // What went up is in the session's Files now, whatever happens next.
+      if (files.length) void queryClient.invalidateQueries({ queryKey: ["quiet", sessionUploadsPath(id)] });
       if (failed.length) {
         setLocalPending(null);
         return { ok: false, stage: "upload", failed };
       }
 
-      const content: Array<
-        | { type: "text"; text: string }
-        | { type: "image"; source: { type: "file"; file_id: string } }
-      > = [];
-      if (text) content.push({ type: "text", text });
-      for (const u of uploaded) content.push({ type: "image", source: { type: "file", file_id: u.id } });
-      if (!text && uploaded.length) {
-        content.unshift({
-          type: "text",
-          text: uploaded.length === 1 ? "Attached image." : "Attached images.",
-        });
-      }
-
       try {
         await api(`/v1/sessions/${id}/events`, {
           method: "POST",
-          body: JSON.stringify({
-            events: [{ type: "user.message", content }],
-          }),
+          body: JSON.stringify({ events: [buildUserMessageEvent(text, attachments)] }),
           // The composer draws the failure next to the words it belongs to.
           silentErrors: true,
         });
@@ -830,7 +783,7 @@ export function SessionDetail() {
       // Clear our local slot so we don't double-render with the server
       // entry — but only if the server's pending hasn't already cleared
       // it via the system.user_message_pending handler.
-      setLocalPending((cur) => (cur?.text === text ? null : cur));
+      setLocalPending((cur) => (cur?.text === pendingText ? null : cur));
       return { ok: true };
     } finally {
       setSending(false);
@@ -880,6 +833,12 @@ export function SessionDetail() {
   const reloadTrajectory = () => {
     if (id) loadTrajectory(id);
   };
+
+  // A turn that ends may have written files: list them again, so links in
+  // the reply and the per-turn Files strip find them.
+  useEffect(() => {
+    if (id && status === "idle") void refreshSessionOutputs(id);
+  }, [id, status]);
 
   // ── What a person can do when the session is waiting on them ──
   const ops = useSessionOperations(id);
@@ -1118,7 +1077,7 @@ export function SessionDetail() {
       .sort((a, b) => a.pending_seq - b.pending_seq)
       .map((p) => ({
         key: `pending-${p.event_id}`,
-        text: eventText(p.event),
+        text: visibleText(p.event),
         images: Array.isArray(p.event.content) ? p.event.content.filter((c) => c.type === "image").length : 0,
       })),
   ];
@@ -1322,6 +1281,10 @@ export function SessionDetail() {
                     </p>
                   </div>
                 ) : (
+                  // Links in the agent's replies that name its files download
+                  // them, and each turn lists the files it wrote.
+                  <OutputLinks sessionId={id}>
+                  <TurnFilesProvider sessionId={id ?? ""} events={threadEvents}>
                   <ConversationView
                     items={conversation.items}
                     agent={speaker}
@@ -1335,6 +1298,8 @@ export function SessionDetail() {
                     onSelectThread={setActiveThreadId}
                     asker={asker}
                   />
+                  </TurnFilesProvider>
+                  </OutputLinks>
                 )}
               </ConversationContent>
               <ConversationEdges />
@@ -1509,6 +1474,17 @@ function ThreadTabs({
       })}
     </div>
   );
+}
+
+/**
+ * What a person wrote in a queued message: its first text block when it
+ * carries attachments. The blocks after it are the note that tells the
+ * agent where the files are, which is not theirs to read back.
+ */
+function visibleText(e: Event): string {
+  if (attachmentsOf(e).length === 0 || !Array.isArray(e.content)) return eventText(e);
+  const first = (e.content as Array<{ type?: string; text?: string }>).find((b) => !b.type || b.type === "text");
+  return first?.text ?? "";
 }
 
 interface EnvironmentApprovalPayload {

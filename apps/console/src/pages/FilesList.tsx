@@ -9,12 +9,18 @@
  * GET /v1/files follows the Anthropic Files API shape: `before_id` as the
  * cursor and `has_more` on the page. The Session filter is the server's
  * `scope_id`; the search narrows the files loaded so far, because the
- * endpoint has no name filter.
+ * endpoint has no name filter. Pages are large (1000): the Node server
+ * ignores the cursor and always answers `has_more: false`, so a small page
+ * would be all the list ever showed.
+ *
+ * Upload puts files in Files (POST /v1/files, the same call the message
+ * box makes), in the session the list is filtered to when it is; from
+ * there a file can be mounted in a new session's Options.
  */
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
-import { CopyIcon, DownloadIcon, EyeIcon, Trash2Icon } from "lucide-react";
+import { CopyIcon, DownloadIcon, EyeIcon, Trash2Icon, UploadIcon } from "lucide-react";
 import { toast } from "sonner";
 import type { FileRecord } from "@open-managed-agents/api-types";
 
@@ -34,13 +40,13 @@ import {
   type ColumnDef,
 } from "@/components/kit";
 import { FilePanel } from "@/components/files/FilePanel";
-import { RefusalBody } from "@/components/files/RefusalBody";
-import { UPLOAD_DOCS_URL } from "@/components/files/refusal";
+import { MAX_ATTACHMENT_MEGABYTES } from "@/components/files/refusal";
 import { OverflowTip } from "@/components/OverflowTip";
 import { downloadFile, fileKind } from "@/components/files/files";
 import { ResourceIdentity, formatBytes } from "@/components/resources/ResourceBits";
 import { ResourceListError } from "@/components/resources/ResourceListError";
 import { useApi } from "@/lib/api";
+import { MAX_ATTACHMENT_BYTES, uploadFile } from "@/lib/attachments";
 import { copyText } from "@/lib/clipboard";
 import { countWords, plural, toDate } from "@/lib/format";
 import { sessionTitle } from "@/lib/sessions";
@@ -117,7 +123,7 @@ export function FilesList() {
     refresh,
     error,
   } = useInfiniteApiQuery<FileRecord>("/v1/files", {
-    limit: 20,
+    limit: 1000,
     params,
     cursorParam: "before_id",
     getNextCursor: (res) => {
@@ -145,6 +151,55 @@ export function FilesList() {
       toast.error(withReason(`${file.filename} could not be downloaded`, e));
     }
   }, []);
+
+  // ── upload ──
+  const picker = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  const upload = async (picked: File[]) => {
+    if (picked.length === 0) return;
+    setUploading(true);
+    let done = 0;
+    for (const file of picked) {
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        toast.error(`“${file.name}” was not uploaded. A file can be up to ${MAX_ATTACHMENT_MEGABYTES} MB.`);
+        continue;
+      }
+      try {
+        await uploadFile(api, file, { scopeId: sessionId || undefined });
+        done += 1;
+      } catch (e) {
+        toast.error(withReason(`“${file.name}” could not be uploaded`, e));
+      }
+    }
+    setUploading(false);
+    if (done > 0) {
+      toast.success(done === 1 ? "File uploaded" : `${done} files uploaded`);
+      refresh();
+    }
+  };
+  const uploadButton = (
+    <>
+      <input
+        ref={picker}
+        type="file"
+        multiple
+        hidden
+        aria-label="Choose files to upload"
+        onChange={(e) => {
+          const picked = Array.from(e.currentTarget.files ?? []);
+          // Reset, so choosing the same file again still counts.
+          e.currentTarget.value = "";
+          void upload(picked);
+        }}
+      />
+      <Tip label={pickedSession ? `Into ${sessionTitle(pickedSession)}` : "Up to 25 MB each"}>
+        <Button onClick={() => picker.current?.click()} loading={uploading} loadingLabel="Uploading…">
+          <UploadIcon data-icon="inline-start" />
+          Upload
+        </Button>
+      </Tip>
+    </>
+  );
 
   const query = search.trim().toLowerCase();
   const rows = useMemo(() => (query ? items.filter((f) => f.filename.toLowerCase().includes(query)) : items), [items, query]);
@@ -286,13 +341,7 @@ export function FilesList() {
         }
       : {
           title: "No files yet",
-          body: (
-            <>
-              Files show up here when an agent saves its work or someone attaches an image to a message. Any other file can be
-              uploaded (<RefusalBody body={[{ link: "how to upload a file", href: UPLOAD_DOCS_URL }]} />), then mounted in a new
-              session's Options.
-            </>
-          ),
+          body: "Files show up here when an agent saves its work or someone attaches a file to a message. Upload one to mount it in a new session's Options.",
           action: undefined,
         };
 
@@ -300,6 +349,7 @@ export function FilesList() {
     <DataTable<FileRecord>
       title="Files"
       subtitle={SUBTITLE}
+      headerActions={uploadButton}
       searchPlaceholder="Search files"
       searchValue={search}
       onSearchChange={setSearch}

@@ -1,8 +1,11 @@
-import { useEffect, useImperativeHandle, useRef, useState, type ComponentType, type ReactNode, type Ref } from "react";
+import { useCallback, useEffect, useImperativeHandle, useRef, useState, type ComponentType, type ReactNode, type Ref } from "react";
 import { ArrowUpIcon, CircleAlertIcon, PaperclipIcon, SquareIcon, XIcon } from "lucide-react";
 
+import { formatBytes } from "@/lib/attachments";
+import { useComposerDraft } from "@/lib/composer-draft";
 import { cn } from "@/lib/utils";
 
+import { fileKind } from "./files/files";
 import { BrandLoader } from "./BrandLoader";
 import { Kbd } from "./Kbd";
 import { Tip } from "./Tip";
@@ -20,7 +23,7 @@ import { MOD_KEY } from "../lib/shell-events";
  *     submitting={starting}
  *     size="lg"
  *     leading={<AgentPicker value={agentId} onChange={setAgentId} />}
- *     attachments={{ files, onAdd: addFiles, onRemove: removeFile, accept: "image/*" }}
+ *     attachments={{ files, onAdd: addFiles, onRemove: removeFile }}
  *   />
  *
  * Anatomy: a raised 24px-radius card. Text area on top; a tool row below
@@ -31,10 +34,16 @@ import { MOD_KEY } from "../lib/shell-events";
  * Keys: Enter sends, Shift+Enter adds a line, ⌘/Ctrl+Enter also sends.
  *
  * Attachments: the composer hands every file that is picked or dropped to
- * `attachments.onAdd` and shows the ones in `attachments.files` (an image
- * wears its own thumbnail). Deciding what is allowed is the host's job, and
- * so is saying so: a file that is turned away is named in a
- * <ComposerNotice> next to the box, never dropped silently.
+ * `attachments.onAdd` and shows the ones in `attachments.files`, each with
+ * its name and size (an image wears its own thumbnail, any other file the
+ * mark of its kind). Any kind of file can be picked. Deciding what is
+ * allowed (size, how many) is the host's job, and so is saying so: a file
+ * that is turned away is named in a <ComposerNotice> next to the box, never
+ * dropped silently.
+ *
+ * Drafts: `draftKey` tags the text area (`data-draft-key`, lib/composer-
+ * draft), so unsent words survive a reload the console starts itself (a new
+ * version, a chunk that failed to load).
  *
  * Send button states:
  *   idle + empty   disabled, soft grey
@@ -52,7 +61,7 @@ export interface ComposerAttachments {
   files: File[];
   onAdd: (files: File[]) => void;
   onRemove: (index: number) => void;
-  /** `accept` for the file input. Default "image/*". */
+  /** `accept` for the file input. Default: any file. */
   accept?: string;
 }
 
@@ -73,6 +82,7 @@ export function Composer({
   footer,
   autoFocus,
   canSubmit,
+  draftKey,
   className,
   "aria-label": ariaLabel,
 }: {
@@ -100,11 +110,25 @@ export function Composer({
   autoFocus?: boolean;
   /** Override "has text or files" (e.g. also require an agent). */
   canSubmit?: boolean;
+  /** Keeps unsent text through a reload the console starts (lib/composer-draft). */
+  draftKey?: string;
   className?: string;
   "aria-label"?: string;
 }) {
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const fileRef = useRef<HTMLInputElement | null>(null);
+  // A restored draft goes through the host's onChange, like typing.
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+  const restore = useCallback((text: string) => onChangeRef.current(text), []);
+  const draft = useComposerDraft(draftKey, restore);
+  const setTextArea = useCallback(
+    (el: HTMLTextAreaElement | null) => {
+      taRef.current = el;
+      draft.ref(el);
+    },
+    [draft.ref], // eslint-disable-line react-hooks/exhaustive-deps
+  );
   useImperativeHandle(
     ref,
     () => ({
@@ -161,7 +185,7 @@ export function Composer({
       }
     >
       {attachments && attachments.files.length > 0 && (
-        <ul className="flex flex-wrap gap-2 px-4 pt-4">
+        <ul data-testid="composer-attachments" aria-label="Attachments" className="flex flex-wrap gap-2 px-4 pt-4">
           {attachments.files.map((f, i) => (
             <AttachmentChip key={`${f.name}-${f.size}-${i}`} file={f} onRemove={() => attachments.onRemove(i)} />
           ))}
@@ -169,7 +193,8 @@ export function Composer({
       )}
 
       <textarea
-        ref={taRef}
+        ref={setTextArea}
+        data-draft-key={draft["data-draft-key"]}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         onKeyDown={(e) => {
@@ -198,17 +223,17 @@ export function Composer({
               type="file"
               multiple
               hidden
-              accept={attachments.accept ?? "image/*"}
+              accept={attachments.accept}
               onChange={(e) => {
                 const picked = Array.from(e.target.files ?? []);
                 if (picked.length) attachments.onAdd(picked);
                 e.target.value = "";
               }}
             />
-            <Tip label="Attach images">
+            <Tip label="Attach files">
               <button
                 type="button"
-                aria-label="Attach images"
+                aria-label="Attach files"
                 disabled={disabled}
                 onClick={() => fileRef.current?.click()}
                 className="flex size-9 shrink-0 items-center justify-center rounded-full text-fg-muted transition-quick hover:bg-bg-hover hover:text-fg"
@@ -277,7 +302,10 @@ export function Composer({
   );
 }
 
-/** One attached file: its thumbnail when it is an image, its name, and a way to take it out. */
+/**
+ * One attached file: its thumbnail when it is an image (the mark of its kind
+ * otherwise), its name and size, and a way to take it out.
+ */
 function AttachmentChip({ file, onRemove }: { file: File; onRemove: () => void }) {
   const [thumb, setThumb] = useState<string | null>(null);
   useEffect(() => {
@@ -286,22 +314,20 @@ function AttachmentChip({ file, onRemove }: { file: File; onRemove: () => void }
     setThumb(url);
     return () => URL.revokeObjectURL(url);
   }, [file]);
+  const Kind = fileKind({ filename: file.name, media_type: file.type }).icon;
   return (
     <li
-      className={cn(
-        "flex h-8 max-w-56 items-center gap-2 rounded-full bg-bg-soft pr-1 text-xs text-fg",
-        thumb ? "pl-1" : "pl-3",
-      )}
+      title={file.name}
+      className={cn("flex h-8 max-w-64 items-center gap-2 rounded-full bg-bg-soft pr-1 text-xs text-fg", thumb ? "pl-1" : "pl-2.5")}
     >
       {thumb ? (
-        // A file that says it is an image but does not decode keeps the paperclip.
+        // A file that says it is an image but does not decode keeps its kind's mark.
         <img src={thumb} alt="" className="size-6 shrink-0 rounded-full object-cover" onError={() => setThumb(null)} />
       ) : (
-        <PaperclipIcon className="size-3.5 shrink-0 text-fg-subtle" />
+        <Kind className="size-3.5 shrink-0 text-fg-subtle" />
       )}
-      <span className="truncate" title={file.name}>
-        {file.name}
-      </span>
+      <span className="min-w-0 truncate">{file.name}</span>
+      <span className="shrink-0 text-fg-subtle tabular-nums">{formatBytes(file.size)}</span>
       <button
         type="button"
         aria-label={`Remove ${file.name}`}
@@ -319,9 +345,8 @@ function AttachmentChip({ file, onRemove }: { file: File; onRemove: () => void }
  * a file that was not attached, a message that did not go through. It names
  * what happened, says why, and offers the way forward.
  *
- *   <ComposerNotice title="“report.pdf” was not attached" onDismiss={clear}
- *                   actions={<Button size="sm" variant="outline">Start a new session</Button>}>
- *     A message carries images only. …
+ *   <ComposerNotice title="“report.pdf” was not attached" onDismiss={clear}>
+ *     A file can be up to 25 MB.
  *   </ComposerNotice>
  *
  * The words for a refused file come from ./files/refusal.

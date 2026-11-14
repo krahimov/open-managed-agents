@@ -1,22 +1,16 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { toast } from "sonner";
-import { ArchiveIcon, FileXIcon, FlagIcon, ImagePlusIcon, PlusIcon } from "lucide-react";
+import { ArchiveIcon, FilePlusIcon, FileXIcon, FlagIcon, PlusIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { useCopy } from "@/lib/clipboard";
-import { useQuietQuery } from "@/lib/useApiQuery";
 import { cn } from "@/lib/utils";
 
 import { Composer, ComposerNotice, type ComposerHandle } from "../Composer";
 import { ModelBadge } from "../ModelBadge";
-import { refusalAdvice, refusalTitle, type FilesKnown, type Refusal } from "../files/refusal";
-import { RefusalBody } from "../files/RefusalBody";
+import { SessionModelPicker } from "../SessionModelPicker";
+import { refusalText, refusalTitle, screenAttachments, type Refusal } from "../files/refusal";
 import { failureSentence } from "@/lib/failure-text";
-
-const MAX_FILES = 10;
-const MAX_BYTES = 25 * 1024 * 1024;
-/** How many files are read to find a refused file in Files. */
-const FILES_LOOKUP = 200;
 
 /**
  * What became of a message the person sent. The composer keeps their words
@@ -71,11 +65,12 @@ function nameList(names: string[]): string {
  * The composer inside a session: the shared <Composer> plus what a session
  * needs around it.
  *
- * Attachments. A message carries images: the paperclip, a paste, or a drop
- * anywhere on the page (up to 10, 25 MB each). Anything else is refused in
- * a line above the box that names the file, says why, and says what is
- * true instead (../files/refusal): another kind of file is mounted from
- * Files when a session starts, so it goes to a new session.
+ * Attachments. A message carries any kind of file: the paperclip, a paste,
+ * or a drop anywhere on the page (up to 10, 25 MB each). Images reach the
+ * model as pictures; every other file is saved in the agent's sandbox and
+ * the message tells the agent where (../files/attach). A file over the
+ * limits is refused in a line above the box that names it and says which
+ * limit it hit (../files/refusal).
  *
  * Sending. The box empties at once and the message shows in the
  * conversation as "Sending…". If the server does not take it, the words and
@@ -83,7 +78,12 @@ function nameList(names: string[]): string {
  * failed, with "Try again". An attachment that fails to upload stops the
  * whole message: the person chooses between trying again and sending
  * without it. Typed text is also kept per session for the life of the tab,
- * so leaving the page does not lose it.
+ * so leaving the page does not lose it, and through a reload the console
+ * starts itself (lib/composer-draft).
+ *
+ * Model. With a session id, the chip slot holds the session's model and
+ * reasoning picker (<SessionModelPicker>); a change applies from the next
+ * turn.
  *
  * Closed. A session that has ended or been archived takes no messages, so
  * there is no box to type in: a quiet bar says so and offers a new session
@@ -153,21 +153,14 @@ export function SessionComposer({
 
   const add = (incoming: File[]) => {
     if (closed) return;
-    const accepted: File[] = [];
-    const turnedAway: Refusal[] = [];
-    for (const f of incoming) {
-      if (!f.type.startsWith("image/")) turnedAway.push({ name: f.name, why: "type", mediaType: f.type });
-      else if (f.size > MAX_BYTES) turnedAway.push({ name: f.name, why: "size" });
-      else if (filesRef.current.length + accepted.length >= MAX_FILES) turnedAway.push({ name: f.name, why: "count" });
-      else accepted.push(f);
-    }
+    const { accepted, refused: turnedAway } = screenAttachments(incoming, filesRef.current.length);
     setRefused(turnedAway);
     if (accepted.length) setFiles((prev) => [...prev, ...accepted]);
   };
   const addRef = useRef(add);
   addRef.current = add;
 
-  // Drop an image anywhere on the page, not only on the box.
+  // Drop a file anywhere on the page, not only on the box.
   useEffect(() => {
     if (closed) return;
     let depth = 0;
@@ -210,18 +203,6 @@ export function SessionComposer({
   }, [closed]);
 
   const name = agentName ?? "the agent";
-
-  // Whether a refused file is already in Files changes what to do with it.
-  // Looked up only once one was refused; unknown, nothing is claimed.
-  const refusedType = refused.some((r) => r.why === "type");
-  const inFiles = useQuietQuery<{ data: Array<{ filename: string }>; has_more?: boolean }>(
-    `/v1/files?limit=${FILES_LOOKUP}`,
-    refusedType,
-  );
-  const filesKnown: FilesKnown | undefined = inFiles.data
-    ? { names: inFiles.data.data.map((f) => f.filename), partial: !!inFiles.data.has_more || inFiles.data.data.length >= FILES_LOOKUP }
-    : undefined;
-  const advice = refusalAdvice({ refused, where: "session", files: filesKnown, maxFiles: MAX_FILES });
 
   /** Send `value` + `attached`. The box is emptied now and refilled if the server does not take them. */
   const deliver = async (value: string, attached: File[]) => {
@@ -340,15 +321,8 @@ export function SessionComposer({
               icon={FileXIcon}
               title={refusalTitle(refused, nameList)}
               onDismiss={() => setRefused([])}
-              actions={
-                advice.action?.kind === "new-session" && onNewSession ? (
-                  <Button size="sm" variant="outline" onClick={onNewSession}>
-                    Start a new session
-                  </Button>
-                ) : undefined
-              }
             >
-              <RefusalBody body={advice.body} />
+              {refusalText(refused)}
             </ComposerNotice>
           )}
         </div>
@@ -365,6 +339,7 @@ export function SessionComposer({
         onStop={onStop}
         autoFocus={autoFocus}
         aria-label={`Message ${name}`}
+        draftKey={sessionId ? `session:${sessionId}` : undefined}
         placeholder={
           running
             ? stalled
@@ -386,9 +361,14 @@ export function SessionComposer({
               setProblem(left.length ? { ...problem, failed: left } : null);
             }
           },
-          accept: "image/*",
         }}
-        leading={model ? <ModelBadge model={model} variant="plain" className="ml-1 text-xs text-fg-subtle" /> : undefined}
+        leading={
+          sessionId ? (
+            <SessionModelPicker sessionId={sessionId} disabled={sending} />
+          ) : model ? (
+            <ModelBadge model={model} variant="plain" className="ml-1 text-xs text-fg-subtle" />
+          ) : undefined
+        }
         footer={footer}
         className={cn(dragging && "border-plum shadow-[var(--shadow-focus)]")}
       />
@@ -397,8 +377,8 @@ export function SessionComposer({
           aria-hidden="true"
           className="pointer-events-none absolute inset-0 flex animate-fade-in items-center justify-center gap-2 rounded-2xl bg-bg-surface/90 text-small font-medium text-fg"
         >
-          <ImagePlusIcon className="size-4 text-plum" />
-          Drop images to attach them
+          <FilePlusIcon className="size-4 text-plum" />
+          Drop files to attach them
         </div>
       )}
       </div>

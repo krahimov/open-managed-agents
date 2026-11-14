@@ -1,14 +1,12 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { toast } from "sonner";
 import {
   BoxIcon,
   CalendarClockIcon,
   FileXIcon,
+  FilePlusIcon,
   HistoryIcon,
-  ImageOffIcon,
-  ImagePlusIcon,
   PencilLineIcon,
   SparkleIcon,
   TriangleAlertIcon,
@@ -16,7 +14,8 @@ import {
 
 import { Button } from "@/components/ui/button";
 import { Collapsible } from "@/components/ui/collapsible";
-import { ApiError, useApi } from "@/lib/api";
+import { useApi } from "@/lib/api";
+import { buildUserMessageEvent } from "@/lib/attachments";
 import { plural } from "@/lib/format";
 import { useAgentActivity, useAgents, useEntityName, useRecentSessions } from "@/lib/directory";
 import { useQuietQuery } from "@/lib/useApiQuery";
@@ -40,10 +39,10 @@ import {
 } from "./draft";
 import { defaultAgent, rememberedDefault } from "./default-agent";
 import { SessionOptionsPanel, SessionOptionsTrigger } from "./SessionOptions";
-import { blankResource, useSessionOptions } from "./session-options";
+import { useSessionOptions } from "./session-options";
 import { buildStarters, type Starter, type StarterKind, type StarterRule } from "./starters";
-import { refusalAdvice, refusalTitle, type FilesKnown, type Refusal } from "../files/refusal";
-import { RefusalBody } from "../files/RefusalBody";
+import { attachToSession, newAttachmentCache, type AttachmentCache } from "../files/attach";
+import { refusalText, refusalTitle, screenAttachments, type Refusal } from "../files/refusal";
 import { failureSentence } from "@/lib/failure-text";
 
 /**
@@ -58,26 +57,27 @@ import { failureSentence } from "@/lib/failure-text";
  * way wherever a person is.
  *
  * Sending creates the session (POST /v1/sessions with the agent, the
- * options and a title cut from the first line), uploads any images to it,
+ * options and a title cut from the first line), attaches any files to it,
  * sends the first `user.message`, then opens the session. If a step fails
  * the words and the attachments stay in the box under a notice that says
  * which step failed; trying again continues with the session that was
  * already created instead of making a second one.
  *
- * Attachments are images only. Anything else that is picked, pasted or
- * dropped (anywhere on the page) is refused in a notice that names the file
- * and says what can be done instead. Nothing is dropped silently.
+ * Attachments can be any kind of file, picked, pasted or dropped anywhere
+ * on the page (up to 10, 25 MB each): an image reaches the model as a
+ * picture, any other file is saved in the agent's sandbox and the message
+ * says where (../files/attach). A file over the limits is refused in a
+ * notice that names it. Nothing is dropped silently.
  *
- * The draft (words, agent, images, options, and a start that failed part
+ * A server that asks for payment before a session can start (402) is said
+ * in the same notice as any other refusal to start: the words stay in the
+ * box, and the starter does not leave for a page this console has not got.
+ *
+ * The draft (words, agent, files, options, and a start that failed part
  * way) is kept per agent in ./draft: closing the dialog, leaving Home or
  * reloading the page brings all of it back, and a starter opened for one
  * agent never takes over a draft written for another.
  */
-
-const MAX_FILES = 10;
-const MAX_BYTES = 25 * 1024 * 1024;
-/** How many files are read to find a refused file in Files. */
-const FILES_LOOKUP = 200;
 
 type Problem = DraftProblem;
 
@@ -174,8 +174,10 @@ export function SessionStarter({
   const [optionsOpen, setOptionsOpen] = useState(false);
   const [dragging, setDragging] = useState(false);
   // What was already done for the session being started, so "Try again"
-  // picks up where it stopped: the session itself, and each uploaded image.
+  // picks up where it stopped: the session itself, and each attached file.
   const made = useRef<DraftStart | null>(boot.draft?.made ?? null);
+  /** Files already uploaded (and attached) to each session started here, by session id. */
+  const attachedTo = useRef(new Map<string, AttachmentCache>());
 
   // ── which agent ───────────────────────────────────────────────────────
   const activeAgents = useMemo(() => agents.filter((a) => !a.archived_at), [agents]);
@@ -383,14 +385,7 @@ export function SessionStarter({
   const filesRef = useRef(files);
   filesRef.current = files;
   const add = (incoming: File[]) => {
-    const accepted: File[] = [];
-    const turnedAway: Refusal[] = [];
-    for (const f of incoming) {
-      if (!f.type.startsWith("image/")) turnedAway.push({ name: f.name, why: "type", mediaType: f.type });
-      else if (f.size > MAX_BYTES) turnedAway.push({ name: f.name, why: "size" });
-      else if (filesRef.current.length + accepted.length >= MAX_FILES) turnedAway.push({ name: f.name, why: "count" });
-      else accepted.push(f);
-    }
+    const { accepted, refused: turnedAway } = screenAttachments(incoming, filesRef.current.length);
     setRefused(turnedAway);
     if (accepted.length) setFiles((prev) => [...prev, ...accepted]);
   };
@@ -438,36 +433,6 @@ export function SessionStarter({
     };
   }, []);
 
-  // What can be done with a file that is not an image depends on what
-  // Files holds: the very file, others, or nothing. Looked up only once a
-  // file was refused; while that is not known, nothing is claimed about it.
-  const refusedType = refused.some((r) => r.why === "type");
-  const mountable = useQuietQuery<{ data: Array<{ id: string; filename: string }>; has_more?: boolean }>(
-    `/v1/files?limit=${FILES_LOOKUP}`,
-    refusedType,
-  );
-  const filesKnown: FilesKnown | undefined = mountable.data
-    ? {
-        names: mountable.data.data.map((f) => f.filename),
-        partial: !!mountable.data.has_more || mountable.data.data.length >= FILES_LOOKUP,
-      }
-    : undefined;
-  const advice = refusalAdvice({ refused, where: "start", files: filesKnown, maxFiles: MAX_FILES });
-  /** Open Options with a file row for each name (one blank row when none is named). */
-  const mountFromFiles = (names: string[]) => {
-    setRefused([]);
-    const rows = options.values.resources;
-    const ids = names
-      .map((n) => mountable.data?.data.find((f) => f.filename === n)?.id)
-      .filter((id): id is string => !!id && !rows.some((r) => r.kind === "file" && r.file_id === id));
-    if (ids.length > 0) {
-      for (const id of ids) options.resources.append({ kind: "file", file_id: id, mount_path: "" });
-    } else if (names.length === 0 && !rows.some((r) => r.kind === "file" && !r.file_id)) {
-      options.resources.append(blankResource("file"));
-    }
-    setOptionsOpen(true);
-  };
-
   // ── starting ──────────────────────────────────────────────────────────
   const start = useAsyncAction(async (mode: "send" | "empty" | "without-failed" = "send") => {
     if (!agent) return;
@@ -499,53 +464,32 @@ export function SessionStarter({
         session = { key, id: created.id, uploads: new Map() };
         made.current = session;
       } catch (err) {
-        // 402 = no balance for a cloud sandbox: say so and open Billing.
-        if (err instanceof ApiError && err.status === 402) {
-          toast.error(failureSentence(err));
-          onNavigate?.();
-          nav("/billing");
-          return;
-        }
+        // A 402 (no balance for a cloud sandbox) is said here like any other
+        // refusal, in the server's words. This console has no Billing page to
+        // send the person to, and leaving would take the draft out of view.
         setProblem({ stage: "create", reason: reasonOf(err) });
         return;
       }
     }
 
-    // Same shape the session composer sends: images upload first, scoped
-    // to the session, then ride along as image blocks.
-    const content: Array<{ type: "text"; text: string } | { type: "image"; source: { type: "file"; file_id: string } }> = [];
-    if (prompt) content.push({ type: "text", text: prompt });
-    const failed: File[] = [];
-    let why = "";
-    for (const file of attach) {
-      try {
-        let uploaded = session.uploads.get(file);
-        if (!uploaded) {
-          const fd = new FormData();
-          fd.append("file", file);
-          fd.append("scope_id", session.id);
-          fd.append("downloadable", "true");
-          uploaded = await api<{ id: string; media_type: string }>("/v1/files", { method: "POST", body: fd, silentErrors: true });
-          session.uploads.set(file, uploaded);
-        }
-        content.push({ type: "image", source: { type: "file", file_id: uploaded.id } });
-      } catch (err) {
-        failed.push(file);
-        why ||= reasonOf(err);
-      }
+    // Same message the session composer sends (../files/attach): every file
+    // uploads first, scoped to the session; images ride along as pictures,
+    // other files are written into the agent's sandbox and named in a note.
+    let cache = attachedTo.current.get(session.id);
+    if (!cache) {
+      cache = newAttachmentCache();
+      attachedTo.current.set(session.id, cache);
     }
+    const { attachments, failed } = await attachToSession(api, session.id, attach, cache, reasonOf);
     if (failed.length > 0) {
-      setProblem({ stage: "upload", reason: why, failed, sessionId: session.id });
+      setProblem({ stage: "upload", reason: failed[0].reason, failed: failed.map((f) => f.file), sessionId: session.id });
       return;
     }
-    if (!prompt && content.length > 0) {
-      content.unshift({ type: "text", text: content.length === 1 ? "Attached image." : "Attached images." });
-    }
-    if (content.length > 0) {
+    if (prompt || attachments.length > 0) {
       try {
         await api(`/v1/sessions/${session.id}/events`, {
           method: "POST",
-          body: JSON.stringify({ events: [{ type: "user.message", content }] }),
+          body: JSON.stringify({ events: [buildUserMessageEvent(prompt, attachments)] }),
           silentErrors: true,
         });
       } catch (err) {
@@ -645,13 +589,12 @@ export function SessionStarter({
               onRemove: (i) => {
                 const removed = files[i];
                 setFiles((cur) => cur.filter((_, idx) => idx !== i));
-                // Taking out the image that failed settles that failure.
+                // Taking out the file that failed settles that failure.
                 if (problem?.stage === "upload" && removed) {
                   const left = problem.failed.filter((f) => f !== removed);
                   setProblem(left.length ? { ...problem, failed: left } : null);
                 }
               },
-              accept: "image/*",
             }}
             leading={
               unavailable ? undefined : (
@@ -672,8 +615,8 @@ export function SessionStarter({
               aria-hidden="true"
               className="pointer-events-none absolute inset-0 flex animate-fade-in items-center justify-center gap-2 rounded-2xl bg-bg-surface/90 text-small font-medium text-fg"
             >
-              <ImagePlusIcon className="size-4 text-plum" />
-              Drop images to attach them
+              <FilePlusIcon className="size-4 text-plum" />
+              Drop files to attach them
             </div>
           )}
         </div>
@@ -725,11 +668,11 @@ export function SessionStarter({
           )}
           {lost.length > 0 && (
             <ComposerNotice
-              icon={ImageOffIcon}
+              icon={FileXIcon}
               title={`${nameList(lost)} ${lost.length === 1 ? "was" : "were"} not kept when the page reloaded`}
               onDismiss={() => setLost([])}
             >
-              The rest of your draft is here. Attach {lost.length === 1 ? "the image" : "the images"} again to send{" "}
+              The rest of your draft is here. Attach {lost.length === 1 ? "the file" : "the files"} again to send{" "}
               {lost.length === 1 ? "it" : "them"}.
             </ComposerNotice>
           )}
@@ -753,7 +696,7 @@ export function SessionStarter({
               title={
                 failedNames.length === 1
                   ? `${nameList(failedNames)} could not be uploaded, so nothing was sent`
-                  : `${failedNames.length} images could not be uploaded, so nothing was sent`
+                  : `${failedNames.length} files could not be uploaded, so nothing was sent`
               }
               onDismiss={() => setProblem(null)}
               actions={
@@ -795,25 +738,8 @@ export function SessionStarter({
             </ComposerNotice>
           )}
           {refused.length > 0 && (
-            <ComposerNotice
-              icon={FileXIcon}
-              title={refusalTitle(refused, nameList)}
-              onDismiss={() => setRefused([])}
-              actions={
-                // Only when Files really holds something to mount: the button
-                // opens Options with the file chosen, or a row to choose one in.
-                advice.action?.kind === "mount" && agent ? (
-                  <Button size="sm" variant="outline" onClick={() => mountFromFiles(advice.action?.kind === "mount" ? advice.action.names : [])}>
-                    {advice.action.names.length === 0
-                      ? "Choose a file from Files"
-                      : advice.action.names.length === 1
-                        ? `Mount “${advice.action.names[0]}”`
-                        : `Mount ${advice.action.names.length} files`}
-                  </Button>
-                ) : undefined
-              }
-            >
-              <RefusalBody body={advice.body} />
+            <ComposerNotice icon={FileXIcon} title={refusalTitle(refused, nameList)} onDismiss={() => setRefused([])}>
+              {refusalText(refused)}
             </ComposerNotice>
           )}
         </div>
@@ -836,7 +762,7 @@ export function SessionStarter({
               <Kbd keys={["⇧", "↵"]} /> for a new line
             </span>
             <span aria-hidden="true">·</span>
-            <span>Paste or drop an image to attach it</span>
+            <span>Paste or drop a file to attach it</span>
           </p>
         )}
         {agentsFailed ? (
@@ -1000,13 +926,13 @@ function StarterRow({
 
 const capitalise = (s: string) => (s ? s[0].toUpperCase() + s.slice(1) : s);
 
-/** What a draft holds, in a few words: “Summarise yesterday's…” and 2 images. */
+/** What a draft holds, in a few words: “Summarise yesterday's…” and 2 files. */
 function describeDraft(d: Draft): string {
   const words = draftPreview(d);
-  const images = d.files.length + d.lostFiles.length;
+  const files = d.files.length + d.lostFiles.length;
   const parts: string[] = [];
   if (words) parts.push(`“${words}”`);
-  if (images > 0) parts.push(plural(images, "image"));
+  if (files > 0) parts.push(plural(files, "file"));
   if (parts.length === 0) return "session options you changed";
   return parts.join(" and ");
 }

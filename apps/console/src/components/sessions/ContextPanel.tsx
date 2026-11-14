@@ -17,9 +17,10 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { getActiveTenantId, useApi } from "@/lib/api";
+import { downloadSessionOutput, refreshSessionOutputs, useSessionOutputs } from "@/lib/session-outputs";
 import { formatAbsolute, formatCompact, formatCost } from "@/lib/format";
 import { rewardHeadline, type Trajectory } from "@/lib/trajectory";
+import { formatBytes as formatSize } from "@/lib/attachments";
 import { useQuietQuery } from "@/lib/useApiQuery";
 import { cn } from "@/lib/utils";
 import { standaloneLink } from "@/lib/links";
@@ -38,6 +39,7 @@ import type { SessionSourceInfo } from "./SessionHeader";
 import { SessionStatus } from "./SessionStatus";
 import { githubLink, LINEAR_HOME, slackLink, slackNoun } from "./source";
 import { failureSentence, withReason } from "@/lib/failure-text";
+import { downloadFile } from "../files/files";
 
 /**
  * The context panel: everything a session is made of and has produced, by
@@ -52,12 +54,7 @@ export type PeekTarget = { kind: "agent" | "environment" | "vault"; id: string }
 /** Where the conversation stands right now, as the page reads it off the live event stream. */
 export type SessionState = "empty" | "running" | "approval" | "failed" | "settled";
 
-export interface SessionOutputFile {
-  filename: string;
-  size_bytes: number;
-  uploaded_at: string;
-  media_type: string;
-}
+export type { SessionOutputFile } from "@/lib/session-outputs";
 
 interface ScopedFile {
   id: string;
@@ -659,11 +656,7 @@ function OutcomeGroup({
 // ── files ───────────────────────────────────────────────────────────────
 
 export function formatBytes(n: number | undefined): string {
-  if (n == null || !Number.isFinite(n)) return "";
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+  return n == null || !Number.isFinite(n) ? "" : formatSize(n);
 }
 
 function fileIcon(name: string, mediaType?: string) {
@@ -675,58 +668,43 @@ function fileIcon(name: string, mediaType?: string) {
   return FileIcon;
 }
 
+/** The query that lists the files attached to a session (its uploads), so a send can refresh it. */
+export const sessionUploadsPath = (sessionId: string) => `/v1/files?scope_id=${encodeURIComponent(sessionId)}&limit=50`;
+
 /**
  * Files of this session: what the agent wrote to its outputs folder, plus
- * files attached to the session. One list; every row downloads.
+ * files attached to the session. One list; every row downloads, with the
+ * console's sign-in (lib/session-outputs, components/files/files), never a
+ * bare link that would go without it.
+ *
+ * The outputs listing is shared with the links in the replies and the
+ * per-turn Files rows, and is read again whenever a turn ends.
  */
 function FilesGroup({ sessionId }: { sessionId: string }) {
-  const { api } = useApi();
-  const [outputs, setOutputs] = useState<SessionOutputFile[] | null>(null);
-  const [error, setError] = useState<Error | null>(null);
-  const [attempt, setAttempt] = useState(0);
+  const { outputs, error: outputsError } = useSessionOutputs(sessionId);
+  // A listing that failed after one that worked keeps showing the files it had.
+  const error = outputs === null && outputsError ? new Error(outputsError) : null;
   // Two reads feed this list. Each is drawn in place when it fails (no
   // toast), and a failure of one never hides what the other returned or
   // passes for "no files".
-  const scoped = useQuietQuery<{ data: ScopedFile[] }>(`/v1/files?scope_id=${encodeURIComponent(sessionId)}&limit=50`);
-
-  useEffect(() => {
-    let cancelled = false;
-    setOutputs(null);
-    setError(null);
-    api<{ data: SessionOutputFile[] }>(`/v1/sessions/${sessionId}/outputs`, { silentErrors: true })
-      .then((d) => !cancelled && setOutputs(d.data ?? []))
-      .catch((e) => !cancelled && setError(e instanceof Error ? e : new Error(String(e))));
-    return () => {
-      cancelled = true;
-    };
-  }, [api, sessionId, attempt]);
+  const scoped = useQuietQuery<{ data: ScopedFile[] }>(sessionUploadsPath(sessionId));
 
   const downloadScoped = async (f: ScopedFile) => {
     try {
-      const tenant = getActiveTenantId();
-      const res = await fetch(`/v1/files/${f.id}/content`, {
-        credentials: "include",
-        headers: tenant ? { "x-active-tenant": tenant } : {},
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const url = URL.createObjectURL(await res.blob());
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = f.filename;
-      a.click();
-      URL.revokeObjectURL(url);
+      await downloadFile({ id: f.id, filename: f.filename });
     } catch (e) {
       toast.error(withReason(`${f.filename} could not be downloaded`, e));
     }
   };
 
-  const attached = scoped.data?.data ?? [];
+  // A Cloudflare server folds the outputs into this listing too, as `out:` ids: they are listed above already.
+  const attached = (scoped.data?.data ?? []).filter((f) => !f.id.startsWith("out:"));
   const outputsLoading = outputs === null && !error;
   // A server without the files endpoint (404 / 501) has no attached files to show; that is not a failure.
   const attachedFailed = !!scoped.error && !scoped.data && !scoped.missing;
   const count = (outputs?.length ?? 0) + attached.length;
   const stillLoading = outputsLoading || scoped.isLoading;
-  const retryOutputs = () => setAttempt((n) => n + 1);
+  const retryOutputs = () => void refreshSessionOutputs(sessionId);
 
   return (
     <PanelGroup label={count > 0 ? `Files · ${count}` : "Files"}>
@@ -750,7 +728,7 @@ function FilesGroup({ sessionId }: { sessionId: string }) {
                   meta={[formatBytes(f.size_bytes), "written by the agent"].filter(Boolean).join(" · ")}
                   mediaType={f.media_type}
                   at={f.uploaded_at}
-                  href={`/v1/sessions/${sessionId}/outputs/${encodeURIComponent(f.filename)}`}
+                  onDownload={() => void downloadSessionOutput(sessionId, f.filename)}
                 />
               ))}
               {attached.map((f) => (
@@ -795,14 +773,12 @@ function FileRow({
   meta,
   mediaType,
   at,
-  href,
   onDownload,
 }: {
   name: string;
   meta: string;
   mediaType?: string;
   at?: string;
-  href?: string;
   onDownload?: () => void;
 }) {
   const Icon = fileIcon(name, mediaType);
@@ -817,7 +793,7 @@ function FileRow({
           {at ? <RelativeTime value={at} /> : null}
         </span>
       </span>
-      {(href || onDownload) && (
+      {onDownload && (
         <DownloadIcon className="size-3.5 shrink-0 text-fg-faint transition-quick group-hover/file:text-fg" aria-hidden="true" />
       )}
     </>
@@ -825,11 +801,7 @@ function FileRow({
   const cls = "group/file -mx-1.5 flex w-[calc(100%+0.75rem)] items-center gap-2.5 rounded-md px-1.5 py-1.5 text-left transition-quick";
   return (
     <li title={name}>
-      {href ? (
-        <a href={href} download={name} aria-label={`Download ${name}`} className={cn(cls, "hover:bg-bg-hover")}>
-          {body}
-        </a>
-      ) : onDownload ? (
+      {onDownload ? (
         <button type="button" onClick={onDownload} aria-label={`Download ${name}`} className={cn(cls, "hover:bg-bg-hover")}>
           {body}
         </button>

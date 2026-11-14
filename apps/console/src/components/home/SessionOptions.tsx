@@ -30,7 +30,8 @@ import { Select, SelectOption } from "../Select";
 import { Skeleton } from "../Skeleton";
 import { Tip } from "../Tip";
 import { EnvironmentPicker, useEnvironmentName } from "./EnvironmentPicker";
-import { UPLOAD_DOCS_URL } from "../files/refusal";
+import { MCP_REGISTRY } from "../../lib/mcp-registry";
+import { serverInfo } from "../sessions/tools";
 import { LookupProblem } from "./LookupProblem";
 import { blankResource, defaultMountPath, KIND_META, RESOURCE_KINDS, type SessionOptions } from "./session-options";
 
@@ -83,6 +84,24 @@ function formatBytes(n: number | undefined): string {
 }
 
 /** A link that leaves the page opens beside it, so the draft is not lost. */
+/**
+ * An app the agent uses, by name: the name the agent gives the server
+ * ("linear", "slack" read as "Linear", "Slack"), else the registry's name
+ * for its address, else its host (`mcp.example.com`) when nothing names it.
+ */
+function appLabel(app: { url: string; name?: string }, host: string): string {
+  const named = app.name?.trim();
+  if (named && !/^https?:|[./]/.test(named)) return serverInfo(named).label;
+  const known = MCP_REGISTRY.find((r) => {
+    try {
+      return new URL(r.url).hostname === host;
+    } catch {
+      return false;
+    }
+  });
+  return known?.name ?? named ?? host;
+}
+
 function AsideLink({ to, children }: { to: string; children: ReactNode }) {
   return (
     <a
@@ -419,20 +438,22 @@ function OptionsBody({ options, agent }: { options: SessionOptions; agent: Agent
   // Apps the agent uses that no chosen vault has a credential for: it would
   // call them unauthenticated and fail mid-conversation. Only said when every
   // chosen vault was read: a vault that could not be checked may cover them.
-  const uncovered: Array<{ url: string; host: string }> = [];
-  const appUrls = ((agent?.mcp_servers ?? []) as Array<{ url?: string }>)
-    .map((s) => s.url)
-    .filter((u): u is string => typeof u === "string" && u.length > 0);
-  if (appUrls.length > 0 && vaultIds.every((id) => coverage.get(id)?.state === "known")) {
+  // Each app is named the way the rest of the console names it (the name
+  // the agent gives the server, or the registry's), its address on hover.
+  const uncovered: Array<{ url: string; host: string; label: string }> = [];
+  const apps = ((agent?.mcp_servers ?? []) as Array<{ url?: string; name?: string }>).filter(
+    (s): s is { url: string; name?: string } => typeof s.url === "string" && s.url.length > 0,
+  );
+  if (apps.length > 0 && vaultIds.every((id) => coverage.get(id)?.state === "known")) {
     const covered = new Set<string>();
     for (const id of vaultIds) {
       const c = coverage.get(id);
       if (c?.state === "known") for (const h of c.hosts) covered.add(h);
     }
-    for (const url of appUrls) {
+    for (const app of apps) {
       try {
-        const host = new URL(url).hostname;
-        if (!covered.has(host)) uncovered.push({ url, host });
+        const host = new URL(app.url).hostname;
+        if (!covered.has(host)) uncovered.push({ url: app.url, host, label: appLabel(app, host) });
       } catch {
         /* not a URL */
       }
@@ -664,7 +685,7 @@ function OptionsBody({ options, agent }: { options: SessionOptions; agent: Agent
                               emptyHint={
                                 <>
                                   Nothing to mount yet: <AsideLink to="/files">Files</AsideLink> is empty. A file gets there when an agent
-                                  saves its work, or when it is uploaded (<AsideLink to={UPLOAD_DOCS_URL}>how to upload a file</AsideLink>).
+                                  saves its work, when it is attached to a message, or when it is uploaded on the Files page.
                                 </>
                               }
                               gone={!!live.file_id && !files.some((f) => f.id === live.file_id)}
@@ -821,13 +842,15 @@ function OptionsBody({ options, agent }: { options: SessionOptions; agent: Agent
                 ? "One vault's credentials could not be read"
                 : `${unchecked.length} vaults' credentials could not be read`
             }
-            action={
+          >
+            So this panel cannot tell whether every app this agent uses has a credential. The session can still be started.
+            {/* Under the words, not beside them: the column is narrow, and a button
+                at the side would squeeze the sentence into a ribbon. */}
+            <span className="mt-2 block">
               <Button variant="outline" size="xs" onClick={retryCoverage}>
                 Try again
               </Button>
-            }
-          >
-            So this panel cannot tell whether every app this agent uses has a credential. The session can still be started.
+            </span>
           </Callout>
         )}
         {uncovered.length > 0 && (
@@ -842,8 +865,8 @@ function OptionsBody({ options, agent }: { options: SessionOptions; agent: Agent
           >
             <span className="mt-1 flex flex-wrap gap-1.5">
               {uncovered.map((s) => (
-                <Chip key={s.url} mono tone="outline" title={s.url}>
-                  {s.host}
+                <Chip key={s.url} mono={s.label === s.host} tone="outline" title={s.url}>
+                  {s.label}
                 </Chip>
               ))}
             </span>
