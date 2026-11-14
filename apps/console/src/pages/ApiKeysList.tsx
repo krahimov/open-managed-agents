@@ -204,122 +204,125 @@ export function ApiKeysList() {
   });
 
   const columns = useMemo<ColumnDef<ApiKey>[]>(
-    () => [
-      {
-        id: "name",
-        accessorKey: "name",
-        header: "Key",
-        size: 280,
-        enableHiding: false,
-        enableSorting: true,
-        cell: ({ row }) => {
-          const k = row.original;
-          return (
-            // Every row here is a key: the name leads, with no icon to repeat.
-            <ResourceIdentity
-              name={k.name?.trim() || "Untitled key"}
-              mono
-              secondary={
-                <>
-                  {k.prefix}
-                  <span aria-hidden="true">••••••••</span>
-                </>
-              }
-              secondaryTitle={`Starts with ${k.prefix}. Only the first characters of a key are kept.`}
-            />
-          );
+    () => {
+      const all: ColumnDef<ApiKey>[] = [
+        {
+          id: "name",
+          accessorKey: "name",
+          header: "Key",
+          size: 280,
+          enableHiding: false,
+          enableSorting: true,
+          cell: ({ row }) => {
+            const k = row.original;
+            return (
+              // Every row here is a key: the name leads, with no icon to repeat.
+              <ResourceIdentity
+                name={k.name?.trim() || "Untitled key"}
+                mono
+                secondary={
+                  <>
+                    {k.prefix}
+                    <span aria-hidden="true">••••••••</span>
+                  </>
+                }
+                secondaryTitle={`Starts with ${k.prefix}. Only the first characters of a key are kept.`}
+              />
+            );
+          },
         },
-      },
-      {
-        id: "access",
-        header: "Access",
-        size: 320,
-        cell: ({ row }) => {
-          const k = row.original;
-          const raw = scoped ? (k.scopes ?? ["*"]) : ["*"];
-          const parts = describeScopes(raw);
-          const restricted = scoped ? Object.entries(k.resource_ids ?? {}) : [];
-          return (
-            <div className="flex min-w-0 items-center gap-1.5">
-              <ChipRow label="Scopes" items={parts.map((p) => ({ key: p.label, label: p.label, mono: p.mono }))} />
-              {restricted.length > 0 && (
-                <Tip label={`Restricted to ${restricted.map(([resource, ids]) => `${ids.length} ${resource}`).join(", ")}`}>
-                  <span
-                    role="img"
-                    aria-label="Restricted to specific resources"
-                    className="inline-flex size-[22px] shrink-0 items-center justify-center rounded-full border border-border-strong text-fg-muted"
-                  >
-                    <LockIcon className="size-3" />
+        {
+          id: "access",
+          header: "Access",
+          size: 320,
+          cell: ({ row }) => {
+            const k = row.original;
+            const raw = scoped ? (k.scopes ?? ["*"]) : ["*"];
+            const parts = describeScopes(raw);
+            const restricted = scoped ? Object.entries(k.resource_ids ?? {}) : [];
+            return (
+              <div className="flex min-w-0 items-center gap-1.5">
+                <ChipRow label="Scopes" items={parts.map((p) => ({ key: p.label, label: p.label, mono: p.mono }))} />
+                {restricted.length > 0 && (
+                  <Tip label={`Restricted to ${restricted.map(([resource, ids]) => `${ids.length} ${resource}`).join(", ")}`}>
+                    <span
+                      role="img"
+                      aria-label="Restricted to specific resources"
+                      className="inline-flex size-[22px] shrink-0 items-center justify-center rounded-full border border-border-strong text-fg-muted"
+                    >
+                      <LockIcon className="size-3" />
+                    </span>
+                  </Tip>
+                )}
+              </div>
+            );
+          },
+        },
+        {
+          id: "expires",
+          // A key that never expires sorts after every dated one.
+          accessorFn: (k) => toDate(k.expires_at)?.getTime(),
+          header: "Expires",
+          size: 170,
+          enableSorting: true,
+          cell: ({ row }) => {
+            const k = row.original;
+            const state = scoped ? expiryState(k.expires_at) : "none";
+            if (state === "none") return <span className="text-fg-subtle">Never</span>;
+            if (state === "expired") return <StatusBadge status="expired" />;
+            if (state === "soon") {
+              return (
+                <Tip label={formatAbsolute(k.expires_at)}>
+                  <span className="inline-flex">
+                    <StatusBadge status="warning" label={`Expires ${formatRelativeTime(k.expires_at)}`} />
                   </span>
                 </Tip>
-              )}
-            </div>
-          );
-        },
-      },
-      {
-        id: "expires",
-        // A key that never expires sorts after every dated one.
-        accessorFn: (k) => toDate(k.expires_at)?.getTime(),
-        header: "Expires",
-        size: 170,
-        enableSorting: true,
-        cell: ({ row }) => {
-          const k = row.original;
-          const state = scoped ? expiryState(k.expires_at) : "none";
-          if (state === "none") return <span className="text-fg-subtle">Never</span>;
-          if (state === "expired") return <StatusBadge status="expired" />;
-          if (state === "soon") {
+              );
+            }
             return (
               <Tip label={formatAbsolute(k.expires_at)}>
-                <span className="inline-flex">
-                  <StatusBadge status="warning" label={`Expires ${formatRelativeTime(k.expires_at)}`} />
-                </span>
+                <span className="text-fg-muted">{formatDate(k.expires_at)}</span>
               </Tip>
             );
-          }
-          return (
-            <Tip label={formatAbsolute(k.expires_at)}>
-              <span className="text-fg-muted">{formatDate(k.expires_at)}</span>
-            </Tip>
-          );
+          },
         },
-      },
-      {
-        id: "last_used",
-        accessorFn: (k) => toDate(k.last_used_at)?.getTime(),
-        header: "Last used",
-        size: 130,
-        enableSorting: true,
-        sortDescFirst: true,
-        cell: ({ row }) => <RelativeTime value={row.original.last_used_at} className="text-fg-muted" fallback="Never" />,
-      },
-      {
-        id: "created",
-        accessorFn: (k) => toDate(k.created_at)?.getTime(),
-        header: "Created",
-        size: 124,
-        enableSorting: true,
-        sortDescFirst: true,
-        meta: { hideBelow: 760 },
-        cell: ({ row }) => <RelativeTime value={row.original.created_at} className="text-fg-muted" />,
-      },
-      {
-        id: "actions",
-        header: "",
-        size: 56,
-        enableHiding: false,
-        cell: ({ row }) => (
-          <RowActionsMenu
-            label={`Actions for ${row.original.name}`}
-            actions={[
-              { label: "Copy key id", icon: <CopyIcon />, onSelect: () => void copyText(row.original.id) },
-              { label: "Revoke", icon: <BanIcon />, destructive: true, onSelect: () => setRevoking(row.original) },
-            ]}
-          />
-        ),
-      },
-    ].filter((c) => c.id !== "last_used" || lastUsedKept),
+        {
+          id: "last_used",
+          accessorFn: (k) => toDate(k.last_used_at)?.getTime(),
+          header: "Last used",
+          size: 130,
+          enableSorting: true,
+          sortDescFirst: true,
+          cell: ({ row }) => <RelativeTime value={row.original.last_used_at} className="text-fg-muted" fallback="Never" />,
+        },
+        {
+          id: "created",
+          accessorFn: (k) => toDate(k.created_at)?.getTime(),
+          header: "Created",
+          size: 124,
+          enableSorting: true,
+          sortDescFirst: true,
+          meta: { hideBelow: 760 },
+          cell: ({ row }) => <RelativeTime value={row.original.created_at} className="text-fg-muted" />,
+        },
+        {
+          id: "actions",
+          header: "",
+          size: 56,
+          enableHiding: false,
+          cell: ({ row }) => (
+            <RowActionsMenu
+              label={`Actions for ${row.original.name}`}
+              actions={[
+                { label: "Copy key id", icon: <CopyIcon />, onSelect: () => void copyText(row.original.id) },
+                { label: "Revoke", icon: <BanIcon />, destructive: true, onSelect: () => setRevoking(row.original) },
+              ]}
+            />
+          ),
+        },
+      ];
+      return all.filter((c) => c.id !== "last_used" || lastUsedKept);
+    },
     [scoped, lastUsedKept],
   );
 

@@ -293,123 +293,126 @@ export function ModelCardsList() {
   ];
 
   const columns = useMemo<ColumnDef<ModelCard>[]>(
-    () => [
-      {
-        id: "model_id",
-        accessorKey: "model_id",
-        header: "Model",
-        size: 310,
-        minSize: 230,
-        enableHiding: false,
-        enableSorting: true,
-        cell: ({ row }) => {
-          const c = row.original;
-          const info = describeModel(c.model_id);
-          const friendly = info.label !== c.model_id;
-          // The id agents ask for, and the model it sends when the two differ.
-          const secondary =
-            (friendly ? c.model_id : c.model !== c.model_id ? `sends ${c.model}` : providerName(c.provider)) +
-            (friendly && c.model !== c.model_id ? ` → ${c.model}` : "");
-          return (
-            <div className="flex min-w-0 items-center gap-3">
-              <ProviderTile card={c} />
-              <div className="min-w-0 flex-1">
-                <div className="flex min-w-0 items-center gap-2">
-                  <RowLink full={c.model_id} className={friendly ? "font-medium text-fg" : "font-mono text-xs font-medium text-fg"}>
-                    {info.label}
-                  </RowLink>
-                  {c.is_default && (
-                    <Tip label="Agents created without a model use this one">
-                      <span className="inline-flex shrink-0">
-                        <Chip>Default</Chip>
-                      </span>
-                    </Tip>
-                  )}
-                </div>
-                <div className="flex min-w-0">
-                  <OverflowTip label={secondary} focusable>
-                    <div className="min-w-0 truncate rounded-sm font-mono text-micro-size text-fg-subtle">{secondary}</div>
-                  </OverflowTip>
+    () => {
+      const all: ColumnDef<ModelCard>[] = [
+        {
+          id: "model_id",
+          accessorKey: "model_id",
+          header: "Model",
+          size: 310,
+          minSize: 230,
+          enableHiding: false,
+          enableSorting: true,
+          cell: ({ row }) => {
+            const c = row.original;
+            const info = describeModel(c.model_id);
+            const friendly = info.label !== c.model_id;
+            // The id agents ask for, and the model it sends when the two differ.
+            const secondary =
+              (friendly ? c.model_id : c.model !== c.model_id ? `sends ${c.model}` : providerName(c.provider)) +
+              (friendly && c.model !== c.model_id ? ` → ${c.model}` : "");
+            return (
+              <div className="flex min-w-0 items-center gap-3">
+                <ProviderTile card={c} />
+                <div className="min-w-0 flex-1">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <RowLink full={c.model_id} className={friendly ? "font-medium text-fg" : "font-mono text-xs font-medium text-fg"}>
+                      {info.label}
+                    </RowLink>
+                    {c.is_default && (
+                      <Tip label="Agents created without a model use this one">
+                        <span className="inline-flex shrink-0">
+                          <Chip>Default</Chip>
+                        </span>
+                      </Tip>
+                    )}
+                  </div>
+                  <div className="flex min-w-0">
+                    <OverflowTip label={secondary} focusable>
+                      <div className="min-w-0 truncate rounded-sm font-mono text-micro-size text-fg-subtle">{secondary}</div>
+                    </OverflowTip>
+                  </div>
                 </div>
               </div>
-            </div>
-          );
+            );
+          },
         },
-      },
-      {
-        id: "provider",
-        accessorKey: "provider",
-        header: "Provider",
-        size: 170,
-        cell: ({ row }) => {
-          const c = row.original;
-          const host = hostOf(c.base_url);
-          return (
-            <div className="min-w-0 leading-tight">
-              <div className="truncate text-fg">{providerName(c.provider)}</div>
-              {host && (
-                <div className="truncate font-mono text-micro-size text-fg-subtle" title={c.base_url}>
-                  {host}
-                </div>
-              )}
-            </div>
-          );
+        {
+          id: "provider",
+          accessorKey: "provider",
+          header: "Provider",
+          size: 170,
+          cell: ({ row }) => {
+            const c = row.original;
+            const host = hostOf(c.base_url);
+            return (
+              <div className="min-w-0 leading-tight">
+                <div className="truncate text-fg">{providerName(c.provider)}</div>
+                {host && (
+                  <div className="truncate font-mono text-micro-size text-fg-subtle" title={c.base_url}>
+                    {host}
+                  </div>
+                )}
+              </div>
+            );
+          },
         },
-      },
-      {
-        id: "api_key",
-        accessorFn: (c) => c.api_key_preview ?? "",
-        header: "API key",
-        size: 150,
-        // Its last characters only tell two keys apart; the edit dialog shows them too.
-        meta: { hideBelow: 1000 },
-        cell: ({ row }) => <MaskedSecret preview={row.original.api_key_preview} />,
-      },
-      {
-        id: "used_by",
-        header: "Used by",
-        size: 250,
-        cell: ({ row }) => <UsedBy agents={usage.models.get(row.original.model_id)} loading={usage.isLoading} />,
-      },
-      {
-        id: "spend",
-        accessorFn: (c) => (spendByModel.get(c.model) ?? spendByModel.get(c.model_id))?.cost,
-        header: `Last ${rangeDays} days`,
-        size: 150,
-        enableSorting: true,
-        sortDescFirst: true,
-        meta: { hideBelow: 720, align: "right", label: "Recent spend" },
-        cell: ({ row }) => {
-          if (usageLoading) return <Skeleton className="ml-auto h-3.5 w-14" rounded="sm" />;
-          const s = spendByModel.get(row.original.model) ?? spendByModel.get(row.original.model_id);
-          if (!s) return <span className="text-fg-subtle">No usage</span>;
-          return (
-            <div className="min-w-0 leading-tight">
-              <div className="truncate text-fg">{formatCost(s.cost)}</div>
-              <div className="truncate text-xs text-fg-subtle">{formatCompact(s.tokens)} tokens</div>
-            </div>
-          );
+        {
+          id: "api_key",
+          accessorFn: (c) => c.api_key_preview ?? "",
+          header: "API key",
+          size: 150,
+          // Its last characters only tell two keys apart; the edit dialog shows them too.
+          meta: { hideBelow: 1000 },
+          cell: ({ row }) => <MaskedSecret preview={row.original.api_key_preview} />,
         },
-      },
-      {
-        id: "created",
-        accessorFn: (c) => toDate(c.created_at)?.getTime(),
-        header: "Added",
-        size: 116,
-        enableSorting: true,
-        sortDescFirst: true,
-        cell: ({ row }) => <RelativeTime value={row.original.created_at} className="text-fg-muted" />,
-      },
-      {
-        id: "actions",
-        header: "",
-        size: 56,
-        enableHiding: false,
-        cell: ({ row }) => (
-          <RowActionsMenu label={`Actions for ${row.original.model_id}`} actions={actionsFor(row.original)} />
-        ),
-      },
-    ].filter((c) => c.id !== "spend" || usageOn),
+        {
+          id: "used_by",
+          header: "Used by",
+          size: 250,
+          cell: ({ row }) => <UsedBy agents={usage.models.get(row.original.model_id)} loading={usage.isLoading} />,
+        },
+        {
+          id: "spend",
+          accessorFn: (c) => (spendByModel.get(c.model) ?? spendByModel.get(c.model_id))?.cost,
+          header: `Last ${rangeDays} days`,
+          size: 150,
+          enableSorting: true,
+          sortDescFirst: true,
+          meta: { hideBelow: 720, align: "right", label: "Recent spend" },
+          cell: ({ row }) => {
+            if (usageLoading) return <Skeleton className="ml-auto h-3.5 w-14" rounded="sm" />;
+            const s = spendByModel.get(row.original.model) ?? spendByModel.get(row.original.model_id);
+            if (!s) return <span className="text-fg-subtle">No usage</span>;
+            return (
+              <div className="min-w-0 leading-tight">
+                <div className="truncate text-fg">{formatCost(s.cost)}</div>
+                <div className="truncate text-xs text-fg-subtle">{formatCompact(s.tokens)} tokens</div>
+              </div>
+            );
+          },
+        },
+        {
+          id: "created",
+          accessorFn: (c) => toDate(c.created_at)?.getTime(),
+          header: "Added",
+          size: 116,
+          enableSorting: true,
+          sortDescFirst: true,
+          cell: ({ row }) => <RelativeTime value={row.original.created_at} className="text-fg-muted" />,
+        },
+        {
+          id: "actions",
+          header: "",
+          size: 56,
+          enableHiding: false,
+          cell: ({ row }) => (
+            <RowActionsMenu label={`Actions for ${row.original.model_id}`} actions={actionsFor(row.original)} />
+          ),
+        },
+      ];
+      return all.filter((c) => c.id !== "spend" || usageOn);
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [usage, spendByModel, usageLoading, rangeDays, usageOn],
   );
