@@ -47,7 +47,7 @@ import { Tip } from "../../components/Tip";
 import { useAsyncAction } from "../../hooks/useAsyncAction";
 import { useApi } from "../../lib/api";
 import { useAgents } from "../../lib/directory";
-import { AUTO_JUDGE, injectJudge, type EvalSuite } from "../../lib/evals";
+import { AUTO_JUDGE, DEFAULT_JUDGE_LEVEL, injectJudge, type EvalSuite } from "../../lib/evals";
 import { plural } from "../../lib/format";
 import { useQueryClient } from "../../lib/useApiQuery";
 import { failureSentence, withReason } from "../../lib/failure-text";
@@ -111,7 +111,7 @@ export function NewEvalRunDialog({ open, onClose }: { open: boolean; onClose: ()
   const [environmentId, setEnvironmentId] = useState("");
   const [envTouched, setEnvTouched] = useState(false);
   const [judgeCardId, setJudgeCardId] = useState(AUTO_JUDGE);
-  const [judgeLevel, setJudgeLevel] = useState("max");
+  const [judgeLevel, setJudgeLevel] = useState<string>(DEFAULT_JUDGE_LEVEL);
   // The tasks: the form's cards, or the JSON while "Edit as JSON" is open.
   const [mode, setMode] = useState<"form" | "json">("form");
   const [tasks, setTasks] = useState<TaskDraft[]>(firstTask);
@@ -129,7 +129,7 @@ export function NewEvalRunDialog({ open, onClose }: { open: boolean; onClose: ()
     setEnvironmentId("");
     setEnvTouched(false);
     setJudgeCardId(AUTO_JUDGE);
-    setJudgeLevel("max");
+    setJudgeLevel(DEFAULT_JUDGE_LEVEL);
     setMode("form");
     setTasks(firstTask());
     setOpenTask(0);

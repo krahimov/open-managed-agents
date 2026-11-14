@@ -4,6 +4,7 @@ import type { ModelCard } from "@open-managed-agents/api-types";
 import { Input } from "@/components/ui/input";
 import { AUTO_JUDGE, REASONING_LEVELS, type EvalSuiteSummary } from "@/lib/evals";
 import { plural } from "@/lib/format";
+import { AGENT_COMPUTER_LABEL, isAgentComputerEnvironment, type EnvironmentChoice } from "@/lib/default-environment";
 import { describeModel } from "@/lib/models";
 import { useApiQuery } from "@/lib/useApiQuery";
 import type { AgentRecord } from "@/types/agent";
@@ -103,8 +104,7 @@ export function AgentField({
   );
 }
 
-interface EnvironmentLite {
-  id: string;
+interface EnvironmentLite extends EnvironmentChoice {
   name: string;
   description?: string;
 }
@@ -143,7 +143,12 @@ export function EnvironmentField({
         getLabel={(e) => (
           <span className="block min-w-0">
             <span className="block truncate font-medium text-fg">{e.name}</span>
-            {e.description && <span className="block truncate text-xs text-fg-subtle">{e.description}</span>}
+            {(e.description || isAgentComputerEnvironment(e)) && (
+              <span className="block truncate text-xs text-fg-subtle">
+                {/* A persistent computer is a billable choice: say so wherever it is picked. */}
+                {[isAgentComputerEnvironment(e) ? `A ${AGENT_COMPUTER_LABEL}` : null, e.description].filter(Boolean).join(" · ")}
+              </span>
+            )}
           </span>
         )}
         getTextLabel={(e) => e.name}

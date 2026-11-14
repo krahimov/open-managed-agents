@@ -26,6 +26,8 @@
  *
  * Pure and synchronous: no React, no fetching.
  */
+import { REASONING_LEVEL_LABELS, UI_REASONING_LEVELS, type UiReasoningLevel } from "@open-managed-agents/api-types";
+
 import type { StatusTone } from "@/components/Badge";
 
 import { toDate } from "./format";
@@ -496,13 +498,15 @@ export function severityTotals(report: FindingsReport | undefined): Array<{ seve
 /** Radix Select items cannot carry an empty value. */
 export const AUTO_JUDGE = "__auto__";
 
-export const REASONING_LEVELS = [
-  { value: "instant", label: "Instant" },
-  { value: "low", label: "Low" },
-  { value: "medium", label: "Medium" },
-  { value: "high", label: "High" },
-  { value: "max", label: "Max" },
-] as const;
+/** The judge's reasoning levels: the same five every model picker offers
+ *  (api-types UI_REASONING_LEVELS, "Extra High" included). The legacy
+ *  "instant" is not offered. */
+export const REASONING_LEVELS: ReadonlyArray<{ value: UiReasoningLevel; label: string }> = UI_REASONING_LEVELS.map(
+  (value) => ({ value, label: REASONING_LEVEL_LABELS[value] }),
+);
+
+/** The judge's level when nobody chose one: the most careful grading. */
+export const DEFAULT_JUDGE_LEVEL: UiReasoningLevel = "max";
 
 /** Write the chosen judge onto every `llm_judge` reward in a reward tree. */
 export function injectJudge(spec: unknown, judge: { model_card_id?: string; reasoning_level: string }): void {
