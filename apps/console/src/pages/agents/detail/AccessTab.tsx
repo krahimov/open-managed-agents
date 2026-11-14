@@ -89,6 +89,23 @@ export function printAuditTrail() {
 const CAPABILITY_PREVIEW = 8;
 
 /**
+ * The server's notes on the tool list, in the console's words. The note
+ * that no policy is enforced is dropped: the card's description says so.
+ * A note this does not know is shown as the server wrote it.
+ */
+export function capabilityNotes(notes: string[] | undefined): string[] {
+  return (notes ?? []).flatMap((note) => {
+    if (/^No enabled baseline grant/i.test(note)) return [];
+    if (/^MCP tool lists are discovered at session runtime/i.test(note)) {
+      return [
+        "An MCP server's tools are only known once a session runs, so each server is one row here and its row applies to all of its tools. Rules for a single MCP tool still apply in sessions.",
+      ];
+    }
+    return [note];
+  });
+}
+
+/**
  * Access: what this agent is allowed to do, and the record of it.
  *
  *   - Access policy: the versioned baseline grant. Edits apply to new
@@ -321,9 +338,9 @@ export function AccessTab({
               </TableBody>
             </Table>
           )}
-          {(capability.data?.notes ?? []).length > 0 && (
+          {capabilityNotes(capability.data?.notes).length > 0 && (
             <div className="space-y-1.5 border-t border-border px-5 py-3.5 text-xs text-fg-subtle">
-              {(capability.data?.notes ?? []).map((n, i) => (
+              {capabilityNotes(capability.data?.notes).map((n, i) => (
                 <p key={i}>{n}</p>
               ))}
             </div>
