@@ -19,7 +19,9 @@ import { CommandPalette } from "./CommandPalette";
 import { Kbd } from "./Kbd";
 import { NavigationProgress } from "./NavigationProgress";
 import { pageColumn, type PageWidth } from "./Page";
+import { useNavigation } from "./navigation";
 import { NewSessionHost } from "./sessions/NewSessionDialog";
+import { TelegramOnboarding } from "./TelegramOnboarding";
 import { Tip } from "./Tip";
 
 /**
@@ -27,6 +29,8 @@ import { Tip } from "./Tip";
  *
  *   ┌ stage (warm tint) ──────────────────────────────────────────┐
  *   │ sidebar │ ╭ panel (page canvas, rounded, 8px inset) ──────╮ │
+ *   │         │ │ Telegram     the offer to link Telegram, until │ │
+ *   │         │ │              linked (TelegramOnboarding)       │ │
  *   │         │ │ top bar      only on nested pages (breadcrumb) │ │
  *   │         │ │              or while the sidebar is hidden    │ │
  *   │         │ │ header slot  <PageHeader> portals here; fixed  │ │
@@ -64,23 +68,34 @@ function sidebarStartsOpen(): boolean {
   }
 }
 
-export function AppShell() {
-  const { isAuthenticated, isLoading } = useAuth();
+/**
+ * The `g` chords: g h → Home, g a → Agents, g s → Sessions, … plus the older
+ * aliases that still work (lib/route-chords.ts). A destination this server
+ * does not have (navigation.tsx) has no chord either. Mounted only once
+ * signed in, so the feature list is not read before there is a session.
+ */
+function RouteChords() {
   const navigate = useNavigate();
-
-  // `g` chords: g h → Home, g a → Agents, g s → Sessions, … plus the older
-  // aliases that still work (lib/route-chords.ts).
+  const { shows } = useNavigation();
   const chordBindings = useMemo<ChordBinding[]>(
     () =>
-      [...Object.entries(ROUTE_CHORDS), ...Object.entries(ROUTE_CHORD_ALIASES)].map(([path, key]) => ({
-        prefix: "g",
-        key,
-        handler: () => navigate(path),
-        label: path,
-      })),
-    [navigate],
+      [...Object.entries(ROUTE_CHORDS), ...Object.entries(ROUTE_CHORD_ALIASES)]
+        .filter(([path]) => shows(path))
+        .map(([path, key]) => ({
+          prefix: "g",
+          key,
+          handler: () => navigate(path),
+          label: path,
+        })),
+    [navigate, shows],
   );
   useChordKeybinding(chordBindings);
+  return null;
+}
+
+export function AppShell() {
+  const { isAuthenticated, isLoading } = useAuth();
+  const { pathname, search, hash } = useLocation();
 
   if (isLoading) {
     return (
@@ -91,7 +106,8 @@ export function AppShell() {
   }
 
   if (!isAuthenticated) {
-    return <Navigate to="/login" replace />;
+    // Back to where they were going once they have signed in (Login honours `next`).
+    return <Navigate to={`/login?next=${encodeURIComponent(pathname + search + hash)}`} replace />;
   }
 
   return (
@@ -118,6 +134,7 @@ export function AppShell() {
           Skip to content
         </a>
         <NavigationProgress />
+        <RouteChords />
         <CommandPalette />
         {/* The one place a session starts from; see lib/shell-events startSession(). */}
         <NewSessionHost />
@@ -208,6 +225,8 @@ function ShellPanel() {
           aria-hidden="true"
           className="pointer-events-none absolute inset-0 overflow-hidden rounded-[inherit]"
         />
+
+        <TelegramOnboarding />
 
         <div
           className={cn(

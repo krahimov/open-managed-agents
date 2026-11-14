@@ -30,7 +30,7 @@ import { SessionStatusDot } from "./sessions/SessionStatus";
 import { useAgentActivityNow, usePatienceForRequests, useSessionReadings } from "./sessions/readings";
 import { Kbd } from "./Kbd";
 import { Logo } from "./Logo";
-import { allWorkspaceGroups, isNavItemActive, PRIMARY_NAV, type NavGroup, type NavItem } from "./navigation";
+import { isNavItemActive, useNavigation, type NavGroup, type NavItem } from "./navigation";
 import { Skeleton } from "./Skeleton";
 import { TenantSwitcher } from "./TenantSwitcher";
 import { Tip } from "./Tip";
@@ -43,7 +43,8 @@ import { UserProfile } from "./UserProfile";
  *   New session       the one prominent control; opens Home's composer
  *   Search            opens the command palette (⌘K)
  *   primary nav       Home · Agents · Sessions · Operations (with a count
- *                     when something is waiting on a person)
+ *                     when something is waiting on a person; only on a
+ *                     server that has it, see navigation.tsx)
  *   Frequent          the agents this workspace talks to most; hover a row
  *                     for "new session with this agent"
  *   Recents           the latest sessions, one flat list, with a dot when
@@ -557,7 +558,8 @@ export function AppSidebar() {
   }, [agents, byAgent]);
   const recents = useMemo(() => sessions.slice(0, RECENT_COUNT), [sessions]);
 
-  const groups = useMemo(() => allWorkspaceGroups(), []);
+  // Destinations this server has (a page whose endpoints it lacks is left out).
+  const { primary, groups } = useNavigation();
 
   // The lists are sized from the room between the primary nav and the
   // Workspace block. That room depends on the window's height and on
@@ -666,7 +668,7 @@ export function AppSidebar() {
           </div>
 
           <nav aria-label="Main" className="flex shrink-0 flex-col items-center gap-0.5">
-            {PRIMARY_NAV.map((item) => {
+            {primary.map((item) => {
               const flagged = item.to === "/operations" && (attention > 0 || unknown > 0);
               return (
                 <RailLink
@@ -756,7 +758,7 @@ export function AppSidebar() {
 
         {/* Primary destinations */}
         <nav aria-label="Main" className="shrink-0 space-y-0.5 px-3 pb-2">
-          {PRIMARY_NAV.map((item) => (
+          {primary.map((item) => (
             <NavRow key={item.to} item={item} badge={item.to === "/operations" ? opsBadge : undefined} />
           ))}
         </nav>

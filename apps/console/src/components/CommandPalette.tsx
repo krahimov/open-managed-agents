@@ -30,7 +30,7 @@ import { AgentAvatar } from "./AgentAvatar";
 import { SessionStatusDot } from "./sessions/SessionStatus";
 import { useSessionReadings } from "./sessions/readings";
 import { Kbd } from "./Kbd";
-import { allNavItems, type NavItem } from "./navigation";
+import { useNavigation, type NavItem } from "./navigation";
 import { RelativeTime } from "./RelativeTime";
 
 const THEMES = [
@@ -267,13 +267,15 @@ export function CommandPalette() {
   ];
   const unread = sources.filter((s) => s.query.data === undefined && s.query.isError && !s.query.isFetching);
 
+  // Only the destinations this server has.
+  const { items: navItems } = useNavigation();
+
   const rows = useMemo<Row[]>(() => {
     const run = (fn: () => void) => () => {
       setOpen(false);
       fn();
     };
     const go = (to: string) => run(() => nav(to));
-    const navItems = allNavItems();
     return [
       {
         kind: "action",
@@ -366,7 +368,7 @@ export function CommandPalette() {
         }),
       ),
     ];
-  }, [agents, sessions, recordLists, theme, nav, setTheme]);
+  }, [agents, sessions, recordLists, theme, nav, setTheme, navItems]);
 
   const searching = query.trim().length > 0;
   const results = useMemo(() => (searching ? rank(query, rows) : []), [searching, query, rows]);

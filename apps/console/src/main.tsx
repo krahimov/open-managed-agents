@@ -18,6 +18,9 @@ import { Toaster } from "./components/ui/sonner";
 import { AppShell } from "./components/AppShell";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { queryClient } from "./lib/query-client";
+import { installChunkReloadHandlers } from "./lib/chunk-reload";
+import { lazyRoute } from "./lib/lazy-route";
+import { installUpdatePrompt, showUpdateToast } from "./lib/update-prompt";
 import { Login } from "./pages/Login";
 import { Dashboard } from "./pages/Dashboard";
 import { AgentsList } from "./pages/AgentsList";
@@ -91,11 +94,28 @@ function entityCrumb(kind: EntityKind, m: UIMatch, fallback: string) {
  * `errorElement` etc). Compared to wrapping `<React.lazy />` in a
  * `<Suspense>`, the data router knows to await the chunk before
  * rendering the route, avoiding a flash of fallback during navigation.
+ * Always go through `lazyRoute` (lib/lazy-route.tsx): a stale-chunk reload
+ * makes the import resolve to undefined instead of rejecting.
  *
  * Per-route `handle.crumb` publishes a label for AppBreadcrumb. For
  * fixed labels pass a string; for dynamic labels (resource name from
  * the loader) pass a function that reads the match.
  */
+
+/**
+ * The Muse kit: every shared component with live data, the visual companion
+ * to DESIGN.md. Not linked from the navigation, and only in dev builds: in
+ * production `/_kit` is an unknown address like any other.
+ */
+const kitRoutes: RouteObject[] = import.meta.env.DEV
+  ? [
+      {
+        path: "_kit",
+        handle: { crumb: "Design kit" },
+        lazy: lazyRoute(() => import("./pages/Kit"), "Kit"),
+      },
+    ]
+  : [];
 
 const protectedRoutes: RouteObject[] = [
   { index: true, element: <Dashboard />, handle: { crumb: "Home" } },
@@ -121,10 +141,7 @@ const protectedRoutes: RouteObject[] = [
             // ai-elements + Shiki like SessionDetail), so keep it out of the list bundle.
             path: "setup",
             handle: { crumb: "Setup" },
-            lazy: async () => {
-              const { AgentSetup } = await import("./pages/agents/AgentSetup");
-              return { Component: AgentSetup };
-            },
+            lazy: lazyRoute(() => import("./pages/agents/AgentSetup"), "AgentSetup"),
           },
         ],
       },
@@ -143,10 +160,7 @@ const protectedRoutes: RouteObject[] = [
         // Streamdown + mermaid + dozens of language defs (~500 kB
         // gzipped). Splitting it out keeps the initial bundle for
         // /agents, /sessions list, etc. under 350 kB.
-        lazy: async () => {
-          const { SessionDetail } = await import("./pages/SessionDetail");
-          return { Component: SessionDetail };
-        },
+        lazy: lazyRoute(() => import("./pages/SessionDetail"), "SessionDetail"),
       },
     ],
   },
@@ -154,10 +168,7 @@ const protectedRoutes: RouteObject[] = [
   {
     path: "usage",
     handle: { crumb: "Usage" },
-    lazy: async () => {
-      const { UsagePage } = await import("./pages/UsagePage");
-      return { Component: UsagePage };
-    },
+    lazy: lazyRoute(() => import("./pages/UsagePage"), "UsagePage"),
   },
   {
     path: "evals",
@@ -181,10 +192,7 @@ const protectedRoutes: RouteObject[] = [
             },
             // Lazy: pulls in TimelineView + trajectory panels, only
             // needed once an operator drills into a trial.
-            lazy: async () => {
-              const { EvalTrialDetail } = await import("./pages/EvalTrialDetail");
-              return { Component: EvalTrialDetail };
-            },
+            lazy: lazyRoute(() => import("./pages/EvalTrialDetail"), "EvalTrialDetail"),
           },
         ],
       },
@@ -230,12 +238,8 @@ const protectedRoutes: RouteObject[] = [
   },
   { path: "model-cards", element: <ModelCardsList />, handle: { crumb: "Models" } },
   { path: "api-keys", element: <ApiKeysList />, handle: { crumb: "API keys" } },
-  { path: "operations", handle: { crumb: "Operations" }, lazy: async () => {
-    const { Operations } = await import("./pages/Operations"); return { Component: Operations };
-  } },
-  { path: "workspace", handle: { crumb: "Workspace" }, lazy: async () => {
-    const { WorkspaceSettings } = await import("./pages/WorkspaceSettings"); return { Component: WorkspaceSettings };
-  } },
+  { path: "operations", handle: { crumb: "Operations" }, lazy: lazyRoute(() => import("./pages/Operations"), "Operations") },
+  { path: "workspace", handle: { crumb: "Workspace" }, lazy: lazyRoute(() => import("./pages/WorkspaceSettings"), "WorkspaceSettings") },
   { path: "runtimes", element: <RuntimesList />, handle: { crumb: "Local runtimes" } },
   {
     path: "integrations",
@@ -305,16 +309,8 @@ const protectedRoutes: RouteObject[] = [
       },
     ],
   },
-  // The Muse kit: every shared component with live data. The visual
-  // companion to DESIGN.md; not linked from the navigation.
-  {
-    path: "_kit",
-    handle: { crumb: "Design kit" },
-    lazy: async () => {
-      const { Kit } = await import("./pages/Kit");
-      return { Component: Kit };
-    },
-  },
+  // The Muse kit (dev builds only, see `kitRoutes`).
+  ...kitRoutes,
   // Plugin-contributed routes (hosted-only extensions). Default empty in
   // OSS — hosted deploy overlays plugins/registry.ts to inject billing
   // / etc. PluginRoute keeps the same `{ path, element }` shape that
@@ -331,24 +327,26 @@ const router = createBrowserRouter([
   { path: "connect-runtime", element: <Titled title="Connect this machine"><ConnectRuntime /></Titled> },
   { path: "composio/callback", element: <Titled title="Connecting an app"><ComposioCallback /></Titled> },
   {
+    // A Telegram bot's Connect button opens this inside Telegram. Outside the
+    // shell: Telegram's signed launch data is the proof, not a console sign-in.
+    path: "telegram/connect/:sessionId/:requestId",
+    lazy: lazyRoute(() => import("./pages/TelegramConnect"), "TelegramConnect"),
+  },
+  {
     element: <AppShell />,
     children: protectedRoutes,
   },
 ]);
 
 // A deploy replaces every hashed chunk; tabs opened before it still hold
-// the old index.html and fail to lazy-load route chunks (Model Cards /
-// Integrations pages silently break). Vite fires this event exactly for
-// that case — reload once to pick up the fresh manifest.
-window.addEventListener("vite:preloadError", (event) => {
-  event.preventDefault();
-  const KEY = "oma-chunk-reload-at";
-  const last = Number(sessionStorage.getItem(KEY) ?? 0);
-  if (Date.now() - last > 10_000) {
-    sessionStorage.setItem(KEY, String(Date.now()));
-    window.location.reload();
-  }
-});
+// the old index.html and fail to lazy-load chunks. A failed route chunk
+// loads the target URL fresh (loop-guarded); any other chunk (grammars,
+// diagrams, the desktop viewer) just shows the update prompt - never a
+// forced reload mid-session.
+installChunkReloadHandlers({ router, onStaleChunk: () => showUpdateToast() });
+// Long-lived tabs otherwise keep running the old build forever: prompt
+// (never force) a reload when a newer deploy is live.
+installUpdatePrompt(router);
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
