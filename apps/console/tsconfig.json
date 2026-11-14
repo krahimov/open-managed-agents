@@ -19,6 +19,5 @@
       "@/registry/default/lib/*": ["./src/lib/*"]
     }
   },
-  "include": ["src"],
-  "exclude": ["src/__main_tests__"]
+  "include": ["src"]
 }

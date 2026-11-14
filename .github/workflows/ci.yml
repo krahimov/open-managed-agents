@@ -68,5 +68,7 @@ jobs:
           node-version: '22'  # matches Dockerfile (node:22-slim); better-sqlite3 11 crashes natively on Node 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # The root typecheck excludes apps/console, so the console checks its own types.
+      - run: pnpm --filter managed-agents-console typecheck
       - run: pnpm run test:console
       - run: pnpm run test:scripts

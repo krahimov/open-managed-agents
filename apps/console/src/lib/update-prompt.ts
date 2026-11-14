@@ -1,5 +1,6 @@
 import { toast } from "sonner";
 import { createUpdateChecker, currentEntryScript } from "./app-version";
+import { BRAND_NAME } from "./brand";
 import { sessionStoreOf, stashDrafts } from "./composer-draft";
 
 const POLL_INTERVAL_MS = 5 * 60_000;
@@ -46,9 +47,9 @@ export function reloadKeepingDrafts(win: Window = window): boolean {
  * right. Same id → never stacks.
  */
 export function showUpdateToast(opts: { onSnooze?: () => void } = {}) {
-  toast("Orrery was updated", {
+  toast(`${BRAND_NAME} was updated`, {
     id: TOAST_ID,
-    description: "A new version is available. Reload when you're ready — your unsent message is kept.",
+    description: "A new version is available. Reload when you're ready. Your unsent message is kept.",
     duration: Infinity,
     position: "top-center",
     closeButton: true,
