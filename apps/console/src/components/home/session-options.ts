@@ -4,6 +4,8 @@ import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
 import { BrainIcon, FileTextIcon, VariableIcon } from "lucide-react";
 
+import { pickDefaultEnvironmentId, type EnvironmentChoice } from "../../lib/default-environment";
+import { useQuietQuery } from "../../lib/useApiQuery";
 import { GitHubIcon } from "../icons";
 import type { AgentRecord } from "../../types/agent";
 import type { DraftOptions } from "./draft";
@@ -23,6 +25,11 @@ import type { DraftOptions } from "./draft";
  * person chooses otherwise, so they are held as "chosen, or not": moving a
  * draft to another agent puts both back to that agent's defaults, while
  * mounted resources and the title are the person's own and stay.
+ *
+ * An agent with no default environment starts in the workspace's first
+ * ordinary environment (`pickDefaultEnvironmentId`), never in a persistent
+ * agent computer nobody chose; only when there is none does the person
+ * have to choose.
  */
 
 // ── resources ───────────────────────────────────────────────────────────
@@ -223,11 +230,24 @@ export function useSessionOptions(
   // An agent bound to a connected machine runs there: no sandbox to choose.
   const localRuntime = !!agent?._oma?.runtime_binding;
 
+  // Without a default of the agent's own (and nothing chosen or pinned), the
+  // first ordinary environment applies. Read only when it is needed.
+  const needsFallback = !!agent && !localRuntime && !defaultEnvironmentId && !pinnedEnvironmentId && !chosenEnvironment;
+  const environmentsQuery = useQuietQuery<{ data: EnvironmentChoice[] }>("/v1/environments?limit=100", needsFallback);
+  const fallbackEnvironmentId = needsFallback ? pickDefaultEnvironmentId(environmentsQuery.data?.data ?? []) : "";
+  const fallbackPending = needsFallback && environmentsQuery.isPending;
+  /** What applies when nothing is chosen: the agent's default, else the fallback. */
+  const baseEnvironmentId = defaultEnvironmentId || fallbackEnvironmentId;
+
   const values = form.watch();
-  const environmentId = localRuntime ? "" : chosenEnvironment || pinnedEnvironmentId || defaultEnvironmentId;
+  const environmentId = localRuntime ? "" : chosenEnvironment || pinnedEnvironmentId || baseEnvironmentId;
   const vaultIds = chosenVaults ?? defaultVaultIds;
-  const environmentMissing = !!agent && !localRuntime && !environmentId;
-  const environmentChanged = !localRuntime && !!environmentId && environmentId !== defaultEnvironmentId;
+  // Said only once the fallback is known, so the warning does not flash.
+  const environmentMissing = !!agent && !localRuntime && !environmentId && !fallbackPending;
+  const environmentChanged = !localRuntime && !!environmentId && environmentId !== baseEnvironmentId;
+  /** The session will run in the first ordinary environment because the
+   *  agent has no default of its own. */
+  const environmentIsFallback = !localRuntime && !!environmentId && !defaultEnvironmentId && environmentId === fallbackEnvironmentId;
   const vaultsChanged = !sameSet(vaultIds, defaultVaultIds);
   const title = values.title.trim();
   /** How many things differ from what the agent would do on its own. */
@@ -296,12 +316,13 @@ export function useSessionOptions(
     vaultIds,
     environmentMissing,
     environmentChanged,
+    environmentIsFallback,
     vaultsChanged,
     title,
     changes,
     resourcesInvalid,
     /** Nothing here stops the session from starting. */
-    ready: !environmentMissing && !resourcesInvalid,
+    ready: !environmentMissing && !fallbackPending && !resourcesInvalid,
     setEnvironment,
     toggleVault,
     load,

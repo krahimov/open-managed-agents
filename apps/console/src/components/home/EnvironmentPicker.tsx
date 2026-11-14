@@ -5,6 +5,7 @@ import { CheckIcon, ChevronDownIcon } from "lucide-react";
 import { Command, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { useApi } from "@/lib/api";
+import { AGENT_COMPUTER_LABEL, isAgentComputerEnvironment, type EnvironmentChoice } from "@/lib/default-environment";
 import { useQuietQuery } from "@/lib/useApiQuery";
 import { cn } from "@/lib/utils";
 
@@ -23,10 +24,13 @@ import { LookupProblem } from "./LookupProblem";
  * own, because it may be the agent's default and not on the first page:
  * `name` reports it to the caller as loading, found, gone, or unavailable,
  * so the field around the picker can say so instead of showing an id.
+ *
+ * An environment that gives the agent a persistent computer of its own is
+ * a billable choice, so it says so in the list and on the field once
+ * chosen ("persistent agent computer", the same words as the agent form).
  */
 
-export interface EnvironmentPick {
-  id: string;
+export interface EnvironmentPick extends EnvironmentChoice {
   name: string;
   description?: string;
   archived_at?: string | null;
@@ -39,6 +43,8 @@ export function useEnvironmentName(id: string | null | undefined) {
   const query = useQuietQuery<EnvironmentPick>(id ? `/v1/environments/${id}` : null);
   return {
     name: query.data?.name,
+    /** It gives the agent a persistent computer. */
+    computer: !!query.data && isAgentComputerEnvironment(query.data),
     archived: !!query.data?.archived_at,
     isLoading: !!id && query.isLoading,
     /** The server says there is no such environment. */
@@ -93,6 +99,7 @@ export function EnvironmentPicker({
   const label = !value
     ? "Choose an environment"
     : (inList?.name ?? name.name ?? (name.isLoading ? "Loading environment…" : name.missing ? "Deleted environment" : "Environment name unavailable"));
+  const computer = !!value && (inList ? isAgentComputerEnvironment(inList) : name.computer);
 
   return (
     <Popover
@@ -114,8 +121,12 @@ export function EnvironmentPicker({
           aria-invalid={invalid || undefined}
           className="inline-flex h-9 w-full items-center justify-between gap-2 rounded-md border border-border-strong bg-bg-surface px-3 text-sm text-fg shadow-[var(--shadow-xs)] transition-quick outline-none hover:border-fg-faint focus-visible:border-plum focus-visible:shadow-[var(--shadow-focus)] focus-visible:outline-none aria-expanded:border-plum aria-invalid:border-danger dark:bg-bg-soft"
         >
-          <span title={label} className={cn("flex-1 truncate text-left", (!value || (!inList && !name.name)) && "text-fg-subtle")}>
+          <span
+            title={computer ? `${label} · ${AGENT_COMPUTER_LABEL}` : label}
+            className={cn("flex-1 truncate text-left", (!value || (!inList && !name.name)) && "text-fg-subtle")}
+          >
             {label}
+            {computer && <span className="text-fg-subtle"> · {AGENT_COMPUTER_LABEL}</span>}
           </span>
           <ChevronDownIcon className="size-4 shrink-0 text-fg-subtle" />
         </button>
@@ -158,7 +169,13 @@ export function EnvironmentPicker({
                   >
                     <span className="block min-w-0 flex-1">
                       <span className="block truncate font-medium text-fg">{e.name}</span>
-                      {e.description && <span className="block truncate text-xs text-fg-subtle">{e.description}</span>}
+                      {(e.description || isAgentComputerEnvironment(e)) && (
+                        <span className="block truncate text-xs text-fg-subtle">
+                          {[isAgentComputerEnvironment(e) ? `A ${AGENT_COMPUTER_LABEL}` : null, e.description]
+                            .filter(Boolean)
+                            .join(" · ")}
+                        </span>
+                      )}
                     </span>
                     {e.id === value && <CheckIcon className="mt-0.5 size-4 shrink-0 text-fg" />}
                   </CommandItem>
