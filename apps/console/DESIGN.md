@@ -2,13 +2,13 @@
 
 This is the contract for every screen. Read it once, top to bottom, before you build. If something you
 need is not here, look at how **Home** (`src/pages/Dashboard.tsx`) and **Agents** (`src/pages/AgentsList.tsx`)
-do it, then at `/_kit` (every shared component rendered with live data, both themes). If it is still not
+do it, then at `/_kit` in a dev build (every shared component rendered with live data, both themes). If it is still not
 there, build it from tokens and existing parts — do not invent a new look.
 
 - Tokens: `src/index.css`
 - Shared components: `src/components/*` (one import: `@/components/kit`)
 - Primitives: `src/components/ui/*`
-- Living reference: `http://127.0.0.1:5194/_kit`
+- Living reference: `/_kit` on the dev server (`vite`); it is not in production builds
 
 Contents: [1 Principles](#1-principles) · [2 Tokens](#2-tokens) · [3 Frame and layout](#3-frame-and-layout) ·
 [4 Components](#4-components) · [5 Page patterns](#5-page-patterns) · [6 Motion](#6-motion) ·
@@ -68,7 +68,7 @@ Text and lines.
 | `text-fg` | Primary text, titles, values | `#261925` | `#f3efec` | 16:1 |
 | `text-fg-muted` | Secondary text, descriptions | `#5f545d` | `#bab1b7` | 7:1 |
 | `text-fg-subtle` | Captions, placeholders, table heads, meta | `#6e666d` | `#a1999e` | ≥ 4.7:1 on every surface, soft fill and hovered row |
-| `text-fg-faint` | Decorative glyphs, chevrons, disabled. **Never text that must be read.** | `#a39ca2` | `#686165` | — |
+| `text-fg-faint` | Decorative glyphs, chevrons, disabled. **Never text that must be read.** Readable text set in it is raised to subtle automatically ("Faint text" in `index.css`), so it passes AA. | `#a39ca2` | `#686165` | — |
 | `border-border` | Hairline (alpha): card edges, dividers | ink 9% | white 8.5% | — |
 | `border-border-strong` | Control edges (inputs, outline buttons), dashed chips | ink 17% | white 17% | — |
 
@@ -259,13 +259,17 @@ everything that enters or moves; plain `ease-in` for exits. Utilities: `transiti
 ```
 
 **Sidebar** (`AppSidebar.tsx`), top to bottom: brand + collapse (⌘B) · **New session** · Search (⌘K) ·
-primary nav (Home, Agents, Sessions, Operations with a count) · **Frequent** agents · **Recents** (one flat
+primary nav (Home, Agents, Sessions, and Operations with a count when the server has it) · **Frequent** agents · **Recents** (one flat
 list of sessions with a status dot; the agent and the day are in each row's tooltip) · **Workspace** (Run /
 Build / Connect / Settings: four rows that each open a menu beside them) · workspace switcher + account menu
 (theme lives there).
 
 How it behaves:
 
+- **A destination the server does not have is not drawn.** A nav item can name a server `feature`
+  (`lib/server-features.ts`); `useNavigation()` then hides it, its ⌘K row and its `g` chord together until
+  `GET /v1/server_features` lists that feature. The route stays mounted, so a typed URL reaches the page's
+  own "not available on this server" state (§4.8), never an error.
 - **One layout. Nothing appears, opens or moves because of the route.** The only thing navigation changes
   is which row is drawn as current. A Workspace page makes its **group's row** current, and the row names the
   page ("Build · Vaults"). Proven by `_rig/notes/muse/tools/r1-shell/sidebar_probe.mjs` on 15 routes at four
@@ -603,7 +607,7 @@ token order. Every chart sits in a `SectionCard` whose title says what is plotte
 |---|---|
 | `Composer` | The prompt box. `size="lg"` on Home, `"md"` in a session. Slots: `leading`, `trailing`, `attachments`, `footer`. Send button states: disabled, ready, `submitting`, `running` + `onStop` (stop square). Enter sends, Shift+Enter adds a line. |
 | `ComposerNotice` | The notice that sits against a composer: a refused file (named, with the reason), a message that was not sent (the server's reason, Try again), an upload that failed. Both composers use it. |
-| `SessionStarter` (`components/home`) | **The one way to start a session** (§9.0): the box, the agent picker, image attachments, Options (environment, vaults, resources, title) and things to ask. Inline on Home, in `NewSessionDialog` everywhere else. |
+| `SessionStarter` (`components/home`) | **The one way to start a session** (§9.0): the box, the agent picker, attachments (any file, 25 MB each), Options (environment, vaults, resources, title) and things to ask. Inline on Home, in `NewSessionDialog` everywhere else. |
 | `AgentPicker` | Pill + searchable popover to choose an agent. |
 | `EventCard` | Everything an agent **does** that is not prose. `kind`: `tool`, `mcp`, `thinking`, `approval`, `error`. |
 | `EventSection`, `CodeWell` | Labelled parts of an event body and mono blocks for input/output. |
@@ -611,7 +615,10 @@ token order. Every chart sits in a `SectionCard` whose title says what is plotte
 
 `EventCard` looks: **tool / mcp** = a 40px soft row (icon · mono name · one-line preview · duration · state
 glyph), closed by default, opens to `EventSection`s. **thinking** = bare muted row that folds; shimmers while
-running. **approval** = amber-tinted, always open, actions in a footer; it cannot be collapsed. **error** =
+running. **approval** = amber-tinted, always open, actions in a footer (`ApprovalControls`: **Allow this call** · **Deny**,
+and Deny opens a second step with an optional reason, "Tell the agent why"); it cannot be collapsed. The
+decision is the session's own `user.tool_confirmation` event (with the sub-agent's thread when it is not the
+main one); everyone may decide when the server keeps no workspace roles. **error** =
 red-tinted, always open, optional Retry. See §9.3 for how they compose into a session.
 
 ### 4.8 States
@@ -623,6 +630,7 @@ red-tinted, always open, optional Retry. See §9.3 for how they compose into a s
 | `ErrorState` (`QueryProblem`) | A read failed. `title` says **what** could not be loaded; the reason is a sentence from `failureSentence` (the server's own words when they read as one, otherwise what kind of failure it was, "The server had a problem (“unavailable”)…", never the bare token); `retry` refetches. `compact` for inside cards. |
 | `Skeleton`, `SkeletonText`, `SkeletonCard`, `SkeletonDetail`, `SkeletonRows` | Loading with a shape. Match the anatomy of what is coming. |
 | `BrandLoader` | Three dots: in buttons and for waits with no shape. Not for page content. |
+| Not on this server | A surface whose endpoint the server lacks. Ask `useServerFeature(key)` (false while loading and on failure) and **hide** the control; a page reached by URL shows `EmptyState` titled "{Thing} is not available on this server" with a body that says where the same work still happens, and one action there. Never let it reach a 404/`not_on_server` error state: detail pages read any 404 as "this record does not exist". `api()` turns a 2xx web page on `/v1` into `ApiError{status: 404, code: "not_on_server"}` as a backstop. |
 
 **Failures are read once** (`lib/failures.ts` `readFailure`): the cause in plain words, then what to do
 next, then the provider's exact response folded under "Provider response" (`ProviderResponse`). The session's
@@ -854,7 +862,7 @@ now and Needs attention side by side (from 880px of real room; a container query
 
 **The session starter** (`components/home/SessionStarter.tsx`) is the one way to start a session.
 
-- The box (`Composer size="lg"`, placeholder "Describe a task…"), the `AgentPicker`, image attachments, and
+- The box (`Composer size="lg"`, placeholder "Describe a task…"), the `AgentPicker`, attachments (any file, 25 MB each), and
   **Options**, a section that opens in place under the box (the disclosure expand) and moves the bands below
   it down; it never floats over the page. In `NewSessionDialog` the dialog grows with it from a fixed top
   edge and scrolls inside when the window is short. Runs in (environment), Title, Resources, Vaults; Done,
@@ -870,18 +878,13 @@ now and Needs attention side by side (from 880px of real room; a container query
   above the fold, in the picker. A chip that leaves the case open reads as a whole ask ("Review a PR…",
   "Triage a ticket…", "New call summary…"); a long ask shortens after its first whole action and never ends
   on a word that leads somewhere ("and", "of").
-- Sending creates the session, uploads images, sends the first `user.message`, then opens the session. If a
+- Sending creates the session, attaches any files, sends the first `user.message`, then opens the session. If a
   step fails, the words and attachments stay in the box under a `ComposerNotice` that says which step failed;
   trying again continues with the session already created. The draft is kept for the life of the tab.
-- Images are the only attachments. Anything else that is picked, pasted or dropped anywhere on the page is
-  refused in a notice that names the file and says why. Nothing is dropped silently. What it says next is
-  only what is true (`components/files/refusal.ts`, tested): another kind of file reaches an agent from Files,
-  mounted in Options when a session starts; a file gets into Files when an agent saves it or through the API,
-  which the notice links to in words ("Upload it to Files (how to upload a file ↗)", the docs section on
-  uploads, opening beside the page so the draft stays; `UPLOAD_DOCS_URL` in `components/files/refusal.ts`).
-  No endpoint is printed in the composer, Options' File hint or Files' empty state. If the very file is already in Files the
-  notice mounts it; in a running session it offers a new session. Never "in this build", never a control
-  that does not exist.
+- Any file can be attached: images reach the model as pictures, other files are saved in the agent's sandbox
+  and named to it in a path note that stays out of the chat bubble (the sent message shows them as chips).
+  Only a file over 25 MB, or an 11th file, is refused, by name, in the same notice (`components/files/refusal.ts`,
+  tested). Nothing is dropped silently. Never "in this build", never a control that does not exist.
 - If the agents request fails, the box is disabled and says so with a retry. "Create your first agent" is
   shown only when the request succeeded and returned none.
 
@@ -1053,10 +1056,10 @@ agent turn by `space-y-3`.
 - **Empty session**: centred `AgentAvatar xl`, the agent's name (`text-h2`), its description, and the
   composer; no wash.
 - **Composer**: `<Composer size="md">` sticky at the bottom of the column on a
-  `bg-gradient-to-t from-bg` fade; `attachments` for images; `running` + `onStop` while the agent works.
+  `bg-gradient-to-t from-bg` fade; `attachments` for any file; `running` + `onStop` while the agent works.
   A send that fails puts the words and attachments back in the box under a notice with the server's reason
   and **Try again**; a failed attachment stops the whole message and is named. Typed text is kept per session
-  for the tab. Files that are not images are refused in the same notice, by name.
+  for the tab. A file over the limits is refused in the same notice, by name.
 - **An ended or archived session has no composer**: a flat band says it cannot take new messages and offers
   **New session with {agent}** (`startSession`). This follows the API contract (409).
 - **Edges**: once scrolled, text passing under the session bar dissolves over a short fade that mirrors the
@@ -1085,6 +1088,8 @@ body in a right `Sheet`. A legend (`ChartLegend`) sits above the axis. `Timeline
 eval trial says "Task" or "Simulated user" where a session says "You".
 
 ### 9.4 Usage (`/usage`)
+
+Needs the server's `usage` feature (main-node's usage tracker; history starts when it was deployed).
 
 `<Page width="default">`, `PageHeader title="Usage"`, `subtitle` explaining that cost is an API-price
 estimate; `actions`: a `SegmentedControl` for the range (24h · 7 days · 30 days · 90 days) and one for
@@ -1155,6 +1160,10 @@ updated, id) and "Used by" (the agents that reference it, as `EntityRef`s — re
 
 ### 9.8 Operations (`/operations`)
 
+Only where the server lists `operations` (not on main-node yet). Elsewhere the nav item is hidden and the
+route shows "Operations is not available on this server", pointing at the Sessions list's "Waiting on you";
+Home and the Sessions filters read approvals and failures from the session logs instead.
+
 `<Page width="default">`, title "Operations", subtitle "Approvals, failures and budgets that need a
 person." KPI row of four tiles (Waiting for approval, Failed work, Running now, Estimated cost today), each
 opening its tab. `TabBar`: **Needs attention · Approvals (n) · Failed work (n) · Running (n) · Budgets** (keep the existing tab names that tests
@@ -1202,7 +1211,7 @@ All in `src/lib`. They use the existing API client and endpoints, cached and de-
 | `startSession({ agentId?, environmentId? })`, `openCommandPalette()` (`shell-events.ts`) | Start a session from anywhere (§9.0); open ⌘K |
 
 Starting a session from anywhere: call `startSession()`. Never navigate to start one. The starter creates the
-session (`POST /v1/sessions`), uploads images, sends the first `user.message`, then opens it.
+session (`POST /v1/sessions`), attaches files, sends the first `user.message`, then opens it.
 
 ---
 
