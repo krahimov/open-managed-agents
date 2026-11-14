@@ -7,6 +7,7 @@ import { useApiQuery } from "@/lib/useApiQuery";
 import { cn } from "@/lib/utils";
 
 import { AppIcon } from "../../../components/agents/controls";
+import { EntityRef } from "../../../components/EntityRef";
 import { harnessFieldLabel } from "../../../components/HarnessDiffCard";
 import {
   Chip,
@@ -128,6 +129,8 @@ function Summary({ harness, changed }: { harness: Harness; changed: string[] }) 
   const model = typeof harness.model === "string" ? harness.model : "";
   const system = typeof harness.system === "string" ? harness.system : "";
   const skills = (Array.isArray(harness.skills) ? harness.skills : []) as Array<{ type?: string; skill_id?: string }>;
+  const memory = harness.memory as { mode?: string; store_id?: string } | undefined;
+  const memoryOn = !!memory?.mode && memory.mode !== "off";
   const tools = useMemo(
     () => summarizeTools({ tools: harness.tools, mcp_servers: harness.mcp_servers } as unknown as AgentRecord),
     [harness.tools, harness.mcp_servers],
@@ -151,6 +154,21 @@ function Summary({ harness, changed }: { harness: Harness; changed: string[] }) 
       <Group label={harnessFieldLabel("model")} changed={was("model")}>
         {model ? <ModelBadge model={model} /> : <span className="text-small text-fg-subtle">Not chosen yet</span>}
       </Group>
+
+      {/* Shown once memory is on: an agent remembers nothing unless it is. */}
+      {memoryOn && (
+        <Group label="Memory" changed={was("memory")}>
+          <p className="text-small text-fg">
+            {memory?.mode === "per_user" ? "Remembers across sessions, separately for each person" : "Remembers across sessions"}
+          </p>
+          {memory?.mode !== "per_user" && memory?.store_id && (
+            <div className="mt-1 flex min-w-0 items-center gap-1.5 text-small text-fg-muted">
+              <span className="shrink-0">Kept in</span>
+              <EntityRef kind="memory_store" id={memory.store_id} />
+            </div>
+          )}
+        </Group>
+      )}
 
       <Group label={harnessFieldLabel("system")} changed={was("system")}>
         {system.trim() ? (

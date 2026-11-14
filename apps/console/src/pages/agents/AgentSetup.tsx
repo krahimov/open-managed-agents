@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Navigate, useNavigate, useParams, useSearchParams } from "react-router";
-import { CheckIcon, SlidersHorizontalIcon } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
+import { CheckIcon, PencilIcon, SlidersHorizontalIcon } from "lucide-react";
 import { OMA_SETUP_HARNESS, OMA_SETUP_KIND_HARNESS_UPDATED } from "@open-managed-agents/api-types";
 
 import { Button } from "@/components/ui/button";
@@ -10,6 +11,8 @@ import { ApiError } from "../../lib/api";
 import type { Event } from "../../lib/events";
 import { useApiQuery } from "../../lib/useApiQuery";
 import { AgentAvatar, RecordNotFound, ErrorState, Page, Skeleton } from "../../components/kit";
+import type { AgentRecord } from "../../types/agent";
+import { EditAgentDialog } from "./EditAgentDialog";
 import { ConfigPanel, type Harness } from "./setup/ConfigPanel";
 import { SessionChat } from "./SessionChat";
 
@@ -22,7 +25,9 @@ import { SessionChat } from "./SessionChat";
  * configuration as it stands (seeded from the agent, then replaced each
  * time the agent edits itself), so every change the agent makes is
  * visible the moment it lands. One primary action: finish, which opens
- * the agent's profile. Below `lg` the panel moves into a sheet.
+ * the agent's profile. "Edit settings" opens the agent's settings right
+ * here, for what is quicker to set than to explain. Below `lg` the panel
+ * moves into a sheet.
  */
 
 const DISPLAY_FIELDS = ["name", "description", "model", "system", "mcp_servers", "tools", "skills"] as const;
@@ -41,6 +46,10 @@ function toHarnessView(agent: Record<string, unknown> | null | undefined): Harne
     if (Array.isArray(value) && value.length === 0) continue;
     view[key] = value;
   }
+  // Memory rides the `_oma` envelope; shown only when on, as the server's
+  // own harness view does.
+  const memory = (agent._oma as { memory?: { mode?: string } } | undefined)?.memory;
+  if (memory?.mode && memory.mode !== "off") view.memory = memory;
   return view;
 }
 
@@ -68,12 +77,17 @@ export function AgentSetup() {
   const sessionId = searchParams.get("session");
   const nav = useNavigate();
   const wide = useWide();
+  const qc = useQueryClient();
   const [panelOpen, setPanelOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
 
   // The agent seeds the panel; the setup session's markers then replace it.
   const agentQuery = useApiQuery<Record<string, unknown>>(id ? `/v1/agents/${id}` : null);
   const [live, setLive] = useState<{ harness: Harness; changed: string[]; at: number } | null>(null);
   const seeded = useMemo(() => toHarnessView(agentQuery.data), [agentQuery.data]);
+  // The marker handler is stable; it reads the agent through this.
+  const agentRef = useRef(agentQuery.data);
+  agentRef.current = agentQuery.data;
   const harness = live?.harness ?? seeded;
   const agentName = (typeof harness.name === "string" && harness.name) || (agentQuery.data?.name as string) || "";
 
@@ -84,7 +98,28 @@ export function AgentSetup() {
       const at = Date.parse(String((ev as { processed_at?: string; created_at?: string }).processed_at ?? (ev as { created_at?: string }).created_at ?? ""));
       setLive({ harness: m.harness_config, changed: m.changed ?? [], at: Number.isFinite(at) ? at : Date.now() });
     }
+    // enable_memory, or a new trigger, switched memory on: no harness marker
+    // comes with it, so it is folded into the panel here.
+    if (ev.type === "system.memory_enabled") {
+      const e = ev as unknown as { mode?: string; store_id?: string; processed_at?: string; created_at?: string };
+      const at = Date.parse(String(e.processed_at ?? e.created_at ?? ""));
+      const memory = { mode: e.mode ?? "shared", ...(e.store_id ? { store_id: e.store_id } : {}) };
+      setLive((cur) => ({
+        harness: { ...(cur?.harness ?? toHarnessView(agentRef.current)), memory },
+        changed: ["memory"],
+        at: Number.isFinite(at) ? at : Date.now(),
+      }));
+    }
   }, []);
+
+  // The setup chat edits the agent on the server: what the agent page has
+  // cached is read again on the way back.
+  const refreshAgent = () => {
+    void qc.invalidateQueries({ queryKey: [`/v1/agents/${id}`] });
+    void qc.invalidateQueries({ queryKey: [`/v1/agents/${id}/versions`] });
+    void qc.invalidateQueries({ queryKey: [`/v1/agents/${id}/memory`] });
+    void qc.invalidateQueries({ queryKey: [`/v1/agents/${id}/ambient-rules`] });
+  };
 
   if (!id) return null;
   // Setup only exists inside its session: without one, show the agent.
@@ -139,7 +174,18 @@ export function AgentSetup() {
             Configuration
           </Button>
         )}
-        <Button onClick={() => nav(`/agents/${id}`)}>
+        {agentQuery.data && (
+          <Button variant="outline" onClick={() => setEditing(true)}>
+            <PencilIcon data-icon="inline-start" />
+            Edit settings
+          </Button>
+        )}
+        <Button
+          onClick={() => {
+            refreshAgent();
+            nav(`/agents/${id}`);
+          }}
+        >
           <CheckIcon data-icon="inline-start" />
           Finish setup
         </Button>
@@ -157,6 +203,19 @@ export function AgentSetup() {
         </div>
         {wide && <div className="w-[380px] shrink-0 border-l border-border xl:w-[440px]">{panel}</div>}
       </div>
+
+      {agentQuery.data && (
+        <EditAgentDialog
+          agent={agentQuery.data as unknown as AgentRecord}
+          open={editing}
+          onClose={() => {
+            setEditing(false);
+            // A saved edit is the configuration now: the panel reads the agent again.
+            setLive(null);
+            refreshAgent();
+          }}
+        />
+      )}
 
       {!wide && (
         <Sheet open={panelOpen} onOpenChange={setPanelOpen}>

@@ -1,9 +1,9 @@
 import { useMemo, useState } from "react";
 import { ChevronRightIcon } from "lucide-react";
+import { DEFAULT_REASONING_LEVEL, REASONING_LEVEL_LABELS, isReasoningLevel } from "@open-managed-agents/api-types";
 
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { FACE_METADATA_KEY, describeFace, naturalFace, parseFace } from "@/lib/agent-face";
-import { harnessLabel } from "@/lib/agents";
 import { describeModel, modelId } from "@/lib/models";
 import { cn } from "@/lib/utils";
 
@@ -11,6 +11,20 @@ import { DiffLines, collapseContext, diffLines, hasChanges, valueToLines, type D
 import { Chip, ErrorState, ModelBadge, RelativeTime, SectionCard, Skeleton, StatusBadge } from "../../../components/kit";
 import type { AgentRecord } from "../../../types/agent";
 import { AgentVersionComparison } from "../AgentVersionComparison";
+import { MEMORY_MODE_LABELS, parseMemoryMode } from "../../../components/MemoryModeControl";
+import { engineLabel } from "../form/model";
+
+/** A level as people read it; unset is the default, said as such. */
+function reasoningWords(level: unknown): string {
+  if (!isReasoningLevel(level)) return `${REASONING_LEVEL_LABELS[DEFAULT_REASONING_LEVEL]} (default)`;
+  return REASONING_LEVEL_LABELS[level];
+}
+
+const TOOL_LOADING_WORDS: Record<string, string> = {
+  auto: "Automatic",
+  eager: "Every tool up front",
+  deferred: "Tools found when needed",
+};
 
 /** The parts of an agent that a new version can change, in reading order. */
 const FIELDS: Array<{ key: string; label: string; read: (a: AgentRecord) => unknown }> = [
@@ -28,9 +42,19 @@ const FIELDS: Array<{ key: string; label: string; read: (a: AgentRecord) => unkn
   { key: "mcp_servers", label: "MCP servers", read: (a) => a.mcp_servers ?? [] },
   { key: "skills", label: "Skills", read: (a) => a.skills ?? [] },
   { key: "multiagent", label: "Delegation", read: (a) => a.multiagent?.agents ?? [] },
-  { key: "harness", label: "Engine", read: (a) => harnessLabel(a._oma?.harness) },
-  { key: "reasoning", label: "Reasoning", read: (a) => a._oma?.reasoning_level ?? "" },
-  { key: "memory", label: "Memory", read: (a) => a._oma?.memory?.mode ?? "off" },
+  { key: "harness", label: "Engine", read: (a) => engineLabel(a._oma?.harness) },
+  { key: "reasoning", label: "Reasoning", read: (a) => reasoningWords(a._oma?.reasoning_level) },
+  { key: "memory", label: "Memory", read: (a) => MEMORY_MODE_LABELS[parseMemoryMode(a._oma?.memory)] },
+  {
+    key: "mcp_tool_loading",
+    label: "MCP tool loading",
+    read: (a) => TOOL_LOADING_WORDS[a._oma?.mcp_tool_loading ?? "auto"] ?? a._oma?.mcp_tool_loading,
+  },
+  {
+    key: "vault_mcp_servers",
+    label: "Servers from vaults",
+    read: (a) => (a._oma?.vault_mcp_servers === "all" ? "Every server a vault signs in to" : "Only the agent's own"),
+  },
 ];
 
 interface Change {
@@ -119,6 +143,7 @@ export function VersionsTab({
         </SectionCard>
       )}
 
+      {/* Renders nothing where the server runs no comparisons. */}
       <AgentVersionComparison key={agent.id} agent={agent} versions={versions} />
     </div>
   );
@@ -200,7 +225,7 @@ function VersionSnapshot({ version }: { version: AgentRecord }) {
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-1.5">
         <ModelBadge model={version.model} />
-        <Chip>{harnessLabel(version._oma?.harness)}</Chip>
+        <Chip>{engineLabel(version._oma?.harness)}</Chip>
       </div>
       <div>
         <h4 className="mb-1.5 text-xs font-medium text-fg-subtle">Instructions</h4>

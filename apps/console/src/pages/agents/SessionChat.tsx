@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { OMA_SETUP_HARNESS, OMA_SETUP_KIND_HARNESS_UPDATED } from "@open-managed-agents/api-types";
 
 import { Button } from "@/components/ui/button";
 
 import { ApiError, useApi } from "../../lib/api";
+import { unwrapCallMcpTool } from "../../lib/deferred-mcp";
 import type { Event } from "../../lib/events";
 import { AccessRequestCard } from "../../components/AccessRequestCard";
 import { Conversation, ConversationContent, ConversationScrollButton } from "../../components/ai-elements/conversation";
@@ -13,8 +14,12 @@ import { Composer, ComposerNotice } from "../../components/Composer";
 import { EmptyState } from "../../components/EmptyState";
 import { CodeWell, EventCard } from "../../components/EventCard";
 import { HarnessDiffCard } from "../../components/HarnessDiffCard";
+import { MemoryEnabledCard } from "../../components/MemoryEnabledCard";
+import { SavedLoginLine } from "../../components/SavedLoginLine";
+import { SessionModelPicker } from "../../components/SessionModelPicker";
 import { ConversationEdges } from "../../components/sessions/ConversationEdges";
 import { BUBBLE, Prose } from "../../components/sessions/ConversationView";
+import { grantedRequestIds } from "../../components/sessions/model";
 import { presentTool } from "../../components/sessions/tools";
 import { SkillRequestCard } from "../../components/SkillRequestCard";
 import { cn } from "@/lib/utils";
@@ -30,7 +35,11 @@ import { cn } from "@/lib/utils";
  * and non-setup tool calls). Setup harness markers ride on `agent.message`
  * tagged `metadata.harness === OMA_SETUP_HARNESS`: those go to the parent
  * through `onEvent` and are never shown as messages, except harness updates,
- * which appear as a diff card.
+ * which appear as a diff card. The cards the setup tools leave (a sign-in
+ * to connect, a saved login it attached, a trigger, memory switched on, a
+ * skill to approve) are drawn as on the session page; a sign-in the server
+ * has already recorded (`system.access_granted`) reads as connected after a
+ * reload too. The composer carries the session's model and reasoning chip.
  */
 interface SessionChatProps {
   sessionId: string;
@@ -58,24 +67,54 @@ function isHarnessUpdate(ev: Event): boolean {
   return isSetupMarker(ev) && (ev.metadata as { kind?: string } | undefined)?.kind === OMA_SETUP_KIND_HARNESS_UPDATED;
 }
 
-/** Events worth showing (everything else, such as stream deltas, status,
+/** The setup tools (the agent editing its own configuration) stay hidden,
+ *  however they were called: by name, through the server's MCP name, or
+ *  wrapped in a deferred `call_mcp_tool`. */
+function isSetupTool(ev: Event): boolean {
+  return (
+    (typeof ev.name === "string" && ev.name.startsWith("mcp__oma_setup__")) ||
+    ev.mcp_server_name === "oma_setup" ||
+    unwrapCallMcpTool(ev.name, ev.input)?.server === "oma_setup"
+  );
+}
+
+/** Events kept in state (everything else, such as stream deltas, status,
  *  spans, results and builder markers, is filtered out). */
 function isRenderable(ev: Event): boolean {
   if (isHarnessUpdate(ev)) return true;
   if (isSetupMarker(ev)) return false;
   if (ev.type === "user.message") return eventText(ev).length > 0;
   if (ev.type === "agent.message") return eventText(ev).trim().length > 0;
-  if (ev.type === "agent.tool_use") {
-    return typeof ev.name === "string" && !ev.name.startsWith("mcp__oma_setup__");
+  if (ev.type === "agent.tool_use" || ev.type === "agent.mcp_tool_use") {
+    return typeof ev.name === "string" && !isSetupTool(ev);
   }
   // Agent-initiated credential requests render as a connect card: during
   // setup this is how the agent hands over the sign-ins for the apps it
   // just added to its own harness.
   if (ev.type === "system.access_request") return true;
+  if (ev.type === "system.saved_login_attached") return true;
+  // Not drawn itself: the request card it answers reads it (granted).
+  if (ev.type === "system.access_granted") return true;
   if (ev.type === "system.ambient_rule_created") return true;
+  if (ev.type === "system.memory_enabled") return true;
   if (ev.type === "system.skill_request") return true;
   return false;
 }
+
+/** A tool row's words: a deferred MCP call by the service and tool it
+ *  reached, an MCP call by its server. */
+function presentEvent(ev: Event) {
+  const input = (ev.input && typeof ev.input === "object" ? ev.input : {}) as Record<string, unknown>;
+  const deferred = unwrapCallMcpTool(ev.name, ev.input);
+  if (deferred) return presentTool({ name: deferred.tool, server: deferred.server, flavor: "mcp", input: deferred.arguments });
+  if (ev.type === "agent.mcp_tool_use") {
+    return presentTool({ name: String(ev.name ?? "tool"), server: ev.mcp_server_name, flavor: "mcp", input });
+  }
+  return presentTool({ name: String(ev.name ?? "tool"), flavor: "tool", input });
+}
+
+/** Drawn as part of the conversation (access_granted only informs a card). */
+const isDrawn = (ev: Event) => ev.type !== "system.access_granted";
 
 /** The readable head of a provider error: drop the JSON tail. */
 function headline(raw: string): string {
@@ -227,8 +266,10 @@ export function SessionChat({ sessionId, onEvent, placeholder, emptyTitle, empty
     [api, sessionId],
   );
 
+  const granted = useMemo(() => grantedRequestIds(events), [events]);
+  const drawn = useMemo(() => events.filter(isDrawn), [events]);
   const streaming = Object.values(streams).some(Boolean);
-  const isEmpty = events.length === 0 && !pending && !streaming && !turnError;
+  const isEmpty = drawn.length === 0 && !pending && !streaming && !turnError;
   const working = status === "running" && !streaming;
 
   return (
@@ -246,7 +287,7 @@ export function SessionChat({ sessionId, onEvent, placeholder, emptyTitle, empty
             />
           ) : (
             <div className="mx-auto w-full max-w-[720px] space-y-4">
-              {events.map((ev, i) => {
+              {drawn.map((ev, i) => {
                 const key = ev.seq != null ? `seq:${ev.seq}` : (ev.id ?? `i${i}`);
                 if (ev.type === "user.message") {
                   return (
@@ -261,12 +302,18 @@ export function SessionChat({ sessionId, onEvent, placeholder, emptyTitle, empty
                   if (isHarnessUpdate(ev)) return <HarnessDiffCard key={key} event={ev} />;
                   return <Prose key={key}>{eventText(ev)}</Prose>;
                 }
-                if (ev.type === "system.access_request") return <AccessRequestCard key={key} event={ev} sessionId={sessionId} />;
+                const requestId = String((ev as { request_id?: unknown }).request_id ?? "");
+                if (ev.type === "system.access_request") {
+                  return <AccessRequestCard key={key} event={ev} sessionId={sessionId} granted={granted.has(requestId)} />;
+                }
+                if (ev.type === "system.saved_login_attached") {
+                  return <SavedLoginLine key={key} event={ev} sessionId={sessionId} switched={granted.has(requestId)} />;
+                }
                 if (ev.type === "system.ambient_rule_created") return <AmbientRuleCard key={key} event={ev} />;
+                if (ev.type === "system.memory_enabled") return <MemoryEnabledCard key={key} event={ev} />;
                 if (ev.type === "system.skill_request") return <SkillRequestCard key={key} event={ev} sessionId={sessionId} />;
-                // agent.tool_use: a quiet row naming the tool and what it was asked to do.
-                const input = (ev.input && typeof ev.input === "object" ? ev.input : {}) as Record<string, unknown>;
-                const p = presentTool({ name: String(ev.name ?? "tool"), flavor: "tool", input });
+                // A tool call: a quiet row naming the tool and what it was asked to do.
+                const p = presentEvent(ev);
                 return <EventCard key={key} kind={p.kind} icon={p.icon} source={p.source} title={p.title} subtitle={p.preview} />;
               })}
               {pending && (
@@ -324,6 +371,8 @@ export function SessionChat({ sessionId, onEvent, placeholder, emptyTitle, empty
             submitting={sending}
             placeholder={placeholder ?? "Send a message…"}
             aria-label="Message the agent"
+            draftKey={`session:${sessionId}`}
+            trailing={<SessionModelPicker sessionId={sessionId} disabled={sending} />}
           />
         </div>
       </div>
