@@ -148,7 +148,9 @@ export function SessionDetail() {
   // pending row the moment SSE delivers it. Single slot is intentional
   // (we never let two POSTs be in flight at once — Send is disabled
   // while `sending`). Set to null when SSE confirms or POST settles.
-  const [localPending, setLocalPending] = useState<{ text: string; images: number } | null>(null);
+  // `match` is the message's first text block (the words, or "Attached 1
+  // file." when there are none), by which the server's pending row is known.
+  const [localPending, setLocalPending] = useState<{ text: string; match: string; images: number; files: number } | null>(null);
   const [agentId, setAgentId] = useState("");
   const [sessionMeta, setSessionMeta] = useState<{
     environmentId?: string;
@@ -384,7 +386,7 @@ export function SessionDetail() {
       const innerText =
         inner && (inner as { content?: Array<{ type?: string; text?: string }> }).content
           ?.find((c) => c.type === "text")?.text;
-      if (innerText) setLocalPending((cur) => (cur?.text === innerText ? null : cur));
+      if (innerText) setLocalPending((cur) => (cur?.match === innerText ? null : cur));
       if (p.event_id) {
         setPendingByEventId((prev) => {
           const next = new Map(prev);
@@ -743,7 +745,8 @@ export function SessionDetail() {
     if (!text && !files.length) return { ok: true };
     if (!id) return { ok: false, stage: "send", reason: "This session is not loaded yet." };
     const pendingText = text || attachmentsLabel(files.length);
-    setLocalPending({ text: pendingText, images: files.filter((f) => f.type.startsWith("image/")).length });
+    const images = files.filter((f) => f.type.startsWith("image/")).length;
+    setLocalPending({ text, match: pendingText, images, files: files.length - images });
     setSending(true);
     try {
       const { attachments, failed } = await attachToSession(api, id, files, attachmentCache.current, sendFailure);
@@ -783,7 +786,7 @@ export function SessionDetail() {
       // Clear our local slot so we don't double-render with the server
       // entry — but only if the server's pending hasn't already cleared
       // it via the system.user_message_pending handler.
-      setLocalPending((cur) => (cur?.text === pendingText ? null : cur));
+      setLocalPending((cur) => (cur?.match === pendingText ? null : cur));
       return { ok: true };
     } finally {
       setSending(false);
@@ -1072,7 +1075,7 @@ export function SessionDetail() {
 
   const queued: QueuedMessage[] = [
     ...(localPending && activeThreadId === PRIMARY_THREAD
-      ? [{ key: "local", text: localPending.text, images: localPending.images, sending: true }]
+      ? [{ key: "local", text: localPending.text, images: localPending.images, files: localPending.files, sending: true }]
       : []),
     ...Array.from(pendingByEventId.values())
       .filter((p) => p.session_thread_id === activeThreadId)
@@ -1081,6 +1084,7 @@ export function SessionDetail() {
         key: `pending-${p.event_id}`,
         text: visibleText(p.event),
         images: Array.isArray(p.event.content) ? p.event.content.filter((c) => c.type === "image").length : 0,
+        files: attachmentsOf(p.event).filter((a) => a.kind !== "image").length,
       })),
   ];
   const liveStreams = {
