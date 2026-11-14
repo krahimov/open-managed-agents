@@ -396,6 +396,7 @@ export function VaultDetail() {
             closeAdd();
             reloadCredentials();
           }}
+          onCredentialsChanged={reloadCredentials}
         />
       )}
 

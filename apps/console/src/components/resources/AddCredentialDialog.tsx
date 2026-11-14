@@ -3,6 +3,8 @@ import { toast } from "sonner";
 import { ExternalLinkIcon, KeyRoundIcon, LayoutGridIcon, LogInIcon, SquareTerminalIcon } from "lucide-react";
 
 import { useApi } from "@/lib/api";
+import { openOAuthPopup, subscribeOAuthMessages } from "@/lib/oauth-popup";
+import { useServerFeature } from "@/lib/server-features";
 import {
   composioEntriesFromCatalog,
   type ComposioIntegrationEntry,
@@ -24,6 +26,7 @@ import { CopyButton } from "../IdChip";
 import { SecretInput } from "../Input";
 import { LocalCombobox } from "../LocalCombobox";
 import { Modal } from "../Modal";
+import { OAuthAppSetupPanel, type OAuthAppRequirement } from "../OAuthAppSetupPanel";
 import { Select, SelectOption } from "../Select";
 import { Skeleton } from "../Skeleton";
 import { CAP_CLIS, type Vault } from "./credentials";
@@ -102,6 +105,13 @@ function OptionalTag({ required }: { required?: boolean }) {
  * Every flow, request and popup protocol is the original one; only the
  * arrangement changed. Secrets typed here are sent once and never shown
  * again.
+ *
+ * MCP sign-in goes through `openOAuthPopup` (one-time start token, so the
+ * server starts the flow without a confirm page) and listens with
+ * `subscribeOAuthMessages` (each popup result once, over postMessage or
+ * BroadcastChannel). A provider that needs a one-time OAuth app first
+ * turns the dialog into that setup (OAuthAppSetupPanel). The CLI sign-in
+ * (device flow) is offered only when the server has it (`cap_cli`).
  */
 export function AddCredentialDialog({
   vault,
@@ -110,6 +120,7 @@ export function AddCredentialDialog({
   hasComposioCredential,
   onClose,
   onCreated,
+  onCredentialsChanged,
 }: {
   vault: Vault;
   initialKind?: CredentialKindChoice;
@@ -117,8 +128,12 @@ export function AddCredentialDialog({
   hasComposioCredential: boolean;
   onClose: () => void;
   onCreated: () => void;
+  /** The vault's credential list changed without this dialog finishing (a
+   *  tool router re-provisioned in the background): reload, do not close. */
+  onCredentialsChanged?: () => void;
 }) {
   const { api } = useApi();
+  const deviceFlowAvailable = useServerFeature("cap_cli");
   const { data: composioStatus, isLoading: composioStatusLoading } =
     useApiQuery<ComposioStatusResponse>("/v1/composio/status");
   const composioConfigured = composioStatus?.configured === true;
@@ -144,6 +159,11 @@ export function AddCredentialDialog({
   });
   const [refreshOpen, setRefreshOpen] = useState(false);
   const [clientCredsOpen, setClientCredsOpen] = useState(false);
+  /** The server being signed in to, kept for a retry after the one-time app setup. */
+  const [lastMcp, setLastMcp] = useState<{ name: string; url: string } | null>(null);
+  /** The provider needs a one-time OAuth app (the popup said so). */
+  const [appReq, setAppReq] = useState<OAuthAppRequirement | null>(null);
+  const [savingApp, setSavingApp] = useState(false);
 
   const composioToolkits = useMemo(() => parseToolkits(form.composioToolkits), [form.composioToolkits]);
   const composioApiKey = composioConfigured ? "" : form.composioApiKey.trim();
@@ -195,9 +215,11 @@ export function AddCredentialDialog({
   // window.opener for providers that set Cross-Origin-Opener-Policy:
   // same-origin on their authorize page (Sentry), so postMessage from the
   // popup cannot reach us there. BroadcastChannel is same-origin and
-  // survives COOP; the popup posts to both and either one is enough.
+  // survives COOP; the popup posts to both, and subscribeOAuthMessages
+  // delivers each result once (it used to toast twice).
   const handleOAuthMessage = useCallback(
-    (event: MessageEvent | { data: unknown }) => {
+    (event: MessageEvent) => {
+      if (event.origin && event.origin !== window.location.origin) return;
       const data = (
         event as {
           data?: {
@@ -207,10 +229,22 @@ export function AddCredentialDialog({
             service?: string;
             probe_ok?: boolean;
             probe_message?: string | null;
+            message?: string;
+            code?: string;
+            provider?: OAuthAppRequirement;
           };
         }
       ).data;
-      if (data?.type === "oauth_complete") {
+      if (data?.type === "oauth_error") {
+        setConnecting(null);
+        if (data.code === "oauth_app_required" && data.provider) {
+          // Not a failure to retry: the provider needs its one-time app.
+          setAppReq(data.provider);
+          setError(null);
+          return;
+        }
+        setError(data.message ?? "The provider did not complete the sign-in. Try again.");
+      } else if (data?.type === "oauth_complete") {
         setConnecting(null);
         onCreated();
         // Report the MCP probe so the person knows whether the stored
@@ -240,34 +274,34 @@ export function AddCredentialDialog({
           return next;
         });
         toast.success("Account connected through Composio.");
+        // The account just turned ACTIVE: re-provision this vault's existing
+        // tool routers so they bind it (a router does not see an unbound
+        // account). Best effort, since sessions also repair on start. Only
+        // the credential list reloads: the dialog stays open, and its own
+        // submit still creates the router for the apps being connected.
+        if (hasComposioCredential) {
+          void api<{ refreshed?: number }>(
+            `/v1/vaults/${vault.id}/credentials/composio_tool_router_session/refresh`,
+            { method: "POST", body: JSON.stringify({}), silentErrors: true },
+          )
+            .then((res) => {
+              if ((res?.refreshed ?? 0) > 0) onCredentialsChanged?.();
+            })
+            .catch(() => {});
+        }
       }
     },
-    [onCreated],
+    [api, hasComposioCredential, onCreated, onCredentialsChanged, vault.id],
   );
 
-  useEffect(() => {
-    window.addEventListener("message", handleOAuthMessage);
-    let bc: BroadcastChannel | null = null;
-    try {
-      bc = new BroadcastChannel("openma-oauth");
-      bc.addEventListener("message", handleOAuthMessage);
-    } catch {
-      // No BroadcastChannel: postMessage only.
-    }
-    return () => {
-      window.removeEventListener("message", handleOAuthMessage);
-      if (bc) {
-        bc.removeEventListener("message", handleOAuthMessage);
-        bc.close();
-      }
-    };
-  }, [handleOAuthMessage]);
+  useEffect(() => subscribeOAuthMessages(handleOAuthMessage), [handleOAuthMessage]);
 
   const connectMcp = (
     entry: McpRegistryEntry | { name: string; url: string },
     opts?: { clientId?: string; clientSecret?: string },
   ) => {
-    setConnecting(entry.name);
+    setError(null);
+    setLastMcp({ name: entry.name, url: entry.url });
     const params = new URLSearchParams({
       mcp_server_url: entry.url,
       vault_id: vault.id,
@@ -275,7 +309,38 @@ export function AddCredentialDialog({
     });
     if (opts?.clientId) params.set("client_id", opts.clientId);
     if (opts?.clientSecret) params.set("client_secret", opts.clientSecret);
-    window.open(`/v1/oauth/authorize?${params.toString()}`, "oauth", "width=600,height=700,popup=yes");
+    if (!openOAuthPopup(params, "oauth")) {
+      setConnecting(null);
+      setError("Your browser blocked the sign-in window. Allow pop-ups for this site and try again.");
+      return;
+    }
+    setConnecting(entry.name);
+  };
+
+  // Store the provider's one-time app for this workspace, then go straight
+  // on to the sign-in it was needed for.
+  const saveOAuthApp = async (clientId: string, clientSecret: string) => {
+    if (!appReq) return;
+    setSavingApp(true);
+    setError(null);
+    // Keep the click's permission to open a window across the save.
+    const held = lastMcp ? window.open("", "oauth", "width=600,height=700,popup=yes") : null;
+    try {
+      await api("/v1/oauth/apps", {
+        method: "PUT",
+        body: JSON.stringify({ issuer: appReq.issuer, client_id: clientId, client_secret: clientSecret }),
+        silentErrors: true,
+      });
+    } catch (e) {
+      held?.close();
+      setError(errorMessage(e, `The ${appReq.label} app could not be saved`));
+      setSavingApp(false);
+      return;
+    }
+    toast.success(`${appReq.label} app saved. Continuing to ${appReq.label}…`);
+    setSavingApp(false);
+    setAppReq(null);
+    if (lastMcp) connectMcp(lastMcp);
   };
 
   const createBearerCred = async () => {
@@ -575,9 +640,11 @@ export function AddCredentialDialog({
             <Button variant="ghost" onClick={onClose} disabled={submitting}>
               Cancel
             </Button>
-            <Button onClick={submit} disabled={!canSubmit || !!connecting} loading={submitting}>
-              {submitLabel}
-            </Button>
+            {!(kind === "oauth" && appReq) && (
+              <Button onClick={submit} disabled={!canSubmit || !!connecting} loading={submitting}>
+                {submitLabel}
+              </Button>
+            )}
           </>
         )
       }
@@ -590,6 +657,7 @@ export function AddCredentialDialog({
             setKind(k);
             setError(null);
             setConnecting(null);
+            setAppReq(null);
           }}
           options={[
             {
@@ -624,7 +692,16 @@ export function AddCredentialDialog({
 
         {error && <Callout tone="danger">{error}</Callout>}
 
-        {kind === "oauth" && (
+        {kind === "oauth" && appReq && (
+          <div className="space-y-4">
+            <OAuthAppSetupPanel requirement={appReq} saving={savingApp} onSave={saveOAuthApp} />
+            <Button variant="ghost" size="sm" onClick={() => setAppReq(null)} disabled={savingApp}>
+              Choose another server
+            </Button>
+          </div>
+        )}
+
+        {kind === "oauth" && !appReq && (
           <>
             {serverField}
             {nameField}
@@ -668,6 +745,10 @@ export function AddCredentialDialog({
                 This dialog updates on its own when the provider sends you back.
               </Callout>
             )}
+            <p className="text-xs text-fg-subtle">
+              Signing in here does not give the login to an agent. An agent uses it once the server is among its tools
+              and this vault is attached to it.
+            </p>
           </>
         )}
 
@@ -729,13 +810,13 @@ export function AddCredentialDialog({
                 {CAP_CLIS.map((c) => (
                   <SelectOption key={c.cli_id} value={c.cli_id}>
                     {c.label}
-                    {c.oauth ? " · sign-in available" : ""}
+                    {c.oauth && deviceFlowAvailable ? " · sign-in available" : ""}
                   </SelectOption>
                 ))}
               </Select>
             </Field>
 
-            {cli?.oauth && (
+            {cli?.oauth && deviceFlowAvailable && (
               <div className="rounded-lg bg-bg-soft p-4">
                 {!deviceFlow && (
                   <div className="flex items-center justify-between gap-4">
@@ -817,7 +898,11 @@ export function AddCredentialDialog({
             </Field>
             <SecretInput
               label="Token"
-              hint={cli?.oauth ? "Write-only. Leave blank if you sign in above." : "Write-only: it cannot be read back after you save."}
+              hint={
+                cli?.oauth && deviceFlowAvailable
+                  ? "Write-only. Leave blank if you sign in above."
+                  : "Write-only: it cannot be read back after you save."
+              }
               value={cliForm.token}
               onChange={(e) => setCliForm({ ...cliForm, token: e.target.value })}
               placeholder="Paste the token"
