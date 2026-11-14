@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
+import { useQueryClient } from "@tanstack/react-query";
+import { REASONING_LEVEL_LABELS, uiReasoningLevel } from "@open-managed-agents/api-types";
 import { BoxIcon, BrainIcon, PencilIcon, PlugIcon, PuzzleIcon, TerminalIcon, WrenchIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { harnessLabel } from "@/lib/agents";
+import type { EnvironmentChoice } from "@/lib/default-environment";
 import { COMPOSIO_MANAGED_AGENT_INTEGRATIONS } from "@/lib/composio-integrations";
 import { plural } from "@/lib/format";
 import { useEntityName, type EntityKind } from "@/lib/directory";
@@ -11,6 +14,9 @@ import { sessionTitle } from "@/lib/sessions";
 import { useApiQuery } from "@/lib/useApiQuery";
 import { cn } from "@/lib/utils";
 
+import { AgentComputerPanel } from "../../../components/AgentComputerPanel";
+import { AgentMemoryPanel } from "../../../components/AgentMemoryPanel";
+import { AgentModelSwitcher } from "../../../components/AgentModelSwitcher";
 import { AppIcon } from "../../../components/agents/controls";
 import { GitHubIcon, LinearIcon, SlackIcon, VaultIcon } from "../../../components/icons";
 import {
@@ -49,14 +55,6 @@ const ANTHROPIC_SKILL_LABEL: Record<string, string> = {
   pdf: "PDF documents",
   pptx: "PowerPoint decks",
   docx: "Word documents",
-};
-
-const REASONING_LABEL: Record<string, string> = {
-  instant: "Instant",
-  low: "Low",
-  medium: "Medium",
-  high: "High",
-  max: "Max",
 };
 
 const DAY_MS = 86_400_000;
@@ -132,7 +130,13 @@ export function OverviewTab({
   const memoryMode = parseMemoryMode(agent._oma?.memory);
   const memoryStoreId = agent._oma?.memory?.store_id;
   const vaultIds = agent._oma?.default_vault_ids ?? [];
-  const reasoning = agent._oma?.reasoning_level;
+  // Unset means the server default (medium), never "Instant".
+  const reasoning = REASONING_LEVEL_LABELS[uiReasoningLevel(agent._oma?.reasoning_level)];
+  const qc = useQueryClient();
+
+  // The default environment decides what the Computer card says while there
+  // is no computer. Not read for a local-runtime agent.
+  const defaultEnvironment = useDefaultEnvironment(binding ? undefined : agent._oma?.default_environment_id);
 
   const perDay = useMemo(() => sessionsPerDay(sessions), [sessions]);
   const last30 = perDay.reduce((a, b) => a + b, 0);
@@ -166,6 +170,14 @@ export function OverviewTab({
             </p>
           )}
         </SectionCard>
+
+        <AgentComputerPanel
+          key={agent.id}
+          agentId={agent.id}
+          localRuntime={!!binding}
+          defaultEnvironment={defaultEnvironment}
+          onEdit={archived ? undefined : onEdit}
+        />
 
         <SectionCard title="Tools and apps" description="What the agent can reach, and whether it has to ask." flush>
           {!hasAnyTool && (
@@ -270,6 +282,8 @@ export function OverviewTab({
           </SectionCard>
         )}
 
+        <AgentMemoryPanel key={agent.id} agentId={agent.id} />
+
         <SectionCard title="Integrations" description="Where people can reach this agent outside the console." flush>
           <PublicationRow kind="linear" label="Linear" icon={LinearIcon} agentId={agent.id} archived={archived} />
           <PublicationRow kind="github" label="GitHub" icon={GitHubIcon} agentId={agent.id} archived={archived} />
@@ -280,10 +294,26 @@ export function OverviewTab({
       <aside className="grid min-w-0 items-start gap-4 md:grid-cols-2 xl:grid-cols-1">
         <SectionCard title="Details">
           <PropertyList labelWidth="narrow">
-            <Property label="Model">
-              <ModelBadge model={agent.model} variant="plain" className="text-fg" />
-            </Property>
-            {reasoning && <Property label="Reasoning">{REASONING_LABEL[reasoning] ?? reasoning}</Property>}
+            {archived || binding ? (
+              <>
+                <Property label="Model">
+                  <ModelBadge model={agent.model} variant="plain" className="text-fg" />
+                </Property>
+                {!binding && <Property label="Reasoning">{reasoning}</Property>}
+              </>
+            ) : (
+              // The quick switcher: model and reasoning in one chip. Each
+              // change saves a new version.
+              <Property label="Model">
+                <AgentModelSwitcher
+                  agent={agent}
+                  onSaved={() => {
+                    void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}`] });
+                    void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}/versions`] });
+                  }}
+                />
+              </Property>
+            )}
             <Property label="Runs on">{harnessLabel(agent._oma?.harness)}</Property>
             {binding && (
               <Property label="Local runtime" align="start">
@@ -406,6 +436,33 @@ export function OverviewTab({
       </aside>
     </div>
   );
+}
+
+/** The directory's environment list (lib/directory.ts reads the same, so
+ *  this shares its cache entry). */
+const ENVIRONMENT_LIST_PARAMS = { limit: "200" };
+
+/**
+ * The agent's default environment, the way the "Runs with" row finds it:
+ * from the environment list when it is there, else by itself. `undefined`
+ * while that is being found out; null when the agent has none, or it was
+ * deleted or could not be read (the Computer card then gives the
+ * session-sandbox advice, without a notice).
+ */
+function useDefaultEnvironment(id: string | undefined): EnvironmentChoice | null | undefined {
+  const list = useApiQuery<{ data: EnvironmentChoice[] }>(id ? "/v1/environments" : null, ENVIRONMENT_LIST_PARAMS, {
+    staleTime: 5 * 60_000,
+  });
+  const fromList = id ? list.data?.data?.find((env) => env.id === id) : undefined;
+  const needSingle = !!id && !fromList && !list.isLoading;
+  const single = useApiQuery<EnvironmentChoice>(needSingle ? `/v1/environments/${id}` : null, undefined, {
+    staleTime: 5 * 60_000,
+  });
+  if (!id) return null;
+  if (fromList) return fromList;
+  if (single.data) return single.data;
+  if (single.isError) return null;
+  return undefined;
 }
 
 /**

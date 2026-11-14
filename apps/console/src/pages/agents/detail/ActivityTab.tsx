@@ -3,7 +3,8 @@ import { ArrowRightIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { formatSpan, plural } from "@/lib/format";
+import { formatSpan, plural, toDate } from "@/lib/format";
+import type { SessionReading } from "@/lib/session-state";
 import {
   SESSION_SOURCE_LABEL,
   sessionSource,
@@ -21,6 +22,7 @@ import {
   RelativeTime,
   SectionCard,
   Skeleton,
+  Tip,
   sectionLinkClass,
 } from "../../../components/kit";
 import type { AgentRecord } from "../../../types/agent";
@@ -30,9 +32,35 @@ import type { SessionRecord } from "../../../types/session";
 export const ACTIVITY_LIMIT = 100;
 
 /**
- * Activity: every session this agent has had, newest first. Rows open the
- * session. Status is upgraded to "Needs approval" or "Failed" when the
- * operations report says a person is needed.
+ * How long the session ran, read as the Sessions list reads it: start to
+ * end for one that ended, start to its last activity otherwise. Null when
+ * nothing was recorded after it started (the API then only knows its age,
+ * which is not a duration).
+ */
+export function sessionSeconds(s: SessionRecord): number | null {
+  const start = toDate(s.created_at)?.getTime();
+  if (start == null) return null;
+  if (s.status === "terminated" && typeof s.stats?.duration_seconds === "number") return s.stats.duration_seconds;
+  const end = toDate(s.terminated_at ?? s.updated_at)?.getTime();
+  if (end == null || end < start) return null;
+  return (end - start) / 1000;
+}
+
+/**
+ * The line under a session's state: what came of it, or what it is waiting
+ * on. Said only where the reading says more than its label: a session at
+ * rest ("Idle", "Ended") needs no second line on every row.
+ */
+function outcomeLine(reading: SessionReading): string | null {
+  if (reading.tone === "neutral" && reading.status !== "unknown") return null;
+  return reading.detail && reading.detail !== reading.label ? reading.detail : null;
+}
+
+/**
+ * Activity: every session this agent has had, newest first, read the way
+ * the Sessions list reads them: the one session reading for the state, with
+ * what came of it or what it waits on under it, how long it ran, and when
+ * it was last active. Rows open the session.
  */
 export function ActivityTab({
   agent,
@@ -64,8 +92,12 @@ export function ActivityTab({
               <Skeleton className="h-3.5 w-[min(22rem,60%)]" rounded="sm" />
               <Skeleton className="h-3 w-28" rounded="sm" />
             </div>
-            <Skeleton className="h-3.5 w-16" rounded="sm" />
-            <Skeleton className="h-3.5 w-14" rounded="sm" />
+            <div className="w-[200px] space-y-2">
+              <Skeleton className="h-3.5 w-20" rounded="sm" />
+              <Skeleton className="h-3 w-36" rounded="sm" />
+            </div>
+            <Skeleton className="hidden h-3.5 w-12 sm:block" rounded="sm" />
+            <Skeleton className="hidden h-3.5 w-16 sm:block" rounded="sm" />
           </div>
         ))}
       </div>
@@ -113,14 +145,16 @@ export function ActivityTab({
       <Table className="table-fixed text-small-size">
         <colgroup>
           <col />
-          <col className="w-[170px]" />
-          <col className="w-[130px]" />
+          <col className="w-[160px] sm:w-[240px]" />
+          <col className="hidden w-[96px] sm:table-column" />
+          <col className="hidden w-[132px] sm:table-column" />
         </colgroup>
         <TableHeader>
           <TableRow className="hover:bg-transparent">
             <TableHead className="pl-5">Session</TableHead>
             <TableHead className="px-4">Status</TableHead>
-            <TableHead className="pr-5 pl-4">Started</TableHead>
+            <TableHead className="hidden px-4 text-right sm:table-cell">Duration</TableHead>
+            <TableHead className="hidden pr-5 pl-4 sm:table-cell">Last activity</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -128,12 +162,10 @@ export function ActivityTab({
             const reading = read(s);
             const source = sessionSource(s);
             const title = sessionTitle(s, agent.name);
-            // `duration_seconds` is only a real run length once the session has ended.
-            const ranFor =
-              s.status === "terminated" && s.stats?.duration_seconds != null ? formatSpan(s.stats.duration_seconds) : null;
+            const seconds = sessionSeconds(s);
+            const outcome = outcomeLine(reading);
             const facts = [
               source === "console" ? "Started in the console" : `Started from ${SESSION_SOURCE_LABEL[source]}`,
-              ranFor ? `ran for ${ranFor}` : null,
               s.agent?.version !== undefined && s.agent.version !== agent.version ? `as v${s.agent.version}` : null,
             ].filter(Boolean);
             // The title is the row's link (Tab + Enter, ⌘-click). A click
@@ -154,10 +186,31 @@ export function ActivityTab({
                   <div className="truncate text-xs text-fg-subtle">{facts.join(" · ")}</div>
                 </TableCell>
                 <TableCell className="px-4">
-                  <SessionStatus reading={reading} />
+                  {/* The detail is written under the badge, so the badge needs no tooltip. */}
+                  <SessionStatus reading={reading} tip={!outcome} />
+                  {outcome && (
+                    <div
+                      className={cn("truncate text-xs", reading.tone === "danger" ? "text-danger" : "text-fg-subtle")}
+                      title={outcome}
+                    >
+                      {outcome}
+                    </div>
+                  )}
                 </TableCell>
-                <TableCell className="pr-5 pl-4">
-                  <RelativeTime value={s.created_at} className="text-fg-muted" fallback="Unknown" />
+                <TableCell className="hidden px-4 text-right sm:table-cell">
+                  {seconds == null ? (
+                    <Tip label="Nothing was recorded after this session started">
+                      <span className="text-fg-faint">
+                        <span aria-hidden="true">–</span>
+                        <span className="sr-only">Not recorded</span>
+                      </span>
+                    </Tip>
+                  ) : (
+                    <span className="text-fg-muted tabular-nums">{seconds < 1 ? "<1s" : formatSpan(seconds)}</span>
+                  )}
+                </TableCell>
+                <TableCell className="hidden pr-5 pl-4 sm:table-cell">
+                  <RelativeTime value={s.updated_at || s.created_at} className="text-fg-muted" fallback="Unknown" />
                 </TableCell>
               </TableRow>
             );

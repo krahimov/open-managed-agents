@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { useNavigate, useParams } from "react-router";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate, useParams, useSearchParams } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   ArchiveIcon,
@@ -18,6 +18,7 @@ import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 
 import { ApiError, useApi } from "../lib/api";
+import { useServerFeature } from "../lib/server-features";
 import { agentCapabilities } from "../lib/agents";
 import { copyText } from "../lib/clipboard";
 import { inlineLink } from "../lib/links";
@@ -44,6 +45,7 @@ import {
   type TabItem,
 } from "../components/kit";
 import { RunUntilDoneDialog } from "../components/RunUntilDoneDialog";
+import { deleteAgentComputerSentence, type MachineResponse } from "../components/AgentComputerPanel";
 import type { AgentRecord as Agent } from "../types/agent";
 import type { SessionRecord } from "../types/session";
 import { AccessTab, printAuditTrail } from "./agents/detail/AccessTab";
@@ -52,9 +54,12 @@ import { OverviewTab } from "./agents/detail/OverviewTab";
 import { AddTriggerDialog, TriggersTab } from "./agents/detail/TriggersTab";
 import { VersionsTab } from "./agents/detail/VersionsTab";
 import { EditAgentDialog } from "./agents/EditAgentDialog";
+import { openSetupSession, setupPath } from "./agents/setup-session";
+import { checkAgentMachine, dropAgentQueries, forgetDeletedAgent } from "./agents/delete-agent";
 import { useSessionReadings } from "../components/sessions/readings";
 
 type Tab = "overview" | "activity" | "triggers" | "versions" | "access";
+
 const TABS: ReadonlyArray<Tab> = ["overview", "activity", "triggers", "versions", "access"];
 
 /**
@@ -78,7 +83,32 @@ export function AgentDetail() {
   const qc = useQueryClient();
   const [tab, setTab] = useTabParam<Tab>("overview", TABS);
 
-  const [editing, setEditing] = useState(false);
+  const [searchParams, setSearchParams] = useSearchParams();
+  // `?edit=1` (the setup chat's "Edit settings") opens the edit dialog.
+  const [editing, setEditingState] = useState(() => searchParams.get("edit") === "1");
+  const setEditing = (next: boolean) => {
+    setEditingState(next);
+    if (!next && searchParams.has("edit")) {
+      const params = new URLSearchParams(searchParams);
+      params.delete("edit");
+      setSearchParams(params, { replace: true });
+    }
+  };
+  const missionsOn = useServerFeature("missions");
+  const [openingSetup, setOpeningSetup] = useState(false);
+  // What the delete confirmation says about the agent's computer: checked
+  // when Delete is chosen, null when it could not be.
+  const [deleteMachine, setDeleteMachine] = useState<MachineResponse | null>(null);
+  const [checkingMachine, setCheckingMachine] = useState(false);
+  // Set once this agent is deleted; the unmount that follows the navigation
+  // away then drops its cached queries.
+  const deletedAgentId = useRef<string | null>(null);
+  useEffect(
+    () => () => {
+      if (deletedAgentId.current) dropAgentQueries(qc, deletedAgentId.current);
+    },
+    [qc],
+  );
   const [showDeploy, setShowDeploy] = useState(false);
   const [showRunDialog, setShowRunDialog] = useState(false);
   const [showAddTrigger, setShowAddTrigger] = useState(false);
@@ -98,12 +128,6 @@ export function AgentDetail() {
   const sessions = sessionsQuery.data?.data ?? EMPTY_SESSIONS;
   // "Running" in the header is the one reading's: a stalled session is not work in progress.
   const { read: readSession } = useSessionReadings();
-
-  // The conversation the agent was set up in, when there is one.
-  const setupSession = useMemo(
-    () => sessions.find((s) => (s.metadata as { oma_setup?: unknown } | undefined)?.oma_setup),
-    [sessions],
-  );
 
   if (agentQuery.error) {
     const missing = agentQuery.error instanceof ApiError && agentQuery.error.status === 404;
@@ -137,20 +161,44 @@ export function AgentDetail() {
   // hold the environment, vaults, resources and title.
   const startSession = () => openSessionStarter({ agentId: agent.id });
 
+  // Back into the agent's setup conversation, or a new one when it has none,
+  // to keep refining it by talking. It reads the live agent, so what was
+  // saved from the form since is what it sees.
+  const openSetup = async () => {
+    setOpeningSetup(true);
+    try {
+      const sessionId = await openSetupSession(api, agent.id, { environmentId: agent._oma?.default_environment_id });
+      nav(setupPath(agent.id, sessionId));
+    } catch {
+      // api() has said what failed.
+    } finally {
+      setOpeningSetup(false);
+    }
+  };
+
+  // The confirmation says for certain whether a computer goes with the
+  // agent, so it asks the server first (the panel's answer may be old).
+  const askDelete = async () => {
+    setCheckingMachine(true);
+    try {
+      setDeleteMachine(await checkAgentMachine(qc, api, agent.id));
+    } finally {
+      setCheckingMachine(false);
+    }
+    setConfirm("delete");
+  };
+
   const menu: RowAction[] = [
     { label: "Deploy", icon: <RocketIcon />, disabled: archived, onSelect: () => setShowDeploy(true) },
-    ...(setupSession
-      ? [
-          {
-            label: "Open setup chat",
-            icon: <MessagesSquareIcon />,
-            onSelect: () => nav(`/agents/${agent.id}/setup?session=${setupSession.id}`),
-          },
-        ]
-      : []),
     { label: "Copy agent id", icon: <CopyIcon />, onSelect: () => void copyText(agent.id) },
     { label: "Archive", icon: <ArchiveIcon />, disabled: archived, onSelect: () => setConfirm("archive") },
-    { label: "Delete", icon: <Trash2Icon />, destructive: true, onSelect: () => setConfirm("delete") },
+    {
+      label: "Delete",
+      icon: <Trash2Icon />,
+      destructive: true,
+      disabled: checkingMachine,
+      onSelect: () => void askDelete(),
+    },
   ];
 
   const tabs: TabItem<Tab>[] = [
@@ -206,12 +254,21 @@ export function AgentDetail() {
         }
         actions={
           <>
-            {longRunning && !archived && (
+            {missionsOn && longRunning && !archived && (
               <Button variant="outline" onClick={() => setShowRunDialog(true)}>
                 <TargetIcon data-icon="inline-start" />
                 Run until done
               </Button>
             )}
+            <Button
+              variant="outline"
+              onClick={() => void openSetup()}
+              disabled={archived || openingSetup}
+              loading={openingSetup}
+            >
+              <MessagesSquareIcon data-icon="inline-start" />
+              Setup chat
+            </Button>
             <Button variant="outline" onClick={() => setEditing(true)}>
               <PencilIcon data-icon="inline-start" />
               Edit
@@ -306,19 +363,23 @@ export function AgentDetail() {
         title={confirm === "delete" ? `Delete ${agent.name}?` : `Archive ${agent.name}?`}
         body={
           confirm === "delete"
-            ? "The agent and all of its versions are removed. Past sessions stay in history. This cannot be undone."
+            ? `The agent and all of its versions are removed. ${deleteAgentComputerSentence(deleteMachine)} Past sessions stay in history. This cannot be undone.`
             : "Archived agents stop accepting new sessions and move out of the gallery. Their history is kept."
         }
         confirmLabel={confirm === "delete" ? "Delete agent" : "Archive agent"}
         onConfirm={async () => {
           if (confirm === "delete") {
+            // Can take a few seconds: the agent's computer is deleted with it.
             await api(`/v1/agents/${agent.id}`, { method: "DELETE" });
-            toast.success("Agent deleted");
+            deletedAgentId.current = agent.id;
+            forgetDeletedAgent(qc, agent.id);
+            toast.success(`Deleted agent "${agent.name}"`);
           } else {
             await api(`/v1/agents/${agent.id}/archive`, { method: "POST", body: "{}" });
             toast.success("Agent archived");
+            void qc.invalidateQueries({ queryKey: ["/v1/agents"] });
+            void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}`] });
           }
-          void qc.invalidateQueries({ queryKey: ["/v1/agents"] });
           nav("/agents");
         }}
       />

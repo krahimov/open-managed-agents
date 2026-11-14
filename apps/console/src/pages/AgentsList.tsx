@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router";
+import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
 import { ArchiveIcon, CopyIcon, LayoutGridIcon, MessageSquarePlusIcon, Rows3Icon, Trash2Icon } from "lucide-react";
 
 import { useApi } from "../lib/api";
@@ -25,6 +27,8 @@ import { PopoverContent } from "@/components/ui/popover";
 import type { ModelCard } from "@open-managed-agents/api-types";
 import type { AgentRecord as Agent } from "../types/agent";
 import { AgentFormDialog } from "./agents/AgentFormDialog";
+import { checkAgentMachine, dropAgentQueries, forgetDeletedAgent } from "./agents/delete-agent";
+import { deleteAgentComputerSentence, type MachineResponse } from "../components/AgentComputerPanel";
 
 type Runtime = {
   id: string;
@@ -73,6 +77,7 @@ function readView(): ViewValue {
  */
 export function AgentsList() {
   const { api } = useApi();
+  const qc = useQueryClient();
   const [params, setParams] = useSearchParams();
   const [allAgents, setAllAgents] = useState<Agent[]>([]);
   const [customSkills, setCustomSkills] = useState<
@@ -178,7 +183,15 @@ export function AgentsList() {
   }, []);
 
   // Destructive actions go through a designed confirmation.
-  const [confirm, setConfirm] = useState<{ kind: "archive" | "delete"; agent: Agent } | null>(null);
+  // A delete also says for certain whether the agent's computer goes with
+  // it: the server is asked when Delete is chosen (null: it could not tell).
+  const [confirm, setConfirm] = useState<
+    { kind: "archive"; agent: Agent } | { kind: "delete"; agent: Agent; machine: MachineResponse | null } | null
+  >(null);
+  const askDelete = async (a: Agent) => {
+    const machine = await checkAgentMachine(qc, api, a.id);
+    setConfirm({ kind: "delete", agent: a, machine });
+  };
 
   const actionsFor = (a: Agent): RowAction[] => {
     const archived = !!a.archived_at;
@@ -204,7 +217,7 @@ export function AgentsList() {
         label: "Delete",
         icon: <Trash2Icon />,
         destructive: true,
-        onSelect: () => setConfirm({ kind: "delete", agent: a }),
+        onSelect: () => void askDelete(a),
       },
     ];
   };
@@ -432,18 +445,23 @@ export function AgentsList() {
         title={confirm?.kind === "delete" ? `Delete ${confirm.agent.name}?` : `Archive ${confirm?.agent.name ?? "agent"}?`}
         body={
           confirm?.kind === "delete"
-            ? "The agent and all of its versions are removed. Past sessions stay in history. This cannot be undone."
+            ? `The agent and all of its versions are removed. ${deleteAgentComputerSentence(confirm.machine)} Past sessions stay in history. This cannot be undone.`
             : "Archived agents stop accepting new sessions and move out of the gallery. Their history is kept."
         }
         confirmLabel={confirm?.kind === "delete" ? "Delete agent" : "Archive agent"}
         onConfirm={async () => {
           if (!confirm) return;
           if (confirm.kind === "delete") {
+            // Can take a few seconds: the agent's computer is deleted with it.
             await api(`/v1/agents/${confirm.agent.id}`, { method: "DELETE" });
+            forgetDeletedAgent(qc, confirm.agent.id);
+            // Nothing on this page observes the agent's own queries.
+            dropAgentQueries(qc, confirm.agent.id);
+            toast.success(`Deleted agent "${confirm.agent.name}"`);
           } else {
             await api(`/v1/agents/${confirm.agent.id}/archive`, { method: "POST", body: "{}" });
+            refreshAgents();
           }
-          refreshAgents();
         }}
       />
     </DataTable>
