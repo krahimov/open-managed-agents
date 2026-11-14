@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 
+import { useAuth } from "../lib/auth";
 import { useAgents } from "../lib/directory";
 import { formatCompact, formatCost, plural } from "../lib/format";
 import type { WorkspaceAccess } from "../lib/operations";
@@ -90,6 +91,23 @@ export function WorkspaceSettings() {
   const adminOn = has("workspace_admin");
   const access = useApiQuery<WorkspaceAccess>(accessOn ? "/v1/workspace/access" : null);
   const me = useApiQuery<Me>("/v1/me");
+  // /v1/me can leave the name and email empty (a better-auth session on
+  // Node); the signed-in user the console already holds fills them in.
+  const authUser = useAuth().user;
+  const meData = useMemo<Me | null>(() => {
+    const data = me.data;
+    if (!data) return null;
+    if (!data.user) return data;
+    const sameUser = !authUser?.id || authUser.id === data.user.id;
+    return {
+      ...data,
+      user: {
+        ...data.user,
+        name: data.user.name?.trim() || (sameUser ? authUser?.name?.trim() : "") || null,
+        email: data.user.email || (sameUser ? authUser?.email : "") || "",
+      },
+    };
+  }, [me.data, authUser?.id, authUser?.name, authUser?.email]);
   const auth = access.data?.authorization;
   const admin = !!auth && ["owner", "admin"].includes(auth.role);
   const editable = admin && auth?.kind !== "api_key" && adminOn;
@@ -133,7 +151,7 @@ export function WorkspaceSettings() {
       ) : !accessOn ? (
         // No roles on this server: everyone signed in manages the workspace.
         <div className="animate-rise-in space-y-6">
-          <AccessCard auth={null} me={me.data ?? null} rolesKept={false} />
+          <AccessCard auth={null} me={meData} rolesKept={false} />
         </div>
       ) : (
         <div className="animate-rise-in space-y-6">
@@ -141,7 +159,7 @@ export function WorkspaceSettings() {
               in Members (the row marked "You", with their role); everyone
               else, who has no member list to look at, gets this card. */}
           {!admin ? (
-            <AccessCard auth={auth ?? null} me={me.data ?? null} />
+            <AccessCard auth={auth ?? null} me={meData} />
           ) : auth?.kind === "api_key" ? (
             <Callout tone="neutral" title="Signed in with an API key">
               This key has {roleMeta(auth.role).label.toLowerCase()} access. Membership and limits can only be changed from a
@@ -153,7 +171,7 @@ export function WorkspaceSettings() {
             <>
               <MembersCard
                 query={adminOn ? members : ONLY_YOU}
-                me={me.data ?? null}
+                me={meData}
                 selfRole={auth?.role}
                 editable={editable}
                 viewerIsOwner={auth?.role === "owner"}
@@ -174,7 +192,7 @@ export function WorkspaceSettings() {
                   }}
                 />
               )}
-              {adminOn && <HistoryCard query={audit} me={me.data ?? null} />}
+              {adminOn && <HistoryCard query={audit} me={meData} />}
             </>
           )}
         </div>
@@ -359,7 +377,7 @@ function MembersCard({
               key={member.user_id}
               member={member}
               isYou={!!me?.user && me.user.id === member.user_id}
-              displayName={me?.user && me.user.id === member.user_id ? me.user.name?.trim() || me.user.email : undefined}
+              displayName={me?.user && me.user.id === member.user_id ? me.user.name?.trim() || me.user.email || undefined : undefined}
               caption={
                 onlyYou
                   ? kept
