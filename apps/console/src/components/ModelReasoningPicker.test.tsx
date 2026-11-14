@@ -1,14 +1,14 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { beforeAll, describe, expect, it, vi } from "vitest";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { MemoryRouter } from "react-router";
+import { http, HttpResponse } from "msw";
 import type { ModelCard } from "@open-managed-agents/api-types";
+
+import { server } from "../mocks/server";
 import { ModelReasoningPicker, prettyModelName } from "./ModelReasoningPicker";
 import { SessionModelPicker } from "./SessionModelPicker";
 import { agentModelPatch } from "./AgentModelSwitcher";
-
-vi.mock("../lib/clerk-auth", () => ({
-  getClerkBearerToken: vi.fn(async () => null),
-}));
 
 const card = (model_id: string, provider: string, model = model_id): ModelCard => ({
   id: `mc_${model_id}`,
@@ -18,27 +18,17 @@ const card = (model_id: string, provider: string, model = model_id): ModelCard =
   created_at: "2026-11-01T00:00:00Z",
 });
 
-const CARDS: ModelCard[] = [
-  card("claude-opus-5-5", "ant"),
-  card("gpt-6.1-sol", "oai"),
-  card("deepseek-chat", "oai-compatible"),
-];
+const CARDS: ModelCard[] = [card("claude-opus-5-5", "ant"), card("gpt-6.1-sol", "oai"), card("deepseek-chat", "oai-compatible")];
 
-beforeEach(() => {
-  vi.stubGlobal(
-    "ResizeObserver",
-    class {
-      observe() {}
-      unobserve() {}
-      disconnect() {}
-    },
-  );
+beforeAll(() => {
+  globalThis.ResizeObserver ??= class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  } as unknown as typeof ResizeObserver;
 });
 
-afterEach(() => {
-  cleanup();
-  vi.unstubAllGlobals();
-});
+const inRouter = (node: React.ReactNode) => <MemoryRouter>{node}</MemoryRouter>;
 
 describe("prettyModelName", () => {
   it.each([
@@ -55,18 +45,21 @@ describe("prettyModelName", () => {
 });
 
 describe("ModelReasoningPicker", () => {
-  it("shows the compact chip and a two-column popover with Default tags and checks", async () => {
+  it("shows a compact chip and a two-column popover with Default marks and checks", async () => {
     const onChange = vi.fn();
     render(
-      <ModelReasoningPicker
-        cards={CARDS}
-        value={{ model: "claude-opus-5-5", level: "high" }}
-        defaults={{ model: "claude-opus-5-5", level: "medium" }}
-        onChange={onChange}
-      />,
+      inRouter(
+        <ModelReasoningPicker
+          cards={CARDS}
+          value={{ model: "claude-opus-5-5", level: "high" }}
+          defaults={{ model: "claude-opus-5-5", level: "medium" }}
+          onChange={onChange}
+        />,
+      ),
     );
     const chip = screen.getByTestId("model-reasoning-chip");
-    expect(chip).toHaveTextContent("Opus 5.5High");
+    expect(chip).toHaveAccessibleName("Model and reasoning: Opus 5.5, High");
+    expect(chip).toHaveTextContent("Opus 5.5·High");
     fireEvent.click(chip);
 
     const models = await screen.findByRole("listbox", { name: "Model" });
@@ -77,6 +70,7 @@ describe("ModelReasoningPicker", () => {
 
     const reasoning = screen.getByRole("listbox", { name: "Reasoning" });
     const levels = within(reasoning).getAllByRole("option").map((o) => o.textContent);
+    // The five levels the server offers; no "Instant".
     expect(levels).toEqual(["Low", "MediumDefault", "High", "Extra High", "Max"]);
     expect(within(reasoning).getByRole("option", { name: "High" })).toHaveAttribute("aria-selected", "true");
 
@@ -84,70 +78,75 @@ describe("ModelReasoningPicker", () => {
     expect(onChange).toHaveBeenCalledWith({ model: "claude-opus-5-5", level: "xhigh" });
   });
 
-  it("switching models keeps the level; non-reasoning models disable the column", async () => {
+  it("switching models keeps the level; a model without reasoning disables the column", async () => {
     const onChange = vi.fn();
     const { rerender } = render(
-      <ModelReasoningPicker cards={CARDS} value={{ model: "claude-opus-5-5", level: "max" }} onChange={onChange} />,
+      inRouter(<ModelReasoningPicker cards={CARDS} value={{ model: "claude-opus-5-5", level: "max" }} onChange={onChange} />),
     );
     fireEvent.click(screen.getByTestId("model-reasoning-chip"));
     fireEvent.click(await screen.findByRole("option", { name: /GPT-6.1 Sol/ }));
     expect(onChange).toHaveBeenCalledWith({ model: "gpt-6.1-sol", level: "max" });
 
-    rerender(<ModelReasoningPicker cards={CARDS} value={{ model: "deepseek-chat", level: "max" }} onChange={onChange} />);
+    rerender(inRouter(<ModelReasoningPicker cards={CARDS} value={{ model: "deepseek-chat", level: "max" }} onChange={onChange} />));
     expect(screen.getByText("This model doesn't take a reasoning level.")).toBeInTheDocument();
     expect(screen.getByRole("option", { name: "Max" })).toBeDisabled();
-    // Chip drops the level for models that ignore it.
+    // The chip drops the level for a model that ignores it.
     expect(screen.getByTestId("model-reasoning-chip")).toHaveTextContent(/^deepseek-chat$/);
   });
 
-  it("unset level reads as Medium", () => {
-    render(<ModelReasoningPicker cards={CARDS} value={{ model: "gpt-6.1-sol", level: undefined }} onChange={() => {}} />);
-    expect(screen.getByTestId("model-reasoning-chip")).toHaveTextContent("GPT-6.1 SolMedium");
+  it("an unset level reads as Medium, and the legacy Instant as Low", () => {
+    const { rerender } = render(
+      inRouter(<ModelReasoningPicker cards={CARDS} value={{ model: "gpt-6.1-sol", level: undefined }} onChange={() => {}} />),
+    );
+    expect(screen.getByTestId("model-reasoning-chip")).toHaveTextContent("GPT-6.1 Sol·Medium");
+    rerender(inRouter(<ModelReasoningPicker cards={CARDS} value={{ model: "gpt-6.1-sol", level: "instant" }} onChange={() => {}} />));
+    expect(screen.getByTestId("model-reasoning-chip")).toHaveTextContent("GPT-6.1 Sol·Low");
+  });
+
+  it("with no model keys, points to where one is added", async () => {
+    render(inRouter(<ModelReasoningPicker cards={[]} value={{ model: "claude-opus-5-5", level: undefined }} onChange={() => {}} />));
+    fireEvent.click(screen.getByTestId("model-reasoning-chip"));
+    expect(await screen.findByRole("link", { name: "Add one" })).toHaveAttribute("href", "/model-cards");
   });
 });
 
 describe("SessionModelPicker", () => {
-  it("loads the session override and posts metadata; picking the agent's own value clears it", async () => {
-    const posts: unknown[] = [];
+  it("loads the session override and saves it; picking the agent's own value clears it", async () => {
+    const posts: Array<{ metadata: Record<string, unknown> }> = [];
     let session = {
       id: "sess_1",
       agent: { id: "agent_1", model: "claude-opus-5-5", reasoning_level: "high" },
       metadata: { model: "gpt-6.1-sol" } as Record<string, unknown>,
     };
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = new URL(String(input), "http://localhost");
-        if (url.pathname === "/v1/model_cards") return Response.json({ data: CARDS });
-        if (url.pathname === "/v1/sessions/sess_1" && init?.method === "POST") {
-          const body = JSON.parse(String(init.body));
-          posts.push(body);
-          session = { ...session, metadata: { ...session.metadata, ...body.metadata } };
-          return Response.json(session);
-        }
-        if (url.pathname === "/v1/sessions/sess_1") return Response.json(session);
-        return Response.json({ data: [] });
+    server.use(
+      http.get("*/v1/model_cards", () => HttpResponse.json({ data: CARDS })),
+      http.get("*/v1/sessions/sess_1", () => HttpResponse.json(session)),
+      http.post("*/v1/sessions/sess_1", async ({ request }) => {
+        const body = (await request.json()) as { metadata: Record<string, unknown> };
+        posts.push(body);
+        session = { ...session, metadata: { ...session.metadata, ...body.metadata } };
+        return HttpResponse.json(session);
       }),
     );
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={client}>
-        <SessionModelPicker sessionId="sess_1" />
+        {inRouter(<SessionModelPicker sessionId="sess_1" />)}
       </QueryClientProvider>,
     );
 
     const chip = await screen.findByTestId("model-reasoning-chip");
-    // Override model, agent's level.
-    await waitFor(() => expect(chip).toHaveTextContent("GPT-6.1 SolHigh"));
+    // The session's own model, the agent's level.
+    await waitFor(() => expect(chip).toHaveTextContent("GPT-6.1 Sol·High"));
     fireEvent.click(chip);
     const reasoning = await screen.findByRole("listbox", { name: "Reasoning" });
-    // "Default" marks the AGENT's configured level, not Medium.
+    // "Default" marks the agent's own level, not Medium.
     expect(within(reasoning).getByRole("option", { name: /HighDefault/ })).toBeInTheDocument();
 
     fireEvent.click(within(reasoning).getByRole("option", { name: "Max" }));
     await waitFor(() => expect(posts).toHaveLength(1));
     expect(posts[0]).toEqual({ metadata: { model: "gpt-6.1-sol", reasoning_level: "max" } });
-    await waitFor(() => expect(screen.getByTestId("model-reasoning-chip")).toHaveTextContent("GPT-6.1 SolMax"));
+    await waitFor(() => expect(screen.getByTestId("model-reasoning-chip")).toHaveTextContent("GPT-6.1 Sol·Max"));
 
     fireEvent.click(screen.getByTestId("model-reasoning-chip"));
     fireEvent.click(await screen.findByRole("option", { name: /Opus 5.5/ }));
@@ -156,10 +155,10 @@ describe("SessionModelPicker", () => {
   });
 });
 
-describe("agentModelPatch (agent page quick switcher)", () => {
+describe("agentModelPatch (the agent page's quick switcher)", () => {
   const agent = { model: { id: "claude-opus-5-5", speed: "fast" }, version: 3, _oma: { reasoning_level: "high" as const } };
 
-  it("sends only changed fields with the version guard, keeping speed", () => {
+  it("sends only what changed, with the version guard, keeping speed", () => {
     expect(agentModelPatch(agent, { model: "claude-sonnet-5-5", level: "high" })).toEqual({
       model: { id: "claude-sonnet-5-5", speed: "fast" },
       version: 3,
@@ -170,7 +169,7 @@ describe("agentModelPatch (agent page quick switcher)", () => {
     });
   });
 
-  it("stores the default level as unset and no-ops when nothing changed", () => {
+  it("stores the default level as unset and does nothing when nothing changed", () => {
     expect(agentModelPatch(agent, { model: "claude-opus-5-5", level: "medium" })).toEqual({
       _oma: { reasoning_level: null },
       version: 3,
