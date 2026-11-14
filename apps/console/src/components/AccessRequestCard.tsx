@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams, Link } from "react-router";
 import { toast } from "sonner";
-import { KeyRoundIcon, Settings2Icon } from "lucide-react";
+import { KeyRoundIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 
@@ -481,7 +481,7 @@ export function AccessRequestCard({
       <EventCard
         kind="approval"
         className={NEEDS_YOU_CARD}
-        icon={isLlmProvider || isApiKeyMcp ? KeyRoundIcon : needsAppSetup ? Settings2Icon : app.icon}
+        icon={isLlmProvider || isApiKeyMcp ? KeyRoundIcon : app.icon}
         title={`${agentName} needs access to ${app.label}`}
         subtitle={ev.reason || "It cannot continue this task without it."}
         actions={
