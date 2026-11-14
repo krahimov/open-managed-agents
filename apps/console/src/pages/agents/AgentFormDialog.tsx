@@ -19,6 +19,7 @@ import { VaultIcon } from "@/components/icons";
 import { toast } from "sonner";
 
 import { getActiveTenantId, readApiErrorMessage, useApi } from "../../lib/api";
+import { getClerkBearerToken } from "../../lib/clerk-auth";
 import { useApiQuery } from "../../lib/useApiQuery";
 import { subscribeOAuthMessages } from "../../lib/oauth-popup";
 import { pickDefaultEnvironmentId } from "../../lib/default-environment";
@@ -1902,9 +1903,13 @@ function isComposioMcpUrl(url?: string): boolean {
 
 async function fetchJsonQuiet<T>(path: string): Promise<T> {
   const activeTenant = getActiveTenantId();
+  const clerkToken = await getClerkBearerToken();
   const res = await fetch(path, {
     credentials: "include",
-    headers: activeTenant ? { "x-active-tenant": activeTenant } : undefined,
+    headers: {
+      ...(clerkToken ? { authorization: `Bearer ${clerkToken}` } : {}),
+      ...(activeTenant ? { "x-active-tenant": activeTenant } : {}),
+    },
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
