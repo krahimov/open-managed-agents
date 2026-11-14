@@ -51,6 +51,7 @@ import { ApiError, useApi } from "../../lib/api";
 import { useAgents } from "../../lib/directory";
 import { AUTO_JUDGE, injectJudge, type SimulationPersona } from "../../lib/evals";
 import { plural } from "../../lib/format";
+import { useServerFeature } from "../../lib/server-features";
 import { describeModel } from "../../lib/models";
 import { useQueryClient } from "../../lib/useApiQuery";
 import { cn } from "../../lib/utils";
@@ -144,6 +145,9 @@ export function NewSimulationDialog({ open, onClose }: { open: boolean; onClose:
   const [count, setCount] = useState<(typeof COUNTS)[number]>("3");
   const [drafting, setDrafting] = useState(false);
   const [draftUnavailable, setDraftUnavailable] = useState(false);
+  // Drafting is offered only where the server has it; elsewhere each
+  // scenario is written by hand from the start.
+  const canDraft = useServerFeature("draft_scenarios");
   const [draftedBy, setDraftedBy] = useState("");
 
   // Step 2
@@ -427,13 +431,19 @@ export function NewSimulationDialog({ open, onClose }: { open: boolean; onClose:
       </Button>
       {hasScenarios ? (
         <>
-          <Tip label={`Replaces the ${plural(scenarios.length, "scenario")} you have now`}>
-            <Button variant="outline" onClick={generate} disabled={!agentId}>
-              Draft again
-            </Button>
-          </Tip>
+          {canDraft && (
+            <Tip label={`Replaces the ${plural(scenarios.length, "scenario")} you have now`}>
+              <Button variant="outline" onClick={generate} disabled={!agentId}>
+                Draft again
+              </Button>
+            </Tip>
+          )}
           <Button onClick={() => setStep(1)}>Continue</Button>
         </>
+      ) : !canDraft ? (
+        <Button onClick={startBlank} disabled={!agentId}>
+          Write the scenarios
+        </Button>
       ) : (
         <>
           <Button variant="outline" onClick={startBlank}>
@@ -515,22 +525,26 @@ export function NewSimulationDialog({ open, onClose }: { open: boolean; onClose:
             fallbackName={agentName}
             hint="The agent that will talk to the simulated users."
           />
-          <Field label="Scenarios to draft" hint="Each one is a different user in a different situation. You can add, edit or remove them next.">
-            <SegmentedControl<(typeof COUNTS)[number]>
-              label="Scenarios to draft"
-              value={count}
-              onChange={setCount}
-              options={COUNTS.map((c) => ({ value: c, label: c }))}
-            />
-          </Field>
-          <Field label="What to probe" hint="Optional. Leave it empty to cover what the agent's instructions say it is for.">
-            <Input
-              value={focus}
-              onChange={(e) => setFocus(e.target.value)}
-              placeholder="Billing disputes, prompt-injection resistance"
-              autoComplete="off"
-            />
-          </Field>
+          {canDraft && (
+            <Field label="Scenarios to draft" hint="Each one is a different user in a different situation. You can add, edit or remove them next.">
+              <SegmentedControl<(typeof COUNTS)[number]>
+                label="Scenarios to draft"
+                value={count}
+                onChange={setCount}
+                options={COUNTS.map((c) => ({ value: c, label: c }))}
+              />
+            </Field>
+          )}
+          {canDraft && (
+            <Field label="What to probe" hint="Optional. Leave it empty to cover what the agent's instructions say it is for.">
+              <Input
+                value={focus}
+                onChange={(e) => setFocus(e.target.value)}
+                placeholder="Billing disputes, prompt-injection resistance"
+                autoComplete="off"
+              />
+            </Field>
+          )}
         </div>
       ) : step === 1 ? (
         <div className="space-y-4">

@@ -39,6 +39,7 @@ import { formatSpan, plural, toDate } from "../lib/format";
 import { useQueryClient } from "../lib/useApiQuery";
 import { NewEvalRunDialog } from "./evals/NewEvalRunDialog";
 import { NewSimulationDialog } from "./evals/NewSimulationDialog";
+import { useServerFeature } from "../lib/server-features";
 
 /**
  * Evals: is each agent still doing its job?
@@ -161,6 +162,8 @@ export function EvalRunsList() {
 
   const [showCreate, setShowCreate] = useState(false);
   const [showSimulation, setShowSimulation] = useState(false);
+  // Simulations are offered only where the server can run them.
+  const simulations = useServerFeature("simulations");
   const [runTarget, setRunTarget] = useState<RunTarget | null>(null);
   const [confirm, setConfirm] = useState<
     { kind: "cancel" | "delete"; run: EvalRun } | { kind: "suite"; suite: EvalSuiteSummary } | null
@@ -290,17 +293,17 @@ export function EvalRunsList() {
     [agents],
   );
 
-  const headerActions = (
+  const headerActions = simulations ? (
     <Button variant="outline" onClick={() => setShowSimulation(true)}>
       <DramaIcon data-icon="inline-start" />
       New simulation
     </Button>
-  );
+  ) : undefined;
 
   const dialogs = (
     <>
       <NewEvalRunDialog open={showCreate} onClose={() => setShowCreate(false)} />
-      <NewSimulationDialog open={showSimulation} onClose={() => setShowSimulation(false)} />
+      {simulations && <NewSimulationDialog open={showSimulation} onClose={() => setShowSimulation(false)} />}
       <RunDialog target={runTarget} onClose={() => setRunTarget(null)} />
       <SuiteSheet
         suite={openSuite}
@@ -389,7 +392,9 @@ export function EvalRunsList() {
         emptySubtitle={
           suitesQuery.unsupported
             ? "This server has nowhere to keep them. You can still start a run with its tasks written out."
-            : "A suite is a saved set of tasks you run again after every change, to see whether the agent got better or worse. Open a session that went well and choose Save as eval, or save the scenarios of a simulation."
+            : simulations
+              ? "A suite is a saved set of tasks you run again after every change, to see whether the agent got better or worse. Open a session that went well and choose Save as eval, or save the scenarios of a simulation."
+              : "A suite is a saved set of tasks you run again after every change, to see whether the agent got better or worse. Open a session that went well and choose Save as eval."
         }
         emptyAction={
           suitesQuery.unsupported ? (
@@ -401,9 +406,11 @@ export function EvalRunsList() {
               <Button variant="outline" asChild>
                 <Link to="/sessions">Choose a session</Link>
               </Button>
-              <Button variant="ghost" onClick={() => setShowSimulation(true)}>
-                New simulation
-              </Button>
+              {simulations && (
+                <Button variant="ghost" onClick={() => setShowSimulation(true)}>
+                  New simulation
+                </Button>
+              )}
             </>
           )
         }
@@ -483,9 +490,11 @@ export function EvalRunsList() {
         ) : (
           <>
             <Button onClick={() => setShowCreate(true)}>New eval run</Button>
-            <Button variant="outline" onClick={() => setShowSimulation(true)}>
-              New simulation
-            </Button>
+            {simulations && (
+              <Button variant="outline" onClick={() => setShowSimulation(true)}>
+                New simulation
+              </Button>
+            )}
           </>
         )
       }

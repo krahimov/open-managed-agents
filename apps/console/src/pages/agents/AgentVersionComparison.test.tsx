@@ -4,10 +4,11 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
 import { AgentVersionComparison } from "./AgentVersionComparison";
 import type { AgentRecord } from "../../types/agent";
 
-const mocks = vi.hoisted(() => ({ api: vi.fn(), detail: null as unknown }));
+const mocks = vi.hoisted(() => ({ api: vi.fn(), detail: null as unknown, comparisons: true, asked: [] as string[] }));
 vi.mock("../../lib/api", () => ({ useApi: () => ({ api: mocks.api }) }));
+vi.mock("../../lib/server-features", () => ({ useServerFeature: (key: string) => key === "comparisons" && mocks.comparisons }));
 vi.mock("../../lib/useApiQuery", () => ({
-  useApiQuery: (path: string) => ({
+  useApiQuery: (path: string) => (mocks.asked.push(path), {
     data: path === "/v1/evals/suites" ? { data: [{ id: "suite-1", name: "Regression", task_count: 2 }] }
       : path === "/v1/environments" ? { data: [{ id: "env-1", name: "Test environment" }] }
       : path === "/v1/evals/comparisons" ? { data: [] }
@@ -17,7 +18,7 @@ vi.mock("../../lib/useApiQuery", () => ({
 }));
 const agent: AgentRecord = { id: "agent-1", name: "Agent", version: 2, model: "test", created_at: "2026-01-01" };
 const view = (versions: AgentRecord[]) => <MemoryRouter><AgentVersionComparison agent={agent} versions={versions} /></MemoryRouter>;
-beforeEach(() => { mocks.api.mockReset(); mocks.detail = null; });
+beforeEach(() => { mocks.api.mockReset(); mocks.detail = null; mocks.comparisons = true; mocks.asked = []; });
 
 describe("agent version comparison", () => {
   it("selects the prior version when history arrives after the agent and launches both against the same suite", async () => {
@@ -57,5 +58,13 @@ describe("agent version comparison", () => {
     fireEvent.click(screen.getByRole("button", { name: "Run comparison" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("Agent version not found");
     expect(screen.getByRole("button", { name: "Run comparison" })).toBeEnabled();
+  });
+
+  it("is left out, asking for nothing, where the server runs no comparisons", () => {
+    mocks.comparisons = false;
+    const { container } = render(view([{ ...agent, version: 1 }]));
+    expect(container).toBeEmptyDOMElement();
+    expect(mocks.asked).toEqual([]);
+    expect(mocks.api).not.toHaveBeenCalled();
   });
 });

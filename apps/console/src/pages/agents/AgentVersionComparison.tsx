@@ -6,6 +6,7 @@ import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 
 import { useApi } from "../../lib/api";
+import { useServerFeature } from "../../lib/server-features";
 import { formatCompact, formatCost, formatRelativeTime } from "../../lib/format";
 import { useApiQuery } from "../../lib/useApiQuery";
 import { PickSelect } from "../../components/agents/controls";
@@ -61,8 +62,16 @@ const FIELD_LABEL: Record<string, string> = {
  * Compare two versions of an agent on a saved test suite: both versions
  * run the same tests in fresh sessions, and the results sit side by side.
  * Lives in the agent profile's Versions tab.
+ *
+ * Only where the server runs comparisons (`useServerFeature("comparisons")`):
+ * elsewhere the card is left out, and nothing is asked for.
  */
-export function AgentVersionComparison({ agent, versions }: { agent: AgentRecord; versions: AgentRecord[] }) {
+export function AgentVersionComparison(props: { agent: AgentRecord; versions: AgentRecord[] }) {
+  const comparisons = useServerFeature("comparisons");
+  return comparisons ? <VersionComparison {...props} /> : null;
+}
+
+function VersionComparison({ agent, versions }: { agent: AgentRecord; versions: AgentRecord[] }) {
   const { api } = useApi();
   const allVersions = [...new Set([agent.version, ...versions.map((v) => v.version)])].sort((a, b) => b - a);
   const [baselineVersion, setBaselineVersion] = useState<number | null>(null);

@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 
 import { useApi } from "../lib/api";
+import { useServerFeature } from "../lib/server-features";
 import { Field } from "./Field";
 import { Modal } from "./Modal";
 import { withReason } from "@/lib/failure-text";
@@ -17,6 +18,9 @@ import { withReason } from "@/lib/failure-text";
  * creates the mission, the backend starts iteration 1, and we go straight
  * into that session, where the run band and the verdict cards tell the
  * rest of the story.
+ *
+ * Only where the server runs missions (`useServerFeature("missions")`);
+ * elsewhere the dialog renders nothing, and its entry point is hidden.
  */
 export function RunUntilDoneDialog({
   agentId,
@@ -34,6 +38,7 @@ export function RunUntilDoneDialog({
   const [maxIterations, setMaxIterations] = useState(10);
   const [wallClock, setWallClock] = useState(120);
   const [starting, setStarting] = useState(false);
+  const missions = useServerFeature("missions");
 
   const start = async () => {
     setStarting(true);
@@ -60,6 +65,8 @@ export function RunUntilDoneDialog({
       setStarting(false);
     }
   };
+
+  if (!missions) return null;
 
   return (
     <Modal

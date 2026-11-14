@@ -9,6 +9,7 @@ import { cn } from "@/lib/utils";
 import { quietLink } from "@/lib/links";
 
 import { useApi } from "../lib/api";
+import { useServerFeature } from "@/lib/server-features";
 import { rememberMissions } from "../lib/sessions";
 import { StatusBadge } from "./Badge";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -98,12 +99,15 @@ export function MissionBanner({
   turn?: { running: boolean; stopping: boolean; onStop: () => void };
 }) {
   const { api } = useApi();
+  // A server that runs no missions has no run to show (and no endpoint to ask).
+  const missions = useServerFeature("missions");
   const [confirm, setConfirm] = useState(false);
   // Read quietly: a failure is drawn here, in the band's own place, not as
   // a toast every five seconds.
   const missionQuery = useQuery<MissionResponse>({
     queryKey: ["mission", missionId],
     queryFn: ({ signal }) => api<MissionResponse>(`/v1/missions/${missionId}`, { signal, silentErrors: true }),
+    enabled: missions,
     refetchInterval: 5000,
     retry: 1,
   });
@@ -120,6 +124,8 @@ export function MissionBanner({
     if (missionQuery.isSuccess) setFault(null);
     else if (missionQuery.isError) setFault(missionQuery.error ?? new Error("The run could not be read"));
   }, [missionQuery.isSuccess, missionQuery.isError, missionQuery.error]);
+
+  if (!missions) return null;
 
   if (!m) {
     // The band keeps its place whatever happens: its shape while the run
