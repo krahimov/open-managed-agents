@@ -4,6 +4,7 @@ import { CopyIcon, LayoutGridIcon, Rows3Icon, Trash2Icon, UploadIcon } from "luc
 
 import { GALLERY_GRID } from "../lib/agents";
 import { useApi } from "../lib/api";
+import { useServerFeature } from "../lib/server-features";
 import { copyText } from "../lib/clipboard";
 import { useApiQuery } from "../lib/useApiQuery";
 import { EntityAvatar } from "../components/AgentAvatar";
@@ -198,6 +199,8 @@ export function SkillsList() {
   const [confirmDelete, setConfirmDelete] = useState<Skill | null>(null);
 
   const [showUpload, setShowUpload] = useState(false);
+  // A .zip upload needs a server that takes one; elsewhere skills come from the catalog.
+  const canUpload = useServerFeature("skill_versions");
   const [title, setTitle] = useState("");
   const [zip, setZip] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
@@ -325,10 +328,12 @@ export function SkillsList() {
       subtitle={SUBTITLE}
       headerActions={
         <>
-          <Button variant="outline" onClick={() => setShowUpload(true)}>
-            <UploadIcon data-icon="inline-start" />
-            Upload skill
-          </Button>
+          {canUpload && (
+            <Button variant="outline" onClick={() => setShowUpload(true)}>
+              <UploadIcon data-icon="inline-start" />
+              Upload skill
+            </Button>
+          )}
           <Button onClick={() => navigate("/skills/catalog")}>Browse catalog</Button>
         </>
       }
@@ -403,9 +408,11 @@ export function SkillsList() {
             <Button asChild>
               <Link to="/skills/catalog">Browse catalog</Link>
             </Button>
-            <Button variant="ghost" onClick={() => setShowUpload(true)}>
-              Upload a skill
-            </Button>
+            {canUpload && (
+              <Button variant="ghost" onClick={() => setShowUpload(true)}>
+                Upload a skill
+              </Button>
+            )}
           </>
         )
       }

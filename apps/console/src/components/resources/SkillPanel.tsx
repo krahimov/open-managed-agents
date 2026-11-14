@@ -5,6 +5,7 @@ import { CheckIcon, DownloadIcon, FileArchiveIcon, ShieldCheckIcon, Trash2Icon, 
 import { Link } from "react-router";
 
 import { useApi } from "@/lib/api";
+import { useServerFeature } from "@/lib/server-features";
 import { formatAbsolute } from "@/lib/format";
 import { useQueryClient } from "@/lib/useApiQuery";
 import { cn } from "@/lib/utils";
@@ -210,8 +211,8 @@ function SkillSheetBody({
   const detail = useQuietQuery<Skill>(`/v1/skills/${listed.id}`);
   const skill: Skill = { ...listed, ...(detail.data ?? {}) };
 
-  // Versions exist only where the runtime keeps them.
-  const versioned = skill.latest_version != null;
+  // Versions exist only where the runtime keeps them (and serves them).
+  const versioned = useServerFeature("skill_versions") && skill.latest_version != null;
   const versions = useQuietQuery<{ data: VersionSummary[] }>(`/v1/skills/${skill.id}/versions`, versioned);
   const latest = useQuietQuery<VersionDetail>(
     `/v1/skills/${skill.id}/versions/${skill.latest_version}`,

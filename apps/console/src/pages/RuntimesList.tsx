@@ -1,4 +1,5 @@
 import { useMemo, useState, type ReactNode } from "react";
+import { Link } from "react-router";
 import { BanIcon, CopyIcon, ExternalLinkIcon, LaptopIcon, PanelRightOpenIcon, PlusIcon, PuzzleIcon, TerminalIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -6,6 +7,7 @@ import { PopoverContent } from "@/components/ui/popover";
 import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetTitle } from "@/components/ui/sheet";
 
 import { useApi } from "../lib/api";
+import { useServerFeature } from "../lib/server-features";
 import { BRAND_NAME } from "../lib/brand";
 import { copyText } from "../lib/clipboard";
 import { plural } from "../lib/format";
@@ -74,9 +76,13 @@ const skillCount = (r: Runtime) => Object.values(r.local_skills ?? {}).reduce((n
  * bound to a runtime runs on that machine instead of a cloud sandbox. The
  * list answers "is my machine connected and what can it run"; a row opens
  * the machine's details, and connecting a new one is a three-step dialog.
+ *
+ * Only a server that can bridge to a machine (`useServerFeature("runtimes")`)
+ * connects and revokes them; elsewhere the page says so and asks for nothing.
  */
 export function RuntimesList() {
   const { api } = useApi();
+  const supported = useServerFeature("runtimes");
   const [showConnect, setShowConnect] = useState(false);
   const [status, setStatus] = useState<StatusValue>("any");
   const [openId, setOpenId] = useState<string | null>(null);
@@ -84,7 +90,7 @@ export function RuntimesList() {
 
   // Refetch every 15s so a freshly attached daemon shows up, and a machine
   // that went to sleep flips to offline, without a reload.
-  const { data: runtimesRes, isLoading: loading, error, refetch } = useApiQuery<RuntimesResponse>("/v1/runtimes", undefined, {
+  const { data: runtimesRes, isLoading: loading, error, refetch } = useApiQuery<RuntimesResponse>(supported ? "/v1/runtimes" : null, undefined, {
     refetchInterval: 15_000,
   });
   const runtimes = useMemo<Runtime[]>(
@@ -214,6 +220,24 @@ export function RuntimesList() {
       />
     </>
   );
+
+  if (!supported) {
+    return (
+      <Page width="wide" header={<PageHeader title="Local runtimes" subtitle={SUBTITLE} width="wide" />}>
+        <EmptyState
+          size="lg"
+          kind="runtime"
+          title="Local runtimes are not available on this server"
+          body="This server does not connect laptops or VMs. Agents run in its environments instead."
+          action={
+            <Button variant="outline" asChild>
+              <Link to="/environments">Open environments</Link>
+            </Button>
+          }
+        />
+      </Page>
+    );
+  }
 
   // A failed read replaces the list: never an empty state for an error.
   if (error && runtimes.length === 0) {

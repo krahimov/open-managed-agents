@@ -8,6 +8,7 @@ import { Avatar } from "../components/Avatar";
 import { Callout } from "../components/Callout";
 import { Skeleton } from "../components/Skeleton";
 import { useApi } from "../lib/api";
+import { useServerFeatures } from "../lib/server-features";
 import { BRAND_NAME } from "../lib/brand";
 import { useApiQuery } from "../lib/useApiQuery";
 import { AuthShell } from "./auth/AuthShell";
@@ -21,7 +22,10 @@ import { AuthShell } from "./auth/AuthShell";
  *
  *  Mirror of CliLogin.tsx — same frame, different mint endpoint, just one
  *  code per setup (no per-tenant fan-out — the token belongs to the active
- *  tenant at code-mint time). */
+ *  tenant at code-mint time).
+ *
+ *  A server that cannot bridge to a machine (`runtimes` off) says so once the
+ *  person is signed in, and Cancel tells the CLI, so nothing waits. */
 
 interface MeResponse {
   user: { id: string; email: string; name: string | null } | null;
@@ -64,7 +68,9 @@ export function ConnectRuntime() {
   // away and back doesn't re-hit the endpoint within staleTime.
   const meQuery = useApiQuery<MeResponse>(paramsValid ? "/v1/me" : null);
   const me = meQuery.data ?? null;
-  const loading = paramsValid ? meQuery.isLoading : false;
+  const features = useServerFeatures();
+  const supported = features.data?.features.has("runtimes") ?? false;
+  const loading = paramsValid ? meQuery.isLoading || (!!me && features.isLoading) : false;
 
   // /v1/me failure: 401 → the "Sign in" step; everything else → shown as is.
   useEffect(() => {
@@ -188,6 +194,28 @@ export function ConnectRuntime() {
 
   const account = me.user?.email ?? me.user?.id ?? "this user";
   const workspace = me.tenant.name?.trim() || "Your workspace";
+
+  if (!supported) {
+    return (
+      <AuthShell
+        title="This server cannot connect machines"
+        subtitle="Local runtimes are not available here, so setup cannot finish."
+        below={
+          <>
+            Signed in as <span className="font-medium text-fg">{account}</span>
+          </>
+        }
+      >
+        <p className="text-small leading-relaxed text-fg-muted">
+          Agents on this server run in its environments. Close setup in your terminal, or choose Cancel to tell it. Nothing was
+          connected.
+        </p>
+        <Button variant="outline" size="lg" className="mt-6 h-11 w-full" onClick={cancel}>
+          Cancel setup
+        </Button>
+      </AuthShell>
+    );
+  }
 
   return (
     <AuthShell
