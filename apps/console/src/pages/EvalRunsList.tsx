@@ -56,7 +56,8 @@ import { useServerFeature } from "../lib/server-features";
  * (the primary) and "New simulation".
  */
 
-const SUBTITLE = "Run your agents on saved tasks and simulated users. A judge model grades every attempt.";
+const SIMULATION_SUBTITLE = "Run your agents on saved tasks and simulated users. A judge model grades every attempt.";
+const TASKS_SUBTITLE = "Run your agents on saved tasks. A judge model grades every attempt.";
 
 type View = "runs" | "suites";
 type StatusValue = "any" | "pending" | "running" | "completed" | "failed";
@@ -164,6 +165,7 @@ export function EvalRunsList() {
   const [showSimulation, setShowSimulation] = useState(false);
   // Simulations are offered only where the server can run them.
   const simulations = useServerFeature("simulations");
+  const SUBTITLE = simulations ? SIMULATION_SUBTITLE : TASKS_SUBTITLE;
   const [runTarget, setRunTarget] = useState<RunTarget | null>(null);
   const [confirm, setConfirm] = useState<
     { kind: "cancel" | "delete"; run: EvalRun } | { kind: "suite"; suite: EvalSuiteSummary } | null

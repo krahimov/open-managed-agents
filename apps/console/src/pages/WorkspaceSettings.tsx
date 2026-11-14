@@ -100,7 +100,7 @@ export function WorkspaceSettings() {
   const budgets = useApiQuery<{ data: Budget[] }>("/v1/workspace/budgets", undefined, { enabled: admin && budgetsSupported });
 
   const tenantName = me.data?.tenant?.name;
-  const topics = [adminOn ? "Members" : "Your access", budgetsSupported ? "execution limits" : "", adminOn ? "administrative history" : ""].filter(Boolean);
+  const topics = [admin ? "Members" : "Your access", budgetsSupported ? "execution limits" : "", adminOn ? "administrative history" : ""].filter(Boolean);
   const about = topics.length === 1 ? topics[0] : `${topics.slice(0, -1).join(", ")} and ${topics[topics.length - 1]}`;
   const loading = features.isLoading || (accessOn && access.isLoading);
 
