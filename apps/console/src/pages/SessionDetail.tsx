@@ -35,7 +35,7 @@ import { ConversationControl, ConversationEdges, JumpToLatest, type Conversation
 import { ConversationView, type QueuedMessage } from "../components/sessions/ConversationView";
 import { attachToSession, newAttachmentCache } from "../components/files/attach";
 import { OutputLinks } from "../components/Markdown";
-import { TurnFilesProvider } from "../components/sessions/TurnFiles";
+import { useTurnFilesMap } from "../components/sessions/TurnFiles";
 import { onTablistKeyDown, useMediaQuery, useMinuteClock, useSessionOperations, useStoredFlag } from "../components/sessions/hooks";
 import { buildConversation, eventText, summarizeUsage } from "../components/sessions/model";
 import { useSessionReadings } from "../components/sessions/readings";
@@ -906,6 +906,8 @@ export function SessionDetail() {
     (lifecycle === "running" || lifecycle === "rescheduling") && usage.lastEventAt != null && now - usage.lastEventAt > STALLED_AFTER_MS;
   const live = running && !stalled;
   const conversation = useMemo(() => buildConversation(threadEvents, { running: live }), [threadEvents, live]);
+  // The files the agent wrote, by the turn that wrote them (shared listing, read again when a turn ends).
+  const turnFiles = useTurnFilesMap(id, threadEvents);
 
   // The identifier people use for a Linear issue ("ENG-142") is often only in
   // the webhook's opening message, not in the session's metadata.
@@ -1284,7 +1286,6 @@ export function SessionDetail() {
                   // Links in the agent's replies that name its files download
                   // them, and each turn lists the files it wrote.
                   <OutputLinks sessionId={id}>
-                  <TurnFilesProvider sessionId={id ?? ""} events={threadEvents}>
                   <ConversationView
                     items={conversation.items}
                     agent={speaker}
@@ -1297,8 +1298,8 @@ export function SessionDetail() {
                     findEnvironmentYaml={findEnvironmentYaml}
                     onSelectThread={setActiveThreadId}
                     asker={asker}
+                    turnFiles={turnFiles}
                   />
-                  </TurnFilesProvider>
                   </OutputLinks>
                 )}
               </ConversationContent>

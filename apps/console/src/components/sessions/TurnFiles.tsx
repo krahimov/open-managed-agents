@@ -1,4 +1,4 @@
-import { createContext, useContext, useMemo, useState, type ReactNode } from "react";
+import { useMemo, useState } from "react";
 import { DownloadIcon } from "lucide-react";
 
 import { formatBytes } from "@/lib/attachments";
@@ -11,8 +11,8 @@ import { fileKind } from "../files/files";
 /**
  * The files an agent wrote during one turn, under that turn.
  *
- *   <TurnFilesProvider sessionId={id} events={threadEvents}>   (the page)
- *     … <TurnFilesFor sessionId={id} events={turnEvents} />     (each agent turn)
+ *   const turnFiles = useTurnFilesMap(id, threadEvents);           (the page)
+ *   <TurnFiles sessionId={id} files={turnFiles.get(lastMessage)} />  (each agent turn)
  *
  * The page lists the session's outputs once (lib/session-outputs, shared
  * with the links in the replies and the details panel) and gives each file
@@ -74,33 +74,13 @@ function DownloadChip({ sessionId, file }: { sessionId: string; file: SessionOut
 
 // ── which files belong to which turn ────────────────────────────────────
 
-const TurnFilesMap = createContext<Map<Event, SessionOutputFile[]> | null>(null);
-
-/** The page: list the session's outputs and share them out by turn. `events` are the thread's, in order. */
-export function TurnFilesProvider({ sessionId, events, children }: { sessionId: string; events: readonly Event[]; children: ReactNode }) {
+/**
+ * The page's half: list the session's outputs (shared, read again when a
+ * turn ends) and give each file to its turn, keyed by the agent message
+ * that closes it. `events` are the thread's, in order. The conversation
+ * shows each turn's files with <TurnFiles>.
+ */
+export function useTurnFilesMap(sessionId: string | undefined, events: readonly Event[]): Map<Event, SessionOutputFile[]> {
   const { outputs } = useSessionOutputs(sessionId || undefined);
-  const byTurn = useMemo(() => outputsByTurn(events, outputs), [events, outputs]);
-  return <TurnFilesMap.Provider value={byTurn}>{children}</TurnFilesMap.Provider>;
-}
-
-/** The files written in the turn these events belong to (an agent turn's messages). */
-export function useTurnFiles(events: readonly Event[]): SessionOutputFile[] {
-  const byTurn = useContext(TurnFilesMap);
-  if (!byTurn || byTurn.size === 0) return [];
-  const out: SessionOutputFile[] = [];
-  const seen = new Set<string>();
-  for (const e of events) {
-    for (const f of byTurn.get(e) ?? []) {
-      if (seen.has(f.filename)) continue;
-      seen.add(f.filename);
-      out.push(f);
-    }
-  }
-  return out;
-}
-
-/** An agent turn's Files row, from the events it was built from. Nothing outside a <TurnFilesProvider>. */
-export function TurnFilesFor({ sessionId, events }: { sessionId: string; events: readonly Event[] }) {
-  const files = useTurnFiles(events);
-  return <TurnFiles sessionId={sessionId} files={files} />;
+  return useMemo(() => outputsByTurn(events, outputs), [events, outputs]);
 }
