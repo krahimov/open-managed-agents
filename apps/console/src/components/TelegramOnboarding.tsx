@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ExternalLinkIcon, SendIcon } from "lucide-react";
 
@@ -47,11 +47,19 @@ export function TelegramOnboarding() {
         return null;
       }
     },
-    // Coming back from Telegram is a focus: read it again then.
     staleTime: 0,
     refetchOnWindowFocus: "always",
     retry: false,
   });
+  // Coming back from Telegram is a focus of this window, which is not always
+  // a visibility change (Telegram opened in another window leaves this tab
+  // visible), so the window's own focus reads the status again too.
+  const { refetch } = status;
+  useEffect(() => {
+    const onFocus = () => void refetch();
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [refetch]);
 
   const [busy, setBusy] = useState(false);
   const [link, setLink] = useState<string | null>(null);
@@ -102,7 +110,7 @@ export function TelegramOnboarding() {
         </div>
       </div>
 
-      <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-1.5 pl-10 sm:pl-0">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-1.5 pl-10 sm:pl-0">
         {link ? (
           <>
             <a className={cn(standaloneLink, "text-small")} href={link} target="_blank" rel="noopener noreferrer">

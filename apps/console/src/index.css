@@ -96,7 +96,7 @@
   --fg: var(--ink);
   --fg-muted: oklch(0.46 0.02 330); /* secondary text */
   --fg-subtle: oklch(0.52 0.016 330); /* captions, placeholders: AA on every surface and on a hovered row */
-  --fg-faint: oklch(0.7 0.012 330); /* decorative glyphs, disabled; never body text */
+  --fg-faint: oklch(0.7 0.012 330); /* decorative glyphs, disabled; never body text (readable text set in it is raised, see "Faint text") */
 
   /* --- Lines. Alpha so they hold on any surface. --- */
   --border: oklch(0.235 0.03 330 / 0.09);
@@ -108,9 +108,13 @@
   --warning: oklch(0.52 0.115 68);
   --warning-subtle: oklch(0.958 0.045 85);
   /* A card that is waiting on a person: a tool approval, an access request,
-     a skill request (.needs-you-card). In light it is the warning tint. */
-  --needs-you-bg: var(--warning-subtle);
-  --needs-you-border: color-mix(in oklab, var(--warning) 30%, transparent);
+     a skill request (.needs-you-card). The full warning tint made three
+     request cards in a row three saturated amber slabs, and a disabled ink
+     pill on it read muddy (round 3). As in dark, the fill is the surface's
+     own step with only a trace of amber, and the amber edge (stronger than
+     before) and the amber mark carry "needs you". */
+  --needs-you-bg: oklch(0.987 0.014 84);
+  --needs-you-border: color-mix(in oklab, var(--warning) 48%, transparent);
   /* A failed turn's card (<EventCard kind="error">): in light the danger tint. */
   --failed-bg: var(--danger-subtle);
   --failed-border: color-mix(in oklab, var(--danger) 20%, transparent);
@@ -510,6 +514,35 @@ body {
   .lucide {
     stroke-width: 1.75;
   }
+}
+
+/* Faint text. `--fg-faint` is for glyphs that decorate (chevrons, icons,
+   separators, the dash of an empty cell, a neutral dot) and for disabled
+   controls; at about 2.7:1 it is too light to be read. Where
+   `text-fg-faint` sets words that carry meaning ("· 7 of 20" in the
+   timeline inspector, a queued pill, a raw record's id) the role is raised
+   to `--fg-subtle`, which passes AA on every surface in both themes. What
+   stays faint is what decorates: an icon (svg), anything aria-hidden,
+   anything disabled, and a stand-in glyph whose words are for a screen
+   reader (an `.sr-only` child). Only the role's variable changes on the
+   element, so its hover and group-hover colours still win, a `bg-` or
+   `border-fg-faint` elsewhere is untouched, and the whole selector weighs
+   nothing (every part sits in :where). */
+:where(.text-fg-faint):not(
+    :where(
+      svg,
+      [aria-hidden="true"],
+      :disabled,
+      [aria-disabled="true"],
+      [data-disabled]:not([data-disabled="false"]),
+      :has(> .sr-only)
+    )
+  ) {
+  --color-fg-faint: var(--fg-subtle);
+}
+/* …and a decorative piece inside raised text keeps the faint role. */
+:where(.text-fg-faint) :where(svg, [aria-hidden="true"], :disabled, [aria-disabled="true"]) {
+  --color-fg-faint: var(--fg-faint);
 }
 
 ::selection {
