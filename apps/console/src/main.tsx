@@ -16,6 +16,7 @@ import { AuthProvider } from "./lib/auth";
 import { MaybeClerkProvider } from "./lib/clerk-auth";
 import { Toaster } from "./components/ui/sonner";
 import { AppShell } from "./components/AppShell";
+import { BrandLoader } from "./components/BrandLoader";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { queryClient } from "./lib/query-client";
 import { installChunkReloadHandlers } from "./lib/chunk-reload";
@@ -321,6 +322,20 @@ const protectedRoutes: RouteObject[] = [
   { path: "*", element: <NotFound />, handle: { crumb: "Page not found" } },
 ];
 
+/**
+ * What shows while a lazy page's code arrives on the first load (a typed URL
+ * or a reload on /usage, /sessions/:id …): the same quiet loader the shell
+ * shows while the sign-in is read. Without it the router renders nothing
+ * and warns.
+ */
+function PageHydrating() {
+  return (
+    <div className="flex h-screen items-center justify-center bg-bg-sidebar">
+      <BrandLoader size="lg" label="Loading" />
+    </div>
+  );
+}
+
 const router = createBrowserRouter([
   { path: "login", element: <Titled title="Sign in"><Login /></Titled> },
   { path: "cli/login", element: <Titled title="Authorize the CLI"><CliLogin /></Titled> },
@@ -330,10 +345,12 @@ const router = createBrowserRouter([
     // A Telegram bot's Connect button opens this inside Telegram. Outside the
     // shell: Telegram's signed launch data is the proof, not a console sign-in.
     path: "telegram/connect/:sessionId/:requestId",
+    HydrateFallback: PageHydrating,
     lazy: lazyRoute(() => import("./pages/TelegramConnect"), "TelegramConnect"),
   },
   {
     element: <AppShell />,
+    HydrateFallback: PageHydrating,
     children: protectedRoutes,
   },
 ]);

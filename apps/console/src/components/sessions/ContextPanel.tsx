@@ -169,12 +169,16 @@ export function ContextPanel({
 }) {
   const ready = trajectory && trajectory !== "loading" && trajectory !== "error" ? trajectory : null;
   const tokens = ready?.summary?.token_usage;
+  // The trajectory is read once when the page opens, so a live session's own
+  // log (`usage`) is newer; each figure takes whichever has counted more.
   // The trajectory's input_tokens is the total input, cache included; `input`
   // here is the uncached part, as in SessionUsage.
-  const output = tokens?.output_tokens ?? usage.outputTokens;
-  const cached = tokens?.cache_read_input_tokens ?? usage.cacheReadTokens;
-  const cacheWrite = tokens?.cache_creation_input_tokens ?? usage.cacheWriteTokens;
-  const input = tokens ? Math.max(0, (tokens.input_tokens ?? 0) - cached - cacheWrite) : usage.inputTokens;
+  const trajCached = tokens?.cache_read_input_tokens ?? 0;
+  const trajWrite = tokens?.cache_creation_input_tokens ?? 0;
+  const output = Math.max(tokens?.output_tokens ?? 0, usage.outputTokens);
+  const cached = Math.max(trajCached, usage.cacheReadTokens);
+  const cacheWrite = Math.max(trajWrite, usage.cacheWriteTokens);
+  const input = Math.max(tokens ? Math.max(0, (tokens.input_tokens ?? 0) - trajCached - trajWrite) : 0, usage.inputTokens);
   const totalTokens = input + output + cached + cacheWrite;
   const cost = ready?.trace_facts?.est_cost_usd;
   const localRuntime = environmentId === "env_local_runtime";
