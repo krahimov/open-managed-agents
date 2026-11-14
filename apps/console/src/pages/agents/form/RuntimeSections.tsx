@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { useApi } from "@/lib/api";
+import { AGENT_COMPUTER_LABEL, isAgentComputerEnvironment } from "@/lib/default-environment";
 import { cn } from "@/lib/utils";
 
 import { CheckRow, FormSection, GroupLabel, PickSelect, RowBox } from "../../../components/agents/controls";
@@ -105,11 +106,22 @@ export function SandboxSection({
             options={environments.map((env) => ({
               value: env.id,
               label: env.name,
-              hint: env.description ?? undefined,
+              // A persistent computer is a billable choice: it says so wherever it is picked.
+              hint:
+                [isAgentComputerEnvironment(env) ? `A ${AGENT_COMPUTER_LABEL}` : null, env.description]
+                  .filter(Boolean)
+                  .join(" · ") || undefined,
               icon: BoxIcon,
             }))}
           />
         </Field>
+      )}
+
+      {selected && isAgentComputerEnvironment(selected) && (
+        <Callout title="This agent gets a computer of its own">
+          Its files, browser and desktop stay from one session to the next. A persistent computer is never chosen
+          for an agent by default.
+        </Callout>
       )}
 
       {selected && (

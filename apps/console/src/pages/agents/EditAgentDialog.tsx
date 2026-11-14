@@ -1,15 +1,14 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { PuzzleIcon } from "lucide-react";
-import type { ModelCard } from "@open-managed-agents/api-types";
+import { PuzzleIcon, SlidersHorizontalIcon } from "lucide-react";
+import { DEFAULT_REASONING_LEVEL, isReasoningLevel, type ModelCard } from "@open-managed-agents/api-types";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { FACE_METADATA_KEY, formatFace, parseFace } from "@/lib/agent-face";
 import { useApi } from "@/lib/api";
-import { harnessLabel } from "@/lib/agents";
 import { describeModel } from "@/lib/models";
 import { useApiQuery } from "@/lib/useApiQuery";
 import { inlineLink } from "@/lib/links";
@@ -17,11 +16,16 @@ import { inlineLink } from "@/lib/links";
 import { AvatarPicker } from "../../components/agents/AvatarPicker";
 import { CheckRow, PickSelect, RowBox } from "../../components/agents/controls";
 import { Callout, EntityAvatar, Field, LocalCombobox, Modal, Skeleton } from "../../components/kit";
-import { MemoryModeControl, parseMemoryMode, type MemoryMode } from "../../components/MemoryModeControl";
+import { MemoryModeControl, memoryForWire, parseMemoryMode, type MemoryMode } from "../../components/MemoryModeControl";
+import { Tip } from "../../components/Tip";
 import type { AgentRecord as Agent } from "../../types/agent";
+import { AgentFormDialog } from "./AgentFormDialog";
+import { cardSupportsReasoningLevel, engineLabel, reasoningLevelForWire, reasoningLevelOptions, type ReasoningLevelValue } from "./form/model";
+import { useAgentFormAux } from "./useAgentFormAux";
 
 const ENGINE_HINT: Record<string, string> = {
   default: "The platform's own loop. Billed to your model key.",
+  pi: "The Pi agent runtime with the platform's tools. Billed to your model key.",
   "claude-agent-sdk": "Headless Claude Code on the server. Billed to its Claude subscription.",
   "codex-sdk": "Headless Codex on the server. Billed to its ChatGPT subscription.",
   "acp-proxy": "Hands the loop to a machine you registered as a local runtime.",
@@ -30,18 +34,66 @@ const ENGINE_HINT: Record<string, string> = {
 /**
  * Edit an agent. Saving posts to `/v1/agents/:id`, which creates a new
  * version; sessions that are already running keep the version they
- * started with. The full config is sent with unedited fields passed
- * through, so a versioned update never drops tools, MCP servers or
- * metadata.
+ * started with. Only what changed is sent (the server keeps the rest), and
+ * the save is guarded by the agent's version, so a version saved meanwhile
+ * (by the setup chat, say) is refused instead of overwritten.
+ *
+ * The dialog edits what people change most: name, description, avatar,
+ * instructions, model and reasoning, engine, memory and skills. "All
+ * settings" opens the full form (tools, apps, MCP servers, delegation,
+ * sandbox, vaults, triggers, and the config as YAML or JSON) for the same
+ * agent. Leaving with unsaved changes asks first.
  */
-export function EditAgentDialog({ agent, open, onClose }: { agent: Agent; open: boolean; onClose: () => void }) {
+export function EditAgentDialog({
+  agent,
+  open,
+  onClose,
+  onOpenSetup,
+}: {
+  agent: Agent;
+  open: boolean;
+  onClose: () => void;
+  /** Offered in the full form: leave it for the agent's setup chat. */
+  onOpenSetup?: () => void;
+}) {
+  const [full, setFull] = useState(false);
+  useEffect(() => {
+    if (!open) setFull(false);
+  }, [open]);
+  if (!open) return null;
+  if (full) return <FullEdit agent={agent} onClose={onClose} onOpenSetup={onOpenSetup} />;
+  // Remount on open so the form always starts from the agent as it is now.
   return (
-    // Remount on open so the form always starts from the agent as it is now.
-    open ? <EditAgentForm key={`${agent.id}:${agent.version}`} agent={agent} onClose={onClose} /> : null
+    <EditAgentForm key={`${agent.id}:${agent.version}`} agent={agent} onClose={onClose} onAllSettings={() => setFull(true)} />
   );
 }
 
-function EditAgentForm({ agent, onClose }: { agent: Agent; onClose: () => void }) {
+/** The full new-agent form, in edit mode, for this agent. */
+function FullEdit({ agent, onClose, onOpenSetup }: { agent: Agent; onClose: () => void; onOpenSetup?: () => void }) {
+  const qc = useQueryClient();
+  const aux = useAgentFormAux(true);
+  return (
+    <AgentFormDialog
+      open
+      onClose={onClose}
+      editAgent={agent}
+      onSaved={() => {
+        void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}`] });
+        void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}/versions`] });
+        void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}/memory`] });
+        void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}/ambient-rules`] });
+        void qc.invalidateQueries({ queryKey: ["/v1/agents"] });
+      }}
+      onOpenSetup={onOpenSetup}
+      allAgents={aux.allAgents}
+      customSkills={aux.customSkills}
+      modelCards={aux.modelCards}
+      runtimes={aux.runtimes}
+    />
+  );
+}
+
+function EditAgentForm({ agent, onClose, onAllSettings }: { agent: Agent; onClose: () => void; onAllSettings: () => void }) {
   const { api } = useApi();
   const qc = useQueryClient();
   const { data: skillsRes, isLoading: skillsLoading } = useApiQuery<{
@@ -61,16 +113,51 @@ function EditAgentForm({ agent, onClose }: { agent: Agent; onClose: () => void }
   const [avatar, setAvatar] = useState(initialAvatar);
   const [model, setModel] = useState(initialModel);
   const [system, setSystem] = useState(agent.system ?? "");
-  const [harness, setHarness] = useState(agent._oma?.harness ?? "default");
-  const [memoryMode, setMemoryMode] = useState<MemoryMode>(() => parseMemoryMode(agent._oma?.memory));
-  const [skillIds, setSkillIds] = useState<Set<string>>(
-    () =>
-      new Set(
-        ((agent.skills ?? []) as Array<{ skill_id?: string }>).map((s) => s?.skill_id).filter((x): x is string => !!x),
-      ),
+  const initialHarness = agent._oma?.harness ?? "default";
+  const [harness, setHarness] = useState(initialHarness);
+  const initialLevel: ReasoningLevelValue = isReasoningLevel(agent._oma?.reasoning_level)
+    ? agent._oma.reasoning_level
+    : DEFAULT_REASONING_LEVEL;
+  const [reasoningLevel, setReasoningLevel] = useState<ReasoningLevelValue>(initialLevel);
+  const initialMemory = parseMemoryMode(agent._oma?.memory);
+  const [memoryMode, setMemoryMode] = useState<MemoryMode>(initialMemory);
+  /** Set once someone picks a mode: a chosen Off is written, so the first
+   *  trigger does not switch memory on by itself. */
+  const [memoryChosen, setMemoryChosen] = useState(false);
+  // Only custom skills are listed here; anything else attached (the
+  // document skills) is kept as it is.
+  const skills = (agent.skills ?? []) as Array<{ type?: string; skill_id?: string }>;
+  const initialSkillIds = useMemo(
+    () => skills.filter((s) => s?.type !== "anthropic").map((s) => s?.skill_id).filter((x): x is string => !!x),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
   );
+  const [skillIds, setSkillIds] = useState<Set<string>>(() => new Set(initialSkillIds));
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  /** The footer is asking whether to throw the changes away. */
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+
+  const skillsChanged =
+    skillIds.size !== initialSkillIds.length || initialSkillIds.some((id) => !skillIds.has(id));
+  const dirty =
+    name !== agent.name ||
+    description.trim() !== (agent.description ?? "").trim() ||
+    avatar !== initialAvatar ||
+    model.trim() !== initialModel ||
+    system !== (agent.system ?? "") ||
+    harness !== initialHarness ||
+    reasoningLevel !== initialLevel ||
+    memoryMode !== initialMemory ||
+    memoryChosen ||
+    skillsChanged;
+  /** Escape, the close button, the scrim and Cancel: ask first when there
+   *  is something to lose. */
+  const leave = () => {
+    if (saving) return;
+    if (dirty) setConfirmDiscard(true);
+    else onClose();
+  };
 
   const toggleSkill = (sid: string) =>
     setSkillIds((prev) => {
@@ -81,48 +168,48 @@ function EditAgentForm({ agent, onClose }: { agent: Agent; onClose: () => void }
     });
 
   const engineOptions = useMemo(() => {
-    const values = ["default", "claude-agent-sdk", "codex-sdk", "acp-proxy"];
+    const values = ["default", "pi", "claude-agent-sdk", "codex-sdk", "acp-proxy"];
     if (!values.includes(harness)) values.push(harness);
-    return values.map((value) => ({ value, label: harnessLabel(value), hint: ENGINE_HINT[value] }));
+    return values.map((value) => ({ value, label: engineLabel(value), hint: ENGINE_HINT[value] }));
   }, [harness]);
 
   const save = async () => {
     setSaving(true);
     setErr(null);
+    setConfirmDiscard(false);
     try {
+      const nextModel = model.trim();
       const body: Record<string, unknown> = {
+        // A version saved since this opened is refused, not overwritten.
+        version: agent.version,
         name,
-        model,
+        // An unchanged model keeps its {id, speed}.
+        model: nextModel === initialModel ? agent.model : nextModel,
         system,
-        tools: agent.tools,
-        mcp_servers: agent.mcp_servers,
-        // Metadata is merged per key on the server; an empty avatar clears a
-        // chosen one, so the agent goes back to the face read from its name.
-        metadata: avatar !== initialAvatar ? { ...(agent.metadata ?? {}), [FACE_METADATA_KEY]: avatar } : agent.metadata,
-        skills: [...skillIds].map((skill_id) => ({ type: "custom", skill_id })),
-        _oma: {
-          ...(agent._oma ?? {}),
-          harness,
-          // "off" clears via null (server drops the field, like
-          // reasoning_level); same mode keeps store_id/extract/push;
-          // a mode change resets to just { mode }.
-          memory:
-            memoryMode === "off"
-              ? null
-              : agent._oma?.memory?.mode === memoryMode
-                ? agent._oma.memory
-                : { mode: memoryMode },
-        },
       };
-      for (const k of Object.keys(body)) {
-        if (body[k] === undefined || body[k] === null) delete body[k];
+      // Metadata is merged per key on the server: only the avatar is sent,
+      // and an empty one (null) goes back to the face read from the name.
+      if (avatar !== initialAvatar) body.metadata = { [FACE_METADATA_KEY]: avatar || null };
+      if (skillsChanged) {
+        body.skills = [
+          ...skills.filter((sk) => sk?.type === "anthropic"),
+          ...[...skillIds].map((skill_id) => ({ type: "custom", skill_id })),
+        ];
       }
       // Sent only when edited; an emptied description is cleared with null.
       const nextDescription = description.trim();
       if (nextDescription !== (agent.description ?? "").trim()) body.description = nextDescription || null;
+      const oma: Record<string, unknown> = {};
+      if (harness !== initialHarness) oma.harness = harness;
+      if (reasoningLevel !== initialLevel) oma.reasoning_level = reasoningLevelForWire(reasoningLevel);
+      if (memoryChosen && (memoryMode !== initialMemory || !agent._oma?.memory)) {
+        oma.memory = memoryForWire(memoryMode, agent._oma?.memory);
+      }
+      if (Object.keys(oma).length > 0) body._oma = oma;
       await api(`/v1/agents/${agent.id}`, { method: "POST", body: JSON.stringify(body) });
       await qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}`] });
       await qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}/versions`] });
+      void qc.invalidateQueries({ queryKey: [`/v1/agents/${agent.id}/memory`] });
       void qc.invalidateQueries({ queryKey: ["/v1/agents"] });
       onClose();
     } catch (e) {
@@ -133,23 +220,51 @@ function EditAgentForm({ agent, onClose }: { agent: Agent; onClose: () => void }
   };
 
   const modelInfo = describeModel(model);
+  const card = (cardsRes?.data ?? []).find((mc) => mc.model_id === model.trim());
+  // A model key that takes no reasoning level (a gateway, a model that does
+  // not reason) hides the field; a typed id the workspace has no key for
+  // keeps it, since the engine may still map it.
+  const showReasoning = harness !== "acp-proxy" && (card ? cardSupportsReasoningLevel(card) : true);
 
   return (
     <Modal
       open
-      onClose={() => !saving && onClose()}
+      onClose={leave}
       title={`Edit ${agent.name}`}
       subtitle={`Saving creates version ${agent.version + 1}. Sessions that are running keep version ${agent.version}.`}
       maxWidth="max-w-2xl"
       footer={
-        <>
-          <Button variant="ghost" onClick={onClose} disabled={saving}>
-            Cancel
-          </Button>
-          <Button onClick={() => void save()} disabled={!name.trim() || !model.trim()} loading={saving}>
-            Save changes
-          </Button>
-        </>
+        confirmDiscard ? (
+          <>
+            <p role="alert" className="mr-auto min-w-0 truncate text-small font-medium text-fg">
+              Discard your changes to this agent?
+            </p>
+            <Button variant="ghost" onClick={() => setConfirmDiscard(false)} autoFocus>
+              Keep editing
+            </Button>
+            <Button variant="destructive" onClick={onClose}>
+              Discard changes
+            </Button>
+          </>
+        ) : (
+          <>
+            <Tip label={dirty ? "Save or undo your changes here first" : "Tools, apps, MCP servers, sandbox, vaults, triggers and the config as YAML or JSON"}>
+              {/* A disabled button gets no pointer events; the span keeps the tip. */}
+              <span className="mr-auto">
+                <Button variant="ghost" onClick={onAllSettings} disabled={saving || dirty}>
+                  <SlidersHorizontalIcon data-icon="inline-start" />
+                  All settings
+                </Button>
+              </span>
+            </Tip>
+            <Button variant="ghost" onClick={leave} disabled={saving}>
+              Cancel
+            </Button>
+            <Button onClick={() => void save()} disabled={!name.trim() || !model.trim()} loading={saving}>
+              Save changes
+            </Button>
+          </>
+        )
       }
     >
       <div className="space-y-5">
@@ -229,13 +344,34 @@ function EditAgentForm({ agent, onClose }: { agent: Agent; onClose: () => void }
               maxHeight="14rem"
             />
           </Field>
-          <Field label="Runs on">
-            <PickSelect value={harness} onValueChange={setHarness} options={engineOptions} />
-          </Field>
+          {showReasoning ? (
+            <Field label="Reasoning" hint="How hard the model thinks before it answers.">
+              <PickSelect<ReasoningLevelValue>
+                value={reasoningLevel}
+                onValueChange={setReasoningLevel}
+                options={reasoningLevelOptions(reasoningLevel)}
+              />
+            </Field>
+          ) : (
+            <Field label="Runs on">
+              <PickSelect value={harness} onValueChange={setHarness} options={engineOptions} />
+            </Field>
+          )}
+          {showReasoning && (
+            <Field label="Runs on">
+              <PickSelect value={harness} onValueChange={setHarness} options={engineOptions} />
+            </Field>
+          )}
         </div>
 
         <Field label="Memory">
-          <MemoryModeControl value={memoryMode} onChange={setMemoryMode} />
+          <MemoryModeControl
+            value={memoryMode}
+            onChange={(mode) => {
+              setMemoryMode(mode);
+              setMemoryChosen(true);
+            }}
+          />
         </Field>
 
         <div>

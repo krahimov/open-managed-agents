@@ -45,7 +45,7 @@ export function parseMemoryMode(memory: unknown): MemoryMode {
   return mode === "shared" || mode === "per_user" ? mode : "off";
 }
 
-type StoredMemory = (AgentMemoryConfig & Record<string, unknown>) | null | undefined;
+type StoredMemory = { mode?: string; store_id?: string } | null | undefined;
 
 /**
  * The `_oma.memory` to write for `mode`, given what the agent has now.

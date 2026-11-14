@@ -1,5 +1,5 @@
 import { Link } from "react-router";
-import { BotIcon, LaptopIcon, SquareTerminalIcon, WorkflowIcon } from "lucide-react";
+import { BotIcon, CircuitBoardIcon, LaptopIcon, SquareTerminalIcon, WorkflowIcon } from "lucide-react";
 import type { ModelCard } from "@open-managed-agents/api-types";
 import { KNOWN_ACP_AGENTS, resolveKnownAgent } from "@open-managed-agents/acp-runtime/known-agents";
 
@@ -24,10 +24,12 @@ import {
 } from "../../../components/kit";
 import { MemoryModeControl } from "../../../components/MemoryModeControl";
 import {
-  REASONING_LEVEL_OPTIONS,
   cardSupportsReasoningLevel,
+  isSubscriptionHarness,
+  reasoningLevelOptions,
   type FormSetter,
   type FormState,
+  type HarnessValue,
   type RuntimeLite,
 } from "./model";
 
@@ -80,9 +82,7 @@ export function BasicsSection({ form, setForm }: { form: FormState; setForm: For
   );
 }
 
-type Engine = "default" | "claude-agent-sdk" | "codex-sdk" | "local";
-
-const REASONING_OPTIONS = REASONING_LEVEL_OPTIONS.map((o) => ({ value: o.value, label: o.label, hint: o.hint }));
+type Engine = HarnessValue | "local";
 
 /**
  * Model and engine: one decision about where the agent's loop runs, then
@@ -106,8 +106,15 @@ export function ModelSection({
   const runtimeRows = Array.isArray(runtimes) ? runtimes : [];
   const selectedCard = modelCards.find((mc) => mc.id === selectedCardId);
   const engine: Engine = form.runtimeId ? "local" : form.harness;
-  const subscription = engine === "claude-agent-sdk" || engine === "codex-sdk";
-  const showReasoningLevel = engine === "default" && cardSupportsReasoningLevel(selectedCard);
+  const subscription = isSubscriptionHarness(engine);
+  // The managed loop and Pi both run on one of the workspace's model keys.
+  const modelKey = engine === "default" || engine === "pi";
+  const showReasoningLevel = modelKey && cardSupportsReasoningLevel(selectedCard);
+  const reasoningOptions = reasoningLevelOptions(form.reasoningLevel);
+  // Nobody chose a memory mode and the agent will have a trigger: the
+  // server turns memory on with it, so say so instead of showing "Off".
+  const memoryFollowsTrigger = !form.memoryChosen && form.ambientEnabled;
+  const memoryShown = memoryFollowsTrigger ? "shared" : form.memoryMode;
 
   // A machine that is offline cannot run a loop, so the option needs one
   // that is online (unless the form is already bound to a machine).
@@ -135,6 +142,13 @@ export function ModelSection({
           icon={WorkflowIcon}
           title="Managed loop"
           description={`${BRAND_NAME} runs the loop. Billed to one of your model keys.`}
+        />
+        <OptionCard
+          selected={engine === "pi"}
+          onSelect={() => pickEngine("pi")}
+          icon={CircuitBoardIcon}
+          title="Pi agent"
+          description="The Pi agent runtime with the platform's tools. Billed to one of your model keys."
         />
         <OptionCard
           selected={engine === "claude-agent-sdk"}
@@ -182,7 +196,7 @@ export function ModelSection({
         </p>
       )}
 
-      {engine === "default" &&
+      {modelKey &&
         (modelCards.length === 0 ? (
           <Callout
             title="No model keys yet"
@@ -223,7 +237,7 @@ export function ModelSection({
                   label="Reasoning"
                   hint={
                     selectedCard?.provider === "ant"
-                      ? "Sets Claude's extended-thinking budget."
+                      ? "Sets how hard Claude thinks before it answers."
                       : "Sets OpenAI reasoning effort."
                   }
                 >
@@ -231,13 +245,21 @@ export function ModelSection({
                     id="agent-reasoning-level"
                     value={form.reasoningLevel}
                     onValueChange={(reasoningLevel) => setForm({ ...form, reasoningLevel })}
-                    options={REASONING_OPTIONS}
+                    options={reasoningOptions}
                   />
                 </Field>
               )}
             </div>
             <Field label="Memory">
-              <MemoryModeControl value={form.memoryMode} onChange={(memoryMode) => setForm({ ...form, memoryMode })} />
+              <MemoryModeControl
+                value={memoryShown}
+                onChange={(memoryMode) => setForm({ ...form, memoryMode, memoryChosen: true })}
+                note={
+                  memoryFollowsTrigger
+                    ? "On because this agent has a trigger: each run is a fresh session, so memory is how it remembers the last one. Choose Off to start every run blank."
+                    : undefined
+                }
+              />
             </Field>
           </>
         ))}
@@ -261,7 +283,7 @@ export function ModelSection({
                 id="agent-sub-reasoning"
                 value={form.reasoningLevel}
                 onValueChange={(reasoningLevel) => setForm({ ...form, reasoningLevel })}
-                options={REASONING_OPTIONS}
+                options={reasoningOptions}
               />
             </Field>
           </div>

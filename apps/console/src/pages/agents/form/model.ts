@@ -1,6 +1,15 @@
 import type { Dispatch, SetStateAction } from "react";
-import type { ModelCard } from "@open-managed-agents/api-types";
+import {
+  DEFAULT_REASONING_LEVEL,
+  REASONING_LEVEL_LABELS,
+  UI_REASONING_LEVELS,
+  modelSupportsReasoning,
+  type McpToolLoading,
+  type ModelCard,
+  type ReasoningLevel,
+} from "@open-managed-agents/api-types";
 
+import { harnessLabel } from "../../../lib/agents";
 import type { MemoryMode } from "../../../components/MemoryModeControl";
 import {
   createDefaultAmbientTriggerDraft,
@@ -46,6 +55,8 @@ export interface EnvironmentLite {
       allow_package_managers?: boolean;
     };
     packages?: { npm?: string[]; pip?: string[] };
+    /** `scope: "agent"` gives the agent a persistent computer of its own. */
+    sandbox?: { scope?: string | null; [key: string]: unknown } | null;
   };
 }
 export interface SandboxConfig {
@@ -162,25 +173,59 @@ export const BUILTIN_TOOLS: Array<{ name: string; group: BuiltinToolGroup; descr
 
 export type ToolOverride = "default" | "always_allow" | "always_ask" | "disabled";
 
-export type ReasoningLevelValue = "instant" | "low" | "medium" | "high" | "max";
+export type ReasoningLevelValue = ReasoningLevel;
 
-export const REASONING_LEVEL_OPTIONS: Array<{ value: ReasoningLevelValue; label: string; hint: string }> = [
-  { value: "instant", label: "Instant", hint: "No reasoning. Fastest and cheapest." },
-  { value: "low", label: "Low", hint: "Brief reasoning." },
-  { value: "medium", label: "Medium", hint: "Moderate reasoning." },
-  { value: "high", label: "High", hint: "Deep reasoning. Slowest." },
-  { value: "max", label: "Max", hint: "Maximum reasoning, for judges and the hardest tasks." },
-];
+const REASONING_LEVEL_HINTS: Record<ReasoningLevel, string> = {
+  instant: "An older setting: the least reasoning the model allows.",
+  low: "Brief reasoning. The fastest.",
+  medium: "Balanced. What an agent uses unless told otherwise.",
+  high: "Deep reasoning.",
+  xhigh: "Deeper than High.",
+  max: "The most reasoning. The slowest, for the hardest tasks.",
+};
 
-/** Reasoning level only applies where the harness can map it: official
- *  OpenAI reasoning models (gpt-5*, o-series → reasoning_effort) and
- *  Anthropic Claude (→ extended-thinking budget). Hidden for gateways
- *  (oai-compatible / ant-compatible) and non-reasoning models (gpt-4o). */
+/** The levels a reasoning field offers: the five the server knows
+ *  (api-types UI_REASONING_LEVELS), plus the legacy "Instant" only while
+ *  the agent being edited still carries it. */
+export function reasoningLevelOptions(current: ReasoningLevelValue): Array<{ value: ReasoningLevelValue; label: string; hint: string }> {
+  const levels: ReasoningLevel[] = current === "instant" ? ["instant", ...UI_REASONING_LEVELS] : [...UI_REASONING_LEVELS];
+  return levels.map((value) => ({
+    value,
+    label: value === DEFAULT_REASONING_LEVEL ? `${REASONING_LEVEL_LABELS[value]} (default)` : REASONING_LEVEL_LABELS[value],
+    hint: REASONING_LEVEL_HINTS[value],
+  }));
+}
+
+/** The wire value for a level: the default is what unset means, so it is
+ *  not stored. */
+export function reasoningLevelForWire(level: ReasoningLevelValue): ReasoningLevel | null {
+  return level === DEFAULT_REASONING_LEVEL ? null : level;
+}
+
+/** Reasoning only applies where the harness can map it: official OpenAI
+ *  reasoning models (o-series, gpt-5 and later → reasoning effort) and
+ *  Anthropic Claude (→ thinking effort or budget). Hidden for gateways
+ *  (oai-compatible / ant-compatible) and models that do not reason. */
 export function cardSupportsReasoningLevel(card: ModelCard | undefined): boolean {
-  if (!card) return false;
-  if (card.provider === "oai") return /^(o[1-9]|gpt-5)/i.test(card.model);
-  if (card.provider === "ant") return card.model.startsWith("claude-");
-  return false;
+  return !!card && modelSupportsReasoning(card.provider, card.model);
+}
+
+/** Engines that run the platform's tools and bill one of the workspace's
+ *  model keys, so they take a model key, a reasoning level and memory. */
+export const MODEL_KEY_HARNESSES = ["default", "pi"] as const;
+/** Engines that run headless Claude Code / Codex on the server and bill its
+ *  subscription (self-host only, env-gated). */
+export const SUBSCRIPTION_HARNESSES = ["claude-agent-sdk", "codex-sdk"] as const;
+export type HarnessValue = (typeof MODEL_KEY_HARNESSES)[number] | (typeof SUBSCRIPTION_HARNESSES)[number];
+
+/** An engine by its name. `pi` is named here until lib/agents' harnessLabel
+ *  knows it. */
+export function engineLabel(harness: string | null | undefined): string {
+  return harness === "pi" ? "Pi agent" : harnessLabel(harness);
+}
+
+export function isSubscriptionHarness(harness: string): boolean {
+  return (SUBSCRIPTION_HARNESSES as readonly string[]).includes(harness);
 }
 
 export const INITIAL_FORM = {
@@ -190,10 +235,22 @@ export const INITIAL_FORM = {
    *  the SDK harnesses run headless Claude Code / Codex on the server host
    *  and bill the host's subscription (self-host only, env-gated).
    *  acp-proxy is not offered here — it's driven by the runtime binding. */
-  harness: "default" as "default" | "claude-agent-sdk" | "codex-sdk",
-  reasoningLevel: "instant" as ReasoningLevelValue,
-  /** `_oma.memory.mode`; "off" is the server default and is never sent. */
+  harness: "default" as HarnessValue,
+  reasoningLevel: DEFAULT_REASONING_LEVEL as ReasoningLevelValue,
+  /** `_oma.memory.mode` as the person chose it. */
   memoryMode: "off" as MemoryMode,
+  /** False until the person picks a memory mode. An agent nobody chose for
+   *  is created without `_oma.memory`: off, and switched on by the server
+   *  with its first trigger (each run is a fresh session). A chosen mode,
+   *  Off included, is written as chosen. */
+  memoryChosen: false,
+  /** `_oma.mcp_tool_loading` (auto | eager | deferred). No form control:
+   *  carried through the YAML/JSON view and edits so it is never dropped.
+   *  "" = unset (auto). */
+  mcpToolLoading: "" as McpToolLoading | "",
+  /** `_oma.vault_mcp_servers`. No form control: carried so the code view
+   *  and edits keep it ("all" = the legacy vault-implied servers). */
+  vaultMcpServers: "declared" as "declared" | "all",
   system: "",
   description: "",
   /** The avatar a person chose or a template carried, as stored in
