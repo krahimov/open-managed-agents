@@ -575,13 +575,16 @@ export function buildConversation(events: Event[], opts: { running?: boolean } =
           isError,
           startedAt: at,
           durationMs: at != null && endAt != null && endAt >= at ? endAt - at : null,
-          status: result
-            ? isError
-              ? "errored"
-              : "completed"
-            : confirmation?.result === "deny"
+          // A denied call's result is the runtime's note of the denial (an
+          // error result): it was denied, not failed.
+          status:
+            confirmation?.result === "deny"
               ? "denied"
-              : waitingOnClient
+              : result
+                ? isError
+                  ? "errored"
+                  : "completed"
+                : waitingOnClient
                 ? "waiting"
                 : opts.running && !waiting && (i > lastTriggerIdx || resumed)
                   ? "running"

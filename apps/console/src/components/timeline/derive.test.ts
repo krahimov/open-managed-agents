@@ -70,6 +70,8 @@ describe("timeline tool spans", () => {
     const { totalMs } = deriveSpans(turn1, all);
     expect(approval!.startMs + approval!.durationMs).toBeLessThanOrEqual(totalMs);
     expect(toolSpan(turn1, all)?.detail).toBe("denied");
+    // Its error result in the next turn is the denial, not a failure.
+    expect(toolSpan(all, all)).toMatchObject({ detail: "denied", failed: false });
   });
 
   it("label a deferred call_mcp_tool as the app call it carries, and a tool search in words", () => {

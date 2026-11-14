@@ -161,6 +161,8 @@ export function deriveSpans(
       const asked =
         (e as { evaluated_permission?: string }).evaluated_permission === "ask" || !!decision || !!later || status === "awaiting_approval";
       let runStartMs = startMs;
+      // A denied call never ran; its error result is the runtime's note of the denial.
+      const denied = ((decision?.e ?? later) as { result?: string } | undefined)?.result === "deny" || status === "denied";
       if (asked && (decision || later || !result)) {
         // Decided in a later turn: this turn waited on it until it closed.
         const decidedMs = decision ? decision.t - t0 : later ? tEnd - t0 : startMs;
@@ -179,7 +181,7 @@ export function deriveSpans(
       const endMs = result ? result.t - t0 : runStartMs;
       if (result) sourceEvents.push(result.e);
       // A bash result that reports a non-zero exit failed, whatever its is_error says.
-      const failed = !!result && isErrorResult(result.e);
+      const failed = !denied && !!result && isErrorResult(result.e);
       const call = readToolUse(e);
       const handoff = handoffKey(call.name);
       const search = call.flavor === "tool" ? parseSearchMcpTools(call.name, call.input) : null;
@@ -195,12 +197,12 @@ export function deriveSpans(
             ? `Searched ${where ?? "all"} tools for “${search.query}”`
             : call.name,
         plain: !!handoff || !!search || undefined,
-        detail: result
-          ? failed
-            ? "failed"
-            : undefined
-          : status === "denied" || (later as { result?: string } | undefined)?.result === "deny" || (decision?.e as { result?: string } | undefined)?.result === "deny"
-            ? "denied"
+        detail: denied
+          ? "denied"
+          : result
+            ? failed
+              ? "failed"
+              : undefined
             : status === "awaiting_client"
               ? "waiting for the app's result"
               : asked && !decision && !later

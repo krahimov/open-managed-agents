@@ -287,11 +287,13 @@ describe("a tool call", () => {
         { type: "session.status_idle", stop_reason: { type: "requires_action", event_ids: ["c1"] } },
         { type: "user.tool_confirmation", tool_use_id: "c1", result: "deny", deny_message: "no" },
         { type: "session.status_running" },
+        { type: "agent.tool_result", tool_use_id: "c1", content: "Denied: no", is_error: true },
         { type: "session.status_idle", stop_reason: { type: "end_turn" } },
       ]),
     );
     expect(c.pendingApprovals).toEqual([]);
-    expect(callsOf(c)[0]).toMatchObject({ status: "denied", approval: "denied", denyMessage: "no" });
+    // The runtime's error result is the denial, not a failure.
+    expect(callsOf(c)[0]).toMatchObject({ status: "denied", approval: "denied", denyMessage: "no", output: "Denied: no" });
   });
 });
 

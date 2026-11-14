@@ -365,8 +365,11 @@ function spanIcon(span: Span): ComponentType<{ className?: string }> {
       return SparklesIcon;
     case "tool":
     case "custom_tool":
-    case "mcp":
-      // A hand-off to another agent, already in words ("Asked PR Reviewer").
+    case "mcp": {
+      // The call as the conversation shows it: a hand-off, a tool search
+      // and a deferred app call each wear their own icon.
+      const use = span.events.find((e) => e.type === "agent.tool_use" || e.type === "agent.custom_tool_use" || e.type === "agent.mcp_tool_use");
+      if (use) return presentTool(readToolUse(use)).icon;
       if (span.plain) return UsersRoundIcon;
       return presentTool({
         name: span.label,
@@ -374,6 +377,7 @@ function spanIcon(span: Span): ComponentType<{ className?: string }> {
         server: span.family === "mcp" ? span.source : undefined,
         input: {},
       }).icon;
+    }
     case "user":
       return UserRoundIcon;
     case "agent":
@@ -746,13 +750,14 @@ function toolCallOf(span: Span): ToolCall | null {
     result,
     output: resultText(result),
     isError,
-    status: result
-      ? isError
-        ? "errored"
-        : "completed"
-      : span.detail === "denied"
+    status:
+      span.detail === "denied"
         ? "denied"
-        : span.detail === "waiting for the app's result"
+        : result
+          ? isError
+            ? "errored"
+            : "completed"
+          : span.detail === "waiting for the app's result"
           ? "waiting"
           : undefined,
     startedAt: eventTime(use),

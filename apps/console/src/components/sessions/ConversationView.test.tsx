@@ -245,10 +245,12 @@ describe("tool calls in the conversation", () => {
       ev({ type: "session.status_idle", id: "i1", stop_reason: { type: "requires_action", event_ids: ["c1"] } }),
       ev({ type: "user.tool_confirmation", id: "x1", tool_use_id: "c1", result: "deny", deny_message: "not on prod" }),
       ev({ type: "session.status_running", id: "r2" }),
+      ev({ type: "agent.tool_result", id: "t1", tool_use_id: "c1", content: "Denied: not on prod", is_error: true }),
       ev({ type: "session.status_idle", id: "i2", stop_reason: { type: "end_turn" } }),
     ]);
     const r = row("env");
     expect(within(r).getByLabelText("Denied")).toBeInTheDocument();
+    expect(within(r).queryByLabelText("Failed")).toBeNull();
     expect(screen.queryByRole("button", { name: "Allow this call" })).toBeNull();
     fireEvent.click(r);
     expect(screen.getByText(/The agent was told: “not on prod”/)).toBeInTheDocument();

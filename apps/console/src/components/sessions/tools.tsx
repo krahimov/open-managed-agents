@@ -423,20 +423,23 @@ function ExternalLink({ href, children }: { href: string; children: ReactNode })
 export function ToolBody({ call }: { call: ToolCall }) {
   const p = presentTool(call);
   const n = (p.kind === "mcp" ? "" : call.name).toLowerCase();
-  const { input, output } = call;
+  const { input } = call;
+  // A denied call never ran: the runtime's result is only its note of the
+  // denial, so the body says what happened instead of showing it as output.
+  const denied = call.status === "denied" || call.approval === "denied";
+  const output = denied ? undefined : call.output;
   const outTone = call.isError ? "danger" : "neutral";
   const outLabel = call.isError ? "Error" : "Output";
-  const waiting =
-    !call.result &&
-    (call.status === "running"
-      ? "Still running…"
-      : call.status === "waiting"
-        ? "This is a custom tool: the app that started the session runs it and sends back the result. The agent carries on once it does."
-        : call.approval === "denied"
-        ? call.denyMessage
-          ? `Denied, so the call did not run. The agent was told: “${call.denyMessage}”`
-          : "Denied, so the call did not run."
-        : null);
+  const waiting = denied
+    ? call.denyMessage
+      ? `Denied, so the call did not run. The agent was told: “${call.denyMessage}”`
+      : "Denied, so the call did not run."
+    : !call.result &&
+      (call.status === "running"
+        ? "Still running…"
+        : call.status === "waiting"
+          ? "This is a custom tool: the app that started the session runs it and sends back the result. The agent carries on once it does."
+          : null);
 
   const outputPart =
     output !== undefined ? (
