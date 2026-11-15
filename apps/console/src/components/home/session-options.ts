@@ -6,7 +6,7 @@ import { BrainIcon, FileTextIcon, VariableIcon } from "lucide-react";
 
 import { pickDefaultEnvironmentId, type EnvironmentChoice } from "../../lib/default-environment";
 import { useQuietQuery } from "../../lib/useApiQuery";
-import { GitHubIcon } from "../icons";
+import { GitHubLogo } from "../app-logos";
 import type { AgentRecord } from "../../types/agent";
 import type { DraftOptions } from "./draft";
 
@@ -105,7 +105,7 @@ export const RESOURCE_KINDS: Array<{
   hint: string;
   icon: ComponentType<{ className?: string }>;
 }> = [
-  { kind: "github", label: "GitHub repository", hint: "Cloned into the workspace", icon: GitHubIcon },
+  { kind: "github", label: "GitHub repository", hint: "Cloned into the workspace", icon: GitHubLogo },
   { kind: "file", label: "File", hint: "One that is already in Files", icon: FileTextIcon },
   { kind: "memory_store", label: "Memory store", hint: "Mounted as a folder", icon: BrainIcon },
   { kind: "env", label: "Environment variable", hint: "A value the sandbox can read", icon: VariableIcon },

@@ -4,6 +4,7 @@ import { AGENT_TEMPLATES, type AgentTemplate } from "@/lib/agent-templates";
 import { MCP_REGISTRY } from "@/lib/mcp-registry";
 import { cn } from "@/lib/utils";
 
+import { appLogoIcon } from "../../../components/app-logos";
 import { AgentAvatar, Chip, EmptyState, EntityAvatar } from "../../../components/kit";
 import { Button } from "../../../components/ui/button";
 
@@ -84,7 +85,9 @@ export function TemplateStep({ search, onPick, onClearSearch }: { search: string
               {facts.length > 0 ? (
                 <>
                   {facts.slice(0, 3).map((fact) => (
-                    <Chip key={fact}>{fact}</Chip>
+                    <Chip key={fact} icon={appLogoIcon(fact)}>
+                      {fact}
+                    </Chip>
                   ))}
                   {facts.length > 3 && <Chip title={facts.slice(3).join(", ")}>+{facts.length - 3}</Chip>}
                 </>

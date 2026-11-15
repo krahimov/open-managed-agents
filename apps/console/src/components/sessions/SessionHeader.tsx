@@ -26,7 +26,7 @@ import { AgentAvatar } from "../AgentAvatar";
 import type { AppOutletContext } from "../AppShell";
 import { Chip } from "../Badge";
 import { EntityRef } from "../EntityRef";
-import { GitHubIcon, LinearIcon, SlackIcon } from "../icons";
+import { GitHubLogo, LinearLogo, SlackLogo } from "../app-logos";
 import { Kbd } from "../Kbd";
 import { PAGE_GUTTER } from "../Page";
 import { RelativeTime } from "../RelativeTime";
@@ -362,7 +362,7 @@ function SourceFact({ source }: { source: SessionSourceInfo }) {
     const ident = linear.issueIdentifier;
     const inner = (
       <>
-        <LinearIcon className="size-3.5 shrink-0" />
+        <LinearLogo className="size-3.5 shrink-0" />
         <span className="truncate">{ident ? `Linear ${ident}` : "Linear issue"}</span>
       </>
     );
@@ -395,7 +395,7 @@ function SourceFact({ source }: { source: SessionSourceInfo }) {
     const link = slackLink(slack);
     const inner = (
       <>
-        <SlackIcon className="size-3.5 shrink-0" />
+        <SlackLogo className="size-3.5 shrink-0" />
         <span className="truncate">{label}</span>
       </>
     );
@@ -422,7 +422,7 @@ function SourceFact({ source }: { source: SessionSourceInfo }) {
     const to = githubLink(source.github);
     const inner = (
       <>
-        <GitHubIcon className="size-3.5 shrink-0" />
+        <GitHubLogo className="size-3.5 shrink-0" />
         <span className="truncate">{to && to.label !== "GitHub" ? `GitHub ${to.label}` : "GitHub"}</span>
       </>
     );

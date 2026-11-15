@@ -29,7 +29,8 @@ import type { SessionReading } from "@/lib/session-state";
 import { AgentAvatar, EntityAvatar } from "../AgentAvatar";
 import { Chip, StatusBadge } from "../Badge";
 import { IdChip } from "../IdChip";
-import { GitHubIcon, LinearIcon, SlackIcon, VaultIcon } from "../icons";
+import { GitHubLogo, LinearLogo, SlackLogo } from "../app-logos";
+import { VaultIcon } from "../icons";
 import { ModelBadge } from "../ModelBadge";
 import { RelativeTime } from "../RelativeTime";
 import { Skeleton } from "../Skeleton";
@@ -394,7 +395,7 @@ function SourceGroup({ source }: { source: SessionSourceInfo }) {
       <PanelGroup label="Started from">
         <div className="flex items-start gap-2.5">
           <EntityAvatar size="md">
-            <LinearIcon className="size-4" />
+            <LinearLogo className="size-4" />
           </EntityAvatar>
           <div className="min-w-0 flex-1">
             <p className="flex min-h-8 flex-wrap items-center gap-x-2 gap-y-1 text-small font-medium text-fg">
@@ -435,7 +436,7 @@ function SourceGroup({ source }: { source: SessionSourceInfo }) {
       <PanelGroup label="Started from">
         <div className="flex items-start gap-2.5">
           <EntityAvatar size="md">
-            <GitHubIcon className="size-4" />
+            <GitHubLogo className="size-4" />
           </EntityAvatar>
           <div className="min-w-0 flex-1">
             <p className="flex min-h-8 items-center text-small font-medium text-fg">
@@ -460,7 +461,7 @@ function SourceGroup({ source }: { source: SessionSourceInfo }) {
       <PanelGroup label="Started from">
         <div className="flex items-start gap-2.5">
           <EntityAvatar size="md">
-            <SlackIcon className="size-4" />
+            <SlackLogo className="size-4" />
           </EntityAvatar>
           <div className="min-w-0 flex-1">
             <p className="flex min-h-8 items-center text-small font-medium text-fg">

@@ -2,7 +2,7 @@ import type { ComponentType } from "react";
 
 import { cn } from "@/lib/utils";
 
-import { GitHubIcon, LinearIcon, SlackIcon } from "../../components/icons";
+import { GitHubLogo, LinearLogo, SlackLogo } from "../../components/app-logos";
 import type { AvatarSize } from "../../components/AgentAvatar";
 import type { PublicationStatus } from "./StatusPill";
 
@@ -39,7 +39,7 @@ export const PROVIDERS: Record<ProviderId, ProviderMeta> = {
   slack: {
     id: "slack",
     name: "Slack",
-    icon: SlackIcon,
+    icon: SlackLogo,
     listPath: "/integrations/slack",
     publishPath: "/integrations/slack/publish",
     installationPath: (id) => `/integrations/slack/installations/${id}`,
@@ -56,7 +56,7 @@ export const PROVIDERS: Record<ProviderId, ProviderMeta> = {
   github: {
     id: "github",
     name: "GitHub",
-    icon: GitHubIcon,
+    icon: GitHubLogo,
     listPath: "/integrations/github",
     publishPath: "/integrations/github/bind",
     installationPath: (id) => `/integrations/github/installations/${id}`,
@@ -73,7 +73,7 @@ export const PROVIDERS: Record<ProviderId, ProviderMeta> = {
   linear: {
     id: "linear",
     name: "Linear",
-    icon: LinearIcon,
+    icon: LinearLogo,
     listPath: "/integrations/linear",
     publishPath: "/integrations/linear/publish",
     installationPath: (id) => `/integrations/linear/installations/${id}`,

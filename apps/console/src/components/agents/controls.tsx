@@ -1,4 +1,4 @@
-import type { ComponentType, ReactNode } from "react";
+import { useState, type ComponentType, type ReactNode } from "react";
 import { Select as SelectPrimitive } from "radix-ui";
 import { CheckIcon } from "lucide-react";
 
@@ -8,6 +8,7 @@ import { initials } from "@/lib/format";
 import { cn } from "@/lib/utils";
 
 import { EntityAvatar, type AvatarSize } from "../AgentAvatar";
+import { LogoImage, appLogo } from "../app-logos";
 import { BRAND_MARKS } from "../brand-marks";
 
 /**
@@ -280,11 +281,11 @@ export function RowBox({ children, className }: { children: ReactNode; className
 }
 
 /**
- * A third-party app's mark. Known apps draw their brand glyph from the
- * vendored set (components/brand-marks.ts) in the text colour, so it sits
- * with the rest of the iconography in both themes; any other app shows its
- * initial. Nothing is fetched from the network, so there is never an empty
- * box or a late-loading image.
+ * A third-party app's logo. Known apps show their real, full-colour logo
+ * from the bundled set (components/app-logos.tsx); an app from a catalog
+ * can pass its logo URL as `src`; failing both, the single-colour glyph from
+ * brand-marks.ts, then the app's initial. Bundled logos need no network, so
+ * the common apps never show an empty box or a late-loading image.
  *
  * `slug` is the app's id where there is one ("googledrive"); the name is
  * tried too ("Google Drive").
@@ -292,21 +293,33 @@ export function RowBox({ children, className }: { children: ReactNode; className
 export function AppIcon({
   name,
   slug,
+  src,
   size = "md",
   tone = "neutral",
   className,
 }: {
   name: string;
   slug?: string | null;
+  /** A logo URL for an app outside the bundled set (a Composio toolkit's `meta.logo`). */
+  src?: string | null;
   size?: AvatarSize;
   /** `neutral` in rows and lists (default); `surface` on a gallery card. */
   tone?: "neutral" | "surface";
   className?: string;
 }) {
-  const path = brandMark(slug) ?? brandMark(name);
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const logo = appLogo(slug) ?? appLogo(name) ?? (src && src !== failedSrc ? { src, invertInDark: false } : undefined);
+  const path = logo ? undefined : (brandMark(slug) ?? brandMark(name));
   return (
     <EntityAvatar size={size} tone={tone} className={cn("font-semibold", path && "text-fg", className)}>
-      {path ? (
+      {logo ? (
+        <LogoImage
+          src={logo.src}
+          invertInDark={logo.invertInDark}
+          className="size-[60%]"
+          onError={logo.src === src ? () => setFailedSrc(src) : undefined}
+        />
+      ) : path ? (
         <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" className="size-[52%]">
           <path d={path} />
         </svg>

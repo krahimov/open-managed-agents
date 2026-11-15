@@ -7,7 +7,7 @@ import { BoxIcon, BrainIcon, PencilIcon, PlugIcon, PuzzleIcon, TerminalIcon, Wre
 import { Button } from "@/components/ui/button";
 import { harnessLabel } from "@/lib/agents";
 import type { EnvironmentChoice } from "@/lib/default-environment";
-import { COMPOSIO_MANAGED_AGENT_INTEGRATIONS } from "@/lib/composio-integrations";
+import { COMPOSIO_MANAGED_AGENT_INTEGRATIONS, composioLogoUrl } from "@/lib/composio-integrations";
 import { plural } from "@/lib/format";
 import { useEntityName, type EntityKind } from "@/lib/directory";
 import { sessionTitle } from "@/lib/sessions";
@@ -18,7 +18,7 @@ import { AgentComputerPanel } from "../../../components/AgentComputerPanel";
 import { AgentMemoryPanel } from "../../../components/AgentMemoryPanel";
 import { AgentModelSwitcher } from "../../../components/AgentModelSwitcher";
 import { AppIcon } from "../../../components/agents/controls";
-import { GitHubIcon, LinearIcon, SlackIcon, VaultIcon } from "../../../components/icons";
+import { VaultIcon } from "../../../components/icons";
 import {
   Chip,
   EntityAvatar,
@@ -39,7 +39,7 @@ import { useSessionReadings } from "../../../components/sessions/readings";
 import { MEMORY_MODE_LABELS, parseMemoryMode } from "../../../components/MemoryModeControl";
 import type { AgentRecord } from "../../../types/agent";
 import type { SessionRecord } from "../../../types/session";
-import { ListRow, TOOL_POLICY, listInWords, localBrandIcon, summarizeTools } from "./parts";
+import { ListRow, TOOL_POLICY, listInWords, summarizeTools } from "./parts";
 
 /** Shared publication shape across Linear, GitHub and Slack. */
 interface Pub {
@@ -209,13 +209,10 @@ export function OverviewTab({
             />
           ))}
           {tools.servers.map((server) => {
-            const Brand = localBrandIcon(server.name);
             return (
               <ListRow
                 key={`mcp-${server.name}`}
-                leading={
-                  Brand ? <EntityAvatar icon={Brand} size="md" /> : <AppIcon name={server.label} size="md" />
-                }
+                leading={<AppIcon slug={server.name} name={server.label} size="md" />}
                 title={server.label}
                 description={
                   <span title={server.host}>
@@ -233,7 +230,7 @@ export function OverviewTab({
           {composioApps.map((app) => (
             <ListRow
               key={`app-${app.slug}`}
-              leading={<AppIcon slug={app.slug} name={app.name} size="md" />}
+              leading={<AppIcon slug={app.slug} name={app.name} src={composioLogoUrl(app)} size="md" />}
               title={app.name}
               description={`Connected app · ${app.category}`}
               trailing={<Chip icon={PlugIcon}>Connected</Chip>}
@@ -285,9 +282,9 @@ export function OverviewTab({
         <AgentMemoryPanel key={`memory-${agent.id}`} agentId={agent.id} />
 
         <SectionCard title="Integrations" description="Where people can reach this agent outside the console." flush>
-          <PublicationRow kind="linear" label="Linear" icon={LinearIcon} agentId={agent.id} archived={archived} />
-          <PublicationRow kind="github" label="GitHub" icon={GitHubIcon} agentId={agent.id} archived={archived} />
-          <PublicationRow kind="slack" label="Slack" icon={SlackIcon} agentId={agent.id} archived={archived} />
+          <PublicationRow kind="linear" label="Linear" agentId={agent.id} archived={archived} />
+          <PublicationRow kind="github" label="GitHub" agentId={agent.id} archived={archived} />
+          <PublicationRow kind="slack" label="Slack" agentId={agent.id} archived={archived} />
         </SectionCard>
       </div>
 
@@ -574,13 +571,11 @@ function ClampedProse({ text }: { text: string }) {
 function PublicationRow({
   kind,
   label,
-  icon,
   agentId,
   archived,
 }: {
   kind: "linear" | "github" | "slack";
   label: string;
-  icon: React.ComponentType<{ className?: string }>;
   agentId: string;
   archived: boolean;
 }) {
@@ -592,7 +587,7 @@ function PublicationRow({
   const first = pubs[0];
   return (
     <ListRow
-      leading={<EntityAvatar icon={icon} size="md" />}
+      leading={<AppIcon slug={kind} name={label} size="md" />}
       title={label}
       description={
         isLoading ? (

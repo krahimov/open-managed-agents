@@ -23,6 +23,7 @@ import { Switch } from "@/components/ui/switch";
 import { useApi } from "@/lib/api";
 import {
   composioEntriesFromCatalog,
+  composioLogoUrl,
   filterComposioEntries,
   type ComposioIntegrationEntry,
   type ComposioToolkitCatalogResponse,
@@ -45,7 +46,6 @@ import {
   Skeleton,
   Tip,
 } from "../../../components/kit";
-import { GitHubIcon, LinearIcon, SlackIcon } from "../../../components/icons";
 import { McpServerPicker } from "../../../components/McpServerPickerModal";
 import type { AgentRecord as Agent } from "../../../types/agent";
 import {
@@ -412,7 +412,7 @@ export function AppsSection({
                     )}
                   >
                     <div className="flex min-w-0 items-start gap-3">
-                      <AppIcon slug={entry.slug} name={entry.name} size="md" />
+                      <AppIcon slug={entry.slug} name={entry.name} src={composioLogoUrl(entry)} size="md" />
                       <div className="min-w-0 flex-1">
                         <div className="flex min-w-0 items-center gap-2">
                           <div className="truncate text-small leading-5 font-medium text-fg" title={entry.name}>
@@ -474,12 +474,6 @@ export function AppsSection({
 // ── MCP servers ──────────────────────────────────────────────────────────
 
 /** Brand marks we ship locally. Other servers show their initial. */
-const BRAND_ICON: Record<string, React.ComponentType<{ className?: string }>> = {
-  github: GitHubIcon,
-  linear: LinearIcon,
-  slack: SlackIcon,
-};
-
 function hostOf(url: string): string {
   try {
     return new URL(url).host;
@@ -574,13 +568,12 @@ export function McpSection({
           {form.mcpServers.map((mcp, i) => {
             const known = MCP_REGISTRY.find((entry) => entry.url === mcp.url || entry.id === mcp.name);
             const label = known?.name ?? (mcp.name ? mcp.name[0].toUpperCase() + mcp.name.slice(1).replace(/[_-]+/g, " ") : "");
-            const Brand = BRAND_ICON[(known?.id ?? mcp.name).toLowerCase()];
             const isOpen = open === i;
             const transport = TRANSPORT_OPTIONS.find((t) => t.value === mcp.type)?.label ?? mcp.type;
             return (
               <div key={i} className="border-t border-border first:border-t-0">
                 <div className="flex min-h-[52px] items-center gap-3 py-2 pr-2 pl-3.5">
-                  {Brand ? <EntityAvatar icon={Brand} size="md" /> : <AppIcon name={label || "?"} size="md" />}
+                  <AppIcon slug={known?.id ?? mcp.name} name={label || "?"} size="md" />
                   <div className="min-w-0 flex-1">
                     <div className="truncate text-small leading-5 font-medium text-fg">
                       {label || <span className="text-fg-subtle">New server</span>}

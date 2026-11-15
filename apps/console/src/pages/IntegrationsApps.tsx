@@ -28,6 +28,7 @@ import { plural } from "../lib/format";
 import { useApiQuery } from "../lib/useApiQuery";
 import {
   composioEntriesFromCatalog,
+  composioLogoUrl,
   filterComposioEntries,
   type ComposioToolkitCatalogResponse,
   type ComposioIntegrationEntry,
@@ -378,7 +379,7 @@ export function IntegrationsApps() {
 
 /** An app's mark: its vendored brand glyph, or its initial. */
 function AppMark({ entry }: { entry: ComposioIntegrationEntry }) {
-  return <AppIcon slug={entry.slug} name={entry.name} size="lg" tone="surface" />;
+  return <AppIcon slug={entry.slug} name={entry.name} src={composioLogoUrl(entry)} size="lg" tone="surface" />;
 }
 
 /** One native integration: its mark, what it covers, and whether it is set up. */
