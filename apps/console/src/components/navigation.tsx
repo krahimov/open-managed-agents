@@ -22,7 +22,8 @@ import {
   WrenchIcon,
 } from "lucide-react";
 
-import { GitHubIcon, LinearIcon, SlackIcon, VaultIcon } from "./icons";
+import { GitHubLogo, LinearLogo, SlackLogo } from "./app-logos";
+import { VaultIcon } from "./icons";
 import { consolePlugins } from "../plugins/registry";
 import { useServerFeatures, type ServerFeature } from "../lib/server-features";
 
@@ -110,9 +111,9 @@ export const WORKSPACE_NAV: NavGroup[] = [
     icon: PlugIcon,
     items: [
       { to: "/integrations/apps", label: "Apps", icon: LayoutGridIcon, keywords: "integrations composio oauth mcp" },
-      { to: "/integrations/slack", label: "Slack", icon: SlackIcon, keywords: "integration chat" },
-      { to: "/integrations/github", label: "GitHub", icon: GitHubIcon, keywords: "integration repos pull requests" },
-      { to: "/integrations/linear", label: "Linear", icon: LinearIcon, keywords: "integration issues" },
+      { to: "/integrations/slack", label: "Slack", icon: SlackLogo, keywords: "integration chat" },
+      { to: "/integrations/github", label: "GitHub", icon: GitHubLogo, keywords: "integration repos pull requests" },
+      { to: "/integrations/linear", label: "Linear", icon: LinearLogo, keywords: "integration issues" },
       { to: "/runtimes", label: "Local runtimes", icon: LaptopIcon, keywords: "daemon machine acp", feature: "runtimes" },
     ],
   },

@@ -21,7 +21,7 @@ import {
   Skeleton,
 } from "../../../components/kit";
 import type { AgentRecord } from "../../../types/agent";
-import { TOOL_POLICY, localBrandIcon, summarizeTools } from "../detail/parts";
+import { TOOL_POLICY, summarizeTools } from "../detail/parts";
 
 /** The agent's configuration as the setup view tracks it: the fields the
  *  agent can rewrite about itself. */
@@ -208,11 +208,10 @@ function Summary({ harness, changed }: { harness: Harness; changed: string[] }) 
               />
             ))}
             {tools.servers.map((server) => {
-              const Brand = localBrandIcon(server.name);
               return (
                 <Row
                   key={`mcp-${server.name}`}
-                  leading={Brand ? <EntityAvatar icon={Brand} size="md" /> : <AppIcon name={server.label} size="md" />}
+                  leading={<AppIcon slug={server.name} name={server.label} size="md" />}
                   title={server.label}
                   description={server.host ? `MCP server · ${server.host}` : "MCP server"}
                 />

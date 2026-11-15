@@ -26,7 +26,7 @@ import { inlineLink, standaloneLink } from "@/lib/links";
 import { AgentAvatar } from "../AgentAvatar";
 import { BRAND_MARKS } from "../brand-marks";
 import { CodeWell, EventCard } from "../EventCard";
-import { GitHubIcon, LinearIcon, SlackIcon } from "../icons";
+import { appLogoIcon } from "../app-logos";
 import { CopyButton } from "../IdChip";
 import { Markdown } from "../Markdown";
 import type { EventStatus } from "../EventCard";
@@ -44,17 +44,11 @@ import { formatElapsed, handoffKey, handoffKeyOf, type ToolCall } from "./model"
 
 type IconType = ComponentType<{ className?: string }>;
 
-/** Brand marks from icons.tsx default to 16px; keep them on the 14px optical size of a filled glyph. */
-const brand = (Icon: IconType): IconType =>
-  function BrandMark({ className }: { className?: string }) {
-    return <Icon className={cn("size-4 p-px", className)} />;
-  };
-
 /** MCP servers and apps people know by name. Anything else is title-cased. */
 const SERVERS: Record<string, { label: string; icon?: IconType }> = {
-  linear: { label: "Linear", icon: brand(LinearIcon) },
-  github: { label: "GitHub", icon: brand(GitHubIcon) },
-  slack: { label: "Slack", icon: brand(SlackIcon) },
+  linear: { label: "Linear" },
+  github: { label: "GitHub" },
+  slack: { label: "Slack" },
   notion: { label: "Notion" },
   sentry: { label: "Sentry" },
   stripe: { label: "Stripe" },
@@ -91,10 +85,11 @@ function markIcon(key: string): IconType | undefined {
 
 export function serverInfo(server: string | undefined): { label: string; icon: IconType } {
   const key = (server ?? "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const icon = appLogoIcon(key) ?? markIcon(key) ?? PlugIcon;
   const known = SERVERS[key];
-  if (known) return { label: known.label, icon: known.icon ?? markIcon(key) ?? PlugIcon };
+  if (known) return { label: known.label, icon: known.icon ?? icon };
   const label = (server ?? "").replace(/[-_]+/g, " ").trim();
-  return { label: label ? label[0].toUpperCase() + label.slice(1) : "App", icon: markIcon(key) ?? PlugIcon };
+  return { label: label ? label[0].toUpperCase() + label.slice(1) : "App", icon };
 }
 
 const BUILT_IN: Record<string, { icon: IconType; verb: string }> = {

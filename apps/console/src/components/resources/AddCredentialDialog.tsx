@@ -7,6 +7,7 @@ import { openOAuthPopup, subscribeOAuthMessages } from "@/lib/oauth-popup";
 import { useServerFeature } from "@/lib/server-features";
 import {
   composioEntriesFromCatalog,
+  composioLogoUrl,
   type ComposioIntegrationEntry,
   type ComposioStatusResponse,
   type ComposioToolkitCatalogResponse,
@@ -17,6 +18,7 @@ import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 
+import { AppIcon } from "../agents/controls";
 import { StatusBadge } from "../Badge";
 import { BrandLoader } from "../BrandLoader";
 import { Callout } from "../Callout";
@@ -69,22 +71,6 @@ const normalizeSlug = (slug: string) => slug.trim().toLowerCase();
 const parseToolkits = (raw: string) =>
   Array.from(new Set(raw.split(/[,\s]+/).map(normalizeSlug).filter(Boolean)));
 const formatToolkits = (toolkits: string[]) => toolkits.join(", ");
-
-/** A neutral letter mark for a service. No remote favicons: the console loads no network images. */
-function InitialTile({ name, size = "md" }: { name: string; size?: "sm" | "md" }) {
-  return (
-    <span
-      aria-hidden="true"
-      className={
-        size === "sm"
-          ? "flex size-4 shrink-0 items-center justify-center rounded-[5px] bg-bg-soft text-[0.5625rem] font-semibold text-fg-muted"
-          : "flex size-7 shrink-0 items-center justify-center rounded-[9px] bg-bg-soft text-xs font-semibold text-fg-muted"
-      }
-    >
-      {(name.trim()[0] ?? "?").toUpperCase()}
-    </span>
-  );
-}
 
 function OptionalTag({ required }: { required?: boolean }) {
   return <span className="ml-1.5 font-normal text-fg-subtle">{required ? "(required)" : "(optional)"}</span>;
@@ -590,14 +576,14 @@ export function AddCredentialDialog({
         getKey={(entry) => entry.id}
         renderItem={(entry) => (
           <div className="flex items-center gap-3 px-2.5 py-2">
-            <InitialTile name={entry.name} />
+            <AppIcon slug={entry.id} name={entry.name} size="md" />
             <div className="min-w-0 flex-1">
               <div className="truncate text-small-size font-medium text-fg">{entry.name}</div>
               <div className="truncate font-mono text-micro-size text-fg-subtle">{entry.url}</div>
             </div>
           </div>
         )}
-        prefix={form.pickedName ? <InitialTile name={form.pickedName} size="sm" /> : null}
+        prefix={form.pickedName ? <AppIcon name={form.pickedName} size="xs" /> : null}
         placeholder="Search known servers, or paste a URL"
         emptyHint="No known server matches. Keep typing to use your own URL."
       />
@@ -972,7 +958,7 @@ export function AddCredentialDialog({
                           onCheckedChange={() => toggleToolkit(entry.slug)}
                           aria-label={`Enable ${entry.name}`}
                         />
-                        <InitialTile name={entry.name} />
+                        <AppIcon slug={entry.slug} name={entry.name} src={composioLogoUrl(entry)} size="md" />
                         <div className="min-w-0 flex-1">
                           <div className="truncate text-small-size font-medium text-fg">{entry.name}</div>
                           <div className="truncate text-xs text-fg-subtle">{entry.category}</div>

@@ -5,13 +5,12 @@ import {
   FileIcon,
   HandIcon,
   MailIcon,
-  MessagesSquareIcon,
   WebhookIcon,
 } from "lucide-react";
 
 import type { AmbientTriggerSource, AmbientWakeMode } from "@/lib/ambient-controls";
 
-import { GitHubIcon, LinearIcon, SlackIcon } from "../icons";
+import { GitHubLogo, LinearLogo, SlackLogo, TeamsLogo } from "../app-logos";
 
 /**
  * The vocabulary for triggers (the API calls them ambient rules): how a
@@ -45,10 +44,10 @@ type IconType = ComponentType<{ className?: string }>;
 export const TRIGGER_SOURCE: Record<AmbientTriggerSource, { label: string; hint: string; icon: IconType }> = {
   schedule: { label: "Schedule", hint: "At set times", icon: CalendarClockIcon },
   webhook: { label: "Webhook", hint: "When another system calls in", icon: WebhookIcon },
-  slack: { label: "Slack", hint: "Mentions, messages and uploads", icon: SlackIcon },
-  teams: { label: "Microsoft Teams", hint: "Mentions and channel activity", icon: MessagesSquareIcon },
-  github: { label: "GitHub", hint: "Pull requests, issues and pushes", icon: GitHubIcon },
-  linear: { label: "Linear", hint: "Issues assigned, created or updated", icon: LinearIcon },
+  slack: { label: "Slack", hint: "Mentions, messages and uploads", icon: SlackLogo },
+  teams: { label: "Microsoft Teams", hint: "Mentions and channel activity", icon: TeamsLogo },
+  github: { label: "GitHub", hint: "Pull requests, issues and pushes", icon: GitHubLogo },
+  linear: { label: "Linear", hint: "Issues assigned, created or updated", icon: LinearLogo },
   email: { label: "Email", hint: "New mail that matches a search", icon: MailIcon },
   memory: { label: "Memory change", hint: "When a memory store is edited", icon: BrainIcon },
   file: { label: "File change", hint: "When a workspace file is edited", icon: FileIcon },

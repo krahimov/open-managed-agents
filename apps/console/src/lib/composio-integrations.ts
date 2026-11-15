@@ -233,6 +233,16 @@ export const COMPOSIO_MANAGED_AGENT_INTEGRATIONS: ComposioIntegrationEntry[] = [
 ];
 
 
+/**
+ * The logo for a Composio toolkit: the catalog's own `meta.logo` when the
+ * catalog sent one, otherwise Composio's logo CDN, which serves every
+ * toolkit slug. <AppIcon> prefers its bundled logos and only loads this
+ * for apps outside that set.
+ */
+export function composioLogoUrl(entry: Pick<ComposioIntegrationEntry, "slug" | "icon">): string {
+  return entry.icon || `https://logos.composio.dev/api/${encodeURIComponent(entry.slug)}`;
+}
+
 export function composioEntriesFromCatalog(
   catalog: ComposioToolkitCatalogResponse | null | undefined,
 ): ComposioIntegrationEntry[] {

@@ -1,9 +1,8 @@
-import type { ComponentType, ReactNode } from "react";
+import type { ReactNode } from "react";
 
 import { MCP_REGISTRY } from "@/lib/mcp-registry";
 import { cn } from "@/lib/utils";
 
-import { GitHubIcon, LinearIcon, SlackIcon } from "../../../components/icons";
 import type { AgentRecord } from "../../../types/agent";
 
 /**
@@ -127,17 +126,6 @@ export function summarizeTools(agent: AgentRecord): AgentToolsSummary {
     });
 
   return { builtIn, custom, servers };
-}
-
-/** Brand marks we ship locally. Other apps fall back to their initial. */
-const LOCAL_BRAND_ICON: Record<string, ComponentType<{ className?: string }>> = {
-  github: GitHubIcon,
-  linear: LinearIcon,
-  slack: SlackIcon,
-};
-
-export function localBrandIcon(name: string | undefined) {
-  return name ? LOCAL_BRAND_ICON[name.toLowerCase()] : undefined;
 }
 
 /** "a, b and c" for short lists inside a sentence. */
