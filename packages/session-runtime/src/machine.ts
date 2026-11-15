@@ -473,10 +473,16 @@ export class SessionStateMachine {
 
       let runHarness = true;
       if (event.type === "user.tool_confirmation" || event.type === "user.custom_tool_result") {
-        await this.applyClientToolResult(log, agent, event, before, controller.signal, resuming);
+        // A repeat answer for a call whose turn already went on (a client
+        // that re-sends ids the intermediate idles still listed while its
+        // first answers sat in the queue — 43 of 108 confirmations on one
+        // 2026-11 eval) changes nothing: it must not resume the model on
+        // the whole context again. Report the session's state as it is.
+        const stale = !resuming && clientResultAlreadySettled(before, clientResultToolUseId(event));
+        if (!stale) await this.applyClientToolResult(log, agent, event, before, controller.signal, resuming);
         const after = await this.readEvents(log);
         const remaining = outstandingRequiredActions(after);
-        if (remaining.length > 0) {
+        if (remaining.length > 0 || stale) {
           // Other calls from the same step still wait on the client —
           // resuming now would send the model an incomplete tool_result
           // set. Hand control back with the remaining ids.
@@ -1003,4 +1009,33 @@ export function modelLoopFinished(turnEvents: SessionEvent[], threadId?: string)
 function seqOf(event: SessionEvent): number | undefined {
   const seq = (event as { seq?: unknown }).seq;
   return typeof seq === "number" ? seq : undefined;
+}
+
+function clientResultToolUseId(event: UserToolConfirmationEvent | UserCustomToolResultEvent): string {
+  return event.type === "user.custom_tool_result" ? event.custom_tool_use_id : event.tool_use_id;
+}
+
+/**
+ * True when `toolUseId` already has its result in `events` and a turn
+ * ended cleanly after it (a session.status_idle carrying a stop_reason),
+ * i.e. the model has been resumed past this call. A failed turn's idle
+ * has no stop_reason, so an answer re-sent after an error still resumes.
+ */
+function clientResultAlreadySettled(events: SessionEvent[], toolUseId: string): boolean {
+  let resolved = false;
+  for (const ev of events as unknown as Array<{
+    type: string;
+    tool_use_id?: string;
+    mcp_tool_use_id?: string;
+    stop_reason?: unknown;
+  }>) {
+    if (!resolved) {
+      resolved =
+        (ev.type === "agent.tool_result" && ev.tool_use_id === toolUseId) ||
+        (ev.type === "agent.mcp_tool_result" && ev.mcp_tool_use_id === toolUseId);
+    } else if (ev.type === "session.status_idle" && ev.stop_reason) {
+      return true;
+    }
+  }
+  return false;
 }

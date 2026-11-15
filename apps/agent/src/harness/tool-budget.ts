@@ -212,11 +212,35 @@ function bareToolName(name: string): string {
   return srv ? name.slice(MCP_PREFIX.length + srv.length + 2) : name;
 }
 
+/**
+ * Deferred tool → the directly-sent tool it duplicates: same bare name,
+ * description and input schema on another server. A second Composio
+ * router mounted from another vault (composio_gmail_…) carries the same
+ * meta tools as the declared one; on the 2026-11 evals the model searched
+ * each of them by exact name for a ~1.5k-token definition it already had.
+ */
+function deferredTwins(direct: ToolSet, deferred: Map<string, Tool>): Map<string, string> {
+  const signature = (name: string, t: Tool) =>
+    JSON.stringify([bareToolName(name), toolDescription(t), jsonSchemaOf(t) ?? null]);
+  const bySignature = new Map<string, string>();
+  for (const [name, t] of Object.entries(direct)) {
+    if (mcpServerOf(name)) bySignature.set(signature(name, t as Tool), name);
+  }
+  const twins = new Map<string, string>();
+  if (bySignature.size === 0) return twins;
+  for (const [name, t] of deferred) {
+    const twin = bySignature.get(signature(name, t));
+    if (twin) twins.set(name, twin);
+  }
+  return twins;
+}
+
 /** "notion: a, b, c; linear: d, e" — bare names per server in deferred
  *  (declared) order, capped at CATALOG_MAX_CHARS. Gives the model the
  *  catalog keyword search alone can't: a generic word ("page") fills
- *  every slot with the tools that carry it in their name. */
-function deferredCatalog(deferred: Map<string, Tool>): string {
+ *  every slot with the tools that carry it in their name. A server whose
+ *  every tool duplicates one loaded directly says so (deferredTwins). */
+function deferredCatalog(deferred: Map<string, Tool>, twins: Map<string, string> = new Map()): string {
   const byServer = new Map<string, string[]>();
   for (const name of deferred.keys()) {
     const srv = mcpServerOf(name) ?? "";
@@ -224,10 +248,21 @@ function deferredCatalog(deferred: Map<string, Tool>): string {
     list.push(bareToolName(name));
     byServer.set(srv, list);
   }
+  const twinServer = (srv: string): string | null => {
+    const sources = new Set<string | null>();
+    for (const name of deferred.keys()) {
+      if (mcpServerOf(name) !== srv) continue;
+      const twin = twins.get(name);
+      sources.add(twin ? mcpServerOf(twin) : null);
+    }
+    const [only] = [...sources];
+    return sources.size === 1 && only ? only : null;
+  };
   let out = "";
   let listed = 0;
   outer: for (const [srv, list] of byServer) {
-    const head = `${out ? "; " : ""}${srv}: `;
+    const same = twinServer(srv);
+    const head = `${out ? "; " : ""}${srv}${same ? ` (same tools and schemas as the loaded mcp__${same}__*)` : ""}: `;
     if (out.length + head.length > CATALOG_MAX_CHARS) break;
     out += head;
     for (let i = 0; i < list.length; i++) {
@@ -288,8 +323,18 @@ function scoreTool(name: string, t: Tool, terms: string[]): number {
 }
 
 /** One search result. Descriptions are cut to SEARCH_DESCRIPTION_CHARS
- *  unless `fullDescription` — and a cut one says how to get the rest. */
-function searchHit(name: string, t: Tool, fullDescription: boolean): Record<string, unknown> {
+ *  unless `fullDescription` — and a cut one says how to get the rest. A
+ *  tool that duplicates a loaded one (`twin`) points at it instead. */
+function searchHit(name: string, t: Tool, fullDescription: boolean, twin?: string): Record<string, unknown> {
+  if (twin) {
+    return {
+      name,
+      server: mcpServerOf(name),
+      same_as: twin,
+      description: `Same description and input schema as ${twin}, which is loaded directly; call this one with ${CALL_TOOL_NAME}.`,
+      ...(hasExecute(t) ? {} : { requires_approval: true }),
+    };
+  }
   const d = toolDescription(t);
   const cut = !fullDescription && d.length > SEARCH_DESCRIPTION_CHARS;
   return {
@@ -383,7 +428,8 @@ export function applyToolBudget(tools: ToolSet, opts: ToolBudgetOptions = {}): T
     : overCount && Number.isFinite(maxTools) ? `this model accepts at most ${maxTools} tools`
     : "their definitions are too large to send with every request";
 
-  const catalog = deferredCatalog(deferred);
+  const twins = deferredTwins(direct, deferred);
+  const catalog = deferredCatalog(deferred, twins);
   direct[SEARCH_TOOL_NAME] = tool({
     description:
       `Find tools from MCP servers that are NOT loaded directly because ${why}. ` +
@@ -407,7 +453,7 @@ export function applyToolBudget(tools: ToolSet, opts: ToolBudgetOptions = {}): T
       // description (Notion's carry its markdown and property-format rules).
       const q = query.trim().toLowerCase();
       const exact = inScope.filter(([name]) => name.toLowerCase() === q || bareToolName(name).toLowerCase() === q);
-      if (exact.length > 0) return JSON.stringify(exact.map(([name, t]) => searchHit(name, t, true)), null, 1);
+      if (exact.length > 0) return JSON.stringify(exact.map(([name, t]) => searchHit(name, t, true, twins.get(name))), null, 1);
 
       const terms = searchTerms(query, Object.keys(deferredByServer));
       const scored: Array<{ name: string; score: number }> = [];
@@ -421,11 +467,15 @@ export function applyToolBudget(tools: ToolSet, opts: ToolBudgetOptions = {}): T
         // Name what there is, so a miss doesn't read as "no such capability".
         return (
           `No deferred tools matched "${query}"${server ? ` on ${server}` : ""}. ` +
-          `Deferred tools: ${server ? deferredCatalog(new Map(inScope)) : catalog}`
+          `Deferred tools: ${server ? deferredCatalog(new Map(inScope), twins) : catalog}`
         );
       }
       // One hit (or limit 1) → its full description, nothing to economize.
-      return JSON.stringify(top.map(({ name }) => searchHit(name, deferred.get(name)!, top.length === 1)), null, 1);
+      return JSON.stringify(
+        top.map(({ name }) => searchHit(name, deferred.get(name)!, top.length === 1, twins.get(name))),
+        null,
+        1,
+      );
     },
   });
 

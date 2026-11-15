@@ -19,9 +19,12 @@ import { withAskGatesLifted } from "@open-managed-agents/session-runtime";
 import { buildTools } from "@open-managed-agents/agent/harness/tools";
 import { CALL_TOOL_NAME, SEARCH_TOOL_NAME, applyAgentToolBudget } from "@open-managed-agents/agent/harness/tool-budget";
 import {
+  DEFAULT_MCP_RESULT_PREVIEW_CHARS,
   MAX_TOOL_RESULT_CHARS,
   mcpModelOutput,
   mcpResultForModel,
+  mcpResultPreviewChars,
+  mcpResultWithSpill,
   mcpWireText,
 } from "@open-managed-agents/agent/harness/mcp-output";
 import { eventsToMessages } from "@open-managed-agents/agent/runtime/history";
@@ -121,6 +124,93 @@ describe("MCP tools from buildTools", () => {
     expect(binding.closed.sort()).toEqual(["notion", "sentry"]);
     await releaseTools(tools); // idempotent
     expect(binding.closed).toHaveLength(2);
+  });
+});
+
+// Oversized results: a result is re-read on every later model call, so a
+// text result over the preview limit goes to the sandbox in full and the
+// model keeps its head plus a pointer (decided once, at insertion).
+describe("oversized MCP results → sandbox file + preview", () => {
+  const spillTo = (files: Map<string, string>, maxChars = 1_000) => ({
+    maxChars,
+    readers: ["read", "grep"],
+    write: async (path: string, content: string) => void files.set(path, content),
+  });
+
+  it("writes a JSON result pretty-printed and returns its head plus a note naming the file", async () => {
+    const files = new Map<string, string>();
+    const rows = Array.from({ length: 200 }, (_, i) => ({ id: i, name: `deal ${i}`, amount: i * 100 }));
+    const raw = { content: [{ type: "text", text: JSON.stringify({ results: rows }) }] };
+    const out = (await mcpResultWithSpill(raw, "call_Ab9/x", spillTo(files))) as string;
+    const path = "/workspace/.tool-results/call_Ab9_x.json";
+    expect(JSON.parse(files.get(path)!)).toEqual({ results: rows });
+    expect(files.get(path)).toContain('\n  "results": [');
+    expect(out.startsWith(JSON.stringify({ results: rows }).slice(0, 1_000))).toBe(true);
+    expect(out).toContain(`The full output is saved at ${path} (pretty-printed JSON, ${files.get(path)!.split("\n").length} lines)`);
+    expect(out).toContain("with read / grep instead of calling the tool again");
+    expect(out.length).toBeLessThan(1_000 + 400);
+    // Pure for the same input: replay and the prompt cache see the same bytes.
+    expect(await mcpResultWithSpill(raw, "call_Ab9/x", spillTo(new Map()))).toBe(out);
+  });
+
+  it("cuts text at a line end near the limit and saves it as .txt", async () => {
+    const files = new Map<string, string>();
+    const text = Array.from({ length: 100 }, (_, i) => `line ${i} ${"-".repeat(40)}`).join("\n");
+    const out = (await mcpResultWithSpill(text, "c2", spillTo(files))) as string;
+    expect(files.get("/workspace/.tool-results/c2.txt")).toBe(text);
+    const head = out.slice(0, out.indexOf("\n...[output truncated"));
+    expect(text.startsWith(head)).toBe(true);
+    expect(text[head.length]).toBe("\n");
+    expect(out).toContain(`showing the first ${head.length} of ${text.length} chars`);
+  });
+
+  it("short results, images, no spill config and a failed write keep the plain cap", async () => {
+    expect(await mcpResultWithSpill({ content: [{ type: "text", text: "small" }] }, "c3", spillTo(new Map()))).toBe("small");
+    const blocks = { content: [{ type: "text", text: "x".repeat(5_000) }, { type: "image", data: "AAAA", mimeType: "image/png" }] };
+    expect(await mcpResultWithSpill(blocks, "c3", spillTo(new Map()))).toEqual(mcpResultForModel(blocks));
+    const huge = { content: [{ type: "text", text: "y".repeat(120_000) }] };
+    expect(await mcpResultWithSpill(huge, "c3", undefined)).toBe(mcpResultForModel(huge));
+    expect(await mcpResultWithSpill(huge, undefined, spillTo(new Map()))).toBe(mcpResultForModel(huge));
+    const failing = { ...spillTo(new Map()), write: async () => { throw new Error("disk full"); } };
+    expect(await mcpResultWithSpill(huge, "c3", failing)).toBe(mcpResultForModel(huge));
+  });
+
+  it("metadata.mcp_result_max_chars sets the preview length; 0 turns spilling off", () => {
+    expect(mcpResultPreviewChars(undefined)).toBe(DEFAULT_MCP_RESULT_PREVIEW_CHARS);
+    expect(mcpResultPreviewChars({ mcp_result_max_chars: 8_000 })).toBe(8_000);
+    expect(mcpResultPreviewChars({ mcp_result_max_chars: 0 })).toBe(0);
+    expect(mcpResultPreviewChars({ mcp_result_max_chars: 10 })).toBe(1_000);
+    expect(mcpResultPreviewChars({ mcp_result_max_chars: "big" })).toBe(DEFAULT_MCP_RESULT_PREVIEW_CHARS);
+  });
+
+  it("buildTools spills through the sandbox only when the agent has a file tool to read it back", async () => {
+    const big = "r".repeat(DEFAULT_MCP_RESULT_PREVIEW_CHARS * 2);
+    const run = async (extra: Partial<AgentConfig>) => {
+      const writes: Array<[string, string]> = [];
+      const sb = { exec: async () => "", readFile: async () => "", writeFile: async (p: string, c: string) => { writes.push([p, c]); return p; } } as never;
+      const tools = (await buildTools(agentConfig(extra), sb, {
+        mcpBinding: servers(() => ({ content: [{ type: "text", text: big }] })),
+        tenantId: "tn_test",
+        sessionId: "sess_mcp",
+      })) as Record<string, any>;
+      const out = await tools.mcp__sentry__get_issue.execute({ id: "1" }, { toolCallId: "call_big", messages: [] });
+      await releaseTools(tools);
+      return { out: out as string, writes };
+    };
+
+    const spilled = await run({});
+    expect(spilled.writes).toEqual([["/workspace/.tool-results/call_big.txt", big]]);
+    expect(spilled.out.length).toBeLessThan(DEFAULT_MCP_RESULT_PREVIEW_CHARS + 400);
+    expect(spilled.out).toContain("with read / grep / bash");
+
+    for (const extra of [
+      { metadata: { mcp_result_max_chars: 0 } },
+      { tools: [{ type: "agent_toolset_20260401", default_config: { enabled: false }, configs: [] }] },
+    ] as Array<Partial<AgentConfig>>) {
+      const legacy = await run(extra);
+      expect(legacy.writes).toEqual([]);
+      expect(legacy.out).toBe(mcpResultForModel({ content: [{ type: "text", text: big }] }));
+    }
   });
 });
 
