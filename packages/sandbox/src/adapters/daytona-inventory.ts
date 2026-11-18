@@ -30,11 +30,12 @@ export class DaytonaBoxInventory {
 
   constructor(private readonly options: DaytonaBoxInventoryOptions = {}) {}
 
-  /** Every box in the provider account, including ones OMA did not create. */
-  async list(): Promise<ProviderBox[]> {
+  /** Every box in the provider account, including ones OMA did not create —
+   *  or, with `labels`, only the boxes carrying all of them. */
+  async list(query?: { labels?: Record<string, string> }): Promise<ProviderBox[]> {
     const { client } = await this.connect();
     const boxes: ProviderBox[] = [];
-    for await (const sb of client.list()) boxes.push(toProviderBox(sb));
+    for await (const sb of client.list(query)) boxes.push(toProviderBox(sb));
     return boxes;
   }
 

@@ -20,6 +20,7 @@ import { computerBackupExecutor } from "./lib/agent-computer-backup.js";
 import { agentComputerSpec, agentComputerEnabled, agentComputerEnv } from "./lib/agent-computer-config.js";
 import { buildAgentComputerRoutes } from "./lib/agent-computer-routes.js";
 import { createAgentComputerCleanup } from "./lib/agent-computer-cleanup.js";
+import { createSessionSandboxCleanup } from "./lib/session-sandbox-cleanup.js";
 import { resolveDeploymentIdentity } from "./lib/deployment-identity.js";
 import { SandboxSweeper, sandboxSweepConfigFromEnv, sandboxSweepCronFromEnv, sandboxSweepSqlLookups } from "./lib/sandbox-sweeper.js";
 
@@ -770,6 +771,16 @@ await machineStore.ensureSchema();
 // boxes it can attribute to this deployment (lib/deployment-identity.ts).
 const deploymentIdentity = await resolveDeploymentIdentity({ sql, dialect });
 const sandboxSweepLookups = sandboxSweepSqlLookups(sql);
+// Account-wide box listing for cleanup (session delete, orphan sweep): only
+// when this install can reach a Daytona account.
+const providerBoxInventory = process.env.DAYTONA_API_KEY
+  ? await import("@open-managed-agents/sandbox/adapters/daytona-inventory").then(
+      ({ DaytonaBoxInventory }) => new DaytonaBoxInventory({ apiKey: process.env.DAYTONA_API_KEY, apiUrl: process.env.DAYTONA_API_URL }),
+    )
+  : null;
+const sessionSandboxCleanup = providerBoxInventory
+  ? createSessionSandboxCleanup({ inventory: providerBoxInventory, deploymentId: deploymentIdentity.id })
+  : null;
 const agentMachines = new AgentMachineManager({
   store: machineStore,
   tickIntervalMs: 0,
@@ -974,6 +985,7 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
   sandboxOrchestrator,
   newEventLog,
   buildSandbox,
+  ...(sessionSandboxCleanup ? { deleteSessionBoxes: sessionSandboxCleanup.onSessionDeleted } : {}),
   sandboxWorkdirRoot: process.env.SANDBOX_WORKDIR ?? "./data/sandboxes",
   sqlDialect: dialect,
   runOutcome: createNodeOutcomeRunner({
@@ -4088,11 +4100,10 @@ const ambientDispatcher = new NodeAmbientDispatcher({
 // Orphan-sandbox sweep: only when this install can reach a Daytona account,
 // and never when the operator switched it off (SANDBOX_SWEEP_CRON=off).
 let sandboxSweeper: SandboxSweeper | null = null;
-if (process.env.DAYTONA_API_KEY && sandboxSweepCronFromEnv(process.env)) {
-  const { DaytonaBoxInventory } = await import("@open-managed-agents/sandbox/adapters/daytona-inventory");
+if (providerBoxInventory && sandboxSweepCronFromEnv(process.env)) {
   const sweepConfig = sandboxSweepConfigFromEnv(process.env);
   sandboxSweeper = new SandboxSweeper({
-    inventory: new DaytonaBoxInventory({ apiKey: process.env.DAYTONA_API_KEY, apiUrl: process.env.DAYTONA_API_URL }),
+    inventory: providerBoxInventory,
     listMachines: () => machineStore.list(),
     destroyMachine: (tenantId, agentId) => agentMachines.destroy(tenantId, agentId, { reason: "agent_missing" }),
     ...sandboxSweepLookups,

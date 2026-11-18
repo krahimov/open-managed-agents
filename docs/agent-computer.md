@@ -107,16 +107,26 @@ Computer controls and scheduled ambient sessions use its chosen environment.
 ## Sandbox cleanup
 
 Sandboxes that nothing owns any more would otherwise fill the provider
-account's disk quota, at which point every new session fails. The Node server
-therefore reconciles the Daytona account with its database on a schedule
-(hourly by default) and deletes:
+account's disk quota, at which point every new session fails.
+
+`DELETE /v1/sessions/:id` deletes the session's own sandboxes right away,
+including after a server restart: besides the sandbox the server holds in
+memory, it looks up every Daytona box labelled with the session
+(`oma-session-id`) and deletes it. It never deletes an agent computer
+(`oma-machine-id`, shared by the agent's sessions), a box labelled for another
+deployment, or a box labelled for another tenant. A failure there does not
+fail the delete (`op: session_sandbox.delete_failed`); the sweep below picks
+the box up.
+
+The Node server also reconciles the Daytona account with its database on a
+schedule (hourly by default) and deletes:
 
 - agent computers whose agent no longer exists, together with their
   `agent_machines` row;
-- per-session sandboxes whose session no longer exists, or has been idle or
-  terminated for more than 7 days. Session workspaces are scratch space; the
-  session itself, its outputs and its memory stores are not touched, and a
-  resumed session gets a fresh sandbox.
+- per-session sandboxes whose session no longer exists, has been terminated
+  for more than an hour, or has been idle for more than 7 days. Session
+  workspaces are scratch space; the session itself, its outputs and its memory
+  stores are not touched, and a resumed session gets a fresh sandbox.
 
 The sweep is deliberately conservative. It only deletes a box when all of the
 following hold:
@@ -144,7 +154,7 @@ nothing. Every deletion is logged with the box, tenant, agent or session ids
 | --- | --- | --- |
 | `SANDBOX_SWEEP_CRON` | `17 * * * *` | Schedule. `off` disables the sweep. |
 | `SANDBOX_SWEEP_DRY_RUN` | `false` | Log what would be deleted (`op: sandbox_sweep.would_delete`) and delete nothing. |
-| `SANDBOX_SWEEP_SESSION_MAX_AGE_DAYS` | `7` | How long a session may be idle or terminated before its sandbox is removed. |
+| `SANDBOX_SWEEP_SESSION_MAX_AGE_DAYS` | `7` | How long a session may be idle before its sandbox is removed. A terminated session's sandbox goes after an hour (or this, if shorter). |
 | `SANDBOX_SWEEP_MAX_DELETIONS` | `50` | Upper bound per sweep; the remainder waits for the next one. |
 | `SANDBOX_SWEEP_ADOPT_UNLABELLED` | `false` | Also treat OMA-labelled boxes that have no deployment label and no database record as this deployment's. Only enable when no other OMA install uses the same Daytona account; run with `SANDBOX_SWEEP_DRY_RUN=true` first. |
 | `OMA_DEPLOYMENT_ID` | generated, stored in the database | Pins the deployment identity. Without it a new database gets a new identity and will not clean up boxes created against the previous one. |

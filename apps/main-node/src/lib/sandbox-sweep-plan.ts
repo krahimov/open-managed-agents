@@ -16,8 +16,10 @@
 //   5. Boxes younger than `minBoxAgeMs`, or of unknown age → left for a
 //      later sweep, so a box is never judged while it is being created.
 //   6. Only then: delete when the owning agent / session no longer exists,
-//      or the session has been idle or terminated longer than
-//      `sessionMaxAgeMs`. A running or rescheduling session is never an orphan.
+//      the session has been idle longer than `sessionMaxAgeMs`, or it has
+//      been terminated longer than `TERMINATED_SESSION_GRACE_MS` (a
+//      terminated session refuses new events, so its box is never used
+//      again). A running or rescheduling session is never an orphan.
 
 import { OMA_BOX_LABELS } from "@open-managed-agents/sandbox/adapters/daytona-types";
 import type { ProviderBox } from "@open-managed-agents/sandbox/adapters/daytona-inventory";
@@ -77,6 +79,10 @@ export interface SweepPlan {
   skipped: Array<{ boxId: string; reason: SweepSkipReason }>;
 }
 
+/** How long a terminated session's box is kept before the sweep may delete
+ *  it — only so a sweep never races the termination itself. */
+export const TERMINATED_SESSION_GRACE_MS = 60 * 60_000;
+
 export function agentKey(tenantId: string, agentId: string): string {
   return `${tenantId}\u0000${agentId}`;
 }
@@ -90,8 +96,10 @@ export function sessionBoxReason(
 ): SessionBoxReason | null {
   if (!session) return "session_missing";
   if (session.status === "running" || session.status === "rescheduling") return null;
-  if (now - session.lastActiveAtMs < sessionMaxAgeMs) return null;
-  return session.status === "terminated" ? "session_terminated" : "session_idle";
+  const terminated = session.status === "terminated";
+  const maxAgeMs = terminated ? Math.min(sessionMaxAgeMs, TERMINATED_SESSION_GRACE_MS) : sessionMaxAgeMs;
+  if (now - session.lastActiveAtMs < maxAgeMs) return null;
+  return terminated ? "session_terminated" : "session_idle";
 }
 
 export function planSandboxSweep(input: SweepPlanInput): SweepPlan {

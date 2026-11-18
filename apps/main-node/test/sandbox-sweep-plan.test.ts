@@ -159,7 +159,7 @@ describe("planSandboxSweep — session sandboxes", () => {
     const b = sessionBox({ "oma-deployment-id": HERE });
     for (const s of [
       session({ lastActiveAtMs: NOW - 6 * DAY }),
-      session({ status: "terminated", lastActiveAtMs: NOW - DAY }),
+      session({ status: "terminated", lastActiveAtMs: NOW - 30 * 60_000 }),
       session({ status: "running", lastActiveAtMs: NOW - 30 * DAY }),
       session({ status: "rescheduling", lastActiveAtMs: NOW - 30 * DAY }),
     ]) {
@@ -167,6 +167,16 @@ describe("planSandboxSweep — session sandboxes", () => {
         actions: [], skipped: [{ boxId: b.id, reason: "live" }],
       });
     }
+  });
+
+  it("deletes a terminated session's box an hour after termination, not a week", () => {
+    const b = sessionBox({ "oma-deployment-id": HERE });
+    const terminated = (ago: number) =>
+      plan({ boxes: [b], sessions: new Map([["sess-1", session({ status: "terminated", lastActiveAtMs: NOW - ago })]]) });
+    expect(terminated(2 * HOUR).actions).toEqual([expect.objectContaining({ kind: "session_box", reason: "session_terminated" })]);
+    expect(terminated(HOUR - 1).actions).toEqual([]);
+    // An idle session of the same age keeps its box: it can still be resumed.
+    expect(plan({ boxes: [b], sessions: new Map([["sess-1", session({ lastActiveAtMs: NOW - 2 * HOUR })]]) }).actions).toEqual([]);
   });
 
   it("treats a pre-label box as this deployment's once its session is in the database", () => {
@@ -191,5 +201,7 @@ describe("sessionBoxReason", () => {
     expect(sessionBoxReason(session({ lastActiveAtMs: NOW - 7 * DAY }), NOW, 7 * DAY)).toBe("session_idle");
     expect(sessionBoxReason(session({ lastActiveAtMs: NOW - 7 * DAY + 1 }), NOW, 7 * DAY)).toBeNull();
     expect(sessionBoxReason(session({ status: "running" }), NOW, 7 * DAY)).toBeNull();
+    expect(sessionBoxReason(session({ status: "terminated", lastActiveAtMs: NOW - HOUR }), NOW, 7 * DAY)).toBe("session_terminated");
+    expect(sessionBoxReason(session({ status: "terminated", lastActiveAtMs: NOW - HOUR + 1 }), NOW, 7 * DAY)).toBeNull();
   });
 });

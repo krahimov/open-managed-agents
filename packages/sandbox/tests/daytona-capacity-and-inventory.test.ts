@@ -135,6 +135,14 @@ describe("DaytonaBoxInventory", () => {
     ]);
   });
 
+  it("narrows the listing to boxes carrying every requested label", async () => {
+    const { fake, inventory } = setup();
+    const mine = await fake.create({ labels: { "oma-session-id": "sess-1", "oma-tenant-id": "t" } });
+    await fake.create({ labels: { "oma-session-id": "sess-2", "oma-tenant-id": "t" } });
+    await fake.create({ labels: { team: "data" } });
+    expect((await inventory.list({ labels: { "oma-session-id": "sess-1" } })).map((b) => b.id)).toEqual([mine.id]);
+  });
+
   it("deletes a box whose labels still match", async () => {
     const { fake, inventory } = setup();
     const sb = await fake.create({ labels: { "oma-session-id": "sess-1" } });
