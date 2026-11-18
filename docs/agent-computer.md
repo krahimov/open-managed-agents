@@ -205,12 +205,22 @@ All endpoints require the owning tenant's authentication and an existing agent.
 | Endpoint | Result |
 | --- | --- |
 | `GET /v1/agents/:id/machine` | Supported flag and public machine state |
-| `POST /v1/agents/:id/machine/start` | Create or resume the computer |
+| `POST /v1/agents/:id/machine/start` | Create or resume the computer; works before the first session |
 | `POST /v1/agents/:id/machine/stop` | Preserve disk and stop when idle |
 | `GET /v1/agents/:id/machine/screenshot` | PNG of the desktop, or current browser tab in headless mode |
 | `POST /v1/agents/:id/machine/desktop-ticket` | Short-lived ticket for the live desktop WebSocket |
 | `POST /v1/agents/:id/archive` | Archives the agent; stops and keeps its computer |
 | `DELETE /v1/agents/:id` | Deletes the agent and its computer |
+
+Support is decided per agent. The agent's default environment's sandbox
+config is layered over the server env, the same way a session's sandbox is, so
+an agent whose default environment has `"scope": "agent"` with the Daytona
+provider reports `supported: true` and can start its computer before its first
+session, even when the server sets no `SANDBOX_SCOPE`. An agent with no default
+environment uses the server env alone. The computer is created with that
+environment's spec, which is the one its sessions acquire. Without an existing
+computer, `start` and `stop` answer `501` for an agent that has no computer
+configured.
 
 The existing session outputs API lists and downloads generated files. Browser
 preview requests do not start a stopped computer. Listing or downloading session

@@ -251,10 +251,13 @@ export function AgentComputerPanel({ agentId, localRuntime = false, defaultEnvir
   const supported = status.data?.supported === true;
   const transitioning = machine ? TRANSITIONING.has(machine.state) : false;
   const canStart = !machine || STARTABLE.has(machine.state);
-  // Instance-wide support is off and there is no computer yet. Computers
-  // are still given per environment: an agent whose default environment has
-  // one gets it from its next session; any other agent runs each session in
-  // a fresh sandbox, and Start would be refused.
+  // The server answers `supported` per agent (its default environment's
+  // sandbox over the server env), so an agent-computer default environment
+  // already reads as supported and can Start. Unsupported with no computer
+  // yet: on an older server that only answers for the whole instance, an
+  // agent whose default environment has one still gets it from its next
+  // session; any other agent runs each session in a fresh sandbox, and Start
+  // would be refused.
   const noComputer = !!status.data && !supported;
   const environmentLoading = noComputer && defaultEnvironment === undefined;
   const fromNextSession = noComputer && !!defaultEnvironment && isAgentComputerEnvironment(defaultEnvironment);
