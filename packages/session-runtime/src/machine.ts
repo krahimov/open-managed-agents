@@ -52,6 +52,8 @@ import { recoverInterruptedState } from "./recovery";
 import {
   buildInterruptedToolResult,
   classifyTool,
+  IGNORED_ANSWER_KEY,
+  ignoredAnswerReason,
   type McpToolAnnotations,
   type ToolExecutionClass,
 } from "./tool-classification";
@@ -204,6 +206,10 @@ export interface QueuedClientResult {
   event: ClientResultEvent;
   /** Pending-queue position, echoed on system.user_message_promoted. */
   pendingSeq?: number;
+  /** Called right before the answer is recorded: the queue commits it to
+   *  this turn. False means it was withdrawn meanwhile (a user.interrupt
+   *  cancelled it) — it is then neither recorded nor applied. */
+  claim?: () => Promise<boolean>;
 }
 
 /**
@@ -239,7 +245,8 @@ export interface TurnOptions {
    *  client POSTed together costs one running/idle cycle and no idle lists
    *  a call whose answer is already queued. Every answer returned is
    *  promoted by this turn when it completes; the caller settles their
-   *  queue rows with this input's (the Node work queue does). */
+   *  queue rows with this input's (the Node work queue does). An answer
+   *  with a `claim` is applied only if the claim succeeds. */
   takeQueuedClientResults?: () => Promise<QueuedClientResult[]>;
 }
 
@@ -382,7 +389,10 @@ export class SessionStateMachine {
     opts: TurnOptions = {},
   ): Promise<TurnResult> {
     const log = opts.eventLog ?? this.deps.adapter.eventLog;
-    event = { ...event, id: (event as { id?: string }).id ?? generateEventId() } as TurnInputEvent;
+    event = withoutIgnoredMarker({
+      ...event,
+      id: (event as { id?: string }).id ?? generateEventId(),
+    } as TurnInputEvent);
     // A previous attempt at this same event already promoted it: this run
     // is a RESUME (lease reclaimed after a crash). The harness rebuilds
     // context from the log, so completed steps aren't redone and the user
@@ -397,7 +407,7 @@ export class SessionStateMachine {
     // Re-entering the harness here would call the model again and could
     // repeat a side effect under a fresh tool-call id.
     if (alreadyPromoted) {
-      if (ignoredReasonOf(alreadyPromoted) !== null) {
+      if (ignoredAnswerReason(alreadyPromoted) !== null) {
         // A client answer recorded as ignored ran no turn at all: the
         // earlier attempt recorded it and died before the queue noticed.
         if (opts.recoverOrphans) await this.onWake(log, { deferIdempotent: false });
@@ -450,7 +460,7 @@ export class SessionStateMachine {
         ...(await this.takeQueuedAnswers(log, events, opts, answered)),
       ];
       if (answers.every((a) => a.ignored !== null)) {
-        for (const a of answers) await this.recordAnswer(log, a);
+        for (const a of answers) await this.recordAnswer(log, a, answered);
         const after = await this.readEvents(log);
         return { status: "completed", stopReason: computeStopReason(after, outstandingRequiredActions(after)) };
       }
@@ -537,14 +547,14 @@ export class SessionStateMachine {
         // above). Ignored ones — a repeat for a call the turn already went
         // past, an id that names no call, a call not waiting on the client
         // — must not resume the model on the whole context again.
-        let remaining = await this.applyClientAnswers(log, agent, answers, controller.signal);
+        let remaining = await this.applyClientAnswers(log, agent, answers, answered, controller.signal);
         // Answers that came in while these were applied belong to the same
         // hand-back: take them before listing what is still owed.
         while (remaining.length > 0) {
           const more = await this.takeQueuedAnswers(log, await this.readEvents(log), opts, answered);
           if (more.length === 0) break;
           answers.push(...more);
-          remaining = await this.applyClientAnswers(log, agent, more, controller.signal);
+          remaining = await this.applyClientAnswers(log, agent, more, answered, controller.signal);
         }
         if (remaining.length > 0) {
           // Other calls from the same step still wait on the client —
@@ -780,26 +790,45 @@ export class SessionStateMachine {
     }
     const out: ClientAnswer[] = [];
     for (const q of queued) {
-      const ev = { ...q.event, id: (q.event as { id?: string }).id ?? generateEventId() } as ClientAnswer["event"];
-      out.push(classifyAnswer(events, ev, q.pendingSeq, await this.findEventById(log, ev.id), answered));
+      const ev = withoutIgnoredMarker({
+        ...q.event,
+        id: (q.event as { id?: string }).id ?? generateEventId(),
+      }) as ClientAnswer["event"];
+      const answer = classifyAnswer(events, ev, q.pendingSeq, await this.findEventById(log, ev.id), answered);
+      if (q.claim) answer.claim = q.claim;
+      out.push(answer);
     }
     return out;
   }
 
-  /** Promote an answer not yet in the log; an ignored one carries its reason. */
-  private async recordAnswer(log: EventLogRepo, a: ClientAnswer): Promise<void> {
+  /**
+   * Promote an answer not yet in the log; an ignored one carries its
+   * reason. Returns false for a queued answer whose claim failed (withdrawn
+   * from the queue after it was handed out): nothing is recorded, and a
+   * later answer for its call no longer counts as a repeat of it.
+   */
+  private async recordAnswer(log: EventLogRepo, a: ClientAnswer, answered: Set<string>): Promise<boolean> {
+    if (a.promoted) return true;
+    if (a.claim && !(await a.claim())) {
+      const toolUseId = clientResultToolUseId(a.event);
+      this.logger.warn(`${a.event.type} for ${toolUseId} was withdrawn from the queue; skipping it`);
+      if (a.ignored === null && toolUseId) answered.delete(toolUseId);
+      a.ignored = "withdrawn from the queue";
+      a.promoted = true;
+      return false;
+    }
     if (a.ignored !== null && !a.existing) {
       this.logger.warn(`ignoring ${a.event.type} for ${clientResultToolUseId(a.event)}: ${a.ignored}`);
     }
-    if (a.promoted) return;
     a.promoted = true;
-    if (a.existing && a.ignored !== null) return; // recorded by an earlier attempt
+    if (a.existing && a.ignored !== null) return true; // recorded by an earlier attempt
     await this.promote(
       log,
       a.ignored !== null ? withIgnoredReason(a.event, a.ignored) : a.event,
       a.pendingSeq,
       a.existing,
     );
+    return true;
   }
 
   /**
@@ -811,11 +840,12 @@ export class SessionStateMachine {
     log: EventLogRepo,
     agent: AgentConfig,
     answers: ClientAnswer[],
+    answered: Set<string>,
     abortSignal: AbortSignal,
   ): Promise<string[]> {
     for (const a of answers) {
       if (abortSignal.aborted) throw abortSignal.reason ?? new Error("aborted");
-      await this.recordAnswer(log, a);
+      if (!(await this.recordAnswer(log, a, answered))) continue;
       if (a.ignored !== null) continue;
       await this.applyClientToolResult(log, agent, a.event, await this.readEvents(log), abortSignal, a.existing !== null);
     }
@@ -1149,6 +1179,8 @@ interface ClientAnswer {
   ignored: string | null;
   /** Promoted by this attempt (or found promoted). */
   promoted?: boolean;
+  /** QueuedClientResult.claim, for an answer taken from the queue. */
+  claim?: () => Promise<boolean>;
 }
 
 /**
@@ -1166,21 +1198,25 @@ function classifyAnswer(
 ): ClientAnswer {
   const toolUseId = clientResultToolUseId(event);
   let ignored: string | null;
-  if (existing) ignored = ignoredReasonOf(existing);
+  if (existing) ignored = ignoredAnswerReason(existing);
   else if (toolUseId && answered.has(toolUseId)) ignored = "answered earlier in this turn";
   else ignored = staleClientResult(events, event);
   if (ignored === null && toolUseId) answered.add(toolUseId);
   return { event, ...(pendingSeq !== undefined ? { pendingSeq } : {}), existing, ignored };
 }
 
-/** The answer as recorded when it is ignored: metadata.ignored names why. */
+/** The answer as recorded when it is ignored: metadata[IGNORED_ANSWER_KEY] names why. */
 function withIgnoredReason<E extends ClientResultEvent>(event: E, reason: string): E {
-  return { ...event, metadata: { ...(event.metadata ?? {}), ignored: reason } };
+  return { ...event, metadata: { ...(event.metadata ?? {}), [IGNORED_ANSWER_KEY]: reason } };
 }
 
-function ignoredReasonOf(event: SessionEvent): string | null {
-  const reason = (event as { metadata?: { ignored?: unknown } }).metadata?.ignored;
-  return typeof reason === "string" ? reason : null;
+/** Client input never carries the ignored marker into the log: only the
+ *  machine writes it, so a recorded marker always means "resolved nothing". */
+function withoutIgnoredMarker<E extends TurnInputEvent>(event: E): E {
+  const metadata = (event as { metadata?: Record<string, unknown> }).metadata;
+  if (!metadata || typeof metadata !== "object" || !(IGNORED_ANSWER_KEY in metadata)) return event;
+  const { [IGNORED_ANSWER_KEY]: _dropped, ...rest } = metadata;
+  return { ...event, metadata: rest };
 }
 
 /**

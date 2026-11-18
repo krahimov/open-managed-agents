@@ -113,13 +113,19 @@ When it did anything, it emits a `session.warning` (`source: "tool_call_recovere
   `user.custom_tool_result` also takes the client answers queued right behind
   it on the same thread (`TurnOptions.takeQueuedClientResults`), so a step's
   answers sent together cost one running/idle cycle. Each is promoted right
-  before it's applied. Their queue rows are marked done with the head item.
-  If the turn fails or the worker dies, they stay pending and later run on
-  their own: a promoted one finds its turn's idle and keeps that outcome. An
-  answer that changes nothing (a repeat, or one for a call that isn't waiting
-  on the client) is recorded with `metadata.ignored` and runs nothing. When
-  every answer in a turn is like that, the turn writes no running/idle events
-  and builds no tools.
+  before it's applied, after its queue row is claimed (pending → `taken`, one
+  conditional UPDATE): a `user.interrupt` either cancels the row first, and
+  the answer never runs, or finds it taken, and leaves it alone (it is in the
+  log, so it is neither reported cancelled nor listed by `GET /pending`).
+  Taken rows are marked done with the head item. If the turn fails they go
+  back to pending and run on their own: a promoted one finds its turn's idle
+  and keeps that outcome. If the worker dies, the head's next claim takes
+  them again. An answer that changes nothing (a repeat, or one for a call
+  that isn't waiting on the client) is recorded with `metadata._oma_ignored`
+  and runs nothing; it doesn't count as its call's result. Only the machine
+  writes that key (it is stripped from client input). When every answer in a
+  turn is like that, the turn writes no running/idle events and builds no
+  tools.
 
 ### `step_final` (contract for harness authors)
 

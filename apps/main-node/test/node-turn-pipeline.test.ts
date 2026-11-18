@@ -40,7 +40,10 @@ type Script = (rt: NodeHarnessRuntime, turn: number) => Promise<void>;
 
 async function setup(
   script: Script,
-  opts: { runOutcome?: SessionMachineDeps["runOutcome"] } = {},
+  opts: {
+    runOutcome?: SessionMachineDeps["runOutcome"];
+    buildTools?: SessionMachineDeps["buildTools"];
+  } = {},
 ) {
   const db = new Database(":memory:");
   const sql: SqlClient = new BetterSqlite3SqlClient(db);
@@ -66,7 +69,7 @@ async function setup(
     adapter: new RuntimeAdapterImpl({ sql, eventLog, streams: new SqlStreamRepo(sql, SID), sandbox }),
     sandbox,
     loadAgent: async () => ({ id: "ag", name: "a", model: "m", system: "", tools: [] }) as unknown as AgentConfig,
-    buildTools: async () => ({}),
+    buildTools: opts.buildTools ?? (async () => ({})),
     buildModel: async () => ({}) as never,
     buildHarness: () => ({
       run: async (ctx) => {
@@ -292,7 +295,7 @@ describe("Node turn pipeline", () => {
     await p.drained();
     const added = (await p.log()).slice(before);
     expect(added).toEqual([
-      expect.objectContaining({ type: "user.tool_confirmation", metadata: { ignored: "already resolved" } }),
+      expect.objectContaining({ type: "user.tool_confirmation", metadata: { _oma_ignored: "already resolved" } }),
     ]);
     p.workQueue.stop();
   });
@@ -331,6 +334,163 @@ describe("Node turn pipeline", () => {
       .bind(SID)
       .all<{ status: string }>();
     expect((rows.results ?? []).map((r) => r.status)).toEqual(["done", "failed", "failed"]);
+  });
+
+  it("answers a turn took along leave the pending queue once promoted, and an interrupt doesn't cancel them", async () => {
+    // They are in the log (and their results with them): GET /pending must
+    // not list them, nor an interrupt report them cancelled.
+    const ids = ["toolu_1", "toolu_2", "toolu_3"];
+    let resumed = false;
+    const p = await setup(async (rt, turn) => {
+      if (turn === 1) {
+        for (const id of ids) {
+          rt.broadcast({ type: "agent.tool_use", id, name: "bash", input: {}, evaluated_permission: "ask" } as unknown as SessionEvent);
+          rt.pendingConfirmations.push(id);
+        }
+        return;
+      }
+      resumed = true;
+      await new Promise<void>((_, reject) =>
+        rt.abortSignal.addEventListener("abort", () => {
+          const e = new Error("aborted");
+          e.name = "AbortError";
+          reject(e);
+        }),
+      );
+    });
+    await p.router.appendEvent(SID, userMsg("clean up"));
+    await until(async () => (await p.log()).some((e) => e.type === "session.status_idle"));
+
+    p.workQueue.stop();
+    for (const id of ids) {
+      await p.router.appendEvent(SID, { type: "user.tool_confirmation", tool_use_id: id, result: "deny" } as unknown as SessionEvent);
+    }
+    await p.drained();
+    p.workQueue.start();
+    const turn = p.drained();
+    await until(() => resumed);
+
+    expect((await p.log()).filter((e) => e.type === "agent.tool_result")).toHaveLength(3);
+    expect(JSON.parse((await p.router.getPending(SID)).body).data).toEqual([]);
+
+    await p.router.appendEvent(SID, { type: "user.interrupt" } as SessionEvent);
+    await turn;
+    p.workQueue.stop();
+
+    expect(p.published.filter((e) => e.type === "system.user_message_cancelled")).toEqual([]);
+    const rows = await p.sql
+      .prepare(`SELECT status FROM session_work_items WHERE session_id = ? ORDER BY pending_seq`)
+      .bind(SID)
+      .all<{ status: string }>();
+    expect((rows.results ?? []).map((r) => r.status)).toEqual(["done", "done", "done", "done"]);
+  });
+
+  it("an answer cancelled on another replica after this turn took it along is never applied", async () => {
+    // R1 runs confirmation A and has handed B and C to the machine; the
+    // user interrupts on R2, which cancels B and C. R1 only sees the
+    // cancel flag on its next heartbeat — B and C must not run meanwhile.
+    const gate = deferred();
+    let builds = 0;
+    let blocked = false;
+    const p = await setup(
+      async (rt, turn) => {
+        if (turn === 1) {
+          for (const id of ["toolu_1", "toolu_2", "toolu_3"]) {
+            rt.broadcast({ type: "agent.tool_use", id, name: "bash", input: {}, evaluated_permission: "ask" } as unknown as SessionEvent);
+            rt.pendingConfirmations.push(id);
+          }
+          return;
+        }
+        rt.broadcast({ type: "agent.message", content: [{ type: "text", text: "resumed" }] } as SessionEvent);
+      },
+      {
+        buildTools: async () => {
+          // The confirmation turn: its queued answers are already taken.
+          if (++builds === 2) {
+            blocked = true;
+            await gate.promise;
+          }
+          return {};
+        },
+      },
+    );
+    await p.router.appendEvent(SID, userMsg("clean up"));
+    await until(async () => (await p.log()).some((e) => e.type === "session.status_idle"));
+
+    p.workQueue.stop();
+    for (const id of ["toolu_1", "toolu_2", "toolu_3"]) {
+      await p.router.appendEvent(SID, { type: "user.tool_confirmation", tool_use_id: id, result: "deny" } as unknown as SessionEvent);
+    }
+    await p.drained();
+    p.workQueue.start();
+    const turn = p.drained();
+    await until(() => blocked);
+
+    const replica = new NodeSessionWorkQueue({ sql: p.sql, dialect: "sqlite", run: async () => {} });
+    const { cancelled } = await replica.requestCancel(SID);
+    expect(cancelled).toHaveLength(2);
+    gate.resolve();
+    await turn;
+    p.workQueue.stop();
+
+    const events = await p.log();
+    expect(events.filter((e) => e.type === "user.tool_confirmation").map((e) => e.tool_use_id)).toEqual(["toolu_1"]);
+    expect(events.filter((e) => e.type === "agent.tool_result").map((e) => e.tool_use_id)).toEqual(["toolu_1"]);
+    expect(events.at(-1)).toMatchObject({
+      type: "session.status_idle",
+      stop_reason: { type: "requires_action", event_ids: ["toolu_2", "toolu_3"] },
+    });
+    const rows = await p.sql
+      .prepare(`SELECT status FROM session_work_items WHERE session_id = ? ORDER BY pending_seq`)
+      .bind(SID)
+      .all<{ status: string }>();
+    expect((rows.results ?? []).map((r) => r.status)).toEqual(["done", "done", "cancelled", "cancelled"]);
+  });
+
+  it("after the worker dies, the head's next claim re-applies the answers its turn had taken", async () => {
+    const p = await setup(async (rt, turn) => {
+      if (turn === 1) {
+        for (const id of ["toolu_1", "toolu_2"]) {
+          rt.broadcast({ type: "agent.tool_use", id, name: "bash", input: {}, evaluated_permission: "ask" } as unknown as SessionEvent);
+          rt.pendingConfirmations.push(id);
+        }
+        return;
+      }
+      rt.broadcast({ type: "agent.message", content: [{ type: "text", text: "resumed" }] } as SessionEvent);
+    });
+    await p.router.appendEvent(SID, userMsg("go"));
+    await until(async () => (await p.log()).some((e) => e.type === "session.status_idle"));
+    p.workQueue.stop();
+    for (const [id, toolUseId] of [["sevt-a", "toolu_1"], ["sevt-b", "toolu_2"]]) {
+      await p.router.appendEvent(SID, { type: "user.tool_confirmation", id, tool_use_id: toolUseId, result: "deny" } as unknown as SessionEvent);
+    }
+    // The dead worker had claimed A, taken B and promoted both, then died
+    // before applying either.
+    const head = await p.sql.prepare(`SELECT id FROM session_work_items WHERE event_id = 'sevt-a'`).first<{ id: string }>();
+    await p.sql
+      .prepare(`UPDATE session_work_items SET status='running', attempts=1, lease_epoch=1, locked_by='dead-worker', locked_at=1 WHERE event_id='sevt-a'`)
+      .run();
+    await p.sql.prepare(`UPDATE session_work_items SET status='taken', locked_by=? WHERE event_id='sevt-b'`).bind(head!.id).run();
+    const writer = new SqlEventLog(p.sql, SID, () => {});
+    await writer.appendAsync({ type: "user.tool_confirmation", id: "sevt-a", tool_use_id: "toolu_1", result: "deny", processed_at: "x" } as unknown as SessionEvent);
+    await writer.appendAsync({ type: "session.status_running", id: "sevt-run" } as unknown as SessionEvent);
+    await writer.appendAsync({ type: "user.tool_confirmation", id: "sevt-b", tool_use_id: "toolu_2", result: "deny", processed_at: "x" } as unknown as SessionEvent);
+    expect(JSON.parse((await p.router.getPending(SID)).body).data).toEqual([]);
+
+    p.workQueue.start();
+    await p.workQueue.sweep();
+    await p.drained();
+    p.workQueue.stop();
+
+    const events = await p.log();
+    expect(events.filter((e) => e.type === "user.tool_confirmation").map((e) => e.id)).toEqual(["sevt-a", "sevt-b"]);
+    expect(events.filter((e) => e.type === "agent.tool_result").map((e) => e.tool_use_id)).toEqual(["toolu_1", "toolu_2"]);
+    expect(events.at(-1)).toMatchObject({ type: "session.status_idle", stop_reason: { type: "end_turn" } });
+    const rows = await p.sql
+      .prepare(`SELECT status FROM session_work_items WHERE session_id = ? ORDER BY pending_seq`)
+      .bind(SID)
+      .all<{ status: string }>();
+    expect((rows.results ?? []).map((r) => r.status)).toEqual(["done", "done", "done"]);
   });
 
   it("rejects a tool confirmation / custom result that names no tool call of the session", async () => {

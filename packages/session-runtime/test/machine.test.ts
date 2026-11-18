@@ -16,6 +16,9 @@ import {
   SessionStateMachine,
   sessionErrorAlreadyEmitted,
   activeOutcomeFromEvents,
+  findOrphanToolUses,
+  findUnresolvedToolUses,
+  TurnLeaseLostError,
 } from "@open-managed-agents/session-runtime";
 import type { RuntimeAdapter } from "@open-managed-agents/session-runtime";
 
@@ -801,7 +804,7 @@ describe("SessionStateMachine batched client answers", () => {
         type: "user.tool_confirmation",
         tool_use_id: "toolu_1",
         processed_at: expect.any(String),
-        metadata: { ignored: "already resolved" },
+        metadata: { _oma_ignored: "already resolved" },
       }),
     ]);
     expect(execute).toHaveBeenCalledTimes(1);
@@ -846,7 +849,7 @@ describe("SessionStateMachine batched client answers", () => {
     const confirmations = (f.log.getEvents() as Array<Record<string, unknown>>).filter(
       (e) => e.type === "user.tool_confirmation",
     );
-    expect(confirmations.map((e) => [e.tool_use_id, (e.metadata as { ignored?: string } | undefined)?.ignored])).toEqual([
+    expect(confirmations.map((e) => [e.tool_use_id, (e.metadata as { _oma_ignored?: string } | undefined)?._oma_ignored])).toEqual([
       ["toolu_a", undefined],
       ["toolu_a", "already resolved"],
       ["toolu_b1", undefined],
@@ -876,6 +879,118 @@ describe("SessionStateMachine batched client answers", () => {
     expect(retried).toMatchObject({ status: "completed", alreadyCompleted: true });
     expect(f.log.getEvents().length).toBe(before);
     expect(h.calls()).toBe(2);
+  });
+
+  it.each(["ignored", "_oma_ignored"])(
+    "a client's own metadata.%s doesn't make a retried answer count as ignored",
+    async (key) => {
+      // Only the machine marks an answer ignored. A real confirmation whose
+      // worker lost its lease mid-resume must resume on the retry.
+      let calls = 0;
+      const execute = vi.fn(async () => "hi\n");
+      const f = createMachine(
+        async (ctx) => {
+          calls++;
+          if (calls === 1) {
+            ctx.eventLog.append({
+              type: "agent.tool_use",
+              id: "toolu_1",
+              name: "bash",
+              input: { command: "echo hi" },
+              evaluated_permission: "ask",
+            } as unknown as SessionEvent);
+            ctx.runtime?.pendingConfirmations?.push("toolu_1");
+            return;
+          }
+          if (calls === 2) throw new TurnLeaseLostError("lease lost mid-resume");
+          ctx.eventLog.append({ type: "agent.message", content: [{ type: "text", text: "done" }] } as SessionEvent);
+        },
+        { runtime: () => ({ pendingConfirmations: [] }), tools: gatedTools(execute) },
+      );
+      Object.assign(f.log, {
+        findEventByIdAsync: async (id: string) =>
+          (f.log.getEvents() as SessionEvent[]).find((e) => (e as { id?: string }).id === id) ?? null,
+      });
+      await f.machine.runTurn("agent_test", userMessage);
+      const answer = confirm("toolu_1", { metadata: { [key]: "client data" } });
+      await expect(f.machine.runTurn("agent_test", answer)).rejects.toThrow(/lease lost/);
+
+      const retried = await f.machine.runTurn("agent_test", answer);
+
+      expect(retried).toMatchObject({ status: "completed", stopReason: { type: "end_turn" } });
+      expect(retried.alreadyCompleted).toBeUndefined();
+      expect(calls).toBe(3);
+      expect(execute).toHaveBeenCalledTimes(1);
+      const stored = (f.log.getEvents() as Array<Record<string, unknown>>).find(
+        (e) => e.id === (answer as { id: string }).id,
+      );
+      // The client's own key is kept; the machine's marker never comes from a client.
+      expect((stored?.metadata as Record<string, unknown> | undefined)?.[key]).toBe(
+        key === "ignored" ? "client data" : undefined,
+      );
+    },
+  );
+
+  it("an ignored custom tool result doesn't resolve its call: the next user.message still closes it", async () => {
+    // An ask-gated call whose turn failed was never handed to the client,
+    // so a custom result for it is ignored — and must not count as its
+    // result, or the model history keeps a tool_use with none.
+    let calls = 0;
+    const f = createMachine(async (ctx) => {
+      calls++;
+      if (calls === 1) {
+        ctx.eventLog.append({
+          type: "agent.tool_use",
+          id: "toolu_x",
+          name: "bash",
+          input: {},
+          evaluated_permission: "ask",
+        } as unknown as SessionEvent);
+        throw new Error("provider 500");
+      }
+      ctx.eventLog.append({ type: "agent.message", content: [{ type: "text", text: "ok" }] } as SessionEvent);
+    });
+    await expect(f.machine.runTurn("agent_test", userMessage)).rejects.toThrow(/provider 500/);
+    await f.machine.runTurn("agent_test", {
+      type: "user.custom_tool_result",
+      id: "sevt-ctr",
+      custom_tool_use_id: "toolu_x",
+      content: [{ type: "text", text: "client output" }],
+    } as never);
+    const events = () => f.log.getEvents() as Array<Record<string, unknown>>;
+    expect(findUnresolvedToolUses(events() as unknown as SessionEvent[]).map((u) => u.id)).toEqual(["toolu_x"]);
+    expect(findOrphanToolUses(events() as unknown as SessionEvent[]).map((o) => o.tool_use_id)).toEqual(["toolu_x"]);
+    expect(events().find((e) => e.id === "sevt-ctr")?.metadata).toEqual({
+      _oma_ignored: "the call is not waiting on the client",
+    });
+
+    await f.machine.runTurn("agent_test", { ...userMessage, id: "sevt-next" } as UserMessageEvent);
+
+    const results = events().filter((e) => e.type === "agent.tool_result" && e.tool_use_id === "toolu_x");
+    expect(results).toHaveLength(1);
+    expect(JSON.stringify(results[0].content)).toMatch(/not executed/);
+    expect(calls).toBe(2);
+  });
+
+  it("an answer withdrawn from the queue after it was handed out is neither recorded nor applied", async () => {
+    // A user.interrupt on another replica cancels the queued rows; this
+    // turn learns of it only on its next heartbeat.
+    const h = gatedToolHarness(["toolu_1", "toolu_2"]);
+    const execute = vi.fn(async () => "hi\n");
+    const f = createMachine(h.run, { runtime: () => ({ pendingConfirmations: [] }), tools: gatedTools(execute) });
+    await f.machine.runTurn("agent_test", userMessage);
+    const withdrawn = confirm("toolu_2");
+    const claim = vi.fn(async () => false);
+    const take = vi.fn(async () => (take.mock.calls.length === 1 ? [{ event: withdrawn, claim }] : []) as never);
+
+    await f.machine.runTurn("agent_test", confirm("toolu_1"), { takeQueuedClientResults: take });
+
+    expect(claim).toHaveBeenCalledTimes(1);
+    const events = f.log.getEvents() as Array<Record<string, unknown>>;
+    expect(events.some((e) => e.id === (withdrawn as { id: string }).id)).toBe(false);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(h.calls()).toBe(1);
+    expect(lastIdle(f.log).stop_reason).toMatchObject({ type: "requires_action", event_ids: ["toolu_2"] });
   });
 });
 
