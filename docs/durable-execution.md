@@ -109,6 +109,17 @@ When it did anything, it emits a `session.warning` (`source: "tool_call_recovere
   before the idle, the turn is finalized from the log without another model
   call. That happens **only** when the last model output is an `agent.message`
   marked `step_final`. Without that marker, the turn resumes as usual.
+- **Client answers (Node).** A turn driven by a `user.tool_confirmation` /
+  `user.custom_tool_result` also takes the client answers queued right behind
+  it on the same thread (`TurnOptions.takeQueuedClientResults`), so a step's
+  answers sent together cost one running/idle cycle. Each is promoted right
+  before it's applied. Their queue rows are marked done with the head item.
+  If the turn fails or the worker dies, they stay pending and later run on
+  their own: a promoted one finds its turn's idle and keeps that outcome. An
+  answer that changes nothing (a repeat, or one for a call that isn't waiting
+  on the client) is recorded with `metadata.ignored` and runs nothing. When
+  every answer in a turn is like that, the turn writes no running/idle events
+  and builds no tools.
 
 ### `step_final` (contract for harness authors)
 

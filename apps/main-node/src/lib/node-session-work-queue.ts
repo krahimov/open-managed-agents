@@ -45,7 +45,11 @@ import type { SqlClient } from "@open-managed-agents/sql-client";
 import type { SessionEvent } from "@open-managed-agents/shared";
 import { generateEventId } from "@open-managed-agents/shared";
 import type { AppendGuard } from "@open-managed-agents/event-log/sql";
-import type { TurnAbortReason, TurnInputEvent } from "@open-managed-agents/session-runtime";
+import type {
+  QueuedClientResult,
+  TurnAbortReason,
+  TurnInputEvent,
+} from "@open-managed-agents/session-runtime";
 import { isTurnLeaseLost } from "@open-managed-agents/session-runtime";
 import { getLogger } from "@open-managed-agents/observability";
 
@@ -70,6 +74,12 @@ export interface NodeSessionRunContext {
   signal: AbortSignal;
   /** Fence for event-log writes made on behalf of this claim. */
   guard: AppendGuard;
+  /** Client answers queued right behind a client-answer item, for the
+   *  machine to apply in the same turn (TurnOptions.takeQueuedClientResults).
+   *  Their rows are settled with this item's when it completes; on failure
+   *  they stay pending and run alone (an already-promoted one finds its
+   *  turn's outcome and acknowledges it). */
+  takeQueuedClientResults(): Promise<QueuedClientResult[]>;
 }
 
 export interface PendingWorkRow {
@@ -101,6 +111,12 @@ export interface NodeSessionWorkQueueDeps {
    *  reconcile the session row here. */
   onAbandoned?(item: NodeSessionWorkItem, reason: "dead" | "cancelled"): Promise<void> | void;
 }
+
+/** Queue inputs a client-answer turn can take along (see takeQueuedClientResults). */
+const CLIENT_RESULT_TYPES = new Set(["user.tool_confirmation", "user.custom_tool_result"]);
+
+/** Most queued answers one take hands out. */
+const MAX_TAKEN_PER_CALL = 100;
 
 const ITEM_COLUMNS =
   "id, tenant_id, session_id, agent_id, event_id, event_json, attempts, lease_epoch, pending_seq, status";
@@ -426,8 +442,13 @@ export class NodeSessionWorkQueue {
       const controller = new AbortController();
       this.running.set(sessionId, controller);
       const heartbeat = this.startHeartbeat(item, controller);
+      const taken: string[] = [];
       try {
-        await this.deps.run(item, { signal: controller.signal, guard: this.appendGuardFor(item) });
+        await this.deps.run(item, {
+          signal: controller.signal,
+          guard: this.appendGuardFor(item),
+          takeQueuedClientResults: () => this.takeQueuedClientResults(item, taken),
+        });
         heartbeat.stop();
         if (!(await this.markDone(item))) {
           log.warn(
@@ -436,6 +457,10 @@ export class NodeSessionWorkQueue {
           );
           return;
         }
+        // Best effort: a row left pending runs alone and acknowledges itself.
+        await this.markTakenDone(taken).catch((err) =>
+          log.warn({ err, op: "node_session_work_queue.taken_done_failed", session_id: sessionId, work_id: item.id }, "settling taken-along rows failed"),
+        );
       } catch (err) {
         heartbeat.stop();
         if (isTurnLeaseLost(err) || isLeaseAbort(controller.signal)) {
@@ -459,6 +484,62 @@ export class NodeSessionWorkQueue {
         if (this.running.get(sessionId) === controller) this.running.delete(sessionId);
       }
     }
+  }
+
+  /**
+   * Pending client answers directly behind `item` on its thread, oldest
+   * first, stopping at the first other input (a later user.message must
+   * not be overtaken). Rows already handed out in this claim (`taken`) are
+   * skipped; they stay pending until the item settles, so a crash leaves
+   * them to run on their own.
+   */
+  private async takeQueuedClientResults(
+    item: NodeSessionWorkItem,
+    taken: string[],
+  ): Promise<QueuedClientResult[]> {
+    if (!CLIENT_RESULT_TYPES.has(item.event.type)) return [];
+    const rows = await this.deps.sql
+      .prepare(
+        `SELECT id, event_json, pending_seq
+           FROM session_work_items
+          WHERE session_id = ? AND status = 'pending'
+          ORDER BY COALESCE(pending_seq, 0) ASC, created_at ASC, id ASC
+          LIMIT ?`,
+      )
+      .bind(item.sessionId, taken.length + MAX_TAKEN_PER_CALL)
+      .all<{ id: string; event_json: string; pending_seq: number | null }>();
+    const thread = threadOf(item.event);
+    const out: QueuedClientResult[] = [];
+    for (const row of rows.results ?? []) {
+      if (taken.includes(row.id)) continue;
+      let event: TurnInputEvent;
+      try {
+        event = JSON.parse(row.event_json) as TurnInputEvent;
+      } catch {
+        break;
+      }
+      if (!CLIENT_RESULT_TYPES.has(event.type) || threadOf(event) !== thread) break;
+      taken.push(row.id);
+      out.push({
+        event: event as QueuedClientResult["event"],
+        pendingSeq: Number(row.pending_seq ?? 0),
+      });
+    }
+    return out;
+  }
+
+  /** Settle rows a completed turn took along (still pending: an interrupt may have cancelled them). */
+  private async markTakenDone(taken: string[]): Promise<void> {
+    if (taken.length === 0) return;
+    const now = Date.now();
+    await this.deps.sql
+      .prepare(
+        `UPDATE session_work_items
+            SET status='done', updated_at=?, processed_at=?
+          WHERE id IN (${taken.map(() => "?").join(", ")}) AND status='pending'`,
+      )
+      .bind(now, now, ...taken)
+      .run();
   }
 
   private startHeartbeat(
@@ -752,6 +833,10 @@ function isUniqueViolation(err: unknown): boolean {
   const msg = typeof e.message === "string" ? e.message : "";
   if (/UNIQUE constraint failed|duplicate key value violates unique constraint/i.test(msg)) return true;
   return e.cause !== undefined && e.cause !== err ? isUniqueViolation(e.cause) : false;
+}
+
+function threadOf(event: TurnInputEvent): string {
+  return (event as { session_thread_id?: string }).session_thread_id ?? "sthr_primary";
 }
 
 function isLeaseAbort(signal: AbortSignal): boolean {

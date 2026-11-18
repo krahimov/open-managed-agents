@@ -718,6 +718,167 @@ describe("SessionStateMachine resume (retried work item)", () => {
   });
 });
 
+describe("SessionStateMachine batched client answers", () => {
+  const confirm = (id: string, extra: Record<string, unknown> = {}) =>
+    ({ type: "user.tool_confirmation", id: `sevt-${id}-${Math.random()}`, tool_use_id: id, result: "allow", ...extra }) as never;
+  const idles = (log: InMemoryEventLog) =>
+    (log.getEvents() as Array<Record<string, unknown>>).filter((e) => e.type === "session.status_idle");
+  const gatedTools = (execute: ReturnType<typeof vi.fn>) => (agent: AgentConfig) => ({
+    bash: JSON.stringify(agent.tools).includes("always_ask") ? {} : { execute },
+  });
+  /** takeQueuedClientResults stub handing out one batch per call. */
+  const queue = (...batches: unknown[][]) => {
+    const take = vi.fn(async () => (batches.shift() ?? []).map((event) => ({ event }) as never));
+    return take;
+  };
+
+  it("applies the answers queued behind a confirmation in the same turn: one running/idle, no idle listing a queued id", async () => {
+    // 2026-11 evals: three confirmations POSTed together ran as three
+    // turns; the idles in between listed the ids still queued, so the
+    // client re-sent them.
+    const h = gatedToolHarness(["toolu_1", "toolu_2", "toolu_3"]);
+    const execute = vi.fn(async () => "hi\n");
+    const f = createMachine(h.run, { runtime: () => ({ pendingConfirmations: [] }), tools: gatedTools(execute) });
+    await f.machine.runTurn("agent_test", userMessage);
+    const turnStart = f.log.getEvents().length;
+
+    const take = queue([confirm("toolu_2"), confirm("toolu_3")]);
+    await f.machine.runTurn("agent_test", confirm("toolu_1"), { takeQueuedClientResults: take });
+
+    const turn = (f.log.getEvents() as Array<Record<string, unknown>>).slice(turnStart);
+    expect(turn.map((e) => e.type)).toEqual([
+      "user.tool_confirmation",
+      "session.status_running",
+      "agent.tool_result",
+      "user.tool_confirmation",
+      "agent.tool_result",
+      "user.tool_confirmation",
+      "agent.tool_result",
+      "agent.message",
+      "session.status_idle",
+    ]);
+    expect(execute).toHaveBeenCalledTimes(3);
+    expect(h.calls()).toBe(2);
+    expect(idles(f.log)).toHaveLength(2);
+    expect(lastIdle(f.log).stop_reason).toEqual({ type: "end_turn" });
+  });
+
+  it("takes answers that arrived while the batch was applied before handing control back", async () => {
+    const h = gatedToolHarness(["toolu_1", "toolu_2"]);
+    const execute = vi.fn(async () => "hi\n");
+    const f = createMachine(h.run, { runtime: () => ({ pendingConfirmations: [] }), tools: gatedTools(execute) });
+    await f.machine.runTurn("agent_test", userMessage);
+
+    const take = queue([], [confirm("toolu_2")]);
+    await f.machine.runTurn("agent_test", confirm("toolu_1"), { takeQueuedClientResults: take });
+
+    expect(take).toHaveBeenCalledTimes(2);
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(h.calls()).toBe(2);
+    expect(idles(f.log)).toHaveLength(2);
+    expect(lastIdle(f.log).stop_reason).toEqual({ type: "end_turn" });
+  });
+
+  it("a repeat answer neither builds tools nor toggles the session status", async () => {
+    const h = gatedToolHarness(["toolu_1"]);
+    const execute = vi.fn(async () => "hi\n");
+    const f = createMachine(h.run, { runtime: () => ({ pendingConfirmations: [] }), tools: gatedTools(execute) });
+    await f.machine.runTurn("agent_test", userMessage);
+    await f.machine.runTurn("agent_test", confirm("toolu_1"));
+    const built = f.buildTools.mock.calls.length;
+    const before = f.log.getEvents().length;
+    vi.mocked(f.adapter.beginTurn).mockClear();
+
+    const again = await f.machine.runTurn("agent_test", confirm("toolu_1"));
+
+    expect(again).toMatchObject({ status: "completed", stopReason: { type: "end_turn" } });
+    expect(f.buildTools.mock.calls.length).toBe(built);
+    expect(f.adapter.beginTurn).not.toHaveBeenCalled();
+    const added = (f.log.getEvents() as Array<Record<string, unknown>>).slice(before);
+    // Recorded (processed, with why it was ignored) — nothing else.
+    expect(added).toEqual([
+      expect.objectContaining({
+        type: "user.tool_confirmation",
+        tool_use_id: "toolu_1",
+        processed_at: expect.any(String),
+        metadata: { ignored: "already resolved" },
+      }),
+    ]);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(h.calls()).toBe(2);
+  });
+
+  it("a repeat ahead of a step's answers is recorded and the step is answered in one turn", async () => {
+    // The eval pattern: a repeat for the previous step sits at the head of
+    // the queue, the new step's answers right behind it.
+    let calls = 0;
+    const execute = vi.fn(async () => "hi\n");
+    const f = createMachine(
+      async (ctx) => {
+        calls++;
+        const ids = calls === 1 ? ["toolu_a"] : calls === 2 ? ["toolu_b1", "toolu_b2"] : [];
+        if (ids.length === 0) {
+          ctx.eventLog.append({ type: "agent.message", content: [{ type: "text", text: "done" }] } as SessionEvent);
+          return;
+        }
+        for (const id of ids) {
+          ctx.eventLog.append({
+            type: "agent.tool_use",
+            id,
+            name: "bash",
+            input: { command: "echo hi" },
+            evaluated_permission: "ask",
+          } as unknown as SessionEvent);
+        }
+        ctx.runtime?.pendingConfirmations?.push(...ids);
+      },
+      { runtime: () => ({ pendingConfirmations: [] }), tools: gatedTools(execute) },
+    );
+    await f.machine.runTurn("agent_test", userMessage);
+    await f.machine.runTurn("agent_test", confirm("toolu_a"));
+    expect(lastIdle(f.log).stop_reason).toMatchObject({ event_ids: ["toolu_b1", "toolu_b2"] });
+
+    const take = queue([confirm("toolu_b1"), confirm("toolu_b1"), confirm("toolu_b2")]);
+    await f.machine.runTurn("agent_test", confirm("toolu_a"), { takeQueuedClientResults: take });
+
+    expect(calls).toBe(3);
+    expect(execute).toHaveBeenCalledTimes(3); // a, b1, b2 — once each
+    const confirmations = (f.log.getEvents() as Array<Record<string, unknown>>).filter(
+      (e) => e.type === "user.tool_confirmation",
+    );
+    expect(confirmations.map((e) => [e.tool_use_id, (e.metadata as { ignored?: string } | undefined)?.ignored])).toEqual([
+      ["toolu_a", undefined],
+      ["toolu_a", "already resolved"],
+      ["toolu_b1", undefined],
+      ["toolu_b1", "answered earlier in this turn"],
+      ["toolu_b2", undefined],
+    ]);
+    expect(idles(f.log)).toHaveLength(3);
+    expect(lastIdle(f.log).stop_reason).toEqual({ type: "end_turn" });
+  });
+
+  it("a retried item whose answer was recorded as ignored is acknowledged without a turn", async () => {
+    const h = gatedToolHarness(["toolu_1"]);
+    const f = createMachine(h.run, { runtime: () => ({ pendingConfirmations: [] }) });
+    Object.assign(f.log, {
+      findEventByIdAsync: async (id: string) =>
+        (f.log.getEvents() as SessionEvent[]).find((e) => (e as { id?: string }).id === id) ?? null,
+    });
+    await f.machine.runTurn("agent_test", userMessage);
+    await f.machine.runTurn("agent_test", confirm("toolu_1", { result: "deny" }));
+    const repeat = confirm("toolu_1");
+    await f.machine.runTurn("agent_test", repeat);
+    const before = f.log.getEvents().length;
+
+    // The worker died after recording it, before the queue acknowledged.
+    const retried = await f.machine.runTurn("agent_test", repeat);
+
+    expect(retried).toMatchObject({ status: "completed", alreadyCompleted: true });
+    expect(f.log.getEvents().length).toBe(before);
+    expect(h.calls()).toBe(2);
+  });
+});
+
 describe("SessionStateMachine interrupt", () => {
   it("aborts a running turn and ends it idle without a session.error", async () => {
     let seenSignal: AbortSignal | null = null;

@@ -1442,6 +1442,8 @@ const sessionWorkQueue = new NodeSessionWorkQueue({
         // The queue guarantees exclusive ownership of the session, so a
         // leftover running turn marker is an orphan of a dead attempt.
         recoverOrphans: true,
+        // Client answers queued behind this one join its turn.
+        takeQueuedClientResults: ctx.takeQueuedClientResults,
       });
       turnSettled = true;
     } finally {

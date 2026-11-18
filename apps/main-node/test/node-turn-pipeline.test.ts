@@ -97,6 +97,7 @@ async function setup(
           eventLog: eventLog.withGuard(ctx.guard),
           pendingSeq: item.pendingSeq,
           recoverOrphans: true,
+          takeQueuedClientResults: ctx.takeQueuedClientResults,
         })
         .then(() => undefined),
   });
@@ -109,7 +110,7 @@ async function setup(
   const router = new NodeSessionRouter({ sql, hub, registry, newEventLog, workQueue });
   const log = async () => (await eventLog.getEventsAsync()) as Array<Record<string, unknown>>;
   const drained = () => workQueue.wake(SID);
-  return { router, log, published, drained, machine, workQueue };
+  return { router, log, published, drained, machine, workQueue, sql };
 }
 
 const text = (e: Record<string, unknown>) =>
@@ -224,6 +225,112 @@ describe("Node turn pipeline", () => {
       "session.status_idle",
     ]);
     expect(events.at(-1)).toMatchObject({ stop_reason: { type: "end_turn" } });
+  });
+
+  it("answers POSTed together for one step run as one turn, and a repeat costs no turn", async () => {
+    // 2026-11 evals: each queued confirmation ran as its own turn and the
+    // idles in between still listed the ids whose answers sat in the
+    // queue, so the client re-sent them (43–599 repeats per session).
+    const ids = ["toolu_1", "toolu_2", "toolu_3"];
+    const p = await setup(async (rt, turn) => {
+      if (turn === 1) {
+        for (const id of ids) {
+          rt.broadcast({
+            type: "agent.tool_use",
+            id,
+            name: "bash",
+            input: { command: "true" },
+            evaluated_permission: "ask",
+          } as unknown as SessionEvent);
+          rt.pendingConfirmations.push(id);
+        }
+        return;
+      }
+      rt.broadcast({ type: "agent.message", content: [{ type: "text", text: "all skipped" }] } as SessionEvent);
+    });
+    await p.router.appendEvent(SID, userMsg("clean up"));
+    await until(async () => (await p.log()).some((e) => e.type === "session.status_idle"));
+    const turnStart = (await p.log()).length;
+
+    // The client answers the whole step at once.
+    p.workQueue.stop();
+    for (const id of ids) {
+      const res = await p.router.appendEvent(SID, {
+        type: "user.tool_confirmation",
+        tool_use_id: id,
+        result: "deny",
+      } as unknown as SessionEvent);
+      expect(res.status).toBe(202);
+    }
+    await p.drained(); // the POSTs' wakes, which claimed nothing
+    p.workQueue.start();
+    await p.drained();
+
+    const turn = (await p.log()).slice(turnStart);
+    expect(turn.map((e) => e.type)).toEqual([
+      "user.tool_confirmation",
+      "session.status_running",
+      "agent.tool_result",
+      "user.tool_confirmation",
+      "agent.tool_result",
+      "user.tool_confirmation",
+      "agent.tool_result",
+      "agent.message",
+      "session.status_idle",
+    ]);
+    expect(turn.at(-1)).toMatchObject({ stop_reason: { type: "end_turn" } });
+    const rows = await p.sql
+      .prepare(`SELECT status FROM session_work_items WHERE session_id = ?`)
+      .bind(SID)
+      .all<{ status: string }>();
+    expect((rows.results ?? []).map((r) => r.status)).toEqual(["done", "done", "done", "done"]);
+    expect(JSON.parse((await p.router.getPending(SID)).body).data).toEqual([]);
+
+    // A repeat is recorded as ignored: no running/idle, no new turn.
+    const before = (await p.log()).length;
+    await p.router.appendEvent(SID, { type: "user.tool_confirmation", tool_use_id: "toolu_2", result: "deny" } as unknown as SessionEvent);
+    await p.drained();
+    const added = (await p.log()).slice(before);
+    expect(added).toEqual([
+      expect.objectContaining({ type: "user.tool_confirmation", metadata: { ignored: "already resolved" } }),
+    ]);
+    p.workQueue.stop();
+  });
+
+  it("when the batched turn fails, the answers it took along keep that outcome instead of re-running", async () => {
+    let turns = 0;
+    const p = await setup(async (rt, turn) => {
+      turns = turn;
+      if (turn === 1) {
+        for (const id of ["toolu_1", "toolu_2"]) {
+          rt.broadcast({ type: "agent.tool_use", id, name: "bash", input: {}, evaluated_permission: "ask" } as unknown as SessionEvent);
+          rt.pendingConfirmations.push(id);
+        }
+        return;
+      }
+      throw new Error("provider 500");
+    });
+    await p.router.appendEvent(SID, userMsg("go"));
+    await until(async () => (await p.log()).some((e) => e.type === "session.status_idle"));
+
+    p.workQueue.stop();
+    for (const id of ["toolu_1", "toolu_2"]) {
+      await p.router.appendEvent(SID, { type: "user.tool_confirmation", tool_use_id: id, result: "deny" } as unknown as SessionEvent);
+    }
+    await p.drained();
+    p.workQueue.start();
+    await p.drained();
+    p.workQueue.stop();
+
+    expect(turns).toBe(2);
+    const events = await p.log();
+    expect(events.filter((e) => e.type === "session.error")).toHaveLength(1);
+    expect(events.filter((e) => e.type === "user.tool_confirmation")).toHaveLength(2);
+    const rows = await p.sql
+      .prepare(`SELECT status FROM session_work_items WHERE session_id = ? ORDER BY pending_seq`)
+      .bind(SID)
+      .all<{ status: string }>();
+    expect((rows.results ?? []).map((r) => r.status)).toEqual(["done", "failed", "failed"]);
   });
 
   it("rejects a tool confirmation / custom result that names no tool call of the session", async () => {
