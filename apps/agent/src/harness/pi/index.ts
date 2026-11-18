@@ -12,6 +12,7 @@ export {
 export {
   modelMessagesToPi,
   ensureContinuableTail,
+  endsOnFinalReply,
   thinkingFromProviderOptions,
   providerOptionsFromThinking,
 } from "./messages";

@@ -13,6 +13,7 @@ import {
   PiHarness,
   adaptOmaTools,
   credentialsFromLanguageModel,
+  endsOnFinalReply,
   ensureContinuableTail,
   modelMessagesToPi,
   normalizeToolOutputForWire,
@@ -91,6 +92,24 @@ describe("pi harness: OMA history → pi messages", () => {
     expect(ensureContinuableTail(pi).at(-1)).toMatchObject({ role: "user" });
     const withUser = modelMessagesToPi(eventsToMessages(events.slice(0, 1)), { model: PI_MODEL });
     expect(ensureContinuableTail(withUser)).toHaveLength(1);
+  });
+
+  it("knows when the last reply already ended the loop", () => {
+    const user = { type: "user.message", content: [{ type: "text", text: "go" }] } as SessionEvent;
+    const final = { type: "agent.message", content: [{ type: "text", text: "done" }], step_final: true } as unknown as SessionEvent;
+    const idle = { type: "session.status_idle", stop_reason: { type: "end_turn" } } as unknown as SessionEvent;
+    const confirm = { type: "user.tool_confirmation", tool_use_id: "t1", result: "allow" } as unknown as SessionEvent;
+    expect(endsOnFinalReply([user, final, idle, confirm])).toBe(true);
+    // New input, an unfinished step, or an open call: the model has work.
+    expect(endsOnFinalReply([user, final, idle, user])).toBe(false);
+    expect(endsOnFinalReply([user, { ...final, step_final: undefined } as SessionEvent])).toBe(false);
+    expect(endsOnFinalReply([user, final, { type: "agent.thinking", text: "hm" } as SessionEvent])).toBe(false);
+    expect(endsOnFinalReply([
+      user,
+      { type: "agent.tool_use", id: "t1", name: "bash", input: {}, evaluated_permission: "ask" } as unknown as SessionEvent,
+      final,
+    ])).toBe(false);
+    expect(endsOnFinalReply([user])).toBe(false);
   });
 });
 
@@ -409,6 +428,54 @@ describe("pi harness: run() against a faux pi-ai model", () => {
     expect(execute).not.toHaveBeenCalled();
     const result = writes.find((w) => w.event.type === "agent.tool_result")!.event as { content: string };
     expect(result.content).toMatch(/Validation failed/);
+  });
+
+  it("ends without a model call when the last reply finished the loop and nothing new arrived", async () => {
+    // A resume with no new input (a stale tool confirmation) used to get the
+    // "Continue." nudge, and the model redid the whole job.
+    resetInflightToolCallsForTest();
+    const { ctx, writes, runtime } = makeCtx({
+      tools: { bash: tool({ inputSchema: z.object({}), execute: async () => "ok" }) },
+      events: [
+        { type: "user.message", content: [{ type: "text", text: "list files" }] } as SessionEvent,
+        { type: "agent.tool_use", id: "t1", name: "bash", input: {}, evaluated_permission: "ask" } as unknown as SessionEvent,
+        { type: "agent.tool_result", tool_use_id: "t1", content: "a.txt" } as unknown as SessionEvent,
+        { type: "agent.message", content: [{ type: "text", text: "Found a.txt" }], step_final: true } as unknown as SessionEvent,
+        { type: "session.status_idle", stop_reason: { type: "end_turn" } } as unknown as SessionEvent,
+        { type: "user.tool_confirmation", tool_use_id: "t1", result: "allow" } as unknown as SessionEvent,
+      ],
+    });
+    const { harness, faux } = fauxResolver([fauxAssistantMessage("Starting over: listing files again.")]);
+
+    await harness.run(ctx);
+
+    expect(faux.state.callCount).toBe(0);
+    expect(writes).toEqual([]);
+    expect(runtime.reportUsage).not.toHaveBeenCalled();
+  });
+
+  it("still continues a step the model hadn't finished (assistant tail without a final reply)", async () => {
+    resetInflightToolCallsForTest();
+    let seen: TranscriptContext | undefined;
+    const { ctx, writes } = makeCtx({
+      tools: {},
+      events: [
+        { type: "user.message", content: [{ type: "text", text: "list files" }] } as SessionEvent,
+        { type: "agent.thinking", text: "plan" } as unknown as SessionEvent,
+      ],
+    });
+    const { harness, faux } = fauxResolver([
+      (context) => {
+        seen = { ...context, messages: [...context.messages] } as TranscriptContext;
+        return fauxAssistantMessage("Found a.txt");
+      },
+    ]);
+
+    await harness.run(ctx);
+
+    expect(faux.state.callCount).toBe(1);
+    expect(seen!.messages.at(-1)).toMatchObject({ role: "user", content: [{ type: "text", text: "Continue." }] });
+    expect(writes.some((w) => w.event.type === "agent.message")).toBe(true);
   });
 
   it("rejects the turn on a provider error and closes the span", async () => {

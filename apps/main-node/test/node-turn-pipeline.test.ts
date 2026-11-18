@@ -226,6 +226,36 @@ describe("Node turn pipeline", () => {
     expect(events.at(-1)).toMatchObject({ stop_reason: { type: "end_turn" } });
   });
 
+  it("rejects a tool confirmation / custom result that names no tool call of the session", async () => {
+    const p = await setup(async (rt) => {
+      rt.broadcast({ type: "agent.message", content: [{ type: "text", text: "done" }] } as SessionEvent);
+    });
+    await p.router.appendEvent(SID, userMsg("hi"));
+    await until(async () => (await p.log()).some((e) => e.type === "session.status_idle"));
+    const before = (await p.log()).length;
+
+    const unknown = await p.router.appendEvent(SID, {
+      type: "user.tool_confirmation",
+      tool_use_id: "toolu_nope",
+      result: "allow",
+    } as unknown as SessionEvent);
+    expect(unknown.status).toBe(400);
+    expect(JSON.parse(unknown.body).error).toContain("toolu_nope");
+    // An event id that isn't a tool call doesn't count either.
+    const notATool = await p.router.appendEvent(SID, {
+      type: "user.custom_tool_result",
+      custom_tool_use_id: (await p.log())[0].id,
+      content: [],
+    } as unknown as SessionEvent);
+    expect(notATool.status).toBe(400);
+    const missing = await p.router.appendEvent(SID, { type: "user.tool_confirmation", result: "allow" } as unknown as SessionEvent);
+    expect(missing.status).toBe(400);
+
+    await p.drained();
+    expect((await p.log()).length).toBe(before);
+    expect(JSON.parse((await p.router.getPending(SID)).body).data).toEqual([]);
+  });
+
   it("user.interrupt aborts the running turn and flushes queued input", async () => {
     let started = false;
     const p = await setup(async (rt) => {

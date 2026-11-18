@@ -477,9 +477,16 @@ export class SessionStateMachine {
         // that re-sends ids the intermediate idles still listed while its
         // first answers sat in the queue — 43 of 108 confirmations on one
         // 2026-11 eval) changes nothing: it must not resume the model on
-        // the whole context again. Report the session's state as it is.
-        const stale = !resuming && clientResultAlreadySettled(before, clientResultToolUseId(event));
-        if (!stale) await this.applyClientToolResult(log, agent, event, before, controller.signal, resuming);
+        // the whole context again. Same for an id that names no call, or
+        // a call that isn't waiting on the client. Report the session's
+        // state as it is.
+        const staleReason = resuming ? null : staleClientResult(before, event);
+        const stale = staleReason !== null;
+        if (stale) {
+          this.logger.warn(`ignoring ${event.type} for ${clientResultToolUseId(event)}: ${staleReason}`);
+        } else {
+          await this.applyClientToolResult(log, agent, event, before, controller.signal, resuming);
+        }
         const after = await this.readEvents(log);
         const remaining = outstandingRequiredActions(after);
         if (remaining.length > 0 || stale) {
@@ -1013,6 +1020,50 @@ function seqOf(event: SessionEvent): number | undefined {
 
 function clientResultToolUseId(event: UserToolConfirmationEvent | UserCustomToolResultEvent): string {
   return event.type === "user.custom_tool_result" ? event.custom_tool_use_id : event.tool_use_id;
+}
+
+/**
+ * Why the client's answer can't move the session on, or null when it can:
+ * it names a call still waiting on the client, or one whose result exists
+ * with no clean idle after it (an answer re-sent after a failed turn
+ * retries that turn). Stale: the turn already went past the call, no call
+ * has that id, or the call isn't waiting on the client (a confirmation for
+ * a call that ran without one must neither run it nor resume the model).
+ */
+function staleClientResult(
+  events: SessionEvent[],
+  event: UserToolConfirmationEvent | UserCustomToolResultEvent,
+): string | null {
+  const toolUseId = clientResultToolUseId(event);
+  if (!toolUseId) return "no tool call id";
+  const known = events.some(
+    (e) =>
+      (e.type === "agent.tool_use" || e.type === "agent.mcp_tool_use" || e.type === "agent.custom_tool_use") &&
+      (e as { id?: string }).id === toolUseId,
+  );
+  if (!known) return "no such tool call in the session";
+  // Same pairing applyClientToolResult resolves against.
+  const use = findUnresolvedToolUses(events, { clientInputResolves: event.type !== "user.custom_tool_result" })
+    .find((u) => u.id === toolUseId);
+  if (!use) return clientResultAlreadySettled(events, toolUseId) ? "already resolved" : null;
+  const awaited =
+    (event.type === "user.custom_tool_result"
+      ? use.type === "agent.custom_tool_use"
+      : use.evaluated_permission === "ask") || askedOfClient(events, toolUseId);
+  return awaited ? null : "the call is not waiting on the client";
+}
+
+/** True when some requires_action idle in `events` handed `toolUseId` to the client. */
+function askedOfClient(events: SessionEvent[], toolUseId: string): boolean {
+  return events.some((e) => {
+    const stop = (e as { stop_reason?: { type?: string; event_ids?: unknown } }).stop_reason;
+    return (
+      e.type === "session.status_idle" &&
+      stop?.type === "requires_action" &&
+      Array.isArray(stop.event_ids) &&
+      stop.event_ids.includes(toolUseId)
+    );
+  });
 }
 
 /**

@@ -58,7 +58,7 @@ import {
   toolCallNeedsApproval,
 } from "../tool-budget";
 import { credentialsFromLanguageModel, resolvePiModel, type PiModelCredentials, type ResolvedPiModel } from "./model";
-import { ensureContinuableTail, modelMessagesToPi, providerOptionsFromThinking } from "./messages";
+import { endsOnFinalReply, ensureContinuableTail, modelMessagesToPi, providerOptionsFromThinking } from "./messages";
 import { adaptOmaTools, piContentToWire, type AdaptedTools, type OmaToolDetails } from "./tools";
 
 export interface PiHarnessOptions {
@@ -454,6 +454,14 @@ export class PiHarness implements HarnessInterface {
           `reported unknown outcome for [${reconciled.injected.join(", ")}].`,
         details: { reexecuted: reconciled.reexecuted, injected: reconciled.injected },
       } as SessionEvent);
+    }
+
+    // Nothing new since the last reply finished the loop: end the turn as
+    // the model left it instead of nudging it into starting over. Before
+    // compaction and model resolution, so such a run costs no model call.
+    if (endsOnFinalReply(mergePersistedResults(visibleEvents(), reconciled.extraEvents))) {
+      console.log(`[pi] loop SKIP: the last reply already ended the loop and nothing new arrived`);
+      return;
     }
 
     const resolved = this.opts.resolveModel

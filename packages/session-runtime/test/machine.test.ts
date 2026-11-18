@@ -251,6 +251,130 @@ describe("SessionStateMachine human-in-the-loop", () => {
     expect(lastIdle(f.log).stop_reason).toEqual({ type: "end_turn" });
   });
 
+  it("a confirmation naming no tool call of the session does not resume the model", async () => {
+    // pi regression eval (2026-11): an answer arriving after the turn's
+    // end_turn re-ran the model, which redid the whole job (~15 more tool
+    // calls and a second, different final answer).
+    const h = gatedToolHarness(["toolu_1"]);
+    const execute = vi.fn(async () => "hi\n");
+    const f = createMachine(h.run, {
+      runtime: () => ({ pendingConfirmations: [] }),
+      tools: (agent) => ({ bash: JSON.stringify(agent.tools).includes("always_ask") ? {} : { execute } }),
+    });
+    await f.machine.runTurn("agent_test", userMessage);
+    await f.machine.runTurn("agent_test", {
+      type: "user.tool_confirmation",
+      tool_use_id: "toolu_1",
+      result: "allow",
+    } as never);
+    expect(h.calls()).toBe(2);
+
+    const unknown = await f.machine.runTurn("agent_test", {
+      type: "user.tool_confirmation",
+      tool_use_id: "toolu_nope",
+      result: "allow",
+    } as never);
+    expect(unknown.status).toBe("completed");
+    expect(h.calls()).toBe(2);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(lastIdle(f.log).stop_reason).toEqual({ type: "end_turn" });
+  });
+
+  it("an unknown id while another call waits hands the outstanding call back and leaves it answerable", async () => {
+    const h = gatedToolHarness(["toolu_1"]);
+    const f = createMachine(h.run, { runtime: () => ({ pendingConfirmations: [] }) });
+    await f.machine.runTurn("agent_test", userMessage);
+
+    await f.machine.runTurn("agent_test", {
+      type: "user.custom_tool_result",
+      custom_tool_use_id: "ctu_nope",
+      content: [{ type: "text", text: "?" }],
+    } as never);
+    expect(h.calls()).toBe(1);
+    expect(lastIdle(f.log).stop_reason).toEqual({
+      type: "requires_action",
+      action_type: "tool_confirmation",
+      event_ids: ["toolu_1"],
+    });
+    expect((f.log.getEvents() as SessionEvent[]).some((e) => e.type === "agent.tool_result")).toBe(false);
+
+    await f.machine.runTurn("agent_test", {
+      type: "user.tool_confirmation",
+      tool_use_id: "toolu_1",
+      result: "deny",
+    } as never);
+    expect(h.calls()).toBe(2);
+    expect(lastIdle(f.log).stop_reason).toEqual({ type: "end_turn" });
+  });
+
+  it("a confirmation for a call that was never gated neither runs it nor resumes the model", async () => {
+    // A cut-off, ungated call stays unresolved (no orphan recovery here);
+    // "allow" for it must not execute it outside the harness.
+    let calls = 0;
+    const execute = vi.fn(async () => "ran\n");
+    const f = createMachine(
+      async (ctx) => {
+        calls++;
+        ctx.eventLog.append({
+          type: "agent.tool_use",
+          id: "toolu_free",
+          name: "bash",
+          input: { command: "echo hi" },
+        } as unknown as SessionEvent);
+      },
+      { runtime: () => ({ pendingConfirmations: [] }), tools: () => ({ bash: { execute } }) },
+    );
+    await f.machine.runTurn("agent_test", userMessage);
+    expect(lastIdle(f.log).stop_reason).toEqual({ type: "end_turn" });
+
+    await f.machine.runTurn("agent_test", {
+      type: "user.tool_confirmation",
+      tool_use_id: "toolu_free",
+      result: "allow",
+    } as never);
+    expect(calls).toBe(1);
+    expect(execute).not.toHaveBeenCalled();
+    expect(lastIdle(f.log).stop_reason).toEqual({ type: "end_turn" });
+  });
+
+  it("an answer re-sent after its turn failed still retries the turn", async () => {
+    // The tool result is in, but the model call after it failed (idle
+    // without stop_reason): the client re-sending the answer is the retry.
+    let calls = 0;
+    const execute = vi.fn(async () => "hi\n");
+    const f = createMachine(
+      async (ctx) => {
+        calls++;
+        if (calls === 1) {
+          ctx.eventLog.append({
+            type: "agent.tool_use",
+            id: "toolu_1",
+            name: "bash",
+            input: { command: "echo hi" },
+            evaluated_permission: "ask",
+          } as unknown as SessionEvent);
+          ctx.runtime?.pendingConfirmations?.push("toolu_1");
+          return;
+        }
+        if (calls === 2) throw new Error("provider 500");
+        ctx.eventLog.append({ type: "agent.message", content: [{ type: "text", text: "done" }] } as SessionEvent);
+      },
+      {
+        runtime: () => ({ pendingConfirmations: [] }),
+        tools: (agent) => ({ bash: JSON.stringify(agent.tools).includes("always_ask") ? {} : { execute } }),
+      },
+    );
+    await f.machine.runTurn("agent_test", userMessage);
+    const confirm = { type: "user.tool_confirmation", tool_use_id: "toolu_1", result: "allow" };
+    await f.machine.runTurn("agent_test", confirm as never).catch(() => {});
+    expect(calls).toBe(2);
+
+    await f.machine.runTurn("agent_test", { ...confirm } as never);
+    expect(calls).toBe(3);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(lastIdle(f.log).stop_reason).toEqual({ type: "end_turn" });
+  });
+
   it("an approved call_mcp_tool runs the deferred MCP tool it names, with its arguments", async () => {
     let calls = 0;
     const run = async (ctx: HarnessInput) => {
