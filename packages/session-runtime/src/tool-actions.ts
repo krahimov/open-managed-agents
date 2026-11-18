@@ -17,6 +17,7 @@
 // agent.mcp_tool_result closes agent.mcp_tool_use by `mcp_tool_use_id`.
 
 import { mcpWireText, type AgentConfig, type ContentBlock, type SessionEvent } from "@open-managed-agents/shared";
+import { ignoredAnswerReason } from "./tool-classification";
 
 export type ToolUseEventType =
   | "agent.tool_use"
@@ -87,8 +88,13 @@ export function findUnresolvedToolUses(
         if (typeof ev.mcp_tool_use_id === "string") uses.delete(ev.mcp_tool_use_id);
         break;
       case "user.custom_tool_result":
-        // Same pairing as findOrphanToolUses (tool-classification.ts).
-        if (clientInputResolves && typeof ev.custom_tool_use_id === "string") {
+        // Same pairing as findOrphanToolUses (tool-classification.ts); an
+        // answer the machine ignored resolved nothing.
+        if (
+          clientInputResolves &&
+          typeof ev.custom_tool_use_id === "string" &&
+          ignoredAnswerReason(ev) === null
+        ) {
           uses.delete(ev.custom_tool_use_id);
         }
         break;

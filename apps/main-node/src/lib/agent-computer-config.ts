@@ -1,4 +1,6 @@
 import type { AgentMachineSpec } from '@open-managed-agents/sandbox/machines';
+import type { EnvironmentConfig } from '@open-managed-agents/shared';
+import { buildSandboxEnvForEnvironment } from './environment-runtime-config.js';
 
 type Env = Readonly<Record<string, string | undefined>>;
 
@@ -25,4 +27,24 @@ export function agentComputerSpec(env: Env): AgentMachineSpec {
 
 export function agentComputerEnabled(env: Env): boolean {
   return env.SANDBOX_PROVIDER === 'daytona' && env.SANDBOX_SCOPE === 'agent';
+}
+
+/**
+ * Sandbox env an agent's computer is built from outside a session: its
+ * default environment's sandbox config layered over the server env, the
+ * same layering `buildSandbox` gives a session started without an explicit
+ * environment. So an environment with `sandbox.scope: "agent"` enables the
+ * computer even when the server sets no SANDBOX_SCOPE, and its spec is the
+ * one the agent's sessions acquire (the machine config is frozen on first
+ * creation). Null when the default environment no longer exists.
+ */
+export async function agentComputerEnv(
+  base: Env,
+  agent: { metadata?: Record<string, unknown> | null },
+  loadEnvironment: (environmentId: string) => Promise<EnvironmentConfig | null>,
+): Promise<Env | null> {
+  const environmentId = agent.metadata?.default_environment_id;
+  if (typeof environmentId !== 'string' || !environmentId) return buildSandboxEnvForEnvironment({ ...base });
+  const environment = await loadEnvironment(environmentId);
+  return environment ? buildSandboxEnvForEnvironment({ ...base }, environment) : null;
 }

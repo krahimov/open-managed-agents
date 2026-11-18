@@ -39,6 +39,8 @@ export {
   type SessionMachineDeps,
   type HarnessRunFn,
   type TurnInputEvent,
+  type ClientResultEvent,
+  type QueuedClientResult,
   type TurnAbortReason,
   type TurnOptions,
   type TurnResult,

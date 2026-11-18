@@ -111,6 +111,23 @@ export function executionClassOf(event: {
 }
 
 /**
+ * `metadata` key the session state machine sets on a client answer it
+ * recorded but ignored (a repeat, an id that names no call, a call not
+ * waiting on the client). Only the machine writes it — client input is
+ * stripped of it before promotion — so an answer carrying it resolved
+ * nothing and must not pair with its call.
+ */
+export const IGNORED_ANSWER_KEY = "_oma_ignored";
+
+/** Why the machine ignored this recorded client answer, or null. */
+export function ignoredAnswerReason(event: { type: string; metadata?: unknown }): string | null {
+  if (event.type !== "user.tool_confirmation" && event.type !== "user.custom_tool_result") return null;
+  const metadata = event.metadata as Record<string, unknown> | null | undefined;
+  const reason = metadata?.[IGNORED_ANSWER_KEY];
+  return typeof reason === "string" ? reason : null;
+}
+
+/**
  * Scan an event list for tool_use events that never got a result. Pairing
  * key is always the use's own `id` (see default-loop emitToolCallEvent):
  *   agent.tool_use / agent.custom_tool_use → agent.tool_result.tool_use_id
@@ -134,6 +151,7 @@ export function findOrphanToolUses(events: readonly SessionEvent[]): OrphanToolU
       evaluated_permission?: string;
       idempotency_key?: string;
       session_thread_id?: string;
+      metadata?: unknown;
     };
     switch (ev.type) {
       case "agent.tool_use":
@@ -158,6 +176,7 @@ export function findOrphanToolUses(events: readonly SessionEvent[]): OrphanToolU
         if (ev.mcp_tool_use_id) resolved.add(ev.mcp_tool_use_id);
         break;
       case "user.custom_tool_result":
+        if (ignoredAnswerReason(ev) !== null) break;
         if (ev.custom_tool_use_id) resolved.add(ev.custom_tool_use_id);
         // Legacy rows keyed the result by the event's own id.
         if (ev.id) resolved.add(ev.id);

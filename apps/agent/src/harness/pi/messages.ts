@@ -16,6 +16,7 @@
  */
 
 import type { ModelMessage } from "ai";
+import type { SessionEvent } from "@open-managed-agents/shared";
 import type {
   Api,
   AssistantMessage,
@@ -299,10 +300,51 @@ export function modelMessagesToPi(messages: ModelMessage[], opts: ToPiOptions): 
 }
 
 /**
+ * True when the log leaves the model nothing to answer: the last event the
+ * model would see is a loop-ending reply (agent.message with step_final)
+ * and every tool call has its result. A run on such a log brought no new
+ * user input or tool result (a stale tool confirmation, a duplicate wake);
+ * calling the model would need the "Continue." nudge below, which models
+ * take as a request to redo the job (2026-11 pi regression eval: ~15 more
+ * tool calls and a second, different final answer). Same signal the
+ * session machine's modelLoopFinished reads after a crash.
+ */
+export function endsOnFinalReply(events: SessionEvent[]): boolean {
+  const open = new Set<string>();
+  let last: SessionEvent | undefined;
+  for (const e of events) {
+    const ev = e as unknown as Record<string, unknown>;
+    if (ev.cancelled_at_ms != null) continue;
+    switch (e.type) {
+      case "agent.tool_use":
+      case "agent.mcp_tool_use":
+      case "agent.custom_tool_use":
+        open.add(String(ev.id));
+        break;
+      case "agent.tool_result":
+        open.delete(String(ev.tool_use_id));
+        break;
+      case "agent.mcp_tool_result":
+        open.delete(String(ev.mcp_tool_use_id));
+        break;
+      case "user.message":
+      case "agent.thinking":
+      case "agent.message":
+        break;
+      default:
+        continue;
+    }
+    last = e;
+  }
+  return open.size === 0 && last?.type === "agent.message" && (last as { step_final?: boolean }).step_final === true;
+}
+
+/**
  * pi-agent-core's continue entry point requires a user / toolResult tail.
- * A transcript that ends on an assistant turn (e.g. a resumed session whose
- * last turn stopped cleanly) gets a minimal user nudge so the request is
- * valid on every provider.
+ * A transcript that ends on an assistant turn gets a minimal user nudge so
+ * the request is valid on every provider. Only for a turn the model hasn't
+ * finished (e.g. a crash after a step's thinking was persisted, before its
+ * reply): a finished one (endsOnFinalReply) never reaches the model.
  */
 export function ensureContinuableTail(messages: Message[]): Message[] {
   const last = messages[messages.length - 1];

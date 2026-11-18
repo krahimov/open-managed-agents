@@ -9,7 +9,10 @@ interface MachineControl {
 
 export interface AgentComputerRouteDeps {
   machines: MachineControl;
-  supported: boolean;
+  /** Whether a computer can be created for this agent: a fixed answer for
+   *  the whole server, or one per agent (its default environment may ask
+   *  for an agent-scope sandbox when the server env does not). */
+  supported: boolean | ((tenantId: string, agentId: string) => boolean | Promise<boolean>);
   spec(tenantId: string, agentId: string): AgentMachineSpec | Promise<AgentMachineSpec>;
   agentExists(tenantId: string, agentId: string): Promise<boolean>;
   screenshot(tenantId: string, agentId: string): Promise<Uint8Array>;
@@ -32,6 +35,8 @@ export function publicMachine(row: AgentMachineRow | null) {
 }
 
 export function buildAgentComputerRoutes(deps: AgentComputerRouteDeps) {
+  const supported = async (tenantId: string, agentId: string) =>
+    typeof deps.supported === 'function' ? await deps.supported(tenantId, agentId) : deps.supported;
   const app = new Hono<{ Variables: { tenant_id: string; user_id?: string } }>();
   app.use('/:id/machine/*', async (c, next) => {
     if (!await deps.agentExists(c.get('tenant_id'), c.req.param('id')!)) {
@@ -52,17 +57,17 @@ export function buildAgentComputerRoutes(deps: AgentComputerRouteDeps) {
   });
   app.get('/:id/machine', async c => {
     const machine = await deps.machines.get(c.get('tenant_id'), c.req.param('id'));
-    return c.json({ supported: deps.supported || !!machine, machine: publicMachine(machine) });
+    return c.json({ supported: !!machine || await supported(c.get('tenant_id'), c.req.param('id')), machine: publicMachine(machine) });
   });
   app.post('/:id/machine/start', async c => {
     const existing = await deps.machines.get(c.get('tenant_id'), c.req.param('id'));
-    if (!deps.supported && !existing) return c.json({ error: 'Agent computers are not enabled on this deployment.' }, 501);
+    if (!existing && !await supported(c.get('tenant_id'), c.req.param('id'))) return c.json({ error: 'Agent computers are not enabled for this agent. Give it a default environment with an agent-scope Daytona sandbox.' }, 501);
     const machine = await deps.machines.start(c.get('tenant_id'), c.req.param('id'), existing?.config ?? await deps.spec(c.get('tenant_id'), c.req.param('id')));
     return c.json({ machine: publicMachine(machine) });
   });
   app.post('/:id/machine/stop', async c => {
     const existing = await deps.machines.get(c.get('tenant_id'), c.req.param('id'));
-    if (!deps.supported && !existing) return c.json({ error: 'Agent computers are not enabled on this deployment.' }, 501);
+    if (!existing && !await supported(c.get('tenant_id'), c.req.param('id'))) return c.json({ error: 'Agent computers are not enabled for this agent. Give it a default environment with an agent-scope Daytona sandbox.' }, 501);
     const machine = await deps.machines.stop(c.get('tenant_id'), c.req.param('id'));
     return c.json({ machine: publicMachine(machine) });
   });

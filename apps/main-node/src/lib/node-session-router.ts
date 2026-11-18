@@ -53,6 +53,8 @@ const QUEUE_INPUT_TYPES = new Set([
   "user.custom_tool_result",
 ]);
 
+const TOOL_USE_TYPES = new Set(["agent.tool_use", "agent.mcp_tool_use", "agent.custom_tool_use"]);
+
 export class NodeSessionRouter implements SessionRouter {
   constructor(private deps: NodeSessionRouterDeps) {}
 
@@ -115,6 +117,10 @@ export class NodeSessionRouter implements SessionRouter {
     if (!QUEUE_INPUT_TYPES.has(event.type)) {
       await this.appendAndPublish(sessionId, event);
       return { status: 202, body: JSON.stringify({ accepted: true }) };
+    }
+    if (event.type === "user.tool_confirmation" || event.type === "user.custom_tool_result") {
+      const rejected = await this.checkClientResultTarget(sessionId, event);
+      if (rejected) return rejected;
     }
 
     // Queue inputs are held in the pending queue (session_work_items) and
@@ -207,6 +213,32 @@ export class NodeSessionRouter implements SessionRouter {
         stop_reason: { type: "end_turn" },
       } as SessionEvent);
     }
+  }
+
+  /**
+   * A tool confirmation / custom tool result must name a tool call the
+   * session made. An id that names none can only be a client bug; queued,
+   * it would run a turn that changes nothing (the machine ignores it too).
+   * Whether the call still waits on the client is the machine's call at
+   * turn start — a repeat queued behind the first answer is legitimate here.
+   */
+  private async checkClientResultTarget(
+    sessionId: string,
+    event: SessionEvent,
+  ): Promise<SessionAppendResult | null> {
+    const field = event.type === "user.custom_tool_result" ? "custom_tool_use_id" : "tool_use_id";
+    const id = (event as unknown as Record<string, unknown>)[field];
+    if (typeof id !== "string" || !id) {
+      return { status: 400, body: JSON.stringify({ error: `${event.type} requires \`${field}\`` }) };
+    }
+    const use = await this.deps.newEventLog(sessionId).findEventByIdAsync(id);
+    if (!use || !TOOL_USE_TYPES.has(use.type)) {
+      return {
+        status: 400,
+        body: JSON.stringify({ error: `${event.type}: no tool call ${id} in this session` }),
+      };
+    }
+    return null;
   }
 
   /**

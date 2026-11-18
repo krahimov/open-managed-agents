@@ -137,6 +137,13 @@ export interface SessionRegistryDeps {
     },
   ): Promise<void>;
 
+  /** Delete the provider boxes labelled with a session, wherever they came
+   *  from — after a restart this process holds none of them in memory.
+   *  Called by `destroy()`; must not throw. Absent when the install has no
+   *  provider account to look in (no DAYTONA_API_KEY). See
+   *  lib/session-sandbox-cleanup.ts. */
+  deleteSessionBoxes?(tenantId: string, sessionId: string): Promise<void>;
+
   /** Sandbox workdir root, e.g. /app/data/sandboxes. Per-session dirs
    *  are joined under it. */
   sandboxWorkdirRoot: string;
@@ -272,22 +279,39 @@ export class SessionRegistry {
   }
 
   /**
-   * Destroy one realized session sandbox and evict it from the in-process
-   * cache. Used by DELETE /v1/sessions/:id. If the session was never
-   * realized, there is no sandbox to tear down.
+   * Destroy a session's sandboxes and evict it from the in-process cache.
+   * Used by DELETE /v1/sessions/:id, before the session row is deleted.
+   * The sandbox this process realized (if any) is torn down first; then
+   * every provider box still labelled with the session is deleted — after
+   * a restart that is all of them, and a session that ran a turn since the
+   * restart also left its pre-restart box behind.
    */
   async destroy(sessionId: string): Promise<void> {
     const p = this.map.get(sessionId);
     this.mountedFiles.delete(sessionId);
-    if (!p) return;
-    this.map.delete(sessionId);
+    if (p) {
+      this.map.delete(sessionId);
+      try {
+        const entry = await p;
+        if (entry.sandbox.destroy) await entry.sandbox.destroy();
+      } catch (err) {
+        log.warn(
+          { err, op: "session_registry.destroy_failed", session_id: sessionId },
+          "session sandbox destroy failed",
+        );
+      }
+    }
+    if (!this.deps.deleteSessionBoxes) return;
     try {
-      const entry = await p;
-      if (entry.sandbox.destroy) await entry.sandbox.destroy();
+      const row = await this.deps.sql
+        .prepare(`SELECT tenant_id FROM sessions WHERE id = ?`)
+        .bind(sessionId)
+        .first<{ tenant_id: string }>();
+      if (row) await this.deps.deleteSessionBoxes(row.tenant_id, sessionId);
     } catch (err) {
       log.warn(
-        { err, op: "session_registry.destroy_failed", session_id: sessionId },
-        "session sandbox destroy failed",
+        { err, op: "session_registry.delete_boxes_failed", session_id: sessionId },
+        "session sandbox lookup failed; the sandbox sweeper will retry",
       );
     }
   }

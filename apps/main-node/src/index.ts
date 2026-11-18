@@ -17,9 +17,10 @@ import { createSandboxBrowserHarness } from "@open-managed-agents/browser-harnes
 import { NodeAgentMachineStore } from "./lib/agent-machine-store.js";
 import { agentComputerOutputsAdapter } from "./lib/agent-computer-outputs.js";
 import { computerBackupExecutor } from "./lib/agent-computer-backup.js";
-import { agentComputerSpec, agentComputerEnabled } from "./lib/agent-computer-config.js";
+import { agentComputerSpec, agentComputerEnabled, agentComputerEnv } from "./lib/agent-computer-config.js";
 import { buildAgentComputerRoutes } from "./lib/agent-computer-routes.js";
 import { createAgentComputerCleanup } from "./lib/agent-computer-cleanup.js";
+import { createSessionSandboxCleanup } from "./lib/session-sandbox-cleanup.js";
 import { resolveDeploymentIdentity } from "./lib/deployment-identity.js";
 import { SandboxSweeper, sandboxSweepConfigFromEnv, sandboxSweepCronFromEnv, sandboxSweepSqlLookups } from "./lib/sandbox-sweeper.js";
 
@@ -770,6 +771,16 @@ await machineStore.ensureSchema();
 // boxes it can attribute to this deployment (lib/deployment-identity.ts).
 const deploymentIdentity = await resolveDeploymentIdentity({ sql, dialect });
 const sandboxSweepLookups = sandboxSweepSqlLookups(sql);
+// Account-wide box listing for cleanup (session delete, orphan sweep): only
+// when this install can reach a Daytona account.
+const providerBoxInventory = process.env.DAYTONA_API_KEY
+  ? await import("@open-managed-agents/sandbox/adapters/daytona-inventory").then(
+      ({ DaytonaBoxInventory }) => new DaytonaBoxInventory({ apiKey: process.env.DAYTONA_API_KEY, apiUrl: process.env.DAYTONA_API_URL }),
+    )
+  : null;
+const sessionSandboxCleanup = providerBoxInventory
+  ? createSessionSandboxCleanup({ inventory: providerBoxInventory, deploymentId: deploymentIdentity.id })
+  : null;
 const agentMachines = new AgentMachineManager({
   store: machineStore,
   tickIntervalMs: 0,
@@ -974,6 +985,7 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
   sandboxOrchestrator,
   newEventLog,
   buildSandbox,
+  ...(sessionSandboxCleanup ? { deleteSessionBoxes: sessionSandboxCleanup.onSessionDeleted } : {}),
   sandboxWorkdirRoot: process.env.SANDBOX_WORKDIR ?? "./data/sandboxes",
   sqlDialect: dialect,
   runOutcome: createNodeOutcomeRunner({
@@ -1430,6 +1442,8 @@ const sessionWorkQueue = new NodeSessionWorkQueue({
         // The queue guarantees exclusive ownership of the session, so a
         // leftover running turn marker is an orphan of a dead attempt.
         recoverOrphans: true,
+        // Client answers queued behind this one join its turn.
+        takeQueuedClientResults: ctx.takeQueuedClientResults,
       });
       turnSettled = true;
     } finally {
@@ -1879,17 +1893,28 @@ v1.use("*", async (c, next) => {
   await next();
 });
 
+// Support and spec are decided per agent from its default environment, so an
+// environment with an agent-scope sandbox gives a computer before the first
+// session even when the server env sets no SANDBOX_SCOPE.
+async function agentComputerEnvFor(tenantId: string, agentId: string) {
+  const agent = await agentsService.get({ tenantId, agentId });
+  if (!agent) throw new Error('Agent not found');
+  return agentComputerEnv(process.env, agent, async (environmentId) => {
+    const environment = await environmentsService.get({ tenantId, environmentId });
+    return environment ? toEnvironmentConfig(environment) : null;
+  });
+}
+
 v1.route("/agents", buildAgentComputerRoutes({
   machines: agentMachines,
-  supported: agentComputerEnabled(process.env),
+  supported: async (tenantId, agentId) => {
+    const env = await agentComputerEnvFor(tenantId, agentId);
+    return !!env && agentComputerEnabled(env);
+  },
   spec: async (tenantId, agentId) => {
-    const agent = await agentsService.get({ tenantId, agentId });
-    if (!agent) throw new Error('Agent not found');
-    const environmentId = agent.metadata?.default_environment_id;
-    const environment = typeof environmentId === 'string'
-      ? await environmentsService.get({ tenantId, environmentId }) : null;
-    if (typeof environmentId === 'string' && !environment) throw new Error('Agent environment not found');
-    return agentComputerSpec(buildSandboxEnvForEnvironment(process.env, environment ? toEnvironmentConfig(environment) : null));
+    const env = await agentComputerEnvFor(tenantId, agentId);
+    if (!env) throw new Error('Agent environment not found');
+    return agentComputerSpec(env);
   },
   agentExists: async (tenantId, agentId) => !!await agentsService.get({ tenantId, agentId }).catch(() => null),
   desktopTicket: (tenantId, agentId) => desktopGateway.issue(tenantId, agentId),
@@ -4077,11 +4102,10 @@ const ambientDispatcher = new NodeAmbientDispatcher({
 // Orphan-sandbox sweep: only when this install can reach a Daytona account,
 // and never when the operator switched it off (SANDBOX_SWEEP_CRON=off).
 let sandboxSweeper: SandboxSweeper | null = null;
-if (process.env.DAYTONA_API_KEY && sandboxSweepCronFromEnv(process.env)) {
-  const { DaytonaBoxInventory } = await import("@open-managed-agents/sandbox/adapters/daytona-inventory");
+if (providerBoxInventory && sandboxSweepCronFromEnv(process.env)) {
   const sweepConfig = sandboxSweepConfigFromEnv(process.env);
   sandboxSweeper = new SandboxSweeper({
-    inventory: new DaytonaBoxInventory({ apiKey: process.env.DAYTONA_API_KEY, apiUrl: process.env.DAYTONA_API_URL }),
+    inventory: providerBoxInventory,
     listMachines: () => machineStore.list(),
     destroyMachine: (tenantId, agentId) => agentMachines.destroy(tenantId, agentId, { reason: "agent_missing" }),
     ...sandboxSweepLookups,

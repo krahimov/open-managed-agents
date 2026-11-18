@@ -36,6 +36,15 @@
 //   A harness failure is NOT retried (status='failed'): the machine has
 //   already surfaced session.error and the client decides.
 //
+// Client answers a client-answer turn takes along (takeQueuedClientResults)
+// stay pending until the machine is about to record one; its claim then
+// flips the row pending → taken (locked_by = the head item's id) in one
+// conditional UPDATE, so a user.interrupt either cancels it first (and it
+// never runs) or finds it taken (it is in the log; neither cancelled nor
+// listed as pending). Taken rows follow their head: done with it; pending
+// again when it fails (they run alone and keep its outcome); re-taken by
+// the head's next claim after a lost lease.
+//
 // A periodic sweep (start()) reclaims stale leases across all sessions and
 // wakes any session with runnable work, so recovery doesn't depend on a
 // process restart or a new incoming event.
@@ -45,7 +54,11 @@ import type { SqlClient } from "@open-managed-agents/sql-client";
 import type { SessionEvent } from "@open-managed-agents/shared";
 import { generateEventId } from "@open-managed-agents/shared";
 import type { AppendGuard } from "@open-managed-agents/event-log/sql";
-import type { TurnAbortReason, TurnInputEvent } from "@open-managed-agents/session-runtime";
+import type {
+  QueuedClientResult,
+  TurnAbortReason,
+  TurnInputEvent,
+} from "@open-managed-agents/session-runtime";
 import { isTurnLeaseLost } from "@open-managed-agents/session-runtime";
 import { getLogger } from "@open-managed-agents/observability";
 
@@ -70,6 +83,13 @@ export interface NodeSessionRunContext {
   signal: AbortSignal;
   /** Fence for event-log writes made on behalf of this claim. */
   guard: AppendGuard;
+  /** Client answers queued right behind a client-answer item, for the
+   *  machine to apply in the same turn (TurnOptions.takeQueuedClientResults).
+   *  Each carries a claim the machine calls right before recording it (see
+   *  the header). Claimed rows are settled with this item's when it
+   *  completes; on failure they go back to pending and run alone (an
+   *  already-promoted one finds its turn's outcome and acknowledges it). */
+  takeQueuedClientResults(): Promise<QueuedClientResult[]>;
 }
 
 export interface PendingWorkRow {
@@ -101,6 +121,12 @@ export interface NodeSessionWorkQueueDeps {
    *  reconcile the session row here. */
   onAbandoned?(item: NodeSessionWorkItem, reason: "dead" | "cancelled"): Promise<void> | void;
 }
+
+/** Queue inputs a client-answer turn can take along (see takeQueuedClientResults). */
+const CLIENT_RESULT_TYPES = new Set(["user.tool_confirmation", "user.custom_tool_result"]);
+
+/** Most queued answers one take hands out. */
+const MAX_TAKEN_PER_CALL = 100;
 
 const ITEM_COLUMNS =
   "id, tenant_id, session_id, agent_id, event_id, event_json, attempts, lease_epoch, pending_seq, status";
@@ -426,8 +452,13 @@ export class NodeSessionWorkQueue {
       const controller = new AbortController();
       this.running.set(sessionId, controller);
       const heartbeat = this.startHeartbeat(item, controller);
+      const handedOut = new Set<string>();
       try {
-        await this.deps.run(item, { signal: controller.signal, guard: this.appendGuardFor(item) });
+        await this.deps.run(item, {
+          signal: controller.signal,
+          guard: this.appendGuardFor(item),
+          takeQueuedClientResults: () => this.takeQueuedClientResults(item, handedOut),
+        });
         heartbeat.stop();
         if (!(await this.markDone(item))) {
           log.warn(
@@ -436,6 +467,10 @@ export class NodeSessionWorkQueue {
           );
           return;
         }
+        // Best effort: a row left taken is settled by the next sweep.
+        await this.settleTaken(item, "done").catch((err) =>
+          log.warn({ err, op: "node_session_work_queue.taken_done_failed", session_id: sessionId, work_id: item.id }, "settling taken-along rows failed"),
+        );
       } catch (err) {
         heartbeat.stop();
         if (isTurnLeaseLost(err) || isLeaseAbort(controller.signal)) {
@@ -452,6 +487,10 @@ export class NodeSessionWorkQueue {
           "session work item failed",
         );
         if (await this.markFailed(item, err)) {
+          // Before the next claim: they must not be overtaken by later input.
+          await this.settleTaken(item, "pending").catch((settleErr) =>
+            log.warn({ err: settleErr, op: "node_session_work_queue.taken_release_failed", session_id: sessionId, work_id: item.id }, "releasing taken-along rows failed"),
+          );
           await this.deps.onError?.(item, err);
         }
       } finally {
@@ -459,6 +498,84 @@ export class NodeSessionWorkQueue {
         if (this.running.get(sessionId) === controller) this.running.delete(sessionId);
       }
     }
+  }
+
+  /**
+   * Pending client answers directly behind `item` on its thread, oldest
+   * first, stopping at the first other input (a later user.message must
+   * not be overtaken), plus the ones an earlier claim of `item` took (a
+   * lost lease: the resumed turn re-applies them). Rows already handed out
+   * in this claim are skipped. Handing out doesn't change a row: each
+   * answer's claim does, right before the machine records it.
+   */
+  private async takeQueuedClientResults(
+    item: NodeSessionWorkItem,
+    handedOut: Set<string>,
+  ): Promise<QueuedClientResult[]> {
+    if (!CLIENT_RESULT_TYPES.has(item.event.type)) return [];
+    const rows = await this.deps.sql
+      .prepare(
+        `SELECT id, event_json, pending_seq
+           FROM session_work_items
+          WHERE session_id = ? AND (status = 'pending' OR (status = 'taken' AND locked_by = ?))
+          ORDER BY COALESCE(pending_seq, 0) ASC, created_at ASC, id ASC
+          LIMIT ?`,
+      )
+      .bind(item.sessionId, item.id, handedOut.size + MAX_TAKEN_PER_CALL)
+      .all<{ id: string; event_json: string; pending_seq: number | null }>();
+    const thread = threadOf(item.event);
+    const out: QueuedClientResult[] = [];
+    for (const row of rows.results ?? []) {
+      if (handedOut.has(row.id)) continue;
+      let event: TurnInputEvent;
+      try {
+        event = JSON.parse(row.event_json) as TurnInputEvent;
+      } catch {
+        break;
+      }
+      if (!CLIENT_RESULT_TYPES.has(event.type) || threadOf(event) !== thread) break;
+      handedOut.add(row.id);
+      out.push({
+        event: event as QueuedClientResult["event"],
+        pendingSeq: Number(row.pending_seq ?? 0),
+        claim: () => this.claimTaken(item, row.id),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Commit a handed-out answer to `item`'s turn: pending → taken, only
+   * while this claim still holds `item`'s lease. One conditional UPDATE, so
+   * it and requestCancel can't both win. False: cancelled meanwhile (or the
+   * lease is gone — the next owner takes it again).
+   */
+  private async claimTaken(item: NodeSessionWorkItem, rowId: string): Promise<boolean> {
+    const res = await this.deps.sql
+      .prepare(
+        `UPDATE session_work_items
+            SET status='taken', locked_by=?, updated_at=?
+          WHERE id = ? AND (status='pending' OR (status='taken' AND locked_by=?))
+            AND EXISTS (
+              SELECT 1 FROM session_work_items h
+               WHERE h.id = ? AND h.lease_epoch = ? AND h.status = 'running')`,
+      )
+      .bind(item.id, Date.now(), rowId, item.id, item.id, item.leaseEpoch)
+      .run();
+    return (res.meta.changes ?? 0) > 0;
+  }
+
+  /** Settle the rows `item`'s turn took: done with it, or pending again to run alone. */
+  private async settleTaken(item: NodeSessionWorkItem, to: "done" | "pending"): Promise<void> {
+    const now = Date.now();
+    await this.deps.sql
+      .prepare(
+        `UPDATE session_work_items
+            SET status=?, locked_by=NULL, updated_at=?, processed_at=?
+          WHERE status='taken' AND locked_by = ?`,
+      )
+      .bind(to, now, to === "done" ? now : null, item.id)
+      .run();
   }
 
   private startHeartbeat(
@@ -508,6 +625,9 @@ export class NodeSessionWorkQueue {
    *   - interrupted rows whose owner died → cancelled (the user asked to stop)
    *   - rows at the attempt cap → dead
    *   - the rest → pending (re-run by the next claim)
+   *   - taken rows whose head no longer runs nor waits to: pending again
+   *     when it failed, else done (it was cancelled / dead-lettered, or
+   *     settling them after it completed failed)
    */
   private async reclaimStale(sessionId: string | null): Promise<void> {
     const now = Date.now();
@@ -546,6 +666,25 @@ export class NodeSessionWorkQueue {
           WHERE status='running' AND locked_at IS NOT NULL AND locked_at < ?${scope}`,
       )
       .bind(...scoped(now, staleBefore))
+      .run();
+    const headIs = (statuses: string) =>
+      `EXISTS (SELECT 1 FROM session_work_items h
+                WHERE h.id = session_work_items.locked_by AND h.status IN ${statuses})`;
+    await this.deps.sql
+      .prepare(
+        `UPDATE session_work_items
+            SET status='pending', locked_by=NULL, updated_at=?
+          WHERE status='taken' AND ${headIs("('failed')")}${scope}`,
+      )
+      .bind(...scoped(now))
+      .run();
+    await this.deps.sql
+      .prepare(
+        `UPDATE session_work_items
+            SET status='done', locked_by=NULL, updated_at=?, processed_at=?
+          WHERE status='taken' AND NOT ${headIs("('pending', 'running')")}${scope}`,
+      )
+      .bind(...scoped(now, now))
       .run();
 
     for (const row of cancelled.results ?? []) await this.abandon(toWorkItem(row), "cancelled");
@@ -752,6 +891,10 @@ function isUniqueViolation(err: unknown): boolean {
   const msg = typeof e.message === "string" ? e.message : "";
   if (/UNIQUE constraint failed|duplicate key value violates unique constraint/i.test(msg)) return true;
   return e.cause !== undefined && e.cause !== err ? isUniqueViolation(e.cause) : false;
+}
+
+function threadOf(event: TurnInputEvent): string {
+  return (event as { session_thread_id?: string }).session_thread_id ?? "sthr_primary";
 }
 
 function isLeaseAbort(signal: AbortSignal): boolean {

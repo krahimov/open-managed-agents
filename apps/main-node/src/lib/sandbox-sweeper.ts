@@ -37,7 +37,8 @@ const DAY_MS = 24 * 60 * 60_000;
 export interface SandboxSweepConfig {
   /** Log what would be deleted without deleting anything. */
   dryRun: boolean;
-  /** A session idle or terminated this long no longer needs its box. */
+  /** A session idle this long no longer needs its box (a terminated one
+   *  goes sooner: TERMINATED_SESSION_GRACE_MS). */
   sessionMaxAgeMs: number;
   /** Boxes younger than this are never judged (creation in progress). */
   minBoxAgeMs: number;
