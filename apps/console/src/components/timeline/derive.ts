@@ -1,9 +1,10 @@
+import { readComposioCall } from "../../lib/composio-calls";
 import { parseSearchMcpTools } from "../../lib/deferred-mcp";
 import { formatCompact } from "../../lib/format";
 import type { Event } from "../../lib/events";
 import { buildToolCallIndex, isErrorResult } from "../../lib/tool-status";
 import { eventTime, formatElapsed, handoffKey, handoffKeyOf, readToolUse } from "../sessions/model";
-import { serverInfo } from "../sessions/tools";
+import { presentTool, serverInfo } from "../sessions/tools";
 import type { Span, Turn, TurnTriggerKind } from "./types";
 
 /**
@@ -186,17 +187,21 @@ export function deriveSpans(
       const handoff = handoffKey(call.name);
       const search = call.flavor === "tool" ? parseSearchMcpTools(call.name, call.input) : null;
       const where = search?.server ? serverInfo(search.server).label : null;
+      // A Composio router call reads as the app call it ran, as in the conversation.
+      const composio = readComposioCall(call.name, call.input) ? presentTool(call) : null;
       pushSpan({
         key: `${e.type === "agent.mcp_tool_use" ? "mcp" : "tool"}-${e.id ?? i}`,
         // A deferred MCP call (call_mcp_tool) reads as the app call it is.
         family: call.flavor === "mcp" ? "mcp" : call.flavor === "custom" ? "custom_tool" : "tool",
-        source: call.flavor === "mcp" ? serverInfo(call.server).label : undefined,
+        source: composio ? composio.source : call.flavor === "mcp" ? serverInfo(call.server).label : undefined,
         label: handoff
           ? `Asked ${handoffNames.get(handoff) ?? "another agent"}`
           : search
             ? `Searched ${where ?? "all"} tools for “${search.query}”`
-            : call.name,
-        plain: !!handoff || !!search || undefined,
+            : composio
+              ? composio.title
+              : call.name,
+        plain: !!handoff || !!search || !!composio || undefined,
         detail: denied
           ? "denied"
           : result

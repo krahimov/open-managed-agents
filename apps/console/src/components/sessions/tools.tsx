@@ -168,6 +168,14 @@ export interface ToolPresentation {
   kind: "tool" | "mcp";
   /** The title is words ("Searched Linear tools"), not a tool's name: set it in the text face. */
   plain?: boolean;
+  /** The tool an access policy actually gates, when the row names something else
+   *  (a Composio router call shown as the app action it runs). */
+  gate?: string;
+}
+
+/** What an approval card says is "set to ask first": the gated tool itself. */
+export function gateLabel(p: ToolPresentation): string {
+  return p.gate ?? (p.source ? `${p.source} · ${p.title}` : p.title);
 }
 
 /** SDK harnesses name MCP tools `mcp__<server>__<tool>`. */
@@ -212,21 +220,29 @@ const appLabels = (toolkits: string[]): string => Array.from(new Set(toolkits.ma
  * "HubSpot · Search deals" with HubSpot's logo, not
  * "Composio · COMPOSIO_MULTI_EXECUTE_TOOL". The body still shows the input as sent.
  */
-function presentComposio(c: ComposioCall, input: Record<string, unknown>): ToolPresentation {
+function presentComposio(c: ComposioCall, input: Record<string, unknown>, meta: string): ToolPresentation {
+  const gate = `Composio · ${meta}`;
   if (c.kind === "execute") {
     const [first] = c.actions;
     const app = serverInfo(first.toolkit);
     const toolkits = c.actions.map((a) => a.toolkit);
-    const actions = Array.from(new Set(c.actions.map((a) => a.action)));
-    const title = actions.length === 1 ? actions[0] : actions.join(", ");
+    const counts = new Map<string, number>();
+    for (const a of c.actions) counts.set(a.action, (counts.get(a.action) ?? 0) + 1);
+    const title = Array.from(counts.entries())
+      .map(([action, n]) => (n > 1 ? `${action} ×${n}` : action))
+      .join(", ");
+    const n = c.actions.length;
+    const firstWords = first.action[0].toLowerCase() + first.action.slice(1);
+    const preview = previewOf(first.action, first.arguments);
     return {
       icon: app.icon,
       source: appLabels(toolkits),
       title,
-      preview: previewOf(first.action, first.arguments),
-      verb: c.actions.length === 1 ? `use ${app.label} (${first.action.toLowerCase()})` : `use ${appLabels(toolkits)}`,
+      preview: preview && n > 1 ? `${preview} +${n - 1} more` : preview,
+      verb: n === 1 ? `use ${app.label} (${firstWords})` : `use ${appLabels(toolkits)} (${n} actions)`,
       kind: "mcp",
       plain: true,
+      gate,
     };
   }
   if (c.kind === "search") {
@@ -238,6 +254,7 @@ function presentComposio(c: ComposioCall, input: Record<string, unknown>): ToolP
       verb: where ? `search ${where}'s tools` : "search its app tools",
       kind: "tool",
       plain: true,
+      gate,
     };
   }
   if (c.kind === "connections") {
@@ -248,6 +265,7 @@ function presentComposio(c: ComposioCall, input: Record<string, unknown>): ToolP
       verb: `check its ${where} connection`,
       kind: "tool",
       plain: true,
+      gate,
     };
   }
   if (c.kind === "schemas") {
@@ -258,6 +276,7 @@ function presentComposio(c: ComposioCall, input: Record<string, unknown>): ToolP
       verb: "read its tools' details",
       kind: "tool",
       plain: true,
+      gate,
     };
   }
   const code = text(input.code_to_execute) ?? text(input.code) ?? text(input.command);
@@ -269,12 +288,13 @@ function presentComposio(c: ComposioCall, input: Record<string, unknown>): ToolP
     verb: "run code in Composio's workbench",
     kind: "tool",
     plain: true,
+    gate,
   };
 }
 
 export function presentTool(call: Pick<ToolCall, "name" | "server" | "flavor" | "input">): ToolPresentation {
   const composio = readComposioCall(call.name, call.input);
-  if (composio) return presentComposio(composio, call.input);
+  if (composio) return presentComposio(composio, call.input, (splitMcpName(call.name)?.tool ?? call.name).toUpperCase());
   const split = splitMcpName(call.name);
   if (call.flavor === "mcp" || split) {
     const server = serverInfo(call.server ?? split?.server);

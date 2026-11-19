@@ -120,11 +120,13 @@ export function readComposioCall(name: unknown, input: unknown): ComposioCall | 
 
   if (meta === "COMPOSIO_MULTI_EXECUTE_TOOL" || meta === "COMPOSIO_EXECUTE_TOOL") {
     const entries = meta === "COMPOSIO_EXECUTE_TOOL" ? [inp] : listOf(inp.tools);
-    const actions = entries
-      .filter(isRecord)
+    const records = entries.filter(isRecord);
+    const actions = records
       .map((t) => parseToolSlug(t.tool_slug ?? t.slug ?? t.action, t.arguments ?? t.params ?? t.input))
       .filter((a): a is ComposioAction => a !== null);
-    return actions.length ? { kind: "execute", actions } : null;
+    // Every entry must be read, or the row (and an approval headline) would
+    // name less than the batch does: such a call stays the plain call it was.
+    return actions.length && actions.length === entries.length ? { kind: "execute", actions } : null;
   }
   if (meta === "COMPOSIO_SEARCH_TOOLS") {
     const queries: string[] = [];
@@ -135,7 +137,8 @@ export function readComposioCall(name: unknown, input: unknown): ComposioCall | 
       if (isRecord(q)) for (const k of toolkitsOf(q.toolkits ?? q.toolkit)) if (!toolkits.includes(k)) toolkits.push(k);
     }
     for (const k of toolkitsOf(inp.toolkits)) if (!toolkits.includes(k)) toolkits.push(k);
-    return { kind: "search", queries, toolkits };
+    // Nothing to say yet (a call still streaming in): leave it as it is.
+    return queries.length || toolkits.length ? { kind: "search", queries, toolkits } : null;
   }
   if (meta === "COMPOSIO_MANAGE_CONNECTIONS" || meta === "COMPOSIO_INITIATE_CONNECTION") {
     return { kind: "connections", toolkits: toolkitsOf(inp.toolkits ?? inp.toolkit) };

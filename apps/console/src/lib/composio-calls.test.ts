@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { presentTool } from "@/components/sessions/tools";
+import { gateLabel, presentTool } from "@/components/sessions/tools";
 
 import { actionWords, parseToolSlug, readComposioCall } from "./composio-calls";
 
@@ -41,6 +41,16 @@ describe("reading a Composio router call", () => {
   it("reads tools sent as a JSON string", () => {
     const call = readComposioCall("COMPOSIO_MULTI_EXECUTE_TOOL", { tools: JSON.stringify([{ tool_slug: "LINEAR_GET_ISSUE", arguments: {} }]) });
     expect(call).toMatchObject({ kind: "execute", actions: [{ toolkit: "linear", action: "Get issue" }] });
+  });
+
+  it("leaves a batch it can't fully read alone, so a row never names less than it runs", () => {
+    const input = { tools: [{ tool_slug: "HUBSPOT_SEARCH_DEALS" }, { tool_slug: "gmail.send_email" }] };
+    expect(readComposioCall("COMPOSIO_MULTI_EXECUTE_TOOL", input)).toBeNull();
+    expect(readComposioCall("COMPOSIO_MULTI_EXECUTE_TOOL", { tools: [{ tool_slug: "SLACK_SEND_MESSAGE" }, "junk"] })).toBeNull();
+  });
+
+  it("leaves a search with nothing in it yet alone", () => {
+    expect(readComposioCall("COMPOSIO_SEARCH_TOOLS", {})).toBeNull();
   });
 
   it("leaves an execute call that names no action alone", () => {
@@ -106,5 +116,34 @@ describe("a Composio call's row", () => {
   it("never shows the mcp__ prefix for a plain MCP call either", () => {
     const p = presentTool({ name: "mcp__linear__get_issue", server: "linear", flavor: "mcp", input: { id: "LHL-1" } });
     expect(p).toMatchObject({ source: "Linear", title: "get_issue" });
+  });
+
+  it("counts a repeated action, and keeps acronyms in the verb", () => {
+    const five = presentTool({
+      name: "COMPOSIO_MULTI_EXECUTE_TOOL",
+      server: "composio",
+      flavor: "mcp",
+      input: { tools: Array.from({ length: 5 }, (_, i) => ({ tool_slug: "SLACK_SEND_MESSAGE", arguments: { text: `m${i}` } })) },
+    });
+    expect(five).toMatchObject({ title: "Send message ×5", preview: "m0 +4 more", verb: "use Slack (5 actions)" });
+    const crm = presentTool({
+      name: "COMPOSIO_MULTI_EXECUTE_TOOL",
+      server: "composio",
+      flavor: "mcp",
+      input: { tools: [{ tool_slug: "HUBSPOT_SEARCH_CRM_OBJECTS_BY_CRITERIA", arguments: {} }] },
+    });
+    expect(crm.verb).toBe("use HubSpot (search CRM objects by criteria)");
+  });
+
+  it("tells an approver which tool is really set to ask first", () => {
+    const p = presentTool({
+      name: "mcp__composio__COMPOSIO_MULTI_EXECUTE_TOOL",
+      server: "composio",
+      flavor: "mcp",
+      input: { tools: [{ tool_slug: "SLACK_SEND_MESSAGE", arguments: {} }] },
+    });
+    expect(gateLabel(p)).toBe("Composio · COMPOSIO_MULTI_EXECUTE_TOOL");
+    expect(gateLabel(presentTool({ name: "COMPOSIO_REMOTE_WORKBENCH", flavor: "tool", input: {} }))).toBe("Composio · COMPOSIO_REMOTE_WORKBENCH");
+    expect(gateLabel(presentTool({ name: "bash", flavor: "tool", input: { command: "ls" } }))).toBe("bash");
   });
 });
