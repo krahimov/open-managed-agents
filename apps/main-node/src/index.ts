@@ -1896,11 +1896,16 @@ v1.route("/agents", buildAgentComputerRoutes({
   screenshot: async (tenantId, agentId) => {
     const row = await agentMachines.get(tenantId, agentId);
     if (!row) throw new Error("Computer is not running");
-    if (row.config.desktop) return withDesktop(tenantId, agentId, async desktop => {
-      const shot = await desktop.screenshot.takeFullScreen();
+    if (row.config.desktop) {
+      // A picture only reads the screen: it takes no lifecycle lock, so the
+      // agent's own computer_* calls never queue behind a viewer's poll, and
+      // it does not count as activity that keeps the computer awake.
+      const box = await agentMachines.getBox(tenantId, agentId);
+      if (!box?.sb.computerUse) throw new Error("Desktop is not running");
+      const shot = await box.sb.computerUse.screenshot.takeFullScreen();
       if (!shot.screenshot) throw new Error('Daytona returned an empty desktop screenshot');
       return Buffer.from(shot.screenshot.replace(/^data:image\/png;base64,/, ''), 'base64');
-    });
+    }
     return agentMachines.withLock(row.id, async () => {
     const box = await agentMachines.getBox(tenantId, agentId);
     if (!box) throw new Error("Computer is not running");

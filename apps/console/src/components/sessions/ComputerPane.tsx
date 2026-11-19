@@ -34,13 +34,21 @@ import { Tip } from "../Tip";
  * cannot connect, it is a picture retaken every 2 seconds while the session
  * runs. Either way it holds nothing while it cannot be seen: the desktop is
  * connected (and counted as a viewer, which keeps the computer from
- * idle-stopping) only while this pane is mounted and the tab is in front.
+ * idle-stopping) only while this pane is mounted, the tab is in front, and
+ * there is something to watch: the session is running, ran a moment ago,
+ * the person has control, or they asked to see it live. A session at rest
+ * does not keep the computer awake just by being on screen.
  */
 
 /** How often the picture is retaken while the session runs. */
 export const SCREENSHOT_POLL_MS = 2_000;
 /** …and after a picture could not be taken. */
 const SCREENSHOT_RETRY_MS = 10_000;
+/** The live view stays connected this long after the session comes to rest,
+ *  so its last moves can be seen; then it pauses. */
+export const LIVE_GRACE_MS = 2 * 60_000;
+/** A live view resumed by hand on a session at rest holds this long. */
+export const LIVE_HOLD_MS = 10 * 60_000;
 
 export interface ComputerPaneProps {
   agentId: string;
@@ -236,6 +244,26 @@ function RunningComputer({
   const [attempt, setAttempt] = useState(0);
   const live = !!machine.desktopEnabled && desktop.state !== "failed";
 
+  // A session at rest keeps the live view only for a while: after its turn
+  // ends (LIVE_GRACE_MS) or after "Resume live view" (LIVE_HOLD_MS). The
+  // connection counts as a viewer, and a viewer keeps the computer awake.
+  const [awake, setAwake] = useState<{ ms: number } | null>(null);
+  // Set while rendering, not in an effect: the view must not drop for one
+  // commit when the turn ends.
+  const [wasRunning, setWasRunning] = useState(sessionRunning);
+  if (wasRunning !== sessionRunning) {
+    setWasRunning(sessionRunning);
+    if (!sessionRunning) setAwake({ ms: LIVE_GRACE_MS });
+  }
+  useEffect(() => {
+    if (!awake) return;
+    const timer = setTimeout(() => setAwake(null), awake.ms);
+    return () => clearTimeout(timer);
+  }, [awake]);
+  const atRest = !sessionRunning && !controlling && !awake;
+  const connect = active && !atRest;
+  const shownState: DesktopStatus = connect ? desktop.state : "connecting";
+
   // Control is taken on purpose, for one connection: a reconnect or a fall
   // back to pictures gives it back.
   useEffect(() => {
@@ -259,17 +287,26 @@ function RunningComputer({
           >
             <DesktopScreen
               agentId={agentId}
-              active={active}
+              active={connect}
               viewOnly={!controlling}
               attempt={attempt}
               onStatusChange={(state, reason) => setDesktop({ state, reason })}
               className="absolute inset-0 h-full w-full"
             />
-            {active && desktop.state !== "connected" && (
+            {connect && shownState !== "connected" && (
               <div aria-hidden="true" className="pointer-events-none absolute inset-0 flex items-center justify-center">
                 <span className="rounded-full bg-bg-raised px-3 py-1 text-xs text-fg-muted shadow-[var(--shadow-xs)]">
-                  {desktop.state === "reconnecting" ? "Reconnecting…" : "Connecting…"}
+                  {shownState === "reconnecting" ? "Reconnecting…" : "Connecting…"}
                 </span>
+              </div>
+            )}
+            {active && atRest && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
+                <MonitorIcon className="size-6 text-fg-faint" aria-hidden="true" />
+                <Button variant="outline" size="sm" onClick={() => setAwake({ ms: LIVE_HOLD_MS })}>
+                  <PlayIcon data-icon="inline-start" />
+                  Resume live view
+                </Button>
               </div>
             )}
           </div>
@@ -277,19 +314,26 @@ function RunningComputer({
             <p role="status" className="min-w-0 flex-1 text-xs text-fg-subtle">
               {!active
                 ? "Paused while this tab is in the background."
-                : controlling
-                  ? "You have control. Your keys and clicks go to the agent's computer."
-                  : inUse && desktop.state === "connected"
-                    ? "Live. The agent is using its computer; you are watching."
-                    : LIVE_WORDS[desktop.state]}
+                : atRest
+                  ? "Paused while the session is at rest, so the computer can go idle."
+                  : controlling
+                    ? "You have control. Your keys and clicks go to the agent's computer."
+                    : inUse && shownState === "connected"
+                      ? "Live. The agent is using its computer; you are watching."
+                      : LIVE_WORDS[shownState]}
             </p>
             <Button
               variant="outline"
               size="sm"
               aria-pressed={controlling}
               className={cn(controlling && "border-plum bg-plum-subtle text-fg hover:bg-plum-subtle")}
-              disabled={desktop.state !== "connected" || !active}
-              onClick={() => setControlling((v) => !v)}
+              disabled={shownState !== "connected" || !connect}
+              onClick={() => {
+                // Giving control back on a session at rest does not cut the
+                // view off at once.
+                if (controlling) setAwake({ ms: LIVE_GRACE_MS });
+                setControlling(!controlling);
+              }}
             >
               <MousePointerClickIcon data-icon="inline-start" />
               {controlling ? "Release control" : "Take control"}

@@ -5,7 +5,7 @@ import type { ComponentProps, ReactNode } from "react";
 
 import { ACTIVE_TENANT_KEY } from "../../lib/api";
 import { DesktopScreen, type DesktopStatus } from "../DesktopViewer";
-import { ComputerPane } from "./ComputerPane";
+import { ComputerPane, LIVE_GRACE_MS } from "./ComputerPane";
 
 vi.mock("../../lib/clerk-auth", () => ({
   getClerkBearerToken: vi.fn(async () => "console-session-token"),
@@ -173,6 +173,40 @@ describe("ComputerPane", () => {
     view.unmount();
     expect(last().disconnected).toBe(true);
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/stop"))).toBe(false);
+  });
+
+  it("does not connect to a session at rest until asked, so the computer can idle-stop", async () => {
+    renderPane({ sessionRunning: false });
+    expect(await screen.findByRole("status")).toHaveTextContent("Paused while the session is at rest");
+    await new Promise((r) => setTimeout(r, 50));
+    expect(vnc.list).toHaveLength(0);
+    expect(tickets).toBe(0);
+    expect(screen.getByRole("button", { name: "Take control" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume live view" }));
+    await waitFor(() => expect(vnc.list).toHaveLength(1));
+    fire(last(), "connect");
+    expect(screen.getByRole("status")).toHaveTextContent("Live. You are watching");
+  });
+
+  it("keeps the live view a while after the session comes to rest, then lets go", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const view = renderPane();
+      await waitFor(() => expect(vnc.list).toHaveLength(1));
+      fire(last(), "connect");
+
+      view.rerenderPane({ sessionRunning: false });
+      expect(last().disconnected).toBe(false);
+      act(() => {
+        vi.advanceTimersByTime(LIVE_GRACE_MS + 10);
+      });
+      expect(last().disconnected).toBe(true);
+      expect(screen.getByRole("status")).toHaveTextContent("Paused while the session is at rest");
+      expect(screen.getByRole("button", { name: "Resume live view" })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("gives control back when the connection drops", async () => {

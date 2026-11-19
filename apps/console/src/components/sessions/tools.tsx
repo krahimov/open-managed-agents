@@ -860,7 +860,21 @@ const glyphOf = (status: ToolCall["status"]): EventStatus | undefined => (status
 /** One tool or MCP call as a 40px row that opens to its body. */
 export function ToolCallCard({ call, defaultOpen }: { call: ToolCall; defaultOpen?: boolean }) {
   if (call.handoff) return <HandoffCard call={call} defaultOpen={defaultOpen} />;
+  return <PlainToolCallCard call={call} defaultOpen={defaultOpen} />;
+}
+
+function PlainToolCallCard({ call, defaultOpen }: { call: ToolCall; defaultOpen?: boolean }) {
   const p = presentTool(call);
+  // A call that came back with a picture (a screenshot) opens on it: the
+  // picture is what there is to see. In a live session the card is there
+  // before its result, so it opens when the picture arrives, once.
+  const hasImages = resultImages(call.result).length > 0;
+  const [open, setOpen] = useState(defaultOpen ?? hasImages);
+  const [sawImages, setSawImages] = useState(hasImages);
+  if (hasImages && !sawImages) {
+    setSawImages(true);
+    if (defaultOpen === undefined) setOpen(true);
+  }
   const meta =
     call.status === "waiting"
       ? "Waiting for the app's result"
@@ -878,9 +892,8 @@ export function ToolCallCard({ call, defaultOpen }: { call: ToolCall; defaultOpe
       subtitle={p.preview}
       status={glyphOf(call.status)}
       meta={meta}
-      // A call that came back with a picture (a screenshot) opens on it: the
-      // picture is what there is to see.
-      defaultOpen={defaultOpen ?? (resultImages(call.result).length > 0 || undefined)}
+      open={open}
+      onOpenChange={setOpen}
     >
       <ToolBody call={call} />
     </EventCard>

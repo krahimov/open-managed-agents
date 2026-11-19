@@ -281,6 +281,34 @@ describe("a screenshot", () => {
     expect(within(dialog).getByRole("img", { name: "Picture from browser_screenshot" })).toHaveAttribute("src", `data:image/png;base64,${png}`);
   });
 
+  it("opens on the picture when it arrives after the call, in a live session", () => {
+    const calling = [
+      ev({ type: "user.message", id: "u1", content: [{ type: "text", text: "what's on screen?" }] }),
+      ev({ type: "agent.tool_use", id: "s1", name: "browser_screenshot", input: {} }),
+    ];
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (events: Event[]) => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <View events={events} running />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    const view = render(tree(calling));
+    expect(screen.queryByRole("img", { name: "Picture from browser_screenshot" })).toBeNull();
+    view.rerender(
+      tree([
+        ...calling,
+        ev({
+          type: "agent.tool_result",
+          tool_use_id: "s1",
+          content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: png } }],
+        }),
+      ]),
+    );
+    expect(screen.getByRole("img", { name: "Picture from browser_screenshot" })).toHaveAttribute("src", `data:image/png;base64,${png}`);
+  });
+
   it("keeps the text that came with the picture, and names a desktop screenshot in words", () => {
     show([
       ev({ type: "user.message", id: "u1", content: [{ type: "text", text: "look" }] }),

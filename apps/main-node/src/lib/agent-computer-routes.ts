@@ -31,8 +31,29 @@ export function publicMachine(row: AgentMachineRow | null) {
   };
 }
 
+/**
+ * One picture of a computer serves every viewer for this long. The session
+ * page retakes it every 2 seconds per open tab; sharing it keeps several
+ * tabs from each taking their own, alongside the agent's own tool calls.
+ */
+export const SCREENSHOT_SHARE_MS = 1_500;
+
 export function buildAgentComputerRoutes(deps: AgentComputerRouteDeps) {
   const app = new Hono<{ Variables: { tenant_id: string; user_id?: string } }>();
+  const shots = new Map<string, { at: number; bytes: Promise<Uint8Array> }>();
+  const sharedScreenshot = (tenantId: string, agentId: string, row: AgentMachineRow) => {
+    const now = Date.now();
+    for (const [k, v] of shots) if (now - v.at >= SCREENSHOT_SHARE_MS) shots.delete(k);
+    const key = JSON.stringify([tenantId, agentId, row.id, row.generation]);
+    const hit = shots.get(key);
+    if (hit) return hit.bytes;
+    const bytes = deps.screenshot(tenantId, agentId);
+    const entry = { at: now, bytes };
+    shots.set(key, entry);
+    // A failed picture is not shared: the next viewer tries again.
+    bytes.catch(() => { if (shots.get(key) === entry) shots.delete(key); });
+    return bytes;
+  };
   app.use('/:id/machine/*', async (c, next) => {
     if (!await deps.agentExists(c.get('tenant_id'), c.req.param('id')!)) {
       return c.json({ error: 'Agent not found' }, 404);
@@ -74,8 +95,9 @@ export function buildAgentComputerRoutes(deps: AgentComputerRouteDeps) {
   app.get('/:id/machine/screenshot', async c => {
     const machine = await deps.machines.get(c.get('tenant_id'), c.req.param('id'));
     if (!machine || machine.state !== 'running') return c.json({ error: 'Computer is not running' }, 409);
-    if (!machine.browserEnabled) return c.json({ error: 'Browser is disabled on this computer' }, 409);
-    const bytes = await deps.screenshot(c.get('tenant_id'), c.req.param('id'));
+    // A desktop computer's picture is of its desktop; it needs no browser.
+    if (!machine.browserEnabled && !machine.config.desktop) return c.json({ error: 'This computer has no browser or desktop to show' }, 409);
+    const bytes = await sharedScreenshot(c.get('tenant_id'), c.req.param('id'), machine);
     return new Response(Buffer.from(bytes), { headers: { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' } });
   });
   return app;

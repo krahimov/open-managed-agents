@@ -12,9 +12,12 @@ describe("the computer's tools", () => {
     for (const name of ["browser_navigate", "browser_screenshot", "computer_click", "mcp__oma_platform__computer_screenshot", "Browser_Click"]) {
       expect(isComputerTool(name)).toBe(true);
     }
-    for (const name of ["bash", "browser", "web_fetch", "mcp__linear__create_issue", "my_browser_tool", undefined]) {
+    for (const name of ["bash", "browser", "web_fetch", "mcp__linear__create_issue", "my_browser_tool", "mcp__playwright__browser_navigate", undefined]) {
       expect(isComputerTool(name)).toBe(false);
     }
+    // Another server's browser is not the agent's computer.
+    expect(isComputerTool("browser_click", "playwright")).toBe(false);
+    expect(isComputerTool("browser_click", "oma_platform")).toBe(true);
   });
 
   it("count for the turn in progress only", () => {
@@ -25,6 +28,8 @@ describe("the computer's tools", () => {
     expect(turnUsesComputer(earlier)).toBe(true);
     expect(turnUsesComputer([...earlier, ev({ type: "user.message", id: "u2" }), ev({ type: "agent.tool_use", id: "c2", name: "bash", input: {} })])).toBe(false);
     expect(turnUsesComputer([ev({ type: "agent.mcp_tool_use", id: "m1", name: "computer_click", mcp_server_name: "oma_platform", input: {} })])).toBe(true);
+    expect(turnUsesComputer([ev({ type: "agent.mcp_tool_use", id: "m2", name: "browser_navigate", mcp_server_name: "playwright", input: {} })])).toBe(false);
+    expect(turnUsesComputer([ev({ type: "agent.tool_use", id: "m3", name: "mcp__playwright__browser_click", input: {} })])).toBe(false);
   });
 });
 

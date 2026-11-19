@@ -9,17 +9,23 @@ import { readToolUse } from "./model";
  *
  * An agent with a persistent computer works on it through two families of
  * tools: `browser_*` (Chromium over CDP) and `computer_*` (the desktop, by
- * pixel). SDK harnesses reach the same tools through an MCP server, so the
- * name may come as `mcp__<server>__browser_click`.
+ * pixel). SDK harnesses reach the same tools through the platform's own MCP
+ * server, so the name may come as `mcp__oma_platform__browser_click`. Any
+ * other server's `browser_*` tools (Playwright MCP, say) drive a browser of
+ * their own, not the agent's computer, and do not count.
  */
 
 const COMPUTER_TOOL = /^(browser|computer)_[a-z0-9_]+$/;
+/** The MCP servers that carry the computer's own tools. */
+const PLATFORM_SERVERS = new Set(["oma_platform", "oma_box"]);
 
-/** Whether a tool name is one of the computer's own tools. */
-export function isComputerTool(name: string | undefined): boolean {
+/** Whether a tool name (and the MCP server it came through, if any) is one of the computer's own tools. */
+export function isComputerTool(name: string | undefined, server?: string): boolean {
   if (!name) return false;
-  const bare = /^mcp__.+?__(.+)$/.exec(name)?.[1] ?? name;
-  return COMPUTER_TOOL.test(bare.toLowerCase());
+  const prefixed = /^mcp__(.+?)__(.+)$/.exec(name);
+  const via = prefixed?.[1] ?? server;
+  if (via && !PLATFORM_SERVERS.has(via.toLowerCase())) return false;
+  return COMPUTER_TOOL.test((prefixed?.[2] ?? name).toLowerCase());
 }
 
 const TOOL_USE = new Set(["agent.tool_use", "agent.mcp_tool_use", "agent.custom_tool_use"]);
@@ -33,7 +39,9 @@ export function turnUsesComputer(events: readonly Event[]): boolean {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
     if (e.type === "user.message") return false;
-    if (TOOL_USE.has(e.type) && isComputerTool(readToolUse(e).name)) return true;
+    if (!TOOL_USE.has(e.type)) continue;
+    const call = readToolUse(e);
+    if (isComputerTool(call.name, call.server)) return true;
   }
   return false;
 }
