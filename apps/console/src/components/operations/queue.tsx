@@ -13,7 +13,7 @@ import { RelativeTime } from "../RelativeTime";
 import { SectionCard } from "../SectionCard";
 import type { ToolCall } from "../sessions/model";
 import { NEEDS_YOU_CARD } from "../sessions/RequestParts";
-import { ProviderResponse, ToolInputPreview, presentTool } from "../sessions/tools";
+import { ProviderResponse, ToolInputPreview, gateLabel, presentTool } from "../sessions/tools";
 import { Tip } from "../Tip";
 import type { OperationActions } from "./actions";
 import {
@@ -151,7 +151,7 @@ function AccessNote({ actions }: { actions: OperationActions }) {
 export function ApprovalCard({ entry, actions }: { entry: ApprovalEntry; actions: OperationActions }) {
   const call: Pick<ToolCall, "name" | "flavor" | "input"> = { name: entry.name, flavor: "tool", input: entry.input };
   const tool = presentTool(call);
-  const toolLabel = tool.source ? `${tool.source} · ${tool.title}` : tool.title;
+  const toolLabel = gateLabel(tool);
   const allowing = actions.busy === `allow:${entry.key}`;
   const denying = actions.busy === `deny:${entry.key}`;
   const decide = (result: "allow" | "deny") =>

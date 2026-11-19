@@ -48,7 +48,7 @@ import { MessageAttachmentChips } from "./AttachmentChips";
 import type { SessionOperations } from "./hooks";
 import { formatElapsed, type Block, type Item, type ToolCall } from "./model";
 import { NEEDS_YOU_CARD } from "./RequestParts";
-import { presentTool, ProviderResponse, serverInfo, ThreadNav, ToolInputPreview, ToolRun } from "./tools";
+import { gateLabel, presentTool, ProviderResponse, serverInfo, ThreadNav, ToolInputPreview, ToolRun } from "./tools";
 import { TurnFiles } from "./TurnFiles";
 
 /**
@@ -821,7 +821,7 @@ function ApprovalCard({ call, agentName, sessionId }: { call: ToolCall; agentNam
     ref.current?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, []);
   const p = presentTool(call);
-  const toolLabel = p.source ? `${p.source} · ${p.title}` : p.title;
+  const toolLabel = gateLabel(p);
   const threadId = typeof call.use.session_thread_id === "string" ? call.use.session_thread_id : undefined;
   return (
     <div ref={ref} data-needs-you="approval" className="scroll-my-24">
