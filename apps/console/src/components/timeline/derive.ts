@@ -313,12 +313,14 @@ export function deriveSpans(
         durationMs: Math.max(0, endMs - startMs),
       });
     } else if (e.type === "user.message") {
-      const md = (e as { metadata?: { harness?: string; kind?: string } }).metadata;
+      const md = (e as { metadata?: { harness?: string; kind?: string; ambient?: unknown } }).metadata;
       const isWakeup = md?.harness === "schedule" && md?.kind === "wakeup";
+      // A trigger's wake message: nobody typed it.
+      const isTrigger = md?.kind === "ambient_wake" || !!md?.ambient;
       pushSpan({
         key: `u-${i}`,
-        family: isWakeup ? "wakeup" : "user",
-        label: isWakeup ? "Woke up on schedule" : "Message from you",
+        family: isWakeup || isTrigger ? "wakeup" : "user",
+        label: isWakeup ? "Woke up on schedule" : isTrigger ? "Started by a trigger" : "Message from you",
         startMs,
         durationMs: 0,
       });
@@ -421,8 +423,10 @@ export function bucketIntoTurns(events: Event[]): Turn[] {
   // sent something".
   const triggerKindOf = (e: Event): TurnTriggerKind | null => {
     if (e.type === "user.message") {
-      const md = (e as { metadata?: { harness?: string; kind?: string } }).metadata;
+      const md = (e as { metadata?: { harness?: string; kind?: string; ambient?: unknown } }).metadata;
       if (md?.harness === "schedule" && md?.kind === "wakeup") return "wakeup";
+      // An ambient rule's wake message (schedule, webhook, Run now): nobody typed it.
+      if (md?.kind === "ambient_wake" || !!md?.ambient) return "trigger";
       return "user_message";
     }
     if (e.type === "user.tool_confirmation") return "tool_confirmation";

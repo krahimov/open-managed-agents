@@ -19,10 +19,12 @@
 // metadata.ambient with the rule id so the console can trace provenance.
 
 import { Cron } from "croner";
-import type {
-  AgentService,
-  AmbientRuleService,
-  AmbientRuleRow,
+import {
+  ambientRunTitle,
+  type AgentService,
+  type AmbientRuleService,
+  type AmbientRuleRow,
+  type AmbientWakeMetadata,
 } from "@open-managed-agents/agents-store";
 import type { SessionService } from "@open-managed-agents/sessions-store";
 import type { UserMessageEvent } from "@open-managed-agents/shared";
@@ -86,6 +88,15 @@ export interface AmbientDispatcherDeps {
   now?(): number;
 }
 
+/** A manual run failed after its session was created: the session id is
+ *  carried so the caller can point at it instead of retrying blindly. */
+export class AmbientRunError extends Error {
+  constructor(message: string, readonly session_id: string) {
+    super(message);
+    this.name = "AmbientRunError";
+  }
+}
+
 export class NodeAmbientDispatcher {
   constructor(private readonly deps: AmbientDispatcherDeps) {}
 
@@ -119,12 +130,31 @@ export class NodeAmbientDispatcher {
     return fired;
   }
 
-  private async fireRule(rule: AmbientRuleRow, nowMs: number): Promise<void> {
+  /**
+   * Fire one rule now, outside its cadence (the console's "Run now"): the
+   * same snapshot, session and wake message a sweep produces, but
+   * next_wake_at is left alone so the schedule keeps its rhythm. `runId`
+   * makes the wake message id deterministic, so a retried request is a
+   * no-op in the work queue. Returns the session it started, or null for
+   * an observe rule. A failure after the session exists throws
+   * AmbientRunError with that session's id.
+   */
+  async runNow(rule: AmbientRuleRow, opts: { runId: string }): Promise<{ session_id: string | null }> {
+    const sessionId = await this.fireRule(rule, this.now(), { runId: opts.runId });
+    return { session_id: sessionId };
+  }
+
+  private async fireRule(
+    rule: AmbientRuleRow,
+    nowMs: number,
+    manual?: { runId: string },
+  ): Promise<string | null> {
     const decidedAt = new Date(nowMs).toISOString();
+    const keepNextWake = !!manual;
 
     if (rule.wake_mode === "observe") {
-      await this.finishRule(rule, nowMs, { outcome: "observe", decided_at: decidedAt });
-      return;
+      await this.finishRule(rule, nowMs, { outcome: "observe", decided_at: decidedAt }, { keepNextWake });
+      return null;
     }
 
     const agent = await this.deps.agents.get({
@@ -132,6 +162,8 @@ export class NodeAmbientDispatcher {
       agentId: rule.agent_id,
     });
     if (!agent || agent.archived_at) {
+      // A manual run reports the problem; it never disables the rule.
+      if (manual) throw new Error("agent missing or archived");
       await this.finishRule(
         rule,
         nowMs,
@@ -139,7 +171,7 @@ export class NodeAmbientDispatcher {
         // Stop rescheduling a rule whose agent is gone.
         { forceClearNextWake: true },
       );
-      return;
+      return null;
     }
 
     // Same snapshot recipe as InProcessSessionCreator: strip tenant_id,
@@ -203,48 +235,78 @@ export class NodeAmbientDispatcher {
         );
       }
     }
+    // Each run gets its own title (the occurrence it fired for, in the
+    // rule's time zone) and says where it came from, so a list of a
+    // daily rule's runs is not twenty identical "Ambient: X" rows and the
+    // console can draw the wake message as "Triggered by" (not a person).
+    const timezone = typeof rule.trigger.config?.timezone === "string" ? rule.trigger.config.timezone : null;
+    const dueMs = rule.next_wake_at ? Date.parse(rule.next_wake_at) : Number.NaN;
+    const scheduledFor = !manual && Number.isFinite(dueMs) ? new Date(dueMs).toISOString() : undefined;
+    const ambient: AmbientWakeMetadata = {
+      rule_id: rule.id,
+      rule_name: rule.name,
+      source: "schedule",
+      wake_mode: rule.wake_mode,
+      fired_at: decidedAt,
+      ...(scheduledFor ? { scheduled_for: scheduledFor } : {}),
+      ...(manual ? { manual: true } : {}),
+    };
     const { session } = await this.deps.sessions.create({
       tenantId: rule.tenant_id,
       agentId: rule.agent_id,
       environmentId,
-      title: `Ambient: ${rule.name}`,
+      title: ambientRunTitle(rule.name, { at: scheduledFor ? dueMs : nowMs, timezone }),
       ...(vaultIds.length > 0 ? { vaultIds } : {}),
       agentSnapshot: agentBase as never,
       environmentSnapshot: environmentSnapshot as never,
-      metadata: { ambient: { rule_id: rule.id, wake_mode: rule.wake_mode } },
+      metadata: { ambient },
     });
-    // Before the wake message: the store has to be bound when the runtime
-    // provisions the sandbox for the first turn.
-    await this.deps.attachAgentMemory?.({
-      tenantId: rule.tenant_id,
-      sessionId: session.id,
-      agentId: rule.agent_id,
-      agentSnapshot: agent,
-    });
+    try {
+      // Before the wake message: the store has to be bound when the runtime
+      // provisions the sandbox for the first turn.
+      await this.deps.attachAgentMemory?.({
+        tenantId: rule.tenant_id,
+        sessionId: session.id,
+        agentId: rule.agent_id,
+        agentSnapshot: agent,
+      });
 
-    const event: UserMessageEvent = {
-      type: "user.message",
-      // Deterministic per (rule, occurrence): work-queue's unique
-      // (session_id, event_id) index turns crash-retries into no-ops.
-      id: `sevt_amb_${rule.id}_${nowMs}`,
-      content: [{ type: "text", text: buildWakePrompt(rule) }],
-      metadata: {
-        kind: "ambient_wake",
-        ambient_rule_id: rule.id,
-        wake_mode: rule.wake_mode,
-        fired_at: decidedAt,
+      const event: UserMessageEvent = {
+        type: "user.message",
+        // Deterministic per (rule, occurrence): work-queue's unique
+        // (session_id, event_id) index turns crash-retries into no-ops.
+        // A manual run is keyed by its run id instead.
+        id: manual ? `sevt_amb_${rule.id}_run_${manual.runId}` : `sevt_amb_${rule.id}_${nowMs}`,
+        // The text stays an ordinary user turn: harnesses build the model's
+        // context from the event log. The metadata only says who sent it.
+        content: [{ type: "text", text: buildWakePrompt(rule) }],
+        metadata: {
+          kind: "ambient_wake",
+          ambient_rule_id: rule.id,
+          wake_mode: rule.wake_mode,
+          fired_at: decidedAt,
+          ambient,
+        },
+      } as UserMessageEvent;
+      await this.deps.appendUserEvent(session.id, rule.tenant_id, rule.agent_id, event);
+    } catch (err) {
+      if (manual) throw new AmbientRunError(err instanceof Error ? err.message : "dispatch failed", session.id);
+      throw err;
+    }
+
+    await this.finishRule(
+      rule,
+      nowMs,
+      {
+        outcome: "create_session",
+        decided_at: decidedAt,
+        session_id: session.id,
       },
-    } as UserMessageEvent;
-    await this.deps.appendUserEvent(session.id, rule.tenant_id, rule.agent_id, event);
-
-    await this.finishRule(rule, nowMs, {
-      outcome: "create_session",
-      decided_at: decidedAt,
-      session_id: session.id,
-    });
+      { keepNextWake },
+    );
     log.info(
       {
-        op: "ambient.rule_fired",
+        op: manual ? "ambient.rule_run_now" : "ambient.rule_fired",
         rule_id: rule.id,
         agent_id: rule.agent_id,
         session_id: session.id,
@@ -252,18 +314,20 @@ export class NodeAmbientDispatcher {
       },
       "ambient rule fired",
     );
+    return session.id;
   }
 
   /** Stamp last_wake/last_decision and advance next_wake_at (cron) or
    *  clear it (one-shot). forceClearNextWake DISABLES the rule as well —
    *  the service re-arms any enabled schedule rule with an empty wake
    *  (the dormant-rule fix), so "stop firing permanently" must flip
-   *  enabled off, which is also the honest UI state for an orphan rule. */
+   *  enabled off, which is also the honest UI state for an orphan rule.
+   *  keepNextWake (a manual run) records the wake but leaves the cadence. */
   private async finishRule(
     rule: AmbientRuleRow,
     nowMs: number,
     decision: { outcome: "observe" | "create_session" | "error"; decided_at: string; reason?: string; session_id?: string },
-    opts?: { forceClearNextWake?: boolean },
+    opts?: { forceClearNextWake?: boolean; keepNextWake?: boolean },
   ): Promise<void> {
     const next = opts?.forceClearNextWake ? null : computeNextWake(rule, nowMs);
     await this.deps.ambientRules.update({
@@ -272,7 +336,7 @@ export class NodeAmbientDispatcher {
       ruleId: rule.id,
       input: {
         last_wake_at: new Date(nowMs).toISOString(),
-        next_wake_at: next ? new Date(next).toISOString() : null,
+        ...(opts?.keepNextWake ? {} : { next_wake_at: next ? new Date(next).toISOString() : null }),
         last_decision: decision,
         ...(opts?.forceClearNextWake ? { enabled: false } : {}),
       },

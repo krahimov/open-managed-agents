@@ -59,11 +59,12 @@ export function readGrant(e: Event): Grant | null {
   return null;
 }
 
-/** A message a person wrote: not a wake-up, not a run's brief, not the server's note of an answer. */
+/** A message a person wrote: not a wake-up, not a trigger's wake, not a run's brief, not the server's note of an answer. */
 export function isPersonMessage(e: Event): boolean {
   if (e.type !== "user.message") return false;
-  const md = e.metadata as { harness?: string; kind?: string } | undefined;
+  const md = e.metadata as { harness?: string; kind?: string; ambient?: unknown } | undefined;
   if (md?.kind === "wakeup" || md?.kind === "mission_iteration" || md?.kind === "skill_attached") return false;
+  if (md?.kind === "ambient_wake" || md?.ambient) return false;
   return readGrant(e) === null;
 }
 

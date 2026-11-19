@@ -1,12 +1,16 @@
 import { useState } from "react";
-import { Link } from "react-router";
+import { Link, useNavigate } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
-import { CopyIcon, PlusIcon, Trash2Icon } from "lucide-react";
+import { CopyIcon, PlayIcon, PlusIcon, SendIcon, Trash2Icon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
 import { useApi } from "@/lib/api";
+import { refreshAgentAfterTriggerCreated } from "@/lib/agent-cache";
+import { SAMPLE_TEST_EVENT_DATA, canRunTriggerNow, parseJsonObject, triggerSourceFires } from "@/lib/ambient-controls";
+import { useAmbientTriggerSources, useServerFeature } from "@/lib/server-features";
 import { copyText } from "@/lib/clipboard";
 import { cn } from "@/lib/utils";
 import { inlineLink } from "@/lib/links";
@@ -28,6 +32,7 @@ import {
   EmptyState,
   EntityAvatar,
   ErrorState,
+  Field,
   Modal,
   RelativeTime,
   RowActionsMenu,
@@ -64,10 +69,51 @@ export function TriggersTab({
   const { api } = useApi();
   const qc = useQueryClient();
   const path = `/v1/agents/${agentId}/ambient-rules`;
+  const navigate = useNavigate();
   const [pending, setPending] = useState<string | null>(null);
   const [toDelete, setToDelete] = useState<AmbientRule | null>(null);
+  const [testing, setTesting] = useState<AmbientRule | null>(null);
+  const supported = useAmbientTriggerSources();
+  const runNowOnServer = useServerFeature("ambient_run_now");
 
   const invalidate = () => qc.invalidateQueries({ queryKey: [path] });
+
+  /**
+   * Fire a rule once, now, without moving its schedule (a webhook rule gets
+   * a test event). The server holds it to the rule's budget; the new
+   * session opens from the toast and from the card's "View session".
+   */
+  const runNow = async (rule: AmbientRule, data?: Record<string, unknown>) => {
+    const out = await api<{ session_id: string | null; event_id: string }>(`${path}/${rule.id}/run`, {
+      method: "POST",
+      body: JSON.stringify(data ? { data } : {}),
+    });
+    await invalidate();
+    void qc.invalidateQueries({ queryKey: ["/v1/sessions"] });
+    const sessionId = out?.session_id;
+    const webhook = rule.trigger?.source === "webhook";
+    if (sessionId) {
+      toast.success(webhook ? "Test event sent" : "Run started", {
+        description: `${rule.name} started a new session.`,
+        action: { label: "Open session", onClick: () => navigate(`/sessions/${sessionId}`) },
+      });
+    } else {
+      toast.success(webhook ? "Test event recorded" : "Run recorded", {
+        description: "This trigger only observes, so no session was started.",
+      });
+    }
+  };
+
+  const runFromCard = async (rule: AmbientRule) => {
+    setPending(rule.id);
+    try {
+      await runNow(rule);
+    } catch {
+      // The API client already raised a toast.
+    } finally {
+      setPending(null);
+    }
+  };
 
   const setEnabled = async (rule: AmbientRule, next: boolean) => {
     setPending(rule.id);
@@ -140,12 +186,21 @@ export function TriggersTab({
             rule={rule}
             agentId={agentId}
             busy={pending === rule.id}
+            fires={triggerSourceFires(rule.trigger?.source, supported)}
+            canRun={runNowOnServer && !archived}
+            onRun={() => (rule.trigger?.source === "webhook" ? setTesting(rule) : void runFromCard(rule))}
             onToggle={(next) => void setEnabled(rule, next)}
             onDelete={() => setToDelete(rule)}
             style={{ "--i": Math.min(i, 8) } as React.CSSProperties}
           />
         ))}
       </div>
+
+      <TestEventDialog
+        rule={testing}
+        onClose={() => setTesting(null)}
+        onSend={(data) => runNow(testing as AmbientRule, data)}
+      />
 
       <ConfirmDialog
         open={!!toDelete}
@@ -174,6 +229,9 @@ function TriggerCard({
   rule,
   agentId,
   busy,
+  fires,
+  canRun,
+  onRun,
   onToggle,
   onDelete,
   style,
@@ -181,6 +239,11 @@ function TriggerCard({
   rule: AmbientRule;
   agentId: string;
   busy: boolean;
+  /** False when this server never fires the rule's source (it saves, nothing reads it). */
+  fires: boolean;
+  /** The server can fire a rule on demand. */
+  canRun: boolean;
+  onRun: () => void;
   onToggle: (next: boolean) => void;
   onDelete: () => void;
   style?: React.CSSProperties;
@@ -200,11 +263,13 @@ function TriggerCard({
   const sourceNamed = d.summary.toLowerCase().includes(source.label.toLowerCase());
   const endpoint = `${window.location.origin}/v1/agents/${agentId}/ambient-rules/${rule.id}/events`;
   const example = '{"event_id":"incident-123","data":{"window_id":"w05"}}';
+  const runnable = canRun && fires && rule.enabled && canRunTriggerNow(rule.trigger?.source);
+  const runLabel = rule.trigger?.source === "webhook" ? "Send test event" : "Run now";
 
   return (
     <article style={style} className="surface stagger animate-rise-in rounded-xl p-5">
       <div className="flex items-start gap-4">
-        <EntityAvatar icon={source.icon} size="lg" className={cn(!rule.enabled && "opacity-60")} />
+        <EntityAvatar icon={source.icon} size="lg" className={cn((!rule.enabled || !fires) && "opacity-60")} />
         <div className="min-w-0 flex-1">
           <h3 className="text-h3 break-words text-fg">{rule.name}</h3>
           <p className="mt-0.5 text-small text-fg-muted">
@@ -231,7 +296,15 @@ function TriggerCard({
           </div>
 
           <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-fg-subtle">
-            {rule.enabled && rule.next_wake_at ? (
+            {!fires ? (
+              <span
+                className="inline-flex items-center gap-1 font-medium text-warning"
+                title={`This deployment never fires ${source.label} triggers`}
+              >
+                <TriangleAlertIcon className="size-3 shrink-0" />
+                Not available on this deployment
+              </span>
+            ) : rule.enabled && rule.next_wake_at ? (
               <span>
                 Next run <RelativeTime value={rule.next_wake_at} className="font-medium text-fg-muted" />
               </span>
@@ -265,7 +338,14 @@ function TriggerCard({
             )}
           </div>
 
-          {rule.trigger?.source === "webhook" && (
+          {!fires && (
+            <p className="mt-1.5 max-w-[72ch] text-xs text-fg-subtle">
+              Nothing on this server reads {source.label} events, so this trigger never wakes the agent. It is kept as it
+              was: delete it, or add a schedule or webhook trigger instead.
+            </p>
+          )}
+
+          {rule.trigger?.source === "webhook" && fires && (
             <Disclosure title="Webhook endpoint" variant="bare" className="-mx-3.5 mt-2">
               <div className="space-y-2">
                 <div className="flex items-center gap-2">
@@ -286,6 +366,12 @@ function TriggerCard({
         </div>
 
         <div className="flex shrink-0 items-center gap-1.5">
+          {runnable && (
+            <Button variant="outline" size="sm" onClick={onRun} disabled={busy} className="max-sm:hidden">
+              {rule.trigger?.source === "webhook" ? <SendIcon data-icon="inline-start" /> : <PlayIcon data-icon="inline-start" />}
+              {runLabel}
+            </Button>
+          )}
           <label className="flex h-8 cursor-pointer items-center gap-2 text-xs font-medium text-fg-muted">
             <span className="w-5 text-right">{rule.enabled ? "On" : "Off"}</span>
             <Switch
@@ -298,6 +384,13 @@ function TriggerCard({
           <RowActionsMenu
             label={`Actions for ${rule.name}`}
             actions={[
+              ...(runnable
+                ? [{
+                    label: runLabel,
+                    icon: rule.trigger?.source === "webhook" ? <SendIcon /> : <PlayIcon />,
+                    onSelect: onRun,
+                  }]
+                : []),
               { label: "Copy trigger id", icon: <CopyIcon />, onSelect: () => void copyText(rule.id) },
               { label: "Delete", icon: <Trash2Icon />, destructive: true, onSelect: onDelete },
             ]}
@@ -347,6 +440,9 @@ export function AddTriggerDialog({
       const body = buildTriggerRuleBody(draft);
       await api(path, { method: "POST", body: JSON.stringify(body) });
       await qc.invalidateQueries({ queryKey: [path] });
+      // Creating a trigger can switch the agent's memory on, which saves a
+      // new version: refetch it so an edit opened next is not a stale save.
+      await refreshAgentAfterTriggerCreated(qc, agentId);
       toast.success("Trigger added");
       setSaving(false);
       onClose();
@@ -383,6 +479,87 @@ export function AddTriggerDialog({
         )}
         <TriggerFields value={draft} onChange={setDraft} autoFocusName />
       </div>
+    </Modal>
+  );
+}
+
+/**
+ * "Send test event" for a webhook trigger: an optional JSON object sent as
+ * the event's data, with an event id the server generates. It runs exactly
+ * as a real delivery would, within the trigger's budget.
+ */
+function TestEventDialog({
+  rule,
+  onClose,
+  onSend,
+}: {
+  rule: AmbientRule | null;
+  onClose: () => void;
+  onSend: (data: Record<string, unknown>) => Promise<void>;
+}) {
+  const [raw, setRaw] = useState(SAMPLE_TEST_EVENT_DATA);
+  const [error, setError] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
+
+  const close = () => {
+    if (sending) return;
+    onClose();
+    window.setTimeout(() => {
+      setRaw(SAMPLE_TEST_EVENT_DATA);
+      setError(null);
+    }, 250);
+  };
+
+  const send = async () => {
+    let data: Record<string, unknown>;
+    try {
+      data = parseJsonObject(raw, "Event data");
+    } catch (e) {
+      setError(e instanceof SyntaxError ? "Event data is not valid JSON" : failureSentence(e));
+      return;
+    }
+    setError(null);
+    setSending(true);
+    try {
+      await onSend(data);
+      setSending(false);
+      onClose();
+    } catch {
+      // The API client already raised a toast; keep the dialog open to retry.
+      setSending(false);
+    }
+  };
+
+  return (
+    <Modal
+      open={!!rule}
+      onClose={close}
+      title="Send test event"
+      subtitle={rule ? `Deliver one event to "${rule.name}" now. It starts a session the way a real call would.` : undefined}
+      footer={
+        <>
+          <Button variant="ghost" onClick={close} disabled={sending}>
+            Cancel
+          </Button>
+          <Button onClick={() => void send()} loading={sending}>
+            Send test event
+          </Button>
+        </>
+      }
+    >
+      <Field
+        label="Event data"
+        hint="Optional. A JSON object, sent as the event's data with a generated event_id."
+        error={error}
+      >
+        <Textarea
+          value={raw}
+          onChange={(e) => setRaw(e.target.value)}
+          rows={6}
+          spellCheck={false}
+          className="font-mono text-small"
+        />
+      </Field>
     </Modal>
   );
 }

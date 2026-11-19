@@ -13,6 +13,32 @@ export const AMBIENT_TRIGGER_SOURCES = [
 
 export type AmbientTriggerSource = (typeof AMBIENT_TRIGGER_SOURCES)[number];
 
+/**
+ * The sources to offer, given what the server says it fires (`null` when
+ * it does not say: every source stays on offer). Order follows
+ * AMBIENT_TRIGGER_SOURCES; a list naming none the console knows falls back
+ * to schedule, which every server with triggers fires.
+ */
+export function offeredTriggerSources(supported: ReadonlySet<string> | null | undefined): AmbientTriggerSource[] {
+  if (!supported) return [...AMBIENT_TRIGGER_SOURCES];
+  const offered = AMBIENT_TRIGGER_SOURCES.filter((s) => supported.has(s));
+  return offered.length > 0 ? offered : ["schedule"];
+}
+
+/** False only when the server listed what it fires and `source` is not on it. */
+export function triggerSourceFires(source: string | undefined, supported: ReadonlySet<string> | null | undefined): boolean {
+  if (!supported) return true;
+  return !!source && supported.has(source);
+}
+
+/** The sources "Run now" can fire on demand (POST …/ambient-rules/:id/run). */
+export function canRunTriggerNow(source: string | undefined): source is "schedule" | "webhook" {
+  return source === "schedule" || source === "webhook";
+}
+
+/** What "Send test event" prefills: a small, obviously-sample payload. */
+export const SAMPLE_TEST_EVENT_DATA = '{\n  "message": "Test event from the console"\n}';
+
 export const AMBIENT_WAKE_MODES = ["observe", "decide", "act", "escalate"] as const;
 
 export type AmbientWakeMode = (typeof AMBIENT_WAKE_MODES)[number];

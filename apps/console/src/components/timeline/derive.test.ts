@@ -118,6 +118,19 @@ describe("timeline tool spans", () => {
 });
 
 describe("bucketIntoTurns", () => {
+  it("heads an ambient rule's run as a trigger, not as a person", () => {
+    const turns = bucketIntoTurns([
+      at({ type: "user.message", metadata: { kind: "ambient_wake", ambient: { rule_id: "r1" } } }),
+      at({ type: "session.status_idle", stop_reason: { type: "end_turn" } }),
+      at({ type: "user.message", metadata: { ambient: { rule_id: "r1" } } }),
+      at({ type: "session.status_idle", stop_reason: { type: "end_turn" } }),
+      at({ type: "user.message", metadata: { harness: "schedule", kind: "wakeup" } }),
+      at({ type: "session.status_idle", stop_reason: { type: "end_turn" } }),
+      at({ type: "user.message" }),
+    ]);
+    expect(turns.map((t) => t.triggerKind)).toEqual(["trigger", "trigger", "wakeup", "user_message"]);
+  });
+
   it("marks a turn parked on requires_action as waiting, not completed", () => {
     const turns = bucketIntoTurns([
       at({ type: "user.message" }),

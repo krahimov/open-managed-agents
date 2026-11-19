@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router";
 import {
   AlarmClockIcon,
+  CalendarClockIcon,
   CheckIcon,
   CircleCheckIcon,
   CircleStopIcon,
@@ -15,6 +16,7 @@ import {
   RefreshCwIcon,
   SplitIcon,
   Undo2Icon,
+  WebhookIcon,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -186,6 +188,9 @@ export function ConversationView({
             break;
           case "wakeup":
             node = <WakeupRow key={item.key} item={item} />;
+            break;
+          case "trigger":
+            node = <TriggerRow key={item.key} item={item} agentId={agent.id} />;
             break;
           case "brief":
             node = <MissionBriefRow key={item.key} item={item} />;
@@ -428,6 +433,69 @@ function WakeupRow({ item }: { item: Extract<Item, { kind: "wakeup" }> }) {
       }
     >
       {item.text ? <p className="break-words whitespace-pre-wrap">{item.text}</p> : "The agent resumed on a timer it set earlier."}
+    </Callout>
+  );
+}
+
+/**
+ * The message a trigger sent to start this run. Nobody typed it, so it is
+ * a line of the record, "Triggered by <rule> · Schedule · 09:00", with the
+ * exact words the agent was given (a webhook's event data among them)
+ * folded away for whoever wants them.
+ */
+function TriggerRow({ item, agentId }: { item: Extract<Item, { kind: "trigger" }>; agentId?: string }) {
+  const [open, setOpen] = useState(false);
+  const t = item.trigger;
+  const webhook = t.source === "webhook";
+  const how = webhook ? (t.manual ? "Webhook test event" : "Webhook") : t.manual ? "Run now" : "Schedule";
+  const name = t.ruleName ?? (webhook ? "a webhook trigger" : "a scheduled trigger");
+  return (
+    <Callout
+      icon={webhook ? WebhookIcon : CalendarClockIcon}
+      title={
+        <>
+          Triggered by{" "}
+          {agentId && t.ruleName ? (
+            <Link to={`/agents/${agentId}?tab=triggers`} className={inlineLink}>
+              {name}
+            </Link>
+          ) : (
+            name
+          )}
+          <span className="font-normal text-fg-subtle">
+            {" "}
+            · {how}
+            {item.at != null && (
+              <>
+                {" "}
+                · <ClockTime value={item.at} />
+              </>
+            )}
+          </span>
+        </>
+      }
+    >
+      <p className="break-words">
+        {webhook
+          ? t.eventId
+            ? <>Event <code className="rounded-sm bg-bg-pressed/60 px-1 py-0.5 font-mono text-xs text-fg">{t.eventId}</code> started this run.</>
+            : "A webhook call started this run."
+          : t.manual
+            ? "Someone ran this trigger by hand; its schedule is unchanged."
+            : "The trigger's schedule started this run."}
+      </p>
+      {item.text && (
+        <>
+          <button type="button" aria-expanded={open} onClick={() => setOpen((v) => !v)} className={cn(quietLink, "mt-1.5")}>
+            {open ? "Hide what the agent was given" : webhook ? "Show the event and prompt" : "Show the prompt"}
+          </button>
+          {open && (
+            <div className="mt-2 animate-fade-in">
+              <CodeWell>{item.text}</CodeWell>
+            </div>
+          )}
+        </>
+      )}
     </Callout>
   );
 }

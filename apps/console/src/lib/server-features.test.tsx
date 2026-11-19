@@ -5,7 +5,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { http, HttpResponse } from "msw";
 import { server } from "../mocks/server";
 import { ApiError, NOT_ON_SERVER_CODE, useApi } from "./api";
-import { SERVER_FEATURE_KEYS, useServerFeature, useServerFeatures } from "./server-features";
+import { SERVER_FEATURE_KEYS, useAmbientTriggerSources, useServerFeature, useServerFeatures } from "./server-features";
 
 vi.mock("sonner", () => ({ toast: Object.assign(vi.fn(), { error: vi.fn(), info: vi.fn(), success: vi.fn() }) }));
 
@@ -46,6 +46,21 @@ describe("useServerFeature", () => {
     expect(result.current.usage).toBe(true);
     expect(result.current.ops).toBe(false);
     expect([...(result.current.all.data?.features ?? [])].sort()).toEqual(["usage", "workspace_access"]);
+  });
+
+  it("reads which trigger sources the server fires, or none when it does not say", async () => {
+    server.use(http.get("*/v1/server_features", () => HttpResponse.json({ features: ["ambient_run_now"], ambient_trigger_sources: ["schedule", "webhook", 3] })));
+    const { result } = renderHook(() => ({ all: useServerFeatures(), sources: useAmbientTriggerSources(), run: useServerFeature("ambient_run_now") }), { wrapper });
+    await waitFor(() => expect(result.current.all.data).toBeDefined());
+    expect(result.current.run).toBe(true);
+    expect([...(result.current.sources ?? [])]).toEqual(["schedule", "webhook"]);
+  });
+
+  it("offers every trigger source on a server that does not list them", async () => {
+    server.use(http.get("*/v1/server_features", () => HttpResponse.json({ features: [] })));
+    const { result } = renderHook(() => ({ all: useServerFeatures(), sources: useAmbientTriggerSources() }), { wrapper });
+    await waitFor(() => expect(result.current.all.data).toBeDefined());
+    expect(result.current.sources).toBeNull();
   });
 
   it("is off while loading", () => {

@@ -17,6 +17,7 @@ import { readGrant, readRequests, requestKey, type Grant } from "./requests";
  *
  *   user        what a person sent (a right-aligned bubble)
  *   wakeup      the agent woke itself on a schedule (a system row, not a bubble)
+ *   trigger     a trigger (ambient rule) started this run (a system row, not a bubble)
  *   agent       one agent turn: prose, thinking, tool runs, approvals, errors,
  *               in the order they happened, under one header
  *   note        a centred caption between turns (stopped, ended)
@@ -184,6 +185,8 @@ export type Item =
       queued: boolean;
     }
   | { kind: "wakeup"; key: string; event: Event; text: string; scheduledAt?: string; at: number | null }
+  /** The message a trigger (ambient rule) sent to start a run: drawn as "Triggered by", never as "you". */
+  | { kind: "trigger"; key: string; event: Event; text: string; trigger: TriggerWake; at: number | null }
   /** The brief a "run until done" mission writes to open one of its iterations. */
   | { kind: "brief"; key: string; event: Event; text: string; iteration?: number; failing: string[]; at: number | null }
   | {
@@ -257,6 +260,59 @@ function eventImages(e: Event): string[] {
 export function isWakeup(e: Event): boolean {
   const md = e.metadata as { harness?: string; kind?: string } | undefined;
   return e.type === "user.message" && md?.harness === "schedule" && md?.kind === "wakeup";
+}
+
+/** Who sent a trigger's wake message, read from `metadata.ambient`. */
+export interface TriggerWake {
+  ruleId?: string;
+  /** Missing on messages written before the rule's name was recorded. */
+  ruleName?: string;
+  source: "schedule" | "webhook";
+  /** Webhook: the caller's event id. */
+  eventId?: string;
+  /** Schedule: the occurrence the run was for (ISO). */
+  scheduledFor?: string;
+  /** Started from the console ("Run now", "Send test event"). */
+  manual: boolean;
+}
+
+const WEBHOOK_PROMPT = /^\[Ambient webhook: (.+)\]\n[\s\S]*\nSource event: ("(?:[^"\\]|\\.)*")\n/;
+
+/**
+ * The wake message of a triggered run, or null for anything else. New
+ * messages carry `metadata.ambient`; a schedule wake from before that has
+ * `kind: "ambient_wake"`, and a webhook one only its own prompt shape.
+ */
+export function readTriggerWake(e: Event): TriggerWake | null {
+  if (e.type !== "user.message") return null;
+  const md = e.metadata as
+    | { kind?: string; ambient_rule_id?: unknown; ambient?: Record<string, unknown> }
+    | undefined;
+  const a = md?.ambient;
+  if (a && typeof a === "object" && (a.source === "schedule" || a.source === "webhook")) {
+    return {
+      ruleId: str(a.rule_id),
+      ruleName: str(a.rule_name),
+      source: a.source,
+      eventId: str(a.event_id),
+      scheduledFor: str(a.scheduled_for),
+      manual: a.manual === true,
+    };
+  }
+  if (md?.kind === "ambient_wake") {
+    return { ruleId: str(md.ambient_rule_id), source: "schedule", manual: false };
+  }
+  const m = WEBHOOK_PROMPT.exec(eventText(e));
+  if (m) {
+    let eventId: string | undefined;
+    try {
+      eventId = str(JSON.parse(m[2]));
+    } catch {
+      eventId = undefined;
+    }
+    return { ruleName: m[1], source: "webhook", eventId, manual: false };
+  }
+  return null;
 }
 
 /**
@@ -459,9 +515,12 @@ export function buildConversation(events: Event[], opts: { running?: boolean } =
         failure = null;
         triggerAt = at;
         lastAt = at;
+        const trigger = readTriggerWake(e);
         if (isWakeup(e)) {
           const md = e.metadata as { scheduled_at?: string } | undefined;
           items.push({ kind: "wakeup", key, event: e, text: eventText(e), scheduledAt: md?.scheduled_at, at });
+        } else if (trigger) {
+          items.push({ kind: "trigger", key, event: e, text: eventText(e), trigger, at });
         } else if (readGrant(e)) {
           items.push({ kind: "answered", key, event: e, grant: readGrant(e) as Grant, text: eventText(e), at });
         } else if (isMissionBrief(e)) {

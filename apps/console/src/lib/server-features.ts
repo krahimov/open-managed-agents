@@ -53,6 +53,8 @@ export const SERVER_FEATURE_KEYS = [
   "runtimes",
   /** POST /v1/cap-cli/oauth/initiate and /poll. */
   "cap_cli",
+  /** POST /v1/agents/:id/ambient-rules/:ruleId/run ("Run now" / "Send test event"). */
+  "ambient_run_now",
 ] as const;
 
 export type ServerFeature = (typeof SERVER_FEATURE_KEYS)[number];
@@ -78,6 +80,13 @@ export const SERVER_FEATURES_QUERY_KEY = ["server_features"] as const;
 export interface ServerFeatures {
   /** The keys that are on. */
   features: ReadonlySet<ServerFeature>;
+  /**
+   * The trigger sources this server actually fires (`ambient_trigger_sources`
+   * in the answer). Null when the server does not say: an older server, or
+   * one (Cloudflare) whose list the console cannot know, where every source
+   * stays on offer as before.
+   */
+  ambientTriggerSources: ReadonlySet<string> | null;
   /** Where the answer came from: the server's own list, or the console's probes. */
   source: "server" | "probe";
 }
@@ -90,9 +99,12 @@ type Api = ReturnType<typeof useApi>["api"];
 
 export async function loadServerFeatures(api: Api, signal?: AbortSignal): Promise<ServerFeatures> {
   try {
-    const body = await api<{ features?: unknown }>("/v1/server_features", { signal, silentErrors: true });
+    const body = await api<{ features?: unknown; ambient_trigger_sources?: unknown }>("/v1/server_features", { signal, silentErrors: true });
     const list = Array.isArray(body?.features) ? body.features.filter(isFeature) : [];
-    return { features: new Set(list), source: "server" };
+    const sources = Array.isArray(body?.ambient_trigger_sources)
+      ? new Set(body.ambient_trigger_sources.filter((s): s is string => typeof s === "string"))
+      : null;
+    return { features: new Set(list), ambientTriggerSources: sources, source: "server" };
   } catch (err) {
     if (!isNotOnServer(err)) throw err;
   }
@@ -107,7 +119,11 @@ export async function loadServerFeatures(api: Api, signal?: AbortSignal): Promis
       }
     }),
   );
-  return { features: new Set(results.filter((k): k is ServerFeature => k !== null)), source: "probe" };
+  return {
+    features: new Set(results.filter((k): k is ServerFeature => k !== null)),
+    ambientTriggerSources: null,
+    source: "probe",
+  };
 }
 
 /** The whole answer. `isLoading` is true until the first answer arrives. */
@@ -134,4 +150,13 @@ export function useServerFeatures() {
 export function useServerFeature(key: ServerFeature): boolean {
   const { data } = useServerFeatures();
   return data?.features.has(key) ?? false;
+}
+
+/**
+ * The trigger sources this server fires, or null when it does not say (or
+ * has not answered yet): then every source is offered, as before the list.
+ */
+export function useAmbientTriggerSources(): ReadonlySet<string> | null {
+  const { data } = useServerFeatures();
+  return data?.ambientTriggerSources ?? null;
 }
