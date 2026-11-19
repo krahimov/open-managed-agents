@@ -29,4 +29,27 @@ describe("withEnvironment", () => {
     const nothing = withEnvironment({ ...INITIAL_FORM, toolDefaultEnabled: false }, "env_computer", environments);
     expect(nothing.toolOverrides).toEqual({});
   });
+
+  it("takes back the browser it turned on when a non-computer environment is chosen", () => {
+    const computer = withEnvironment(INITIAL_FORM, "env_computer", environments);
+    const back = withEnvironment(computer, "env_session", environments);
+    expect(back.environmentId).toBe("env_session");
+    expect(back.toolOverrides).toEqual({});
+    expect(back.browserAutoOverride).toBeNull();
+    // Back to the computer turns it on again.
+    expect(withEnvironment(back, "env_computer", environments).toolOverrides.browser).toBe("always_allow");
+    // Computer → computer keeps it, still tracked as automatic.
+    const again = withEnvironment(computer, "env_computer", environments);
+    expect(again.toolOverrides.browser).toBe("always_allow");
+    expect(withEnvironment(again, "env_headless", environments).toolOverrides).toEqual({});
+  });
+
+  it("keeps a browser the person changed after it was turned on", () => {
+    const computer = withEnvironment(INITIAL_FORM, "env_computer", environments);
+    const asked = { ...computer, toolOverrides: { ...computer.toolOverrides, browser: "always_ask" as const } };
+    expect(withEnvironment(asked, "env_session", environments).toolOverrides.browser).toBe("always_ask");
+    // An explicit browser on an agent loaded that way is not automatic.
+    const loaded = { ...INITIAL_FORM, environmentId: "env_computer", toolOverrides: { browser: "always_allow" as const } };
+    expect(withEnvironment(loaded, "env_session", environments).toolOverrides.browser).toBe("always_allow");
+  });
 });

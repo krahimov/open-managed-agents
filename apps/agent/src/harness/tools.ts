@@ -452,6 +452,20 @@ export function getToolPermission(agentConfig: AgentConfig, toolName: string): s
   return resolveToolPermission(agentConfig.tools, toolName);
 }
 
+/**
+ * Whether the `write` tool is registered and runs without approval: enabled,
+ * always_allow, and allowed by the pinned access policy. Tools that write
+ * files as a side effect (browser_screenshot's save_path) are offered that
+ * side effect only then.
+ */
+export function writeRunsUnasked(agentConfig: AgentConfig, enabled: Set<string>): boolean {
+  return (
+    enabled.has("write") &&
+    getToolPermission(agentConfig, "write") === "always_allow" &&
+    evaluatePolicy(agentConfig.effective_policy, "write").effect === "allow"
+  );
+}
+
 /** Options for `getEnabledTools`. */
 export interface EnabledToolsOptions {
   /** The session runs on an agent computer whose machine has its browser
@@ -770,8 +784,12 @@ export async function buildTools(
   if (env?.browser && browserTools) {
     const { buildBrowserTools } = await import("@open-managed-agents/browser-harness");
     Object.assign(tools, buildBrowserTools(env.browser, env.browserBillingHook ?? null, {
-      // Screenshots saved where the file tools see them (save_path).
-      ...(sandbox.writeFileBytes ? { saveFile: (path: string, bytes: Uint8Array) => sandbox.writeFileBytes!(path, bytes) } : {}),
+      // Screenshots saved where the file tools see them (save_path) — only
+      // when the write tool itself could do that unasked, so save_path is
+      // never a way around a disabled, ask-gated or policy-limited write.
+      ...(sandbox.writeFileBytes && writeRunsUnasked(agentConfig, enabled)
+        ? { saveFile: (path: string, bytes: Uint8Array) => sandbox.writeFileBytes!(path, bytes) }
+        : {}),
     }));
     if (env.computer) {
       const { buildComputerTools } = await import("@open-managed-agents/browser-harness");

@@ -62,7 +62,7 @@ describe("browser_screenshot save_path", () => {
 
   it("refuses save_path where the host cannot write files, or for a directory", async () => {
     const plain = buildBrowserTools(harnessWith({}));
-    expect(await plain.browser_screenshot.execute({ save_path: "/tmp/a.png" }, OPTS)).toMatch(/save_path is not supported/);
+    expect(await plain.browser_screenshot.execute({ save_path: "/tmp/a.png" }, OPTS)).toMatch(/save_path is not available/);
     const withFs = buildBrowserTools(harnessWith({}), null, { saveFile: async (p) => p });
     expect(await withFs.browser_screenshot.execute({ save_path: "/workspace/" }, OPTS)).toMatch(/must be a file path/);
   });

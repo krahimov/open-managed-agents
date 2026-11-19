@@ -81,7 +81,8 @@ export const BROWSER_TOOL_NAMES = [
 export interface BrowserToolOptions {
   /** Write bytes into the session's sandbox (the same filesystem as the
    *  file tools) and return the absolute path written. Enables
-   *  browser_screenshot's `save_path`; absent → the parameter is refused. */
+   *  browser_screenshot's `save_path`; absent → the parameter is refused.
+   *  Hosts pass it only where a file write needs no approval. */
   saveFile?: (path: string, bytes: Uint8Array) => Promise<string>;
 }
 
@@ -190,7 +191,9 @@ export function buildBrowserTools(
       try {
         const target = save_path?.trim();
         if (target !== undefined) {
-          if (!options.saveFile) return "Screenshot error: save_path is not supported on this browser.";
+          if (!options.saveFile) {
+            return "Screenshot error: save_path is not available in this session (saving needs the write tool, enabled and allowed without approval). Take the screenshot without save_path.";
+          }
           if (!target || target.endsWith("/")) return "Screenshot error: save_path must be a file path, e.g. /workspace/shot.png";
         }
         const page = await ensurePage();

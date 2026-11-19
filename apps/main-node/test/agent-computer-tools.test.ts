@@ -84,6 +84,29 @@ describe("browser on by default on an agent computer", () => {
     expect(writes).toEqual([{ path: "/mnt/sessions/s1/outputs/page.png", size: 3 }]);
     expect(out).toMatchObject({ saved_path: "/mnt/sessions/s1/outputs/page.png" });
   });
+
+  it("refuses save_path unless the write tool could write unasked", async () => {
+    const page = { goto: async () => null, url: () => "", screenshot: async () => new Uint8Array([1, 2, 3]), locator: () => ({}), evaluate: async () => null, content: async () => "" };
+    const live: BrowserHarness = { launch: async () => ({ page: async () => page, close: async () => {}, isOpen: () => true }) };
+    const policyDeniesWrite = {
+      ...(agent(toolset()) as object),
+      effective_policy: { rules: [{ effect: "deny", selector: "write" }] },
+    } as never;
+    const cases = [
+      agent(toolset({ configs: [{ name: "write", enabled: false }] })),
+      agent(toolset({ configs: [{ name: "write", enabled: true, permission_policy: { type: "always_ask" } }] })),
+      agent(toolset({ default_config: { enabled: true, permission_policy: { type: "always_ask" } } })),
+      policyDeniesWrite,
+    ];
+    for (const config of cases) {
+      const tools = await buildTools(config, sandbox, { browser: live, browserByDefault: true });
+      writes.length = 0;
+      const out = await tools.browser_screenshot.execute?.({ save_path: "/workspace/app/config.json" }, { toolCallId: "t", messages: [] });
+      expect(writes).toEqual([]);
+      if (out !== undefined) expect(String(out)).toMatch(/save_path is not available/);
+      expect(tools.browser_screenshot.description).not.toMatch(/save_path/);
+    }
+  });
 });
 
 describe("browser and computer calls are built-in tool uses", () => {

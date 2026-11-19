@@ -281,6 +281,10 @@ export const INITIAL_FORM = {
   toolDefaultEnabled: true,
   toolDefaultPermission: "always_allow" as "always_allow" | "always_ask",
   toolOverrides: {} as Record<string, ToolOverride>,
+  /** The browser override withEnvironment set on its own when a persistent
+   *  agent computer was picked (null = none), so picking a non-computer
+   *  environment can take it back while the person hasn't changed it. */
+  browserAutoOverride: null as ToolOverride | null,
   // Opt-in to the built-in `general_subagent` tool.
   enableGeneralSubagent: false,
   // Long-running capability: sessions on this agent can carry a goal
@@ -305,13 +309,25 @@ export type FormSetter = Dispatch<SetStateAction<FormState>>;
  * browser turns the Web › browser tool on, as the server does for such an
  * agent, so Tools shows what the agent will get. A browser the person set
  * themselves (on or off) and "start from nothing" are left as they are.
+ * Choosing any other environment takes back a browser this function turned
+ * on, as long as it is still what it set.
  */
 export function withEnvironment(form: FormState, environmentId: string, environments: readonly EnvironmentLite[]): FormState {
-  const next = { ...form, environmentId };
   const env = environments.find((e) => e.id === environmentId);
   const computerBrowser = !!env && isAgentComputerEnvironment(env) && env.config?.sandbox?.browser !== false;
-  if (!computerBrowser || !form.toolDefaultEnabled || (form.toolOverrides.browser ?? "default") !== "default") return next;
-  return { ...next, toolOverrides: { ...form.toolOverrides, browser: form.toolDefaultPermission } };
+  const current = form.toolOverrides.browser ?? "default";
+  const auto = form.browserAutoOverride !== null && current === form.browserAutoOverride;
+  if (!computerBrowser) {
+    if (!auto) return { ...form, environmentId, browserAutoOverride: null };
+    const rest = { ...form.toolOverrides };
+    delete rest.browser;
+    return { ...form, environmentId, toolOverrides: rest, browserAutoOverride: null };
+  }
+  if (auto || !form.toolDefaultEnabled || current !== "default") {
+    return { ...form, environmentId, browserAutoOverride: auto ? form.browserAutoOverride : null };
+  }
+  const browser = form.toolDefaultPermission;
+  return { ...form, environmentId, toolOverrides: { ...form.toolOverrides, browser }, browserAutoOverride: browser };
 }
 
 /** The sections of the form, as the dialog's side navigation lists them. */
