@@ -125,7 +125,9 @@ POST /v1/agents/:id/ambient-rules
 - Run one now without changing its cadence:
   `POST /v1/agents/:id/ambient-rules/:ruleId/run` (body optional:
   `{"event_id"?, "data"?}`; `data` is a webhook test event's payload). It is
-  held to the rule's budget and idempotent per `event_id`; answers
+  held to the rule's budget (a schedule's own latest run counts toward
+  `max_concurrent_sessions`; `max_runs_per_day` counts only Run now runs)
+  and idempotent per `event_id`; answers
   `{event_id, session_id}` (`session_id` is null for `observe` rules).
   Feature key `ambient_run_now`.
 - Each run's session is titled `<rule name> · <time or event id>`, and its

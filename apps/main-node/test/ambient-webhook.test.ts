@@ -203,6 +203,47 @@ describe("POST …/ambient-rules/:ruleId/run", () => {
     expect((await f.run({ data: { a: 1 } })).status).toBe(400);
   });
 
+  it("frees the slot of a run that failed after its session exists once that session settles", async () => {
+    let attempt = 0;
+    const f = await fixture({
+      runScheduleRuleNow: async () => {
+        attempt++;
+        if (attempt === 1) {
+          f.sessions.set("sess_failed", { id: "sess_failed", status: "idle", completed: false });
+          throw Object.assign(new Error("append failed"), { session_id: "sess_failed" });
+        }
+        return { session_id: `sess_ok${attempt}` };
+      },
+    });
+    await f.update({ trigger: { source: "schedule", config: { cron: "0 9 * * *" } } });
+    const failed = await f.run();
+    expect(failed.status).toBe(502);
+    expect((await failed.json() as { session_id: string }).session_id).toBe("sess_failed");
+    // The message may have landed: the slot stays taken while that session could still run…
+    expect((await f.run()).status).toBe(429);
+    // …and frees once it has settled, instead of blocking Run now for good.
+    f.sessions.get("sess_failed").completed = true;
+    expect((await f.run()).status).toBe(202);
+  });
+
+  it("counts the schedule's own running sweep run toward one-at-a-time", async () => {
+    const f = await fixture({ runScheduleRuleNow: async () => ({ session_id: "sess_manual" }) });
+    f.sessions.set("sess_sweep", { id: "sess_sweep", status: "running", completed: false });
+    await f.update({
+      trigger: { source: "schedule", config: { cron: "0 * * * *" } },
+      last_decision: { outcome: "create_session", decided_at: new Date().toISOString(), session_id: "sess_sweep" },
+    });
+    const busy = await f.run();
+    expect(busy.status).toBe(429);
+    f.sessions.set("sess_sweep", { id: "sess_sweep", status: "idle", completed: true });
+    expect((await f.run()).status).toBe(202);
+    // A rule's last decision that is a Run now (already tracked) is not counted twice.
+    await f.update({ budget: { max_concurrent_sessions: 2 },
+      last_decision: { outcome: "create_session", decided_at: new Date().toISOString(), session_id: "sess_manual" } });
+    f.sessions.set("sess_manual", { id: "sess_manual", status: "running", completed: false });
+    expect((await f.run()).status).toBe(202);
+  });
+
   it("frees the slot when a schedule run fails before any session exists", async () => {
     let fail = true;
     const f = await fixture({

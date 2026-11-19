@@ -423,8 +423,10 @@ export function bucketIntoTurns(events: Event[]): Turn[] {
   // sent something".
   const triggerKindOf = (e: Event): TurnTriggerKind | null => {
     if (e.type === "user.message") {
-      const md = (e as { metadata?: { harness?: string; kind?: string } }).metadata;
+      const md = (e as { metadata?: { harness?: string; kind?: string; ambient?: unknown } }).metadata;
       if (md?.harness === "schedule" && md?.kind === "wakeup") return "wakeup";
+      // An ambient rule's wake message (schedule, webhook, Run now): nobody typed it.
+      if (md?.kind === "ambient_wake" || !!md?.ambient) return "trigger";
       return "user_message";
     }
     if (e.type === "user.tool_confirmation") return "tool_confirmation";

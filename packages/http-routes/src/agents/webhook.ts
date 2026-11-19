@@ -33,6 +33,7 @@ type Receipt = { event_id: string; payload: string; session_id: string | null; s
 // agree across workers. The gate row serializes admission on Postgres as well.
 // Despite the name, the receipts also admit "Run now" for schedule rules, so
 // a manual run is held to the rule's budget and is idempotent per event_id.
+// (The schedule sweep itself writes no receipt; see sweepRunning below.)
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS ambient_webhook_gates (
     tenant_id TEXT NOT NULL, rule_id TEXT NOT NULL,
@@ -138,25 +139,46 @@ async function deliver(c: RouteContext, deps: AmbientWebhookDeps, d: Delivery): 
     }), c.env, executionCtx);
   };
 
-  // A newly queued session may still say idle. Only release its concurrency
-  // slot once the event log confirms a terminal transition after the message.
+  // A newly queued session may still say idle: it has settled only once the
+  // event log confirms a terminal transition after the message. A failed
+  // dispatch (`failed`) whose log is empty never got its message, so it can
+  // never run.
+  const sessionSettled = async (sessionId: string, failed: boolean): Promise<boolean> => {
+    const session = await services.sessions.get({ tenantId, sessionId });
+    if (!session || session.archived_at || session.status === "terminated") return true;
+    if (session.status !== "idle" || !inner) return false;
+    const response = await dispatch(`/${encodeURIComponent(sessionId)}/events?order=desc&limit=1`);
+    if (!response.ok) return false;
+    const page = await response.json() as { data?: Array<{ type: string }> };
+    const last = page.data?.[0]?.type;
+    if (!last) return failed;
+    return last === "session.status_idle" || last === "session.status_terminated";
+  };
+  // Release concurrency slots whose session has settled. That includes a
+  // failed dispatch whose session exists (the message may have landed): it
+  // holds its slot until that session settles, then frees it, so one failed
+  // "Run now" cannot block the rule for good.
   const active = await sql.prepare(`SELECT * FROM ambient_webhook_receipts
-    WHERE tenant_id = ? AND rule_id = ? AND active = 1 AND status = 'accepted'`)
+    WHERE tenant_id = ? AND rule_id = ? AND active = 1 AND status IN ('accepted', 'error')`)
     .bind(tenantId, ruleId).all<Receipt>();
   for (const receipt of active.results ?? []) {
     if (!receipt.session_id) continue;
-    const session = await services.sessions.get({ tenantId, sessionId: receipt.session_id });
-    let finished = !session || !!session.archived_at || session.status === "terminated";
-    if (!finished && session?.status === "idle" && inner) {
-      const response = await dispatch(`/${encodeURIComponent(receipt.session_id)}/events?order=desc&limit=1`);
-      if (response.ok) {
-        const page = await response.json() as { data?: Array<{ type: string }> };
-        finished = ["session.status_idle", "session.status_terminated"].includes(page.data?.[0]?.type ?? "");
-      }
+    if (await sessionSettled(receipt.session_id, receipt.status === "error")) {
+      await sql.prepare(`UPDATE ambient_webhook_receipts SET active = 0
+        WHERE tenant_id = ? AND rule_id = ? AND event_id = ? AND status IN ('accepted', 'error')`)
+        .bind(tenantId, ruleId, receipt.event_id).run();
     }
-    if (finished) await sql.prepare(`UPDATE ambient_webhook_receipts SET active = 0
-      WHERE tenant_id = ? AND rule_id = ? AND event_id = ? AND status = 'accepted'`)
-      .bind(tenantId, ruleId, receipt.event_id).run();
+  }
+  // A schedule's own sweep runs write no receipt. Its latest run (the rule's
+  // last_decision) still takes a concurrency slot while it works, so Run now
+  // cannot start a second session beside it. Runs per day count only the
+  // runs admitted here (Run now), not the sweep's.
+  let sweepRunning = 0;
+  const lastSessionId = isSchedule ? rule.last_decision?.session_id : undefined;
+  if (lastSessionId) {
+    const tracked = await sql.prepare(`SELECT event_id FROM ambient_webhook_receipts
+      WHERE tenant_id = ? AND rule_id = ? AND session_id = ?`).bind(tenantId, ruleId, lastSessionId).first();
+    if (!tracked && !(await sessionSettled(lastSessionId, false))) sweepRunning = 1;
   }
   const now = new Date().toISOString();
   const startOfDay = `${now.slice(0, 10)}T00:00:00.000Z`;
@@ -172,7 +194,7 @@ async function deliver(c: RouteContext, deps: AmbientWebhookDeps, d: Delivery): 
       AND (SELECT COUNT(*) FROM ambient_webhook_receipts WHERE tenant_id = ? AND rule_id = ? AND active = 1) < ?
       ON CONFLICT (tenant_id, rule_id, event_id) DO NOTHING`)
       .bind(...key, payload, rule.wake_mode === "observe" ? 0 : 1, now,
-        tenantId, ruleId, startOfDay, maxDaily, tenantId, ruleId, maxConcurrent),
+        tenantId, ruleId, startOfDay, maxDaily, tenantId, ruleId, (maxConcurrent as number) - sweepRunning),
   ]);
   if (!admitted[1].meta.changes) {
     const receipt = await getReceipt();
@@ -249,8 +271,10 @@ async function deliver(c: RouteContext, deps: AmbientWebhookDeps, d: Delivery): 
     return c.json({ event_id: eventId, session_id: sessionId, duplicate: false }, 202);
   } catch (error) {
     console.error("[ambient-webhook] delivery failed", { tenantId, ruleId, eventId, sessionId, error });
-    await sql.prepare(`UPDATE ambient_webhook_receipts SET status = 'error', active = ?
-      WHERE tenant_id = ? AND rule_id = ? AND event_id = ?`).bind(dispatchStarted ? 1 : 0, ...key).run();
+    // Keep the session on the receipt: a slot held for a started dispatch is
+    // released once that session settles.
+    await sql.prepare(`UPDATE ambient_webhook_receipts SET status = 'error', active = ?, session_id = COALESCE(session_id, ?)
+      WHERE tenant_id = ? AND rule_id = ? AND event_id = ?`).bind(dispatchStarted ? 1 : 0, sessionId, ...key).run();
     return c.json({
       error: isSchedule && !dispatchStarted
         ? `The run could not be started: ${error instanceof Error ? error.message : "dispatch failed"}`
