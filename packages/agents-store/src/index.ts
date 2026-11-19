@@ -13,6 +13,7 @@
 
 export * from "./types";
 export * from "./ambient-types";
+export * from "./ambient-run";
 export * from "./grants-types";
 export * from "./errors";
 export * from "./ports";

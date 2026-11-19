@@ -266,3 +266,47 @@ describe("long output", () => {
     expect(screen.getByText(/line 50/)).toBeInTheDocument();
   });
 });
+
+describe("a triggered run", () => {
+  it("opens with a Triggered by card, not a bubble from you, with the prompt folded away", () => {
+    show([
+      ev({
+        type: "user.message",
+        id: "u1",
+        processed_at: at(0),
+        content: [{ type: "text", text: "Summarize the overnight alerts." }],
+        metadata: {
+          kind: "ambient_wake",
+          ambient: { rule_id: "amb_1", rule_name: "Morning sweep", source: "schedule", wake_mode: "act", fired_at: at(0) },
+        },
+      }),
+      ev({ type: "agent.message", id: "a1", processed_at: at(2), content: [{ type: "text", text: "All quiet." }] }),
+    ]);
+    const card = screen.getByText(/Triggered by/).closest("[role=note]") as HTMLElement;
+    expect(within(card).getByRole("link", { name: "Morning sweep" })).toHaveAttribute("href", "/agents/agent-1?tab=triggers");
+    expect(within(card).getByText(/Schedule/)).toBeInTheDocument();
+    // The exact words are there for whoever opens them.
+    expect(screen.queryByText("Summarize the overnight alerts.")).not.toBeInTheDocument();
+    fireEvent.click(within(card).getByRole("button", { name: "Show the prompt" }));
+    expect(within(card).getByText("Summarize the overnight alerts.")).toBeInTheDocument();
+  });
+
+  it("names a webhook test event by its id", () => {
+    show([
+      ev({
+        type: "user.message",
+        id: "u1",
+        processed_at: at(0),
+        content: [{ type: "text", text: '[Ambient webhook: Deploys]\nCheck it.\nSource event: "test-abc"\n{"message":"hi"}' }],
+        metadata: {
+          kind: "ambient_wake",
+          ambient: { rule_id: "amb_2", rule_name: "Deploys", source: "webhook", wake_mode: "act", fired_at: at(0), event_id: "test-abc", manual: true },
+        },
+      }),
+    ]);
+    const card = screen.getByText(/Triggered by/).closest("[role=note]") as HTMLElement;
+    expect(within(card).getByText(/Webhook test event/)).toBeInTheDocument();
+    expect(within(card).getByText("test-abc")).toBeInTheDocument();
+    expect(within(card).getByRole("button", { name: "Show the event and prompt" })).toBeInTheDocument();
+  });
+});

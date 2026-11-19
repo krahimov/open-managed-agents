@@ -105,7 +105,10 @@ POST /v1/agents/:id/ambient-rules
 ```
 
 - Trigger sources: `schedule`, `webhook`, `slack`, `teams`, `github`, `linear`,
-  `email`, `memory`, `file`, `manual`.
+  `email`, `memory`, `file`, `manual`. Not every deployment fires every source:
+  `GET /v1/server_features` lists the ones it does in `ambient_trigger_sources`
+  (the Node server fires `schedule` and `webhook` only; other rules save but
+  never wake).
 - Wake modes: `observe` | `decide` (default) | `act` | `escalate` — how much
   initiative the woken agent takes.
 - Schedule rules arm themselves: create/update computes the first
@@ -119,6 +122,15 @@ POST /v1/agents/:id/ambient-rules
   the config field. See `docs/agent-memory.md`.
 - Full CRUD: `GET/POST /v1/agents/:id/ambient-rules`,
   `GET/PATCH/DELETE /v1/agents/:id/ambient-rules/:ruleId`.
+- Run one now without changing its cadence:
+  `POST /v1/agents/:id/ambient-rules/:ruleId/run` (body optional:
+  `{"event_id"?, "data"?}`; `data` is a webhook test event's payload). It is
+  held to the rule's budget and idempotent per `event_id`; answers
+  `{event_id, session_id}` (`session_id` is null for `observe` rules).
+  Feature key `ambient_run_now`.
+- Each run's session is titled `<rule name> · <time or event id>`, and its
+  wake message carries `metadata.ambient` (`rule_id`, `rule_name`, `source`,
+  `event_id` / `scheduled_for`, `manual`).
 
 **Agents can wire their own crons from chat.** The default toolset includes
 `create_ambient_rule` / `list_ambient_rules` / `delete_ambient_rule` — tell an

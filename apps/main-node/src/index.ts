@@ -2253,6 +2253,9 @@ v1.route("/agents", buildAgentRoutes({
   onAmbientRuleCreated: async ({ tenantId, agentId }) => {
     await autoEnableMemoryForAmbientRule(agentMemoryDeps, { tenantId, agentId });
   },
+  // "Run now" on a schedule rule: the same dispatcher the sweep uses
+  // (declared further down; only called once requests are served).
+  runScheduleRuleNow: ({ rule, runId }) => ambientDispatcher.runNow(rule, { runId }),
 }));
 // GET/PUT /v1/agents/:id/memory — the console's memory toggle.
 v1.route("/agents", buildAgentMemoryRoutes({ memory: agentMemoryDeps }));

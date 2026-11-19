@@ -137,13 +137,18 @@ describe("GET /v1/server_features", () => {
       headers: { "x-caller": JSON.stringify({ auth_type: "disabled", tenant_id: "default" }) },
     });
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ features: ["workspace_access", "usage"] });
+    expect(await res.json()).toEqual({
+      features: ["workspace_access", "usage", "ambient_run_now"],
+      // Only the sources Node dispatches; the console hides the rest.
+      ambient_trigger_sources: ["schedule", "webhook"],
+    });
   });
 
   it("only names keys the console knows", () => {
     const known = [
       "operations", "workspace_access", "usage", "missions", "workspace_admin", "budgets", "scoped_keys",
       "simulations", "draft_scenarios", "comparisons", "memory_writes", "skill_versions", "runtimes", "cap_cli",
+      "ambient_run_now",
     ];
     for (const key of SERVER_FEATURES) expect(known).toContain(key);
   });
