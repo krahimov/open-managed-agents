@@ -1914,15 +1914,16 @@ v1.route("/agents", buildAgentComputerRoutes({
   desktopTicket: (tenantId, agentId) => desktopGateway.issue(tenantId, agentId),
   screenshot: async (tenantId, agentId, row) => {
     if (row.config.desktop) {
-      // Read-only and outside the lifecycle lease: a session attaching to
-      // this running computer holds the lease while it checks the box, and
-      // the picture must not wait for (or fail on) that.
+      // A picture only reads the screen: it takes no lifecycle lock, so the
+      // agent's own computer_* calls never queue behind a viewer's poll, and
+      // a session attaching to this running computer (which holds the lease)
+      // doesn't blank it. It does not count as activity that keeps the
+      // computer awake.
       const box = await agentMachines.getBox(tenantId, agentId);
       if (!box?.sb.computerUse) return null;
       try {
         const shot = await box.sb.computerUse.screenshot.takeFullScreen();
         if (!shot.screenshot) throw new Error('Daytona returned an empty desktop screenshot');
-        await machineStore.update(row.id, { lastActiveAt: Date.now() }, Date.now());
         return Buffer.from(shot.screenshot.replace(/^data:image\/png;base64,/, ''), 'base64');
       } catch (err) {
         // Mid-start the desktop may not answer yet: not running, not a failure.

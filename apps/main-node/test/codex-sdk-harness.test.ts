@@ -8,6 +8,7 @@ import path from "node:path";
 import {
   CodexSdkHarness,
   codexModelFor,
+  contentOfMcpResult,
   curatedCodexEnv,
   type CodexLike,
 } from "../src/lib/codex-sdk-harness.js";
@@ -413,5 +414,28 @@ describe("CodexSdkHarness.run", () => {
     expect(seen.tools).toContain("request_access");
     expect(seen.tools).not.toContain("enable_memory");
     expect(enabledFor).toHaveLength(1);
+  });
+});
+
+describe("contentOfMcpResult", () => {
+  const call = (result: unknown, error?: { message: string }) =>
+    ({ id: "i", type: "mcp_tool_call", server: "oma_platform", tool: "computer_screenshot", arguments: {}, status: "completed", result, error }) as never;
+
+  it("keeps a screenshot's picture as a wire image block, so the console can show it", () => {
+    expect(contentOfMcpResult(call({ content: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }] }))).toEqual([
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "aGVsbG8=" } },
+    ]);
+    expect(
+      contentOfMcpResult(call({ content: [{ type: "text", text: "Captured" }, { type: "image", data: "aGk=", mimeType: "image/jpeg" }] })),
+    ).toEqual([
+      { type: "text", text: "Captured" },
+      { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "aGk=" } },
+    ]);
+  });
+
+  it("leaves text results and failures as the strings they were", () => {
+    expect(contentOfMcpResult(call({ content: [{ type: "text", text: "Clicked desktop" }] }))).toBe("Clicked desktop");
+    expect(contentOfMcpResult(call(undefined, { message: "boom" }))).toBe("error: boom");
+    expect(contentOfMcpResult(call({ content: [] }))).toBe("(no output)");
   });
 });

@@ -40,7 +40,7 @@ import { StatusBadge, type StatusTone } from "./Badge";
  * the endpoint.
  */
 
-interface AgentMachine {
+export interface AgentMachine {
   id: string;
   state: string;
   generation: number;
@@ -107,10 +107,18 @@ const STATE: Record<string, { label: string; tone: StatusTone; live?: boolean }>
   error: { label: "Failed", tone: "danger" },
 };
 
-const TRANSITIONING = new Set(["creating", "bootstrapping", "starting", "stopping", "recreating", "deleting"]);
-const STARTABLE = new Set(["stopped", "archived", "error"]);
+export const TRANSITIONING = new Set(["creating", "bootstrapping", "starting", "stopping", "recreating", "deleting"]);
+export const STARTABLE = new Set(["stopped", "archived", "error"]);
 
-function MachineState({ machine }: { machine: AgentMachine | null | undefined }) {
+/** How often the computer's state is read again: every 3s while it is
+ *  changing, every 10s while it runs, not at all otherwise. */
+export function machineRefetchInterval(query: { state: { data?: MachineResponse } }): number | false {
+  const state = query.state.data?.machine?.state;
+  if (state && TRANSITIONING.has(state)) return 3_000;
+  return state === "running" ? 10_000 : false;
+}
+
+export function MachineState({ machine }: { machine: AgentMachine | null | undefined }) {
   if (!machine) return <span className="text-fg-muted">Not started</span>;
   const def = STATE[machine.state];
   // `running` and `provisioning` carry the live halo in the vocabulary.
@@ -120,7 +128,7 @@ function MachineState({ machine }: { machine: AgentMachine | null | undefined })
 
 // Images need an authenticated fetch: a plain <img src> cannot attach the
 // Clerk bearer token or the selected workspace header.
-async function fetchScreenshot(path: string, signal: AbortSignal): Promise<Blob> {
+export async function fetchScreenshot(path: string, signal: AbortSignal): Promise<Blob> {
   const clerkToken = await getClerkBearerToken();
   const activeTenant = getActiveTenantId();
   const response = await fetch(path, {
@@ -234,11 +242,7 @@ export function AgentComputerPanel({ agentId, localRuntime = false, defaultEnvir
   const machinePath = agentMachineQueryKey(agentId)[0];
   const status = useApiQuery<MachineResponse>(machinePath, undefined, {
     staleTime: 0,
-    refetchInterval: (query) => {
-      const state = query.state.data?.machine?.state;
-      if (state && TRANSITIONING.has(state)) return 3_000;
-      return state === "running" ? 10_000 : false;
-    },
+    refetchInterval: machineRefetchInterval,
   });
   // The failure is said in the panel, so the request raises no toast.
   const control = useMutation<{ machine: AgentMachine }, Error, "start" | "stop">({
