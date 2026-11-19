@@ -10,7 +10,9 @@ import { cn } from "@/lib/utils";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { IntegrationsApi } from "../integrations/api/client";
-import { ApiError, useApi } from "../lib/api";
+import { ApiError, isNotOnServer, useApi } from "../lib/api";
+import { isAgentComputerEnvironment, type EnvironmentChoice } from "../lib/default-environment";
+import { useApiQuery } from "../lib/useApiQuery";
 import { attachmentsLabel, attachmentsOf, buildUserMessageEvent } from "../lib/attachments";
 import { eventKey } from "../lib/event-key";
 import type { Event } from "../lib/events";
@@ -22,6 +24,7 @@ import { startSession } from "../lib/shell-events";
 import type { Trajectory } from "../lib/trajectory";
 import type { SessionRecord } from "../types/session";
 import { AgentAvatar } from "../components/AgentAvatar";
+import { agentMachineQueryKey, type MachineResponse } from "../components/AgentComputerPanel";
 import { useCrumbLabel } from "../components/AppBreadcrumb";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { RecordNotFound } from "../components/EmptyState";
@@ -30,6 +33,8 @@ import { Page, PAGE_GUTTER } from "../components/Page";
 import { QueryProblem } from "../components/QueryProblem";
 import { Tip } from "../components/Tip";
 import { Conversation, ConversationContent } from "../components/ai-elements/conversation";
+import { ComputerPane } from "../components/sessions/ComputerPane";
+import { turnUsesComputer, useComputerView } from "../components/sessions/computer";
 import { ContextPanel, sessionUploadsPath, type PeekTarget, type SessionState } from "../components/sessions/ContextPanel";
 import { ConversationControl, ConversationEdges, JumpToLatest, type ConversationHandle } from "../components/sessions/ConversationEdges";
 import { ConversationView, type QueuedMessage } from "../components/sessions/ConversationView";
@@ -158,7 +163,7 @@ export function SessionDetail() {
     vaults?: Array<{ id: string; name?: string; problem?: LookupProblem }>;
     createdAt?: string;
     agentSnapshot?: { id?: string; name?: string; model?: string | { id: string }; description?: string; version?: number };
-    envSnapshot?: { id?: string; name?: string; description?: string };
+    envSnapshot?: { id?: string; name?: string; description?: string; config?: EnvironmentChoice["config"] };
     /** The environment's name lookup did not return a record. */
     envProblem?: LookupProblem;
   }>({});
@@ -503,7 +508,9 @@ export function SessionDetail() {
   const resolveEnvironment = (sessionId: string, environmentId: string | undefined) => {
     if (!environmentId || environmentId === "env_local_runtime") return;
     setSessionMeta((prev) => ({ ...prev, envProblem: undefined }));
-    api<{ id: string; name?: string; description?: string }>(`/v1/environments/${environmentId}`, { silentErrors: true })
+    api<{ id: string; name?: string; description?: string; config?: EnvironmentChoice["config"] }>(`/v1/environments/${environmentId}`, {
+      silentErrors: true,
+    })
       .then((env) => {
         if (currentId.current === sessionId) setSessionMeta((prev) => ({ ...prev, envSnapshot: env, envProblem: undefined }));
       })
@@ -859,10 +866,11 @@ export function SessionDetail() {
   const [timelineInspecting, setTimelineInspecting] = useState(false);
   const [filesNonce, setFilesNonce] = useState(0);
   const [confirm, setConfirm] = useState<"archive" | "delete" | null>(null);
-  const panelOpen = isWide ? panelPref : panelSheet;
-  const togglePanel = () => (isWide ? setPanelPref(!panelPref) : setPanelSheet(!panelSheet));
-  const toggleRef = useRef(togglePanel);
-  toggleRef.current = togglePanel;
+  // The agent's computer sits between the conversation and the details
+  // panel from 1024px, and in a sheet over the page below that.
+  const computerInline = useMediaQuery("(min-width: 1024px)");
+  const computerBesideDetails = useMediaQuery("(min-width: 1600px)");
+  const toggleRef = useRef<() => void>(() => {});
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "." && (e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey) {
@@ -969,6 +977,43 @@ export function SessionDetail() {
   }, [session?.metadata, events]);
 
   const agent = sessionMeta.agentSnapshot ?? session?.agent ?? (agentId ? { id: agentId } : {});
+
+  // ── The agent's computer ──
+  // Shown when this session runs on the agent's persistent computer: its
+  // environment is marked as one (sandbox scope "agent"), or, when the
+  // environment could not be read, the agent has a computer. Nothing is
+  // shown for a local runtime or a server without agent computers.
+  const sessionEnvironmentId = sessionMeta.environmentId ?? session?.environment_id;
+  const environmentKnown = !!sessionMeta.envSnapshot || !!sessionMeta.envProblem;
+  const environmentConfig = sessionMeta.envSnapshot?.config;
+  const envIsComputer =
+    environmentConfig && sessionEnvironmentId
+      ? isAgentComputerEnvironment({ id: sessionEnvironmentId, config: environmentConfig })
+      : undefined;
+  const computerAgentId =
+    agent.id && sessionEnvironmentId && sessionEnvironmentId !== "env_local_runtime" && environmentKnown && envIsComputer !== false
+      ? agent.id
+      : null;
+  const machineStatus = useApiQuery<MachineResponse>(computerAgentId ? agentMachineQueryKey(computerAgentId)[0] : null);
+  const hasComputer =
+    !!computerAgentId &&
+    !(machineStatus.error && isNotOnServer(machineStatus.error)) &&
+    (envIsComputer === true || !!machineStatus.data?.machine);
+  // The main thread's turn in progress is using the browser or the desktop.
+  const mainEvents = useMemo(
+    () => events.filter((e) => ((e as { session_thread_id?: string }).session_thread_id ?? PRIMARY_THREAD) === PRIMARY_THREAD),
+    [events],
+  );
+  const computerInUse = hasComputer && live && turnUsesComputer(mainEvents);
+  const computerView = useComputerView({ sessionId: id, available: hasComputer, inUse: computerInUse, inline: computerInline });
+  const computerOpenInline = computerView.inlineOpen;
+
+  // With the computer open beside it, the details panel stays inline only
+  // where both fit beside a readable conversation; otherwise it is a sheet.
+  const detailsInline = isWide && !(computerOpenInline && !computerBesideDetails);
+  const panelOpen = detailsInline ? panelPref : panelSheet;
+  const togglePanel = () => (detailsInline ? setPanelPref(!panelPref) : setPanelSheet(!panelSheet));
+  toggleRef.current = togglePanel;
   const activeThread = threads.find((t) => t.id === activeThreadId);
   // A sub-agent wears its own face: the agent it is, not the thread it runs in.
   const speaker = activeThread
@@ -1112,7 +1157,7 @@ export function SessionDetail() {
   // either: there is no conversation to show, and that is not "empty".
   const historyUnavailable = !conversationLoading && !!historyError && events.length === 0;
   const isEmpty = !conversationLoading && !historyUnavailable && conversation.items.length === 0 && queued.length === 0 && !running;
-  const showInlinePanel = isWide && panelPref && !(view === "timeline" && timelineInspecting);
+  const showInlinePanel = detailsInline && panelPref && !(view === "timeline" && timelineInspecting);
 
   const sourceInfo = {
     kind: session ? sessionSource(session) : "console",
@@ -1224,7 +1269,7 @@ export function SessionDetail() {
         onOpenTrajectory={() => setShowTrajectory(true)}
         trajectoryDisabled={trajectory === undefined || trajectory === "loading"}
         onShowFiles={() => {
-          if (isWide) setPanelPref(true);
+          if (detailsInline) setPanelPref(true);
           else setPanelSheet(true);
           setFilesNonce((n) => n + 1);
         }}
@@ -1233,6 +1278,7 @@ export function SessionDetail() {
         sessionId={id ?? ""}
         panelOpen={panelOpen}
         onTogglePanel={togglePanel}
+        computer={hasComputer ? { open: computerView.open, live: computerInUse, onToggle: computerView.toggle } : undefined}
         below={
           (threads.length > 0 || (missionId && id)) && (
             <div className={cn("space-y-3 pb-3.5", PAGE_GUTTER)}>
@@ -1342,8 +1388,35 @@ export function SessionDetail() {
         )}
       </div>
 
+      {computerOpenInline && computerAgentId && (
+        <ComputerPane
+          agentId={computerAgentId}
+          sessionRunning={live}
+          inUse={computerInUse}
+          onClose={computerView.toggle}
+          width={computerView.width}
+          onWidthChange={computerView.setWidth}
+          // The conversation keeps 400px, and the details panel its 320px.
+          reserve={400 + (showInlinePanel ? 320 : 0)}
+        />
+      )}
+      {!computerInline && hasComputer && computerAgentId && (
+        <Sheet open={computerView.sheetOpen} onOpenChange={computerView.setSheetOpen}>
+          <SheetContent showCloseButton={false} className="gap-0 p-0 data-[side=right]:w-full data-[side=right]:sm:max-w-[min(92vw,720px)]">
+            <SheetTitle className="sr-only">Computer</SheetTitle>
+            <SheetDescription className="sr-only">The agent's computer, live.</SheetDescription>
+            <ComputerPane
+              variant="sheet"
+              agentId={computerAgentId}
+              sessionRunning={live}
+              inUse={computerInUse}
+              onClose={() => computerView.setSheetOpen(false)}
+            />
+          </SheetContent>
+        </Sheet>
+      )}
       {showInlinePanel && (loading ? <ContextPanelSkeleton /> : <ContextPanel {...panelProps} />)}
-      {!isWide && (
+      {!detailsInline && (
         <Sheet open={panelSheet} onOpenChange={setPanelSheet}>
           <SheetContent className="gap-0 p-0 sm:max-w-[360px]">
             <SheetTitle className="px-5 pt-5">Session details</SheetTitle>

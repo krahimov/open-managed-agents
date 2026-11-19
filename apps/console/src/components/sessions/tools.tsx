@@ -2,20 +2,28 @@ import { createContext, useContext, useMemo, useState, type ComponentType, type 
 import {
   AlarmClockIcon,
   BrainIcon,
+  CameraIcon,
   ChevronRightIcon,
+  CodeIcon,
   ExternalLinkIcon,
   FilePenLineIcon,
   FileSearchIcon,
   FileTextIcon,
   FolderSearchIcon,
   GlobeIcon,
+  KeyboardIcon,
   LayersIcon,
   ListChecksIcon,
+  MonitorIcon,
+  MousePointerClickIcon,
+  MoveVerticalIcon,
   PlugIcon,
   SearchIcon,
   TerminalIcon,
+  TextCursorInputIcon,
   UsersRoundIcon,
   WrenchIcon,
+  XIcon,
 } from "lucide-react";
 
 import { readComposioCall, type ComposioCall } from "@/lib/composio-calls";
@@ -30,8 +38,9 @@ import { CodeWell, EventCard } from "../EventCard";
 import { appLogoIcon } from "../app-logos";
 import { CopyButton } from "../IdChip";
 import { Markdown } from "../Markdown";
+import { Modal } from "../Modal";
 import type { EventStatus } from "../EventCard";
-import { formatElapsed, handoffKey, handoffKeyOf, type ToolCall } from "./model";
+import { formatElapsed, handoffKey, handoffKeyOf, resultImages, type ResultImage, type ToolCall } from "./model";
 
 /**
  * How a tool call is shown: its icon, name, a one-line preview of what it
@@ -123,6 +132,19 @@ const BUILT_IN: Record<string, { icon: IconType; verb: string }> = {
   todowrite: { icon: ListChecksIcon, verb: "update its task list" },
   task: { icon: UsersRoundIcon, verb: "delegate to another agent" },
   general_subagent: { icon: UsersRoundIcon, verb: "delegate to another agent" },
+  // The agent's own computer (packages/browser-harness).
+  browser_navigate: { icon: GlobeIcon, verb: "open a page in its browser" },
+  browser_screenshot: { icon: CameraIcon, verb: "take a picture of its browser" },
+  browser_click: { icon: MousePointerClickIcon, verb: "click in its browser" },
+  browser_type: { icon: TextCursorInputIcon, verb: "type in its browser" },
+  browser_get_text: { icon: FileTextIcon, verb: "read the page in its browser" },
+  browser_eval: { icon: CodeIcon, verb: "run a script in its browser" },
+  browser_close: { icon: XIcon, verb: "close its browser" },
+  computer_screenshot: { icon: CameraIcon, verb: "take a picture of its desktop" },
+  computer_click: { icon: MousePointerClickIcon, verb: "click on its desktop" },
+  computer_type: { icon: KeyboardIcon, verb: "type on its desktop" },
+  computer_press: { icon: KeyboardIcon, verb: "press a key on its desktop" },
+  computer_scroll: { icon: MoveVerticalIcon, verb: "scroll on its desktop" },
 };
 
 const text = (v: unknown): string | undefined => (typeof v === "string" && v.trim() ? v : undefined);
@@ -538,6 +560,30 @@ export function ToolBody({ call }: { call: ToolCall }) {
           ? "This is a custom tool: the app that started the session runs it and sends back the result. The agent carries on once it does."
           : null);
 
+  // Pictures the tool returned (a browser or desktop screenshot) are shown
+  // as pictures, with whatever text came with them.
+  const images = denied ? [] : resultImages(call.result);
+  if (images.length > 0) {
+    const hasInput = Object.keys(input).length > 0;
+    return (
+      <>
+        {hasInput && (
+          <Part label="Arguments" copy={JSON.stringify(input, null, 2)}>
+            <Arguments input={input} />
+          </Part>
+        )}
+        <Part label={images.length === 1 ? "Picture" : "Pictures"} hint={images.length > 1 ? `${images.length}` : undefined}>
+          <ResultImages images={images} label={presentTool(call).title} />
+        </Part>
+        {output?.trim() && (
+          <Part label={outLabel} hint={sizeHint(output)} copy={output}>
+            <OutputWell tone={outTone}>{output}</OutputWell>
+          </Part>
+        )}
+      </>
+    );
+  }
+
   const outputPart =
     output !== undefined ? (
       <Part label={outLabel} hint={sizeHint(output)} copy={output}>
@@ -682,6 +728,43 @@ export function ToolBody({ call }: { call: ToolCall }) {
   );
 }
 
+/**
+ * The pictures a tool returned, as thumbnails that open larger. A
+ * screenshot is the whole screen, so the thumbnail is capped in height and
+ * keeps its proportions; the larger view fits the window.
+ */
+function ResultImages({ images, label }: { images: ResultImage[]; label: string }) {
+  const [open, setOpen] = useState<number | null>(null);
+  const shown = open === null ? undefined : images[open];
+  const name = (i: number) => (images.length > 1 ? `Picture ${i + 1} of ${images.length} from ${label}` : `Picture from ${label}`);
+  return (
+    <>
+      <div className="flex flex-wrap gap-2">
+        {images.map((image, i) => (
+          <button
+            key={i}
+            type="button"
+            onClick={() => setOpen(i)}
+            aria-label={`Open ${name(i).toLowerCase()} larger`}
+            className="group block max-w-full overflow-hidden rounded-md border border-border bg-bg-inset transition-quick hover:border-border-strong"
+          >
+            <img
+              src={image.src}
+              alt={name(i)}
+              loading="lazy"
+              decoding="async"
+              className="block max-h-44 w-auto max-w-full object-contain transition-quick group-hover:opacity-90"
+            />
+          </button>
+        ))}
+      </div>
+      <Modal open={shown !== undefined} onClose={() => setOpen(null)} title={open === null ? label : name(open)} maxWidth="max-w-4xl">
+        {shown && <img src={shown.src} alt={name(open ?? 0)} className="mx-auto block max-h-[75vh] w-auto max-w-full rounded-md object-contain" />}
+      </Modal>
+    </>
+  );
+}
+
 /** Just the exact input, for an approval card: what will run if you allow it. */
 export function ToolInputPreview({ call }: { call: ToolCall }) {
   const n = call.name.toLowerCase();
@@ -795,7 +878,9 @@ export function ToolCallCard({ call, defaultOpen }: { call: ToolCall; defaultOpe
       subtitle={p.preview}
       status={glyphOf(call.status)}
       meta={meta}
-      defaultOpen={defaultOpen}
+      // A call that came back with a picture (a screenshot) opens on it: the
+      // picture is what there is to see.
+      defaultOpen={defaultOpen ?? (resultImages(call.result).length > 0 || undefined)}
     >
       <ToolBody call={call} />
     </EventCard>

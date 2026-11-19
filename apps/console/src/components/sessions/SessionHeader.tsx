@@ -9,6 +9,7 @@ import {
   FlaskConicalIcon,
   FolderIcon,
   LaptopIcon,
+  MonitorIcon,
   PanelRightCloseIcon,
   PanelRightOpenIcon,
   SquareIcon,
@@ -95,6 +96,7 @@ export function SessionHeader({
   sessionId,
   panelOpen,
   onTogglePanel,
+  computer,
   below,
 }: {
   loading: boolean;
@@ -128,6 +130,10 @@ export function SessionHeader({
   sessionId: string;
   panelOpen: boolean;
   onTogglePanel: () => void;
+  /** Set when the session's agent has a computer to watch: the toggle for
+   *  the Computer view beside the conversation. `live` marks it while the
+   *  agent is using the computer and the view is closed. */
+  computer?: { open: boolean; live: boolean; onToggle: () => void };
   /** Rows under the bar: thread tabs, the mission banner. */
   below?: ReactNode;
 }) {
@@ -258,6 +264,23 @@ export function SessionHeader({
             </Tip>
           )}
           <RowActionsMenu label="Session actions" actions={menu} />
+          {computer && (
+            <Tip label={computer.open ? "Hide computer" : computer.live ? "Watch the agent use its computer" : "Show computer"}>
+              <Button
+                variant="ghost"
+                size="icon-sm"
+                aria-label={computer.open ? "Hide computer" : "Show computer"}
+                aria-pressed={computer.open}
+                onClick={computer.onToggle}
+                className={cn("relative", computer.open && "bg-bg-soft text-fg")}
+              >
+                <MonitorIcon />
+                {computer.live && !computer.open && (
+                  <span aria-hidden="true" className="absolute top-1 right-1 size-1.5 rounded-full bg-plum" />
+                )}
+              </Button>
+            </Tip>
+          )}
           <Tip
             label={
               <>

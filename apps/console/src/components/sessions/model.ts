@@ -290,9 +290,15 @@ export function resultText(result: Event | undefined): string | undefined {
   if (typeof raw === "string") return raw;
   if (Array.isArray(raw)) {
     // Content-block arrays: join the text blocks; anything else is shown as JSON.
+    // Images are drawn as pictures (resultImages), so a result of text and
+    // images reads as its text alone, never as a wall of base64.
     const blocks = raw as Array<{ type?: string; text?: string }>;
-    if (blocks.every((b) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string")) {
-      return blocks.map((b) => b.text).join("\n");
+    const isText = (b: { type?: string; text?: string }) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string";
+    if (blocks.every((b) => isText(b) || imageOfBlock(b))) {
+      return blocks
+        .filter(isText)
+        .map((b) => b.text)
+        .join("\n");
     }
   }
   try {
@@ -300,6 +306,47 @@ export function resultText(result: Event | undefined): string | undefined {
   } catch {
     return String(raw);
   }
+}
+
+/** A picture a tool returned, ready for an <img src>. */
+export interface ResultImage {
+  src: string;
+  mediaType: string;
+}
+
+const RASTER = /^image\/(png|jpeg|jpg|gif|webp)$/i;
+
+/** One wire image block (`{ type: "image", source }`) as a picture, or null.
+ *  Only raster images inline, and only https links: a tool's result is not
+ *  trusted to point the console anywhere else. */
+function imageOfBlock(block: unknown): ResultImage | null {
+  if (!block || typeof block !== "object" || (block as { type?: unknown }).type !== "image") return null;
+  const source = (block as { source?: { type?: unknown; media_type?: unknown; data?: unknown; url?: unknown } }).source;
+  if (!source || typeof source !== "object") return null;
+  const mediaType = typeof source.media_type === "string" && source.media_type ? source.media_type : "image/png";
+  if (source.type === "base64" && typeof source.data === "string" && source.data && RASTER.test(mediaType)) {
+    return { src: `data:${mediaType};base64,${source.data}`, mediaType };
+  }
+  if (source.type === "url" && typeof source.url === "string" && /^https:\/\//i.test(source.url)) {
+    return { src: source.url, mediaType };
+  }
+  return null;
+}
+
+/**
+ * The pictures in a tool's result: a browser or desktop screenshot is
+ * `[{ type: "image", source: { type: "base64", media_type, data } }]`
+ * (apps/agent normalizeToolOutputForWire). Empty for any other result.
+ */
+export function resultImages(result: Event | undefined): ResultImage[] {
+  const raw = (result as { content?: unknown } | undefined)?.content;
+  if (!Array.isArray(raw)) return [];
+  const out: ResultImage[] = [];
+  for (const block of raw) {
+    const image = imageOfBlock(block);
+    if (image) out.push(image);
+  }
+  return out;
 }
 
 const stableKey = (e: Event, i: number): string =>

@@ -56,4 +56,35 @@ describe('desktop gateway', () => {
       expect(denied.message).toContain('403');
     } finally { client.terminate(); gateway.close(); await new Promise<void>(resolve => server.close(() => resolve())); await new Promise<void>(resolve => upstream.close(() => resolve())); }
   });
+
+  it('drops a viewer that stops answering pings, so it no longer counts against idle stop', async () => {
+    const upstream = new WebSocketServer({ port: 0, host: '127.0.0.1' });
+    await once(upstream, 'listening');
+    const port = (upstream.address() as { port: number }).port;
+    upstream.on('connection', ws => ws.send(Buffer.from('RFB 003.008\n')));
+    let released = 0;
+    const server = createServer();
+    const gateway = new DesktopGateway(async () => ({
+      url: `ws://127.0.0.1:${port}`, headers: {}, release: async () => { released++; },
+    }), 'https://test.example', Date.now, { keepaliveMs: 40 });
+    gateway.attach(server);
+    server.listen(0, '127.0.0.1'); await once(server, 'listening');
+    const appPort = (server.address() as { port: number }).port;
+    const ticketPath = () => gateway.issue('tenant-a', 'agent-a');
+    // One viewer answers pings (the default), one has gone silent.
+    const healthy = new WebSocket(`ws://127.0.0.1:${appPort}${ticketPath()}`, { origin: 'https://test.example' });
+    const silent = new WebSocket(`ws://127.0.0.1:${appPort}${ticketPath()}`, { origin: 'https://test.example', autoPong: false });
+    try {
+      await Promise.all([once(healthy, 'message'), once(silent, 'message')]);
+      const [code] = await once(silent, 'close');
+      expect(code).toBe(1006);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(released).toBe(1);
+      expect(healthy.readyState).toBe(WebSocket.OPEN);
+    } finally {
+      healthy.terminate(); silent.terminate(); gateway.close();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      await new Promise<void>(resolve => upstream.close(() => resolve()));
+    }
+  });
 });

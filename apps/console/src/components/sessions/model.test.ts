@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { Event } from "@/lib/events";
 import { sessionTitle } from "@/lib/sessions";
 
-import { briefFailures, buildConversation, grantedRequestIds, handoffKey, handoffKeyOf, summarizeUsage, type Block, type Conversation, type ToolCall } from "./model";
+import { briefFailures, buildConversation, grantedRequestIds, handoffKey, handoffKeyOf, resultImages, resultText, summarizeUsage, type Block, type Conversation, type ToolCall } from "./model";
 
 const events = (list: Array<Record<string, unknown>>): Event[] =>
   list.map((e, i) => ({ id: `e${i}`, seq: i + 1, ts: 1_800_000_000_000 + i * 1000, ...e })) as unknown as Event[];
@@ -393,5 +393,32 @@ describe("session usage", () => {
     expect(u.cacheReadTokens).toBe(4000);
     expect(u.outputTokens).toBe(50);
     expect(u.modelCalls).toBe(2);
+  });
+});
+
+describe("a tool result's pictures", () => {
+  const image = (source: Record<string, unknown>) => ({ type: "image", source });
+  const result = (content: unknown) => ({ type: "agent.tool_result", tool_use_id: "c1", content }) as Event;
+
+  it("reads base64 raster images and https links as pictures, and leaves their bytes out of the text", () => {
+    const r = result([
+      { type: "text", text: "Captured" },
+      image({ type: "base64", media_type: "image/png", data: "AAAA" }),
+      image({ type: "url", url: "https://cdn.example/shot.webp", media_type: "image/webp" }),
+    ]);
+    expect(resultImages(r)).toEqual([
+      { src: "data:image/png;base64,AAAA", mediaType: "image/png" },
+      { src: "https://cdn.example/shot.webp", mediaType: "image/webp" },
+    ]);
+    expect(resultText(r)).toBe("Captured");
+    expect(resultText(result([image({ type: "base64", media_type: "image/png", data: "AAAA" })]))).toBe("");
+  });
+
+  it("does not inline anything else", () => {
+    expect(resultImages(result("plain text"))).toEqual([]);
+    expect(resultImages(result([image({ type: "base64", media_type: "image/svg+xml", data: "PHN2Zz4=" })]))).toEqual([]);
+    expect(resultImages(result([image({ type: "url", url: "javascript:alert(1)" })]))).toEqual([]);
+    expect(resultImages(result([image({ type: "url", url: "http://insecure.example/a.png" })]))).toEqual([]);
+    expect(resultImages(undefined)).toEqual([]);
   });
 });
