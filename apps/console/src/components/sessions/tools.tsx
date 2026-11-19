@@ -18,6 +18,7 @@ import {
   WrenchIcon,
 } from "lucide-react";
 
+import { readComposioCall, type ComposioCall } from "@/lib/composio-calls";
 import { parseSearchMcpTools } from "@/lib/deferred-mcp";
 import { useAgents } from "@/lib/directory";
 import { cn } from "@/lib/utils";
@@ -62,6 +63,17 @@ const SERVERS: Record<string, { label: string; icon?: IconType }> = {
   googledrive: { label: "Google Drive" },
   airtable: { label: "Airtable" },
   asana: { label: "Asana" },
+  posthog: { label: "PostHog" },
+  googlecalendar: { label: "Google Calendar" },
+  googlesheets: { label: "Google Sheets" },
+  googledocs: { label: "Google Docs" },
+  googleslides: { label: "Google Slides" },
+  googlemeet: { label: "Google Meet" },
+  microsoftteams: { label: "Microsoft Teams" },
+  outlook: { label: "Outlook" },
+  salesforce: { label: "Salesforce" },
+  clickup: { label: "ClickUp" },
+  youtube: { label: "YouTube" },
 };
 
 /** The app's own vendored mark (components/brand-marks.ts), as an icon. One component per app, made once. */
@@ -180,7 +192,7 @@ function previewOf(name: string, input: Record<string, unknown>): string | undef
   if (n === "web_search" || n === "websearch") return text(input.query) && `“${oneLine(String(input.query), 120)}”`;
   if (n === "web_fetch" || n === "webfetch") return text(input.url)?.replace(/^https?:\/\//, "");
   // Anything else: the first argument that reads as the "subject" of the call.
-  for (const key of ["query", "q", "title", "name", "text", "body", "prompt", "url", "path", "channel", "issueId", "issue_id", "id"]) {
+  for (const key of ["query", "q", "title", "name", "text", "markdown_text", "body", "prompt", "url", "path", "channel", "issueId", "issue_id", "id"]) {
     const v = input[key];
     if (typeof v === "string" && v.trim()) return oneLineText(v, 120);
   }
@@ -192,8 +204,78 @@ function previewOf(name: string, input: Record<string, unknown>): string | undef
   return parts.length ? oneLineText(parts.join(" · "), 120) : undefined;
 }
 
+/** Apps by name, "HubSpot + Linear", each once. */
+const appLabels = (toolkits: string[]): string => Array.from(new Set(toolkits.map((k) => serverInfo(k).label))).join(" + ");
+
+/**
+ * A Composio router call shown as the app call it is (lib/composio-calls):
+ * "HubSpot · Search deals" with HubSpot's logo, not
+ * "Composio · COMPOSIO_MULTI_EXECUTE_TOOL". The body still shows the input as sent.
+ */
+function presentComposio(c: ComposioCall, input: Record<string, unknown>): ToolPresentation {
+  if (c.kind === "execute") {
+    const [first] = c.actions;
+    const app = serverInfo(first.toolkit);
+    const toolkits = c.actions.map((a) => a.toolkit);
+    const actions = Array.from(new Set(c.actions.map((a) => a.action)));
+    const title = actions.length === 1 ? actions[0] : actions.join(", ");
+    return {
+      icon: app.icon,
+      source: appLabels(toolkits),
+      title,
+      preview: previewOf(first.action, first.arguments),
+      verb: c.actions.length === 1 ? `use ${app.label} (${first.action.toLowerCase()})` : `use ${appLabels(toolkits)}`,
+      kind: "mcp",
+      plain: true,
+    };
+  }
+  if (c.kind === "search") {
+    const where = c.toolkits.length ? appLabels(c.toolkits) : null;
+    return {
+      icon: SearchIcon,
+      title: where ? `Searched ${where} tools` : "Searched app tools",
+      preview: c.queries.length ? `“${oneLine(c.queries[0], 120)}”${c.queries.length > 1 ? ` +${c.queries.length - 1} more` : ""}` : undefined,
+      verb: where ? `search ${where}'s tools` : "search its app tools",
+      kind: "tool",
+      plain: true,
+    };
+  }
+  if (c.kind === "connections") {
+    const where = c.toolkits.length ? appLabels(c.toolkits) : "app";
+    return {
+      icon: c.toolkits.length === 1 ? serverInfo(c.toolkits[0]).icon : PlugIcon,
+      title: `Checked ${where} connection${c.toolkits.length > 1 ? "s" : ""}`,
+      verb: `check its ${where} connection`,
+      kind: "tool",
+      plain: true,
+    };
+  }
+  if (c.kind === "schemas") {
+    return {
+      icon: FileSearchIcon,
+      title: c.actions.length ? `Read ${appLabels(c.actions.map((a) => a.toolkit))} tool details` : "Read tool details",
+      preview: c.actions.length ? oneLine(c.actions.map((a) => a.action).join(", "), 120) : undefined,
+      verb: "read its tools' details",
+      kind: "tool",
+      plain: true,
+    };
+  }
+  const code = text(input.code_to_execute) ?? text(input.code) ?? text(input.command);
+  return {
+    icon: TerminalIcon,
+    source: "Composio",
+    title: "Ran code in the workbench",
+    preview: code && oneLine(code),
+    verb: "run code in Composio's workbench",
+    kind: "tool",
+    plain: true,
+  };
+}
+
 export function presentTool(call: Pick<ToolCall, "name" | "server" | "flavor" | "input">): ToolPresentation {
-  const split = call.flavor !== "mcp" ? splitMcpName(call.name) : null;
+  const composio = readComposioCall(call.name, call.input);
+  if (composio) return presentComposio(composio, call.input);
+  const split = splitMcpName(call.name);
   if (call.flavor === "mcp" || split) {
     const server = serverInfo(call.server ?? split?.server);
     const tool = split?.tool ?? call.name;
