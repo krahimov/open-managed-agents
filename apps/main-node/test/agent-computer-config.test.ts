@@ -11,7 +11,8 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { canonicalSpec } from "@open-managed-agents/sandbox/machines/manager";
-import { agentComputerSpec } from "../src/lib/agent-computer-config";
+import { agentComputerBrowserEnabled, agentComputerEnabled, agentComputerSpec } from "../src/lib/agent-computer-config";
+import { buildSandboxEnvForEnvironment } from "../src/lib/environment-runtime-config";
 
 const fixture = JSON.parse(
   readFileSync(new URL("./fixtures/agent-computer-canonical-spec.json", import.meta.url), "utf8"),
@@ -25,5 +26,21 @@ describe("agentComputerSpec canonical config", () => {
   it("snapshot env (bootstrap_tools off) matches the pinned fixture", () => {
     const spec = agentComputerSpec({ DAYTONA_SNAPSHOT: "daytona-small", DAYTONA_BOOTSTRAP_TOOLS: "false" });
     expect(canonicalSpec(spec)).toBe(JSON.stringify(fixture.snapshot));
+  });
+});
+
+describe("agent computer support per environment", () => {
+  const computerEnv = { config: { sandbox: { provider: "daytona", scope: "agent", browser: true, desktop: true } } } as never;
+  it("is on for an agent whose default environment is an agent-scoped Daytona box, on any deployment", () => {
+    const env = buildSandboxEnvForEnvironment({ SANDBOX_PROVIDER: "subprocess" }, computerEnv);
+    expect(agentComputerEnabled(env)).toBe(true);
+    expect(agentComputerBrowserEnabled(env)).toBe(true);
+  });
+  it("is off for session sandboxes, and the browser follows the environment", () => {
+    expect(agentComputerEnabled(buildSandboxEnvForEnvironment({}, null))).toBe(false);
+    expect(agentComputerEnabled(buildSandboxEnvForEnvironment({}, { config: { sandbox: { provider: "daytona" } } } as never))).toBe(false);
+    const headless = buildSandboxEnvForEnvironment({}, { config: { sandbox: { provider: "daytona", scope: "agent", browser: false } } } as never);
+    expect(agentComputerEnabled(headless)).toBe(true);
+    expect(agentComputerBrowserEnabled(headless)).toBe(false);
   });
 });

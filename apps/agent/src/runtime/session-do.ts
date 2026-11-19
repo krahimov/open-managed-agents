@@ -82,6 +82,7 @@ import {
   type OutcomeEvaluationRecord,
 } from "./outcome-supervisor";
 import { buildTools } from "../harness/tools";
+import { isBuiltinTool } from "../harness/default-loop";
 import { MemoryStoreService } from "@open-managed-agents/memory-store";
 import { buildCfServices, buildCfTenantDbProvider, getCfServicesForTenant } from "@open-managed-agents/services";
 import { toEnvironmentConfig } from "@open-managed-agents/environments-store";
@@ -4861,9 +4862,9 @@ export class SessionDO extends DurableObject<Env> {
       // agent.tool_use, not custom); name heuristic only for older state.
       const hasCustomToolPending = storedPendingCalls.some(p =>
         p.eventType ? p.eventType === "agent.custom_tool_use" :
-        !["bash", "read", "write", "edit", "glob", "grep", "web_fetch", "web_search"].includes(p.toolName) &&
-        !p.toolName.startsWith("mcp_") &&
-        !p.toolName.startsWith("call_agent_") &&
+        // Same classifier the harness emits with, so browser_* / schedule
+        // calls in older state are not mistaken for client-owned tools.
+        !isBuiltinTool(p.toolName) &&
         !p.toolName.startsWith("memory_")
       );
 

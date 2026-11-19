@@ -1,6 +1,17 @@
 import { execFileSync } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
-import { bootstrapAgentComputer, buildAgentBrowserStartScript, buildAgentComputerPythonScript, resolveAgentComputerBrowser } from "../src/machines/browser";
+import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  AGENT_BROWSER_POLICY,
+  agentBrowserLaunchFlags,
+  bootstrapAgentComputer,
+  buildAgentBrowserPrefsScript,
+  buildAgentBrowserStartScript,
+  buildAgentComputerPythonScript,
+  resolveAgentComputerBrowser,
+} from "../src/machines/browser";
 import { FakeDaytona, type FakeSandboxInstance } from "./fake-daytona.js";
 import type { DaytonaSandboxInstance } from "../src/adapters/daytona-types";
 import type { AgentMachineSpec } from "../src/machines/ports";
@@ -20,7 +31,7 @@ describe("agent computer browser bootstrap", () => {
     await bootstrapAgentComputer(f.sb, spec);
     expect(f.executeCommand.mock.calls[0][0]).toContain("'chromium'");
     expect(f.executeCommand.mock.calls[0][0]).toContain("'git'");
-    expect(f.uploadFile).toHaveBeenCalledTimes(2);
+    expect(f.uploadFile).toHaveBeenCalledTimes(3);
     expect(f.executeCommand.mock.calls.at(-1)?.[0]).toBe("sh '/var/lib/oma/browser/start.sh'");
     const script = buildAgentBrowserStartScript();
     expect(script).toContain("--remote-debugging-address=127.0.0.1");
@@ -192,5 +203,73 @@ describe("agent computer python setup", () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+describe("camera-clean Chromium", () => {
+  it("launches without infobars, first-run, translate, crash-restore or keyring prompts", () => {
+    for (const desktop of [false, true]) {
+      const flags = agentBrowserLaunchFlags(desktop);
+      for (const flag of ["--test-type", "--no-first-run", "--no-default-browser-check", "--password-store=basic", "--hide-crash-restore-bubble"]) {
+        expect(flags).toContain(flag);
+      }
+      expect(flags.find((f) => f.startsWith("--disable-features="))).toMatch(/\bTranslate\b/);
+      // Isolation is unchanged: CDP stays on loopback.
+      expect(flags).toContain("--remote-debugging-address=127.0.0.1");
+      expect(buildAgentBrowserStartScript(desktop)).toContain(flags.join(" "));
+    }
+    expect(agentBrowserLaunchFlags(true)).toContain("--start-maximized");
+    expect(agentBrowserLaunchFlags(false)).toContain("--headless=new");
+  });
+
+  it("applies preferences and installs the managed policy before every launch, never after", () => {
+    const script = buildAgentBrowserStartScript(true);
+    const prefs = script.indexOf("node '/var/lib/oma/browser/prefs.cjs' '/var/lib/oma/browser/profile/Default/Preferences'");
+    const policy = script.indexOf("/etc/chromium/policies/managed");
+    const launch = script.indexOf('nohup "$browser_bin"');
+    expect(prefs).toBeGreaterThan(script.indexOf("if ! curl -fsS --max-time 2 http://127.0.0.1:9222"));
+    expect(prefs).toBeLessThan(launch);
+    expect(policy).toBeGreaterThan(prefs);
+    expect(policy).toBeLessThan(launch);
+    expect(script).toContain("/etc/opt/chrome/policies/managed");
+    // Cosmetic steps never stop the browser from starting.
+    expect(script).toMatch(/prefs\.cjs[^\n]*\|\| echo/);
+    expect(() => execFileSync("sh", ["-n"], { input: script })).not.toThrow();
+  });
+
+  it("turns off the password manager in the profile and keeps the profile's other settings", () => {
+    const dir = mkdtempSync(join(tmpdir(), "oma-prefs-"));
+    const script = join(dir, "prefs.cjs");
+    writeFileSync(script, buildAgentBrowserPrefsScript());
+    const prefsPath = join(dir, "profile", "Default", "Preferences");
+    const policyPath = join(dir, "policy.json");
+    // First launch: no profile yet.
+    execFileSync(process.execPath, [script, prefsPath, policyPath]);
+    let prefs = JSON.parse(readFileSync(prefsPath, "utf8"));
+    expect(prefs.credentials_enable_service).toBe(false);
+    expect(prefs.profile.password_manager_enabled).toBe(false);
+    expect(prefs.translate.enabled).toBe(false);
+    expect(JSON.parse(readFileSync(policyPath, "utf8"))).toEqual(AGENT_BROWSER_POLICY);
+    expect(AGENT_BROWSER_POLICY.PasswordManagerEnabled).toBe(false);
+    // An existing profile Chromium left after a hard stop.
+    writeFileSync(prefsPath, JSON.stringify({ homepage: "https://example.com", profile: { exit_type: "Crashed", name: "Agent" }, credentials_enable_service: true }));
+    execFileSync(process.execPath, [script, prefsPath, policyPath]);
+    prefs = JSON.parse(readFileSync(prefsPath, "utf8"));
+    expect(prefs).toMatchObject({ homepage: "https://example.com", credentials_enable_service: false, profile: { name: "Agent", exit_type: "Normal", password_manager_enabled: false } });
+    // A corrupt file is replaced rather than blocking the launch.
+    writeFileSync(prefsPath, "{not json");
+    execFileSync(process.execPath, [script, prefsPath, policyPath]);
+    expect(JSON.parse(readFileSync(prefsPath, "utf8")).credentials_enable_service).toBe(false);
+  });
+
+  it("re-uploads the launch files on every bootstrap so existing computers get them on their next start", async () => {
+    const f = fakeSandbox();
+    await bootstrapAgentComputer(f.sb, spec);
+    await bootstrapAgentComputer(f.sb, spec);
+    const uploaded = f.uploadFile.mock.calls.map((args) => args[1]);
+    expect(uploaded.filter((p) => p === "/var/lib/oma/browser/prefs.cjs")).toHaveLength(2);
+    expect(uploaded.filter((p) => p === "/var/lib/oma/browser/start.sh")).toHaveLength(2);
+    const startScript = f.uploadFile.mock.calls.find((args) => args[1] === "/var/lib/oma/browser/start.sh")![0].toString();
+    expect(startScript).toContain("--test-type");
   });
 });

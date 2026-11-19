@@ -64,6 +64,58 @@ export class NotSupportedError extends Error {
 
 const DEFAULT_TIMEOUT = 30_000;
 
+/** Every tool name `buildBrowserTools` registers. Hosts classify these as
+ *  built-in (server-executed) tools — the toolset config names the group
+ *  "browser", which is never a registered tool itself. */
+export const BROWSER_TOOL_NAMES = [
+  "browser_navigate",
+  "browser_screenshot",
+  "browser_click",
+  "browser_type",
+  "browser_get_text",
+  "browser_eval",
+  "browser_close",
+] as const;
+
+/** Host hooks for browser tools that touch the session's machine. */
+export interface BrowserToolOptions {
+  /** Write bytes into the session's sandbox (the same filesystem as the
+   *  file tools) and return the absolute path written. Enables
+   *  browser_screenshot's `save_path`; absent → the parameter is refused.
+   *  Hosts pass it only where a file write needs no approval. */
+  saveFile?: (path: string, bytes: Uint8Array) => Promise<string>;
+}
+
+/**
+ * Make `expression` safe for Playwright's string `evaluate` when it uses
+ * top-level `await`, which is a syntax error in a plain script. An
+ * expression becomes `(async () => (expr))()`; statements become an async
+ * IIFE body, so a value must be `return`ed. Code without `await` is sent
+ * unchanged. The form is chosen by parsing (never running) the code here;
+ * where the runtime forbids code generation (workerd), the expression form
+ * is assumed.
+ */
+export function wrapTopLevelAwait(expression: string): string {
+  if (!/\bawait\b/.test(expression)) return expression;
+  const trimmed = expression.trim().replace(/;+\s*$/, "");
+  // Already an async function or IIFE: the page awaits what it returns.
+  if (/^\(?\s*async\b/.test(trimmed)) return expression;
+  const asExpression = `(async () => (${trimmed}\n))()`;
+  const asStatements = `(async () => {\n${expression}\n})()`;
+  const parses = (source: string): boolean | null => {
+    try {
+      // Parse only: the constructed function is never called.
+      new Function(source);
+      return true;
+    } catch (err) {
+      return err instanceof SyntaxError ? false : null;
+    }
+  };
+  // null = this runtime cannot parse here: assume an expression.
+  if (parses(asExpression) !== false) return asExpression;
+  return parses(asStatements) ? asStatements : asExpression;
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type ToolSet = Record<string, any>;
 
@@ -80,6 +132,7 @@ type ToolSet = Record<string, any>;
 export function buildBrowserTools(
   harness: BrowserHarness | null,
   hook?: BrowserBillingHook | null,
+  options: BrowserToolOptions = {},
 ): ToolSet {
   if (!harness) return {};
   const h = harness;
@@ -122,18 +175,35 @@ export function buildBrowserTools(
       "Capture a PNG screenshot of the current page (visible viewport). Returns " +
       "the image so you can read text, layout, charts, etc. directly. Use this " +
       "when text extraction (browser_get_text) isn't enough — e.g. images, PDFs " +
-      "rendered in browser, charts, complex layout.",
+      "rendered in browser, charts, complex layout." +
+      (options.saveFile
+        ? " Pass save_path to also write the PNG to a file on this machine (e.g. in " +
+          "the session outputs directory) so you can attach it to a report."
+        : ""),
     inputSchema: z.object({
       full_page: z.boolean().optional().describe("If true, capture the entire scrollable page (slower)."),
+      save_path: z
+        .string()
+        .optional()
+        .describe("Optional file path ending in .png to also save the screenshot to, e.g. <outputs dir>/checkout.png"),
     }),
-    execute: async ({ full_page }: { full_page?: boolean }) => {
+    execute: async ({ full_page, save_path }: { full_page?: boolean; save_path?: string }) => {
       try {
+        const target = save_path?.trim();
+        if (target !== undefined) {
+          if (!options.saveFile) {
+            return "Screenshot error: save_path is not available in this session (saving needs the write tool, enabled and allowed without approval). Take the screenshot without save_path.";
+          }
+          if (!target || target.endsWith("/")) return "Screenshot error: save_path must be a file path, e.g. /workspace/shot.png";
+        }
         const page = await ensurePage();
         const buf = await page.screenshot({ fullPage: full_page === true, type: "png" });
         const data = bufferToBase64(buf);
+        const saved = target ? await options.saveFile!(target, base64ToBytes(data)) : undefined;
         return {
           type: "image" as const,
           source: { type: "base64" as const, media_type: "image/png", data },
+          ...(saved ? { saved_path: saved } : {}),
         };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -142,10 +212,14 @@ export function buildBrowserTools(
     },
     toModelOutput: ({ output }: { output: unknown }) => {
       if (output && typeof output === "object" && "type" in output && (output as { type?: string }).type === "image") {
-        const src = (output as unknown as { source: { data: string; media_type: string } }).source;
+        const image = output as unknown as { source: { data: string; media_type: string }; saved_path?: string };
+        const src = image.source;
         return {
           type: "content" as const,
-          value: [{ type: "image-data" as const, data: src.data, mediaType: src.media_type }],
+          value: [
+            ...(image.saved_path ? [{ type: "text" as const, text: `Saved screenshot to ${image.saved_path}` }] : []),
+            { type: "image-data" as const, data: src.data, mediaType: src.media_type },
+          ],
         };
       }
       return { type: "text" as const, value: typeof output === "string" ? output : JSON.stringify(output) };
@@ -225,9 +299,13 @@ export function buildBrowserTools(
     description:
       "Run a JavaScript expression in the page context. Returns the JSON-stringified " +
       "result. Use for fetching computed properties, hidden state, or DOM queries the " +
-      "other tools can't reach. Example: 'document.querySelectorAll(\"a\").length'.",
+      "other tools can't reach. Example: 'document.querySelectorAll(\"a\").length'. " +
+      "Top-level await works: 'await (await fetch(\"/api/me\")).json()'. For several " +
+      "statements, `return` the value you want back.",
     inputSchema: z.object({
-      expression: z.string().describe("JavaScript expression (sync or async). Result is serialized to JSON."),
+      expression: z
+        .string()
+        .describe("JavaScript expression or statements (top-level await allowed). Result is serialized to JSON."),
     }),
     execute: async ({ expression }: { expression: string }) => {
       try {
@@ -235,8 +313,8 @@ export function buildBrowserTools(
         // String overload of Playwright's evaluate isn't in the typed
         // signature — cast to call it directly.
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const result = await (page.evaluate as any)(expression);
-        return JSON.stringify(result, null, 2).slice(0, 30_000);
+        const result = await (page.evaluate as any)(wrapTopLevelAwait(expression));
+        return (JSON.stringify(result, null, 2) ?? "undefined").slice(0, 30_000);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return `Eval error: ${msg}`;
@@ -275,4 +353,11 @@ function bufferToBase64(buf: Uint8Array | { toString(enc: string): string }): st
   return (buf as { toString: (enc: string) => string }).toString("base64");
 }
 
-export { buildComputerTools, type DesktopControl } from "./computer";
+function base64ToBytes(data: string): Uint8Array {
+  const binary = atob(data);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+export { buildComputerTools, COMPUTER_TOOL_NAMES, type DesktopControl } from "./computer";

@@ -10,6 +10,7 @@ import {
 } from "@open-managed-agents/api-types";
 
 import { harnessLabel } from "../../../lib/agents";
+import { isAgentComputerEnvironment } from "../../../lib/default-environment";
 import type { MemoryMode } from "../../../components/MemoryModeControl";
 import {
   createDefaultAmbientTriggerDraft,
@@ -161,7 +162,7 @@ export const BUILTIN_TOOLS: Array<{ name: string; group: BuiltinToolGroup; descr
     name: "browser",
     group: "web",
     description:
-      "A full browser session for multi-step navigation, JavaScript-heavy pages and sign-in flows. Heavy, so models tend to over-use it; turn it on only when needed.",
+      "A full browser session for multi-step navigation, JavaScript-heavy pages and sign-in flows. On for an agent with a persistent computer, where it is the computer's own Chromium. Elsewhere it is heavy and models tend to over-use it, so turn it on only when needed.",
   },
   { name: "schedule", group: "schedule", description: "Wake this session later, or on a repeating schedule" },
   { name: "list_schedules", group: "schedule", description: "List this session's pending wake-ups" },
@@ -280,6 +281,10 @@ export const INITIAL_FORM = {
   toolDefaultEnabled: true,
   toolDefaultPermission: "always_allow" as "always_allow" | "always_ask",
   toolOverrides: {} as Record<string, ToolOverride>,
+  /** The browser override withEnvironment set on its own when a persistent
+   *  agent computer was picked (null = none), so picking a non-computer
+   *  environment can take it back while the person hasn't changed it. */
+  browserAutoOverride: null as ToolOverride | null,
   // Opt-in to the built-in `general_subagent` tool.
   enableGeneralSubagent: false,
   // Long-running capability: sessions on this agent can carry a goal
@@ -298,6 +303,32 @@ export const INITIAL_FORM = {
 
 export type FormState = typeof INITIAL_FORM;
 export type FormSetter = Dispatch<SetStateAction<FormState>>;
+
+/**
+ * The form with `environmentId` chosen. A persistent agent computer with its
+ * browser turns the Web › browser tool on, as the server does for such an
+ * agent, so Tools shows what the agent will get. A browser the person set
+ * themselves (on or off) and "start from nothing" are left as they are.
+ * Choosing any other environment takes back a browser this function turned
+ * on, as long as it is still what it set.
+ */
+export function withEnvironment(form: FormState, environmentId: string, environments: readonly EnvironmentLite[]): FormState {
+  const env = environments.find((e) => e.id === environmentId);
+  const computerBrowser = !!env && isAgentComputerEnvironment(env) && env.config?.sandbox?.browser !== false;
+  const current = form.toolOverrides.browser ?? "default";
+  const auto = form.browserAutoOverride !== null && current === form.browserAutoOverride;
+  if (!computerBrowser) {
+    if (!auto) return { ...form, environmentId, browserAutoOverride: null };
+    const rest = { ...form.toolOverrides };
+    delete rest.browser;
+    return { ...form, environmentId, toolOverrides: rest, browserAutoOverride: null };
+  }
+  if (auto || !form.toolDefaultEnabled || current !== "default") {
+    return { ...form, environmentId, browserAutoOverride: auto ? form.browserAutoOverride : null };
+  }
+  const browser = form.toolDefaultPermission;
+  return { ...form, environmentId, toolOverrides: { ...form.toolOverrides, browser }, browserAutoOverride: browser };
+}
 
 /** The sections of the form, as the dialog's side navigation lists them. */
 export type FormTab =

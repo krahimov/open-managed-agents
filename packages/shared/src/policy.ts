@@ -13,6 +13,7 @@ import type {
   PermissionRule,
   PolicyDecision,
 } from "@open-managed-agents/api-types";
+import { toolGroupOf } from "./tool-permission";
 
 /** deny beats ask beats allow when two rules tie on specificity. */
 const EFFECT_RANK: Record<PermissionEffect, number> = {
@@ -40,7 +41,9 @@ export function selectorSpecificity(selector: string): number {
 
 /**
  * Evaluate one tool name against a policy. Most-specific matching rule wins;
- * on ties, deny > ask > allow. No matching rule (or no policy) = allow —
+ * on ties, deny > ask > allow. A selector naming a tool's config group
+ * ("browser" for browser_* / computer_*, see toolGroupOf) matches the
+ * group's tools, at the group name's specificity. No matching rule (or no policy) = allow —
  * the baseline grant is the ceiling and its absence is the legacy world.
  */
 export function evaluatePolicy(
@@ -52,8 +55,9 @@ export function evaluatePolicy(
   }
   let winner: PermissionRule | null = null;
   let winnerScore = -1;
+  const group = toolGroupOf(toolName);
   for (const rule of policy.rules) {
-    if (!matchesSelector(rule.selector, toolName)) continue;
+    if (!matchesSelector(rule.selector, toolName) && rule.selector !== group) continue;
     const score = selectorSpecificity(rule.selector);
     if (
       score > winnerScore ||
