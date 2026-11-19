@@ -29,12 +29,15 @@ import { StatusBadge, type StatusTone } from "./Badge";
  * one) and a screenshot of its browser, fetched with the bearer and
  * workspace headers (a bare <img src> cannot carry them).
  *
- * With no computer and `supported: false`, what it says depends on the
- * agent's default environment: one marked as a persistent agent computer
- * creates it on the next session; anything else runs each session in a
- * fresh sandbox, and the panel says how to change that. An agent on a
- * local runtime without a computer shows nothing, and so does a server
- * without the endpoint.
+ * `supported` is decided per agent: an agent whose default environment is
+ * a persistent agent computer is supported before its first session, so a
+ * new computer agent gets a working Start. With no computer and
+ * `supported: false` (a server that only knows instance-wide support), what
+ * it says depends on that environment: a persistent agent computer is
+ * created on the next session; anything else runs each session in a fresh
+ * sandbox, and the panel says how to change that. An agent on a local
+ * runtime without a computer shows nothing, and so does a server without
+ * the endpoint.
  */
 
 interface AgentMachine {
@@ -251,10 +254,11 @@ export function AgentComputerPanel({ agentId, localRuntime = false, defaultEnvir
   const supported = status.data?.supported === true;
   const transitioning = machine ? TRANSITIONING.has(machine.state) : false;
   const canStart = !machine || STARTABLE.has(machine.state);
-  // Instance-wide support is off and there is no computer yet. Computers
-  // are still given per environment: an agent whose default environment has
-  // one gets it from its next session; any other agent runs each session in
-  // a fresh sandbox, and Start would be refused.
+  // The server does not offer this agent a computer and it has none yet. An
+  // older server only reports instance-wide support, so an agent whose
+  // default environment has a computer still gets it from its next session;
+  // any other agent runs each session in a fresh sandbox, and Start would be
+  // refused.
   const noComputer = !!status.data && !supported;
   const environmentLoading = noComputer && defaultEnvironment === undefined;
   const fromNextSession = noComputer && !!defaultEnvironment && isAgentComputerEnvironment(defaultEnvironment);

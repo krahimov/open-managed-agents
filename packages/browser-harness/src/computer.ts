@@ -9,6 +9,15 @@ export interface DesktopControl {
   scroll(x: number, y: number, direction: 'up' | 'down' | 'left' | 'right', amount: number): Promise<unknown>;
 }
 
+/** Every tool name `buildComputerTools` registers (see BROWSER_TOOL_NAMES). */
+export const COMPUTER_TOOL_NAMES = [
+  'computer_screenshot',
+  'computer_click',
+  'computer_type',
+  'computer_press',
+  'computer_scroll',
+] as const;
+
 /** These tools operate the SAME desktop/browser that the human sees over VNC. */
 export function buildComputerTools(desktop: DesktopControl) {
   const coordinate = z.number().int().min(0).max(7680);

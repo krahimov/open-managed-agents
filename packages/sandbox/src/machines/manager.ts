@@ -258,8 +258,12 @@ export class AgentMachineManager {
         const needsBootstrap = created || previousRef !== sb.id || current.state !== "running" || sb.state !== "started";
         // Persist the provider identity before bootstrap: retrying a failed
         // bootstrap must use the same retained disk, not leak another box.
+        // A box that is already running stays `running`: every session
+        // attaching to it passes through here, and flipping it to
+        // `starting` blanked the console's live view on each session start.
         await this.options.store.update(current.id, {
-          providerRef: sb.id, generation, desiredState: "running", state: "starting",
+          providerRef: sb.id, generation, desiredState: "running",
+          ...(needsBootstrap || needsRestore ? { state: "starting" as const } : {}),
           bootstrapHash: needsRestore ? null : current.bootstrapHash,
         }, this.now());
         if (sb.state === "error" && sb.recoverable) await sb.recover(120);

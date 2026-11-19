@@ -25,6 +25,7 @@ import {
   type SandboxConfig,
   type SandboxStorageCheck,
   type VaultLite,
+  withEnvironment,
 } from "./model";
 
 // ── Sandbox ──────────────────────────────────────────────────────────────
@@ -101,7 +102,7 @@ export function SandboxSection({
         <Field label="Default environment">
           <PickSelect
             value={form.environmentId}
-            onValueChange={(environmentId) => setForm({ ...form, environmentId })}
+            onValueChange={(environmentId) => setForm(withEnvironment(form, environmentId, environments))}
             placeholder="Choose an environment"
             options={environments.map((env) => ({
               value: env.id,

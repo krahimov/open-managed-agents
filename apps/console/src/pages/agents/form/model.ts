@@ -10,6 +10,7 @@ import {
 } from "@open-managed-agents/api-types";
 
 import { harnessLabel } from "../../../lib/agents";
+import { isAgentComputerEnvironment } from "../../../lib/default-environment";
 import type { MemoryMode } from "../../../components/MemoryModeControl";
 import {
   createDefaultAmbientTriggerDraft,
@@ -161,7 +162,7 @@ export const BUILTIN_TOOLS: Array<{ name: string; group: BuiltinToolGroup; descr
     name: "browser",
     group: "web",
     description:
-      "A full browser session for multi-step navigation, JavaScript-heavy pages and sign-in flows. Heavy, so models tend to over-use it; turn it on only when needed.",
+      "A full browser session for multi-step navigation, JavaScript-heavy pages and sign-in flows. On for an agent with a persistent computer, where it is the computer's own Chromium. Elsewhere it is heavy and models tend to over-use it, so turn it on only when needed.",
   },
   { name: "schedule", group: "schedule", description: "Wake this session later, or on a repeating schedule" },
   { name: "list_schedules", group: "schedule", description: "List this session's pending wake-ups" },
@@ -298,6 +299,20 @@ export const INITIAL_FORM = {
 
 export type FormState = typeof INITIAL_FORM;
 export type FormSetter = Dispatch<SetStateAction<FormState>>;
+
+/**
+ * The form with `environmentId` chosen. A persistent agent computer with its
+ * browser turns the Web › browser tool on, as the server does for such an
+ * agent, so Tools shows what the agent will get. A browser the person set
+ * themselves (on or off) and "start from nothing" are left as they are.
+ */
+export function withEnvironment(form: FormState, environmentId: string, environments: readonly EnvironmentLite[]): FormState {
+  const next = { ...form, environmentId };
+  const env = environments.find((e) => e.id === environmentId);
+  const computerBrowser = !!env && isAgentComputerEnvironment(env) && env.config?.sandbox?.browser !== false;
+  if (!computerBrowser || !form.toolDefaultEnabled || (form.toolOverrides.browser ?? "default") !== "default") return next;
+  return { ...next, toolOverrides: { ...form.toolOverrides, browser: form.toolDefaultPermission } };
+}
 
 /** The sections of the form, as the dialog's side navigation lists them. */
 export type FormTab =

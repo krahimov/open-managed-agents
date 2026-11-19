@@ -14,6 +14,8 @@ import { mcpModelOutput, mcpResultForModel, truncateResult } from "./mcp-output"
 // Concrete adapters (CF / Node / CDP / Disabled) live in the package and
 // dynamic-import their workerd / Node peers only at first launch().
 import type { BrowserHarness, BrowserBillingHook } from "@open-managed-agents/browser-harness";
+// Name lists only — the tool builders stay behind the dynamic import below.
+import { BROWSER_TOOL_NAMES, COMPUTER_TOOL_NAMES } from "@open-managed-agents/browser-harness";
 
 // Source of truth for which tool names are part of the agent_toolset_20260401
 // built-in suite. Used by buildTools() below to decide which tool entries to
@@ -38,8 +40,20 @@ export const DEFAULT_TOOLS = ["bash", "read", "write", "edit", "glob", "grep", "
 export const OPT_IN_TOOLS = ["browser"];
 
 /** Backwards-compat union — used as the recognised-tool-name set for
- *  validation. New callers should prefer DEFAULT_TOOLS or OPT_IN_TOOLS. */
+ *  validation. New callers should prefer DEFAULT_TOOLS or OPT_IN_TOOLS.
+ *  These are CONFIG names: "browser" names the browser group, not a tool. */
 export const ALL_TOOLS = [...DEFAULT_TOOLS, ...OPT_IN_TOOLS];
+
+/** Every tool name the built-in suite can register — what the model
+ *  actually calls. The "browser" group expands to the browser_* tools (and
+ *  computer_* on a desktop); `general_subagent` is opt-in via its own flag.
+ *  harness/default-loop.ts classifies these as `agent.tool_use`. */
+export const BUILTIN_TOOL_NAMES: readonly string[] = [
+  ...DEFAULT_TOOLS,
+  ...BROWSER_TOOL_NAMES,
+  ...COMPUTER_TOOL_NAMES,
+  "general_subagent",
+];
 // MAX_TOOL_RESULT_CHARS / truncateResult live in ./mcp-output.ts — MCP
 // results are capped with the same limit as built-ins.
 const DEFAULT_BASH_TIMEOUT = 120000;  // 2 minutes (CC default)
@@ -438,9 +452,43 @@ export function getToolPermission(agentConfig: AgentConfig, toolName: string): s
   return resolveToolPermission(agentConfig.tools, toolName);
 }
 
+/** Options for `getEnabledTools`. */
+export interface EnabledToolsOptions {
+  /** The session runs on an agent computer whose machine has its browser
+   *  on. The browser is then part of the default set: the computer exists
+   *  so its work happens visibly in that browser. An agent can still opt
+   *  out (see `browserExplicitlyDisabled`). */
+  browserByDefault?: boolean;
+}
+
+/**
+ * Whether the agent's built-in toolset switches the browser off: a
+ * per-tool `{ name: "browser", enabled: false }`, or a toolset whose
+ * `default_config.enabled` is false ("start from nothing") without a
+ * per-tool `{ name: "browser", enabled: true }`.
+ */
+export function browserExplicitlyDisabled(tools: AgentConfig["tools"]): boolean {
+  for (const t of tools ?? []) {
+    if (t.type === "custom" || t.type.startsWith("mcp_toolset")) continue;
+    const ts = t as ToolsetConfig;
+    const own = ts.configs?.find((c) => c.name === "browser");
+    // Same reading as configuredTools: a config entry without enabled:true
+    // switches its tool off.
+    if (own) return !own.enabled;
+    return ts.default_config?.enabled === false;
+  }
+  return false;
+}
+
 // Exported so the evidence capability statement reports the SAME surface
 // buildTools() registers — a disabled tool must not show up as allowed.
-export function getEnabledTools(tools: AgentConfig["tools"]): Set<string> {
+export function getEnabledTools(tools: AgentConfig["tools"], opts: EnabledToolsOptions = {}): Set<string> {
+  const enabled = configuredTools(tools);
+  if (opts.browserByDefault && !browserExplicitlyDisabled(tools)) enabled.add("browser");
+  return enabled;
+}
+
+function configuredTools(tools: AgentConfig["tools"]): Set<string> {
   // Default = DEFAULT_TOOLS only. OPT_IN_TOOLS (browser) require an
   // explicit per-tool { enabled: true } in the agent's tools config.
   const defaultSet = new Set(DEFAULT_TOOLS);
@@ -605,6 +653,11 @@ export async function buildTools(
      *  Node self-host wires the playwright-core adapter (or CDP, or the
      *  throw-on-call Disabled adapter). */
     browser?: BrowserHarness;
+    /** The browser is the session's agent computer's own Chromium: browser
+     *  tools are registered unless the agent switched the browser off,
+     *  without the usual opt-in (see getEnabledTools). Leave unset for
+     *  shared/remote browsers (CF Browser Rendering, Browserless). */
+    browserByDefault?: boolean;
     computer?: import("@open-managed-agents/browser-harness").DesktopControl;
     /** Optional billing hook fired once on browser_close — CF sets this
      *  to attribute browser_active_seconds to the tenant/session. */
@@ -701,18 +754,25 @@ export async function buildTools(
     }) => Promise<{ request_id: string; status: string; note?: string }>;
   }
 ): Promise<Record<string, any>> {
-  const enabled = getEnabledTools(agentConfig.tools);
+  const enabled = getEnabledTools(agentConfig.tools, {
+    browserByDefault: !!env?.browser && env.browserByDefault === true,
+  });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const tools: Record<string, any> = {};
+  const browserTools = !!env?.browser && enabled.has("browser");
 
   // Browser tools. Wire the BrowserHarness from the platform bundle —
   // CF passes the @cloudflare/playwright adapter, Node passes
   // playwright-core / CDP / Disabled. The agent must opt in to "browser"
-  // in its toolset; the Disabled adapter throws at first launch() with
-  // an LLM-readable install-instructions message.
-  if (env?.browser && enabled.has("browser")) {
+  // in its toolset (an agent computer's own browser is on by default); the
+  // Disabled adapter throws at first launch() with an LLM-readable
+  // install-instructions message.
+  if (env?.browser && browserTools) {
     const { buildBrowserTools } = await import("@open-managed-agents/browser-harness");
-    Object.assign(tools, buildBrowserTools(env.browser, env.browserBillingHook ?? null));
+    Object.assign(tools, buildBrowserTools(env.browser, env.browserBillingHook ?? null, {
+      // Screenshots saved where the file tools see them (save_path).
+      ...(sandbox.writeFileBytes ? { saveFile: (path: string, bytes: Uint8Array) => sandbox.writeFileBytes!(path, bytes) } : {}),
+    }));
     if (env.computer) {
       const { buildComputerTools } = await import("@open-managed-agents/browser-harness");
       Object.assign(tools, buildComputerTools(env.computer));
@@ -1048,10 +1108,19 @@ export async function buildTools(
   if (enabled.has("web_fetch")) {
     tools.web_fetch = tool({
       description:
-        "Fetch a URL and return clean markdown — strips boilerplate (nav/ads/scripts), " +
-        "preserves headings and links. Use this as the default way to read web pages; " +
-        "fall back to browser_* tools only if you need to interact (click, fill forms) " +
-        "or if the page is JS-rendered (SPA) and returns empty markdown. Large pages " +
+        (env?.browserByDefault && browserTools
+          // Agent computer: the browser is the default for web work, so it
+          // happens visibly on the computer (see agentComputerGuidance).
+          ? "Fetch a URL and return clean markdown — strips boilerplate (nav/ads/scripts), " +
+            "preserves headings and links. Use this only for quick reads of static pages " +
+            "such as documentation or a README. For everything else on the web — browsing, " +
+            "signing in, clicking, filling forms, checking how a page looks or behaves — use " +
+            "the browser_* tools so the work happens in your computer's browser. "
+          : "Fetch a URL and return clean markdown — strips boilerplate (nav/ads/scripts), " +
+            "preserves headings and links. Use this as the default way to read web pages; " +
+            "fall back to browser_* tools only if you need to interact (click, fill forms) " +
+            "or if the page is JS-rendered (SPA) and returns empty markdown. ") +
+        "Large pages " +
         "may be auto-summarized when an aux model is configured on the agent — the " +
         "full raw markdown is then saved to /workspace/.web/, readable via the `read` " +
         "tool when you need detail beyond the summary.",

@@ -110,6 +110,31 @@ describe("AgentComputerPanel", () => {
     expect(screen.queryByRole("button", { name: "Start computer" })).not.toBeInTheDocument();
   });
 
+  it("offers Start to a new computer agent the server supports, before any session", async () => {
+    let machine: typeof runningMachine | null = null;
+    fetchMock.mockImplementation(async (input, init) => {
+      if (input === `${machinePath}/start` && init?.method === "POST") {
+        machine = runningMachine;
+        return Response.json({ machine });
+      }
+      if (input === `${machinePath}/screenshot`) {
+        return new Response(new Uint8Array([137, 80, 78, 71]), { headers: { "content-type": "image/png" } });
+      }
+      if (input === machinePath) return Response.json({ machine, supported: true });
+      throw new Error(`Unexpected request: ${input}`);
+    });
+
+    renderPanel({ defaultEnvironment: agentComputerEnv });
+
+    const start = await screen.findByRole("button", { name: "Start computer" });
+    expect(start).toBeEnabled();
+    expect(screen.queryByText(/created when its next session starts/)).not.toBeInTheDocument();
+    expect(screen.getByText("Start it here, or start a session and it is created for you.")).toBeInTheDocument();
+    fireEvent.click(start);
+    expect(await screen.findByText("Running")).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(`${machinePath}/start`, expect.objectContaining({ method: "POST" }));
+  });
+
   it("waits for the default environment before choosing what to say", async () => {
     fetchMock.mockResolvedValue(Response.json({ machine: null, supported: false }));
 

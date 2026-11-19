@@ -50,6 +50,45 @@ export const externalServiceGuidance =
 export const environmentProposalGuidance =
   "When the user asks you to configure or create a sandbox environment, propose it as a single fenced `yaml` block with top-level key `environment`. Include `name`, optional `description`, and `config`. For self-host cloud sandboxes, use `config.type: cloud` and include relevant `sandbox` fields (`provider`, `image`, `workdir`, `ephemeral`, `bootstrap_tools`, `bootstrap_apt_packages`, `max_file_bytes`), `resources.outputs`, `memory.stores`, `packages`, `networking`, or `dockerfile` when needed. The user can approve that YAML in the session UI; do not claim the environment exists until a tool/API call or user approval confirms it.";
 
+/** What the session's agent computer offers, as its registered tools show. */
+export interface AgentComputerGuidanceOptions {
+  /** browser_* tools are registered (the machine's Chromium). */
+  browser: boolean;
+  /** computer_* tools are registered (the machine's Linux desktop). */
+  desktop: boolean;
+}
+
+/**
+ * Sent only to sessions on an agent computer (one persistent box per
+ * agent), so it is off the prompt-cache prefix of every other agent. It
+ * corrects the outputs guidance's "/workspace is scratch" for this machine
+ * and steers web work into the visible browser instead of web_fetch, which
+ * agents otherwise reach for first (seen on prod 2026-11).
+ */
+export function agentComputerGuidanceFor(
+  computer: AgentComputerGuidanceOptions,
+  outputsPath: string = DEFAULT_SESSION_OUTPUTS_PATH,
+): string {
+  const machine = computer.desktop
+    ? "a Linux desktop with a Chromium browser"
+    : computer.browser
+      ? "a Linux machine with a Chromium browser"
+      : "a Linux machine";
+  const lines = [
+    `You have your own persistent computer: ${machine} that belongs to this agent and is kept between sessions. On it, \`/workspace/\` is not scratch: files there are still there in your next session. Deliverables for the user still go in this session's outputs directory, \`${outputsPath}\`.`,
+  ];
+  if (computer.browser) {
+    lines.push(
+      "For web work — browsing, signing in, clicking, filling forms, checking how a page looks or behaves — use the browser_* tools, so the work happens visibly in your computer's browser" +
+        (computer.desktop
+          ? ". Use the computer_* tools for pixel-level control the browser tools cannot reach, such as native dialogs, file pickers or canvas."
+          : ".") +
+        " Use web_fetch only for quick reads of static pages such as documentation. To attach a screenshot to a report, use browser_screenshot with save_path.",
+    );
+  }
+  return lines.join(" ");
+}
+
 /** Options accepted by `platformGuidanceFor` / `composeSystemPrompt`. */
 export interface PlatformGuidanceOptions {
   /** Absolute outputs dir (with or without trailing slash) to name in the
@@ -59,6 +98,9 @@ export interface PlatformGuidanceOptions {
    *  sandboxes). Pass false when agent commands run on the host instead of
    *  a bootstrapped sandbox (host-workdir SDK harnesses, subprocess). */
   pythonTooling?: boolean;
+  /** The session runs on an agent computer: append
+   *  `agentComputerGuidanceFor`. Omit for every other sandbox. */
+  agentComputer?: AgentComputerGuidanceOptions;
 }
 
 /**
@@ -70,7 +112,10 @@ export function platformGuidanceFor(opts?: PlatformGuidanceOptions): string {
     ? sessionOutputsGuidanceFor(opts.outputsPath)
     : sessionOutputsGuidance;
   const python = opts?.pythonTooling === false ? "" : `${pythonToolingGuidance}\n\n`;
-  return `${authenticatedCommandGuidance}\n\n${loopStopGuidance}\n\n${outputs}\n\n${python}${externalServiceGuidance}\n\n${environmentProposalGuidance}`;
+  const computer = opts?.agentComputer
+    ? `\n\n${agentComputerGuidanceFor(opts.agentComputer, opts.outputsPath)}`
+    : "";
+  return `${authenticatedCommandGuidance}\n\n${loopStopGuidance}\n\n${outputs}${computer}\n\n${python}${externalServiceGuidance}\n\n${environmentProposalGuidance}`;
 }
 
 export const platformGuidance = platformGuidanceFor();
