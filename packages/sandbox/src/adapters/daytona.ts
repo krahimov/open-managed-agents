@@ -194,6 +194,8 @@ export class DaytonaSandbox implements SandboxExecutor {
   /** In-flight replacement of a vanished box, shared by concurrent callers. */
   private recovery: { failedSandboxId: string; promise: Promise<DaytonaSandboxInstance> } | null = null;
   private processes = new Map<string, DaytonaProcessHandle>();
+  /** `<box id>\0<dir>` for directories ensureParentDir created. */
+  private createdDirs = new Set<string>();
   private processStartedAt = new Map<string, number>();
 
   constructor(private opts: DaytonaSandboxOptions) {
@@ -428,9 +430,9 @@ export class DaytonaSandbox implements SandboxExecutor {
     const target = this.normalise(path);
     this.assertAllowedWrite(target, Buffer.byteLength(content, "utf8"));
     return this.withSandboxRecovery("writeFile", async (sb) => {
-      await this.ensureParentDir(sb, target);
-      await sb.fs.uploadFile(Buffer.from(content, "utf8"), target);
-      await this.syncAfterMutation(sb, target);
+      const body = Buffer.from(content, "utf8");
+      await this.upload(sb, body, target);
+      await this.syncAfterMutation(sb, target, body);
       return target;
     });
   }
@@ -439,9 +441,9 @@ export class DaytonaSandbox implements SandboxExecutor {
     const target = this.normalise(path);
     this.assertAllowedWrite(target, bytes.byteLength);
     return this.withSandboxRecovery("writeFileBytes", async (sb) => {
-      await this.ensureParentDir(sb, target);
-      await sb.fs.uploadFile(Buffer.from(bytes), target);
-      await this.syncAfterMutation(sb, target);
+      const body = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      await this.upload(sb, body, target);
+      await this.syncAfterMutation(sb, target, body);
       return target;
     });
   }
@@ -455,24 +457,60 @@ export class DaytonaSandbox implements SandboxExecutor {
    * 2026-07-16: session 1 wrote codeword.md via the write tool, a fresh
    * session's mount came up empty). Scoped to mutations under a mounted
    * resource so plain workdir writes don't pay the sync round-trip.
+   *
+   * Only the written file is put, from the bytes already in hand. A full
+   * resync listed the mount and downloaded every file in it again, so each
+   * screenshot saved into outputs also paid for every earlier one.
    */
   private async syncAfterMutation(
     sb: DaytonaSandboxInstance,
     target: string,
+    body: Buffer,
   ): Promise<void> {
-    const underMount =
-      [...this.mountedMemoryStores.values()].some((m) =>
-        target.startsWith(`${m.mountPoint}/`),
-      ) ||
-      (this.mountedOutputs
-        ? target.startsWith(`${this.mountedOutputs.mountPoint}/`)
-        : false);
-    if (!underMount) return;
-    await this.syncMountedResourcesToS3(sb).catch((err) => {
-      this.logger.warn(
-        `resource sync after file write failed: ${(err as Error).message}`,
-      );
-    });
+    const where = this.mountedObjectKey(target);
+    if (!where || !this.opts.memoryBucket) return;
+    try {
+      if (where === "resync") {
+        // A path the key mapping cannot express: sync the mounts as before.
+        await this.syncMountedResourcesToS3(sb);
+        return;
+      }
+      if (body.byteLength > this.maxFileBytes) return;
+      const s3 = await this.ensureS3Runtime();
+      await s3.client.send(new s3.PutObjectCommand({
+        Bucket: this.opts.memoryBucket.bucketName,
+        Key: where.key,
+        Body: body,
+      }));
+    } catch (err) {
+      // The next exec or destroy resync still carries the file.
+      this.logger.warn(`resource sync after file write failed: ${(err as Error).message}`);
+    }
+  }
+
+  /** Where a write to `target` is written back: null outside every
+   *  writable mount (read-only memory stores are never written back). */
+  private mountedObjectKey(target: string): { key: string } | "resync" | null {
+    // `..` / `.` segments may resolve into another mount than the prefix
+    // names (or out of one): resolve them, and let the full resync write
+    // back whatever lands under a mount.
+    if (target.split("/").some((part) => part === "." || part === "..")) {
+      const resolved = resolveDotSegments(target);
+      return this.mountedObjectKey(resolved) ? "resync" : null;
+    }
+    const under = (mountPoint: string, prefix: string): { key: string } | "resync" | null => {
+      if (!target.startsWith(`${mountPoint}/`)) return null;
+      const rel = safeRelativePath(target.slice(mountPoint.length + 1));
+      return rel ? { key: `${prefix}${rel}` } : "resync";
+    };
+    for (const mount of this.mountedMemoryStores.values()) {
+      const hit = under(mount.mountPoint, `${mount.storeId}/`);
+      if (hit) return mount.readOnly ? null : hit;
+    }
+    const outputs = this.mountedOutputs;
+    return outputs
+      ? under(outputs.mountPoint, `session-outputs/${outputs.tenantId}/${outputs.sessionId}/`)
+      : null;
   }
 
   async destroy(): Promise<void> {
@@ -929,12 +967,35 @@ export class DaytonaSandbox implements SandboxExecutor {
     return `${this.workdir()}/${p}`;
   }
 
+  /**
+   * Upload into a parent directory that exists. A directory this adapter
+   * already created on this box skips the createFolder round trip; when
+   * the upload then fails because the directory is gone (the agent may
+   * have removed it), it is created and the upload retried once. Any other
+   * failure surfaces as is (and the next write re-checks the directory).
+   */
+  private async upload(sb: DaytonaSandboxInstance, body: Buffer, target: string): Promise<void> {
+    const dir = parentDir(target);
+    const known = dir !== null && this.createdDirs.has(`${sb.id}\0${dir}`);
+    if (!known) await this.ensureParentDir(sb, target);
+    try {
+      await sb.fs.uploadFile(body, target);
+    } catch (err) {
+      if (!known || this.isSandboxGone(err)) throw err;
+      this.createdDirs.delete(`${sb.id}\0${dir}`);
+      if (!isMissingPathError(err)) throw err;
+      await this.ensureParentDir(sb, target);
+      await sb.fs.uploadFile(body, target);
+    }
+  }
+
   private async ensureParentDir(sb: DaytonaSandboxInstance, filePath: string): Promise<void> {
-    const slash = filePath.lastIndexOf("/");
-    if (slash <= 0) return;
-    const dir = filePath.slice(0, slash);
+    const dir = parentDir(filePath);
+    if (dir === null) return;
     try {
       await sb.fs.createFolder(dir, "0755");
+      if (this.createdDirs.size >= 256) this.createdDirs.clear();
+      this.createdDirs.add(`${sb.id}\0${dir}`);
     } catch {
       // Already exists or permission denied; let the upload's own error
       // surface if the dir really isn't writable.
@@ -1060,6 +1121,29 @@ async function bodyToBuffer(body: unknown): Promise<Buffer> {
     return Buffer.concat(chunks);
   }
   throw new Error("unsupported S3 body type");
+}
+
+/** `/a/b/../c/./d` → `/a/c/d` (never above `/`). */
+function resolveDotSegments(absPath: string): string {
+  const out: string[] = [];
+  for (const part of absPath.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") out.pop();
+    else out.push(part);
+  }
+  return `/${out.join("/")}`;
+}
+
+/** An upload that failed because its parent directory does not exist. */
+function isMissingPathError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  const code = (err as { code?: unknown } | null)?.code;
+  return code === "ENOENT" || /no such file|not found|does not exist|ENOENT/i.test(message);
+}
+
+function parentDir(filePath: string): string | null {
+  const slash = filePath.lastIndexOf("/");
+  return slash <= 0 ? null : filePath.slice(0, slash);
 }
 
 function safeRelativePath(value: string): string | null {

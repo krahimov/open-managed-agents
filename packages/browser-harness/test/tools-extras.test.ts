@@ -52,6 +52,39 @@ describe("browser_screenshot save_path", () => {
     expect(model.value[1]).toMatchObject({ type: "image-data", mediaType: "image/png" });
   });
 
+  it("captures once and hands the captured bytes straight to the host", async () => {
+    const captures: unknown[] = [];
+    const big = new Uint8Array(3 * 1024 * 1024).map((_, i) => i % 251);
+    let received: Uint8Array | null = null;
+    const tools = buildBrowserTools(harnessWith({ screenshot: async (opts) => { captures.push(opts); return big; } }), null, {
+      saveFile: async (path, bytes) => { received = bytes; return path; },
+    });
+    const out = await tools.browser_screenshot.execute({ save_path: "/workspace/big.png" }, OPTS);
+    expect(captures).toEqual([{ fullPage: false, type: "png" }]);
+    // No decode/re-encode round trip: the very buffer the browser returned.
+    expect(received).toBe(big);
+    expect(out.source.data).toBe(Buffer.from(big).toString("base64"));
+  });
+
+  it("saves a .jpg path as a JPEG and shows the model the same JPEG", async () => {
+    const JPEG = new Uint8Array([0xff, 0xd8, 0xff, 0xe0]);
+    const captures: unknown[] = [];
+    const writes: Uint8Array[] = [];
+    const tools = buildBrowserTools(harnessWith({ screenshot: async (opts) => { captures.push(opts); return JPEG; } }), null, {
+      saveFile: async (path, bytes) => { writes.push(bytes); return path; },
+    });
+    const out = await tools.browser_screenshot.execute({ save_path: "/workspace/shot.JPG" }, OPTS);
+    expect(captures).toEqual([{ fullPage: false, type: "jpeg", quality: 80 }]);
+    expect([...writes[0]!]).toEqual([...JPEG]);
+    expect(out).toMatchObject({ source: { media_type: "image/jpeg" }, saved_path: "/workspace/shot.JPG" });
+    expect(tools.browser_screenshot.toModelOutput({ output: out }).value[1]).toMatchObject({ mediaType: "image/jpeg" });
+  });
+
+  it("reports a failed save instead of claiming the file exists", async () => {
+    const tools = buildBrowserTools(harnessWith({}), null, { saveFile: async () => { throw new Error("disk full"); } });
+    expect(await tools.browser_screenshot.execute({ save_path: "/workspace/a.png" }, OPTS)).toBe("Screenshot error: disk full");
+  });
+
   it("returns only the image when no path is given", async () => {
     let wrote = false;
     const tools = buildBrowserTools(harnessWith({}), null, { saveFile: async (p) => { wrote = true; return p; } });

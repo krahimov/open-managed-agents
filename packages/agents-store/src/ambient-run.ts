@@ -31,7 +31,7 @@ const MAX_SUFFIX = 40;
 /**
  * "<rule name> · Nov 18, 09:00 UTC": a distinct, readable title per run.
  * The time is shown in the rule's own time zone when it has a valid one,
- * else UTC. `suffix` (a webhook's event id) replaces the time when given.
+ * else UTC. `suffix` (see webhookRunSuffix) replaces the time when given.
  */
 export function ambientRunTitle(
   ruleName: string,
@@ -44,6 +44,64 @@ export function ambientRunTitle(
     return `${name} · ${short}`;
   }
   return `${name} · ${formatRunTime(opts.at, opts.timezone)}`;
+}
+
+/**
+ * Event-data fields that name one delivery ("1287", "v2.4.1"), in order of
+ * preference. They outrank the caller's event id.
+ */
+export const WEBHOOK_RUN_NAME_FIELDS = ["build", "version", "release"] as const;
+/**
+ * Fields many deliveries share ("production", "nightly"): used only when
+ * the event id is one nobody chose, since a chosen id tells runs apart.
+ */
+export const WEBHOOK_RUN_FALLBACK_FIELDS = ["tag", "environment"] as const;
+const MAX_NAME_FIELD = 32;
+
+/**
+ * What a webhook run's title is suffixed with: a short human value naming
+ * the delivery ("v2.4.1", "1287"), else the caller's event id when it
+ * reads as a name ("deploy-1287"), else a shared value such as the tag or
+ * environment ("staging"), else null, which titles the run by its time.
+ * Ids nobody chose (the console's "test-3842931265d9", "run-…", UUIDs,
+ * long hex digests) never become the title, and neither does text that
+ * would not read as one plain line.
+ */
+export function webhookRunSuffix(eventId: string, data?: Record<string, unknown> | null): string | null {
+  const fromData = (fields: readonly string[]): string | null => {
+    for (const field of fields) {
+      const name = shortName(data?.[field], MAX_NAME_FIELD);
+      if (name) return name;
+    }
+    return null;
+  };
+  const named = fromData(WEBHOOK_RUN_NAME_FIELDS);
+  if (named) return named;
+  const id = shortName(eventId, Number.POSITIVE_INFINITY);
+  if (id && !isGeneratedId(id)) return id;
+  return fromData(WEBHOOK_RUN_FALLBACK_FIELDS);
+}
+
+/**
+ * Text that cannot draw itself as something else: no control characters,
+ * line or paragraph separators, bidi overrides/isolates or zero-width
+ * characters (Unicode Cc, Cf, Zl, Zp).
+ */
+const NOT_ONE_PLAIN_LINE = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u;
+
+function shortName(value: unknown, maxLength: number): string | null {
+  if (typeof value === "number") return Number.isSafeInteger(value) ? String(value) : null;
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!text || text.length > maxLength || NOT_ONE_PLAIN_LINE.test(text)) return null;
+  return text;
+}
+
+/** The console's generated ids, UUIDs and bare hex digests. */
+function isGeneratedId(id: string): boolean {
+  return /^(test|run)-[0-9a-f]{12}$/i.test(id) ||
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id) ||
+    /^[0-9a-f]{16,}$/i.test(id);
 }
 
 /** "Nov 18, 09:00 UTC" in `timezone` (IANA), falling back to UTC when it is missing or unknown. */

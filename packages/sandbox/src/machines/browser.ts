@@ -156,6 +156,90 @@ if (policyPath) fs.writeFileSync(policyPath, JSON.stringify(policy));
 `;
 }
 
+// Camera-clean desktop. Daytona's computer-use desktop is a stock XFCE
+// session: a top panel (panel-1: Applications menu, workspace switcher,
+// clock, the "daytona" user name) and a bottom launcher dock (panel-2,
+// centred, "autohide intelligently", so under a maximized window it hides
+// into a thin strip at the bottom of the screen — the grey bar at y≈797).
+// The live view must show only the agent's Chromium, maximized to the full
+// screen, so after computerUse.start() the panels are told to always hide
+// (persisted in xfconf, so a session restart brings them back hidden) and
+// then quit; `xfce4-panel --quit` also tells xfce4-session not to respawn
+// it, where a plain kill would be restarted at once. Third-party docks and
+// the notification daemon are stopped too. Screen size is untouched, so
+// computer_* pixel coordinates (taken from the full screenshot) still map.
+// Idempotent: it runs on every bootstrap (each start of the computer) and
+// before every Chromium launch, and does nothing once the panels are gone.
+const DESKTOP_SCRIPT = "/var/lib/oma/desktop.sh";
+/** How long bootstrap waits for a just-started session to show its panel. */
+const DESKTOP_PANEL_WAIT_SEC = 15;
+/** Other docks/panels some desktop images ship; stopped when present. */
+const DESKTOP_DOCKS = ["plank", "docky", "cairo-dock", "tint2", "xfce4-notifyd"];
+
+/** `sh desktop.sh [wait seconds]`: hides the desktop chrome. Best effort
+ *  (always exits 0) and cheap once the panels are gone. Exported for tests. */
+export function buildAgentDesktopCleanScript(): string {
+  return [
+    "#!/bin/sh",
+    "set -u",
+    'wait_for="${1:-0}"',
+    'case "$wait_for" in ""|*[!0-9]*) wait_for=0 ;; esac',
+    'as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }',
+    'if [ -z "${DISPLAY:-}" ]; then',
+    '  display_socket="$(find /tmp/.X11-unix -name "X*" -type s 2>/dev/null | head -n 1)"',
+    '  [ -n "$display_socket" ] || { echo "no X display; nothing to clean"; exit 0; }',
+    '  export DISPLAY=":${display_socket##*/X}"',
+    "fi",
+    ...DESKTOP_DOCKS.map((name) => `pkill -x ${quote(name)} >/dev/null 2>&1 || true`),
+    // xfce4-session starts the panel shortly after computerUse.start(); a
+    // session that has been up longer than the wait already quit it. No
+    // session means no panel is coming; nor once xfdesktop (launched after
+    // the panel) has been up a couple of seconds without one.
+    'session_age=0',
+    'session_pid="$(pgrep -x xfce4-session 2>/dev/null | head -n 1)"',
+    'if [ -n "$session_pid" ]; then session_age="$(ps -o etimes= -p "$session_pid" 2>/dev/null | tr -d " ")"; else wait_for=0; fi',
+    'case "$session_age" in ""|*[!0-9]*) session_age=0 ;; esac',
+    'waited=0',
+    'settled=0',
+    'while ! pgrep -x xfce4-panel >/dev/null 2>&1 && [ $((session_age + waited)) -lt "$wait_for" ] && [ "$settled" -lt 2 ]; do',
+    '  if pgrep -x xfdesktop >/dev/null 2>&1; then settled=$((settled + 1)); fi',
+    '  sleep 1; waited=$((waited + 1))',
+    'done',
+    'pgrep -x xfce4-panel >/dev/null 2>&1 || { echo "desktop: no panel running (waited ${waited}s)"; exit 0; }',
+    // xfconf-query and `xfce4-panel --quit` must reach the desktop session's
+    // own bus, which the toolbox shell does not inherit.
+    'for pid in $(pgrep -x xfce4-session 2>/dev/null) $(pgrep -x xfce4-panel 2>/dev/null) $(pgrep -x xfwm4 2>/dev/null); do',
+    String.raw`  addr="$( (cat /proc/$pid/environ 2>/dev/null || as_root cat /proc/$pid/environ 2>/dev/null) | tr '\000' '\n' | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' | head -n 1)"`,
+    '  if [ -n "$addr" ]; then export DBUS_SESSION_BUS_ADDRESS="$addr"; break; fi',
+    "done",
+    'if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v xfconf-query >/dev/null 2>&1; then',
+    // Always hide every configured panel (1 = intelligently, 2 = always).
+    "  for id in $(xfconf-query -c xfce4-panel -p /panels 2>/dev/null | grep -E '^[0-9]+$'); do",
+    '    xfconf-query -c xfce4-panel -p "/panels/panel-$id/autohide-behavior" -n -t uint -s 2 >/dev/null 2>&1 || true',
+    "  done",
+    // No title bar on maximized windows, should a window ever get one.
+    "  xfconf-query -c xfwm4 -p /general/titleless_maximize -n -t bool -s true >/dev/null 2>&1 || true",
+    "fi",
+    "attempt=0",
+    'while pgrep -x xfce4-panel >/dev/null 2>&1 && [ "$attempt" -lt 3 ]; do',
+    "  attempt=$((attempt + 1))",
+    '  if [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v xfce4-panel >/dev/null 2>&1; then xfce4-panel --quit >/dev/null 2>&1 || true; fi',
+    "  sleep 1",
+    // No session bus: quit by signal (the session may respawn it, retried).
+    '  if pgrep -x xfce4-panel >/dev/null 2>&1 && [ "$attempt" -ge 2 ]; then pkill -x xfce4-panel >/dev/null 2>&1 || as_root pkill -x xfce4-panel >/dev/null 2>&1 || true; sleep 1; fi',
+    "done",
+    'if pgrep -x xfce4-panel >/dev/null 2>&1; then',
+    // Last resort: keep the process (no respawn) but unmap its windows.
+    '  if command -v xdotool >/dev/null 2>&1; then xdotool search --class xfce4-panel 2>/dev/null | while read -r w; do xdotool windowunmap "$w" >/dev/null 2>&1 || true; done; fi',
+    '  echo "desktop: xfce4-panel is still running; its windows were unmapped where possible"',
+    "else",
+    '  echo "desktop: panels hidden and xfce4-panel quit (attempts: $attempt)"',
+    "fi",
+    "exit 0",
+    "",
+  ].join("\n");
+}
+
 /** Exported for shell syntax checks and a real local Chromium smoke test. */
 export function buildAgentBrowserStartScript(desktop = false): string {
   return [
@@ -167,6 +251,8 @@ export function buildAgentBrowserStartScript(desktop = false): string {
     // flock serializes concurrent sessions connecting after a stop/start.
     `exec 9>${quote(`${BROWSER_DIR}/start.lock`)}`,
     "flock -w 45 9",
+    // Cheap once clean; catches a desktop session restarted since bootstrap.
+    ...(desktop ? [`if [ -f ${quote(DESKTOP_SCRIPT)} ]; then sh ${quote(DESKTOP_SCRIPT)} 0 >/dev/null 2>&1 9>&- || true; fi`] : []),
     `if ! curl -fsS --max-time 2 http://127.0.0.1:${AGENT_BROWSER_PORT}/json/version >/dev/null 2>&1; then`,
     '  browser_bin="$(command -v chromium || command -v chromium-browser || command -v google-chrome || true)"',
     '  if [ -z "$browser_bin" ]; then echo "Chromium is not installed in the agent computer" >&2; exit 127; fi',
@@ -249,6 +335,25 @@ async function ensurePython(sb: DaytonaSandboxInstance): Promise<void> {
   }
 }
 
+/** Best-effort: a computer whose panels still show is still a working computer. */
+async function cleanDesktop(sb: DaytonaSandboxInstance): Promise<void> {
+  try {
+    await sb.fs.uploadFile(Buffer.from(buildAgentDesktopCleanScript()), DESKTOP_SCRIPT);
+    const result = await sb.process.executeCommand(`sh ${quote(DESKTOP_SCRIPT)} ${DESKTOP_PANEL_WAIT_SEC}`, undefined, undefined, DESKTOP_PANEL_WAIT_SEC + 30);
+    const output = (result.result ?? "").trim().slice(-1000);
+    // Always logged: the status line is the only sign of what the live view
+    // should now show (a strip left on screen with "panels hidden" here is
+    // something other than the XFCE panel).
+    if (result.exitCode !== 0 || /still running/.test(output)) {
+      console.warn("[agent-computer] desktop cleanup", { sandboxId: sb.id, exitCode: result.exitCode, output });
+    } else {
+      console.info("[agent-computer] desktop cleanup", { sandboxId: sb.id, output });
+    }
+  } catch (err) {
+    console.warn("[agent-computer] desktop cleanup failed; panels may show", { sandboxId: sb.id, error: String(err) });
+  }
+}
+
 async function execute(sb: DaytonaSandboxInstance, command: string, timeoutSec: number): Promise<string> {
   const result = await sb.process.executeCommand(command, undefined, undefined, timeoutSec);
   if (result.exitCode !== 0) {
@@ -303,6 +408,7 @@ export async function bootstrapAgentComputer(sb: DaytonaSandboxInstance, spec: A
     if (!sb.computerUse) throw new Error("Daytona SDK does not support desktop control");
     console.info("[agent-computer] starting Daytona desktop", { sandboxId: sb.id });
     await sb.computerUse.start();
+    await cleanDesktop(sb);
   }
   if (!spec.browser) return;
   await execute(sb, `mkdir -p ${quote(BROWSER_DIR)} ${quote(`${spec.workdir}/downloads`)}`, 30);

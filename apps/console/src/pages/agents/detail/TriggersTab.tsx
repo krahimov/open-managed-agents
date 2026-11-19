@@ -5,6 +5,7 @@ import { CopyIcon, PlayIcon, PlusIcon, SendIcon, Trash2Icon, TriangleAlertIcon }
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useApi } from "@/lib/api";
@@ -83,18 +84,20 @@ export function TriggersTab({
    * a test event). The server holds it to the rule's budget; the new
    * session opens from the toast and from the card's "View session".
    */
-  const runNow = async (rule: AmbientRule, data?: Record<string, unknown>) => {
-    const out = await api<{ session_id: string | null; event_id: string }>(`${path}/${rule.id}/run`, {
+  const runNow = async (rule: AmbientRule, data?: Record<string, unknown>, eventId?: string) => {
+    const out = await api<{ session_id: string | null; event_id: string; duplicate?: boolean }>(`${path}/${rule.id}/run`, {
       method: "POST",
-      body: JSON.stringify(data ? { data } : {}),
+      body: JSON.stringify({ ...(eventId ? { event_id: eventId } : {}), ...(data ? { data } : {}) }),
     });
     await invalidate();
     void qc.invalidateQueries({ queryKey: ["/v1/sessions"] });
     const sessionId = out?.session_id;
     const webhook = rule.trigger?.source === "webhook";
     if (sessionId) {
-      toast.success(webhook ? "Test event sent" : "Run started", {
-        description: `${rule.name} started a new session.`,
+      toast.success(out.duplicate ? "Event already delivered" : webhook ? "Test event sent" : "Run started", {
+        description: out.duplicate
+          ? `This event ID already ran ${rule.name}; nothing new was started.`
+          : `${rule.name} started a new session.`,
         action: { label: "Open session", onClick: () => navigate(`/sessions/${sessionId}`) },
       });
     } else {
@@ -199,7 +202,7 @@ export function TriggersTab({
       <TestEventDialog
         rule={testing}
         onClose={() => setTesting(null)}
-        onSend={(data) => runNow(testing as AmbientRule, data)}
+        onSend={(data, eventId) => runNow(testing as AmbientRule, data, eventId)}
       />
 
       <ConfirmDialog
@@ -485,8 +488,9 @@ export function AddTriggerDialog({
 
 /**
  * "Send test event" for a webhook trigger: an optional JSON object sent as
- * the event's data, with an event id the server generates. It runs exactly
- * as a real delivery would, within the trigger's budget.
+ * the event's data, and an optional event id (the server generates one when
+ * it is left empty). It runs exactly as a real delivery would, within the
+ * trigger's budget; resending an id already used replays its first result.
  */
 function TestEventDialog({
   rule,
@@ -495,10 +499,12 @@ function TestEventDialog({
 }: {
   rule: AmbientRule | null;
   onClose: () => void;
-  onSend: (data: Record<string, unknown>) => Promise<void>;
+  onSend: (data: Record<string, unknown>, eventId?: string) => Promise<void>;
 }) {
   const [raw, setRaw] = useState(SAMPLE_TEST_EVENT_DATA);
+  const [eventId, setEventId] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [idError, setIdError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
 
   const close = () => {
@@ -506,11 +512,15 @@ function TestEventDialog({
     onClose();
     window.setTimeout(() => {
       setRaw(SAMPLE_TEST_EVENT_DATA);
+      setEventId("");
       setError(null);
+      setIdError(null);
     }, 250);
   };
 
   const send = async () => {
+    const id = eventId.trim();
+    setIdError(id.length > MAX_EVENT_ID ? `Event ID is at most ${MAX_EVENT_ID} characters` : null);
     let data: Record<string, unknown>;
     try {
       data = parseJsonObject(raw, "Event data");
@@ -519,11 +529,14 @@ function TestEventDialog({
       return;
     }
     setError(null);
+    if (id.length > MAX_EVENT_ID) return;
     setSending(true);
     try {
-      await onSend(data);
+      await onSend(data, id || undefined);
       setSending(false);
       onClose();
+      // The data stays for the next test; an event ID names one delivery.
+      window.setTimeout(() => setEventId(""), 250);
     } catch {
       // The API client already raised a toast; keep the dialog open to retry.
       setSending(false);
@@ -549,7 +562,7 @@ function TestEventDialog({
     >
       <Field
         label="Event data"
-        hint="Optional. A JSON object, sent as the event's data with a generated event_id."
+        hint="Optional. A JSON object, sent as the event's data. A short build, version or release field names the run; so does a tag or environment when no event id is given."
         error={error}
       >
         <Textarea
@@ -560,9 +573,27 @@ function TestEventDialog({
           className="font-mono text-small"
         />
       </Field>
+      <Field
+        label="Event ID"
+        hint="Optional. Generated when empty. Sending an ID again replays its first run instead of starting another."
+        error={idError}
+        className="mt-4"
+      >
+        <Input
+          value={eventId}
+          onChange={(e) => setEventId(e.target.value)}
+          placeholder="deploy-1287"
+          autoComplete="off"
+          spellCheck={false}
+          className="font-mono"
+        />
+      </Field>
     </Modal>
   );
 }
+
+/** The server's limit on a webhook event_id. */
+const MAX_EVENT_ID = 200;
 
 /** The raw event name of an event trigger ("pull_request.labeled"), when it has one. */
 function eventOf(rule: AmbientRule): string {

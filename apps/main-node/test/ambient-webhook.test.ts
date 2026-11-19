@@ -140,11 +140,22 @@ describe("POST …/ambient-rules/:ruleId/run", () => {
     const out = await res.json() as { event_id: string; session_id: string };
     expect(out.session_id).toBe("s1");
     expect(out.event_id).toMatch(/^test-[0-9a-f]{12}$/);
-    expect(f.created[0].title).toBe(`Regression · ${out.event_id}`);
+    // Titled by its time, not the generated id.
+    expect(f.created[0].title).toMatch(/^Regression · [A-Z][a-z]{2} \d{1,2}, \d{2}:\d{2} UTC$/);
+    expect(f.created[0].title).not.toContain(out.event_id);
     const event = f.messages[0].events[0];
     expect(event.content[0].text).toContain('"window_id":"w09"');
     expect(event.metadata.ambient).toMatchObject({ manual: true, event_id: out.event_id, source: "webhook" });
     expect((await f.getRule())?.last_decision).toMatchObject({ outcome: "create_session", session_id: "s1" });
+  });
+
+  it("names a run by a short human value from its data", async () => {
+    const f = await fixture();
+    expect((await f.run({ data: { build: "1287", environment: "prod" } })).status).toBe(202);
+    expect(f.created[0].title).toBe("Regression · 1287");
+    f.sessions.get("s1").completed = true;
+    expect((await f.post("6f1c9a2e-8b7d-4c3e-9f10-2a3b4c5d6e7f", { version: "v2.4.1" })).status).toBe(202);
+    expect(f.created[1].title).toBe("Regression · v2.4.1");
   });
 
   it("accepts an empty body and is idempotent on a given event_id", async () => {
