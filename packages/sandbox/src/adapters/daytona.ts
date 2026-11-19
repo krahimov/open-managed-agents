@@ -491,6 +491,13 @@ export class DaytonaSandbox implements SandboxExecutor {
   /** Where a write to `target` is written back: null outside every
    *  writable mount (read-only memory stores are never written back). */
   private mountedObjectKey(target: string): { key: string } | "resync" | null {
+    // `..` / `.` segments may resolve into another mount than the prefix
+    // names (or out of one): resolve them, and let the full resync write
+    // back whatever lands under a mount.
+    if (target.split("/").some((part) => part === "." || part === "..")) {
+      const resolved = resolveDotSegments(target);
+      return this.mountedObjectKey(resolved) ? "resync" : null;
+    }
     const under = (mountPoint: string, prefix: string): { key: string } | "resync" | null => {
       if (!target.startsWith(`${mountPoint}/`)) return null;
       const rel = safeRelativePath(target.slice(mountPoint.length + 1));
@@ -963,8 +970,9 @@ export class DaytonaSandbox implements SandboxExecutor {
   /**
    * Upload into a parent directory that exists. A directory this adapter
    * already created on this box skips the createFolder round trip; when
-   * the upload then fails (the agent may have removed it), the directory
-   * is created and the upload retried once.
+   * the upload then fails because the directory is gone (the agent may
+   * have removed it), it is created and the upload retried once. Any other
+   * failure surfaces as is (and the next write re-checks the directory).
    */
   private async upload(sb: DaytonaSandboxInstance, body: Buffer, target: string): Promise<void> {
     const dir = parentDir(target);
@@ -975,6 +983,7 @@ export class DaytonaSandbox implements SandboxExecutor {
     } catch (err) {
       if (!known || this.isSandboxGone(err)) throw err;
       this.createdDirs.delete(`${sb.id}\0${dir}`);
+      if (!isMissingPathError(err)) throw err;
       await this.ensureParentDir(sb, target);
       await sb.fs.uploadFile(body, target);
     }
@@ -1112,6 +1121,24 @@ async function bodyToBuffer(body: unknown): Promise<Buffer> {
     return Buffer.concat(chunks);
   }
   throw new Error("unsupported S3 body type");
+}
+
+/** `/a/b/../c/./d` → `/a/c/d` (never above `/`). */
+function resolveDotSegments(absPath: string): string {
+  const out: string[] = [];
+  for (const part of absPath.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") out.pop();
+    else out.push(part);
+  }
+  return `/${out.join("/")}`;
+}
+
+/** An upload that failed because its parent directory does not exist. */
+function isMissingPathError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  const code = (err as { code?: unknown } | null)?.code;
+  return code === "ENOENT" || /no such file|not found|does not exist|ENOENT/i.test(message);
 }
 
 function parentDir(filePath: string): string | null {

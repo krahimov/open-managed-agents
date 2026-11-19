@@ -562,7 +562,7 @@ function TestEventDialog({
     >
       <Field
         label="Event data"
-        hint="Optional. A JSON object, sent as the event's data. A short build, version, release, tag or environment field names the run."
+        hint="Optional. A JSON object, sent as the event's data. A short build, version or release field names the run; so does a tag or environment when no event id is given."
         error={error}
       >
         <Textarea

@@ -272,6 +272,34 @@ describe("DaytonaSandbox (session scope) — box lifecycle", () => {
     expect(await a.readFile("/workspace/out/b.txt")).toBe("b");
   });
 
+  it("does not retry an upload that failed for another reason than a missing directory", async () => {
+    const fake = new FakeDaytona();
+    const a = makeSandbox(fake);
+    await a.writeFile("/workspace/out/a.txt", "a");
+    const sb = onlyBox(fake);
+    const upload = vi.spyOn(sb.fs, "uploadFile").mockRejectedValueOnce(new Error("upload timed out"));
+    const createFolder = vi.spyOn(sb.fs, "createFolder");
+    await expect(a.writeFile("/workspace/out/b.txt", "b")).rejects.toThrow("upload timed out");
+    expect(upload).toHaveBeenCalledTimes(1);
+    expect(createFolder).not.toHaveBeenCalled();
+    // The next write re-checks the directory instead of trusting the cache.
+    expect(await a.writeFile("/workspace/out/c.txt", "c")).toBe("/workspace/out/c.txt");
+    expect(createFolder).toHaveBeenCalledTimes(1);
+  });
+
+  it("writes back a .. path that resolves from a read-only store into a writable one", async () => {
+    const fake = new FakeDaytona();
+    const a = makeSandbox(fake, { memoryBucket: bucket });
+    const sends = fakeS3(a);
+    await a.mountMemoryStore({ storeName: "docs", storeId: "store-2", readOnly: true });
+    await a.mountMemoryStore({ storeName: "notes", storeId: "store-1", readOnly: false });
+    const sb = onlyBox(fake);
+    sb.writeText("/mnt/memory/notes/fact.md", "f");
+    await a.writeFile("/mnt/memory/docs/../notes/fact.md", "f").catch(() => {});
+    expect(sends.filter((s) => s.type === "PutObject").map((s) => s.input.Key)).toContain("store-1/fact.md");
+    expect(sends.filter((s) => s.type === "PutObject").map((s) => s.input.Key)).not.toContain("store-2/fact.md");
+  });
+
   it("never writes a read-only memory store back", async () => {
     const fake = new FakeDaytona();
     const a = makeSandbox(fake, { memoryBucket: bucket });

@@ -107,7 +107,7 @@ describe("agent computer clean desktop", () => {
    * Runs the generated script against stub binaries: a process "runs"
    * while <state>/<name> exists, and every stub call is logged.
    */
-  function runDesktopScript(opts: { panelRunning?: boolean; quitWorks?: boolean; respawns?: boolean; dbus?: boolean; docks?: string[] }) {
+  function runDesktopScript(opts: { panelRunning?: boolean; quitWorks?: boolean; respawns?: boolean; dbus?: boolean; docks?: string[]; session?: boolean; sessionAge?: number; xfdesktop?: boolean }) {
     const dir = mkdtempSync(join(tmpdir(), "oma-desktop-"));
     const bin = join(dir, "bin");
     const state = join(dir, "state");
@@ -119,26 +119,32 @@ describe("agent computer clean desktop", () => {
       chmodSync(join(bin, name), 0o755);
     };
     stub("sleep", "exit 0");
-    stub("ps", "echo 120");
+    stub("ps", `echo ${opts.sessionAge ?? 120}`);
     stub("pgrep", `[ -f '${state}'/"$2" ] && echo 999999999`); // no such /proc entry
     stub("pkill", `[ -f '${state}'/"$2" ] || exit 1\nrm -f '${state}'/"$2"\n${opts.respawns ? `[ "$2" = xfce4-panel ] && touch '${state}/xfce4-panel'` : ""}\nexit 0`);
     stub("xfconf-query", `case "$*" in *"-p /panels") printf 'Value is an array with 2 items:\\n\\n1\\n2\\n' ;; esac`);
     stub("xfce4-panel", opts.quitWorks ? `rm -f '${state}/xfce4-panel'` : "exit 1");
     stub("xdotool", `case "$1" in search) echo 77 ;; esac`);
-    for (const name of ["xfce4-session", ...(opts.panelRunning === false ? [] : ["xfce4-panel"]), ...(opts.docks ?? [])]) {
+    for (const name of [
+      ...(opts.session === false ? [] : ["xfce4-session"]),
+      ...(opts.panelRunning === false ? [] : ["xfce4-panel"]),
+      ...(opts.xfdesktop ? ["xfdesktop"] : []),
+      ...(opts.docks ?? []),
+    ]) {
       writeFileSync(join(state, name), "");
     }
     const env: NodeJS.ProcessEnv = { PATH: `${bin}:/usr/bin:/bin`, DISPLAY: ":0" };
     if (opts.dbus !== false) env.DBUS_SESSION_BUS_ADDRESS = "unix:path=/tmp/bus";
+    let stdout = "";
     try {
-      execFileSync("sh", ["-c", buildAgentDesktopCleanScript(), "desktop.sh", "15"], { env, stdio: ["ignore", "pipe", "pipe"] });
+      stdout = execFileSync("sh", ["-c", buildAgentDesktopCleanScript(), "desktop.sh", "15"], { env, stdio: ["ignore", "pipe", "pipe"] }).toString();
     } catch (err) {
       throw new Error(`desktop script failed: ${String((err as { stderr?: unknown }).stderr ?? err)}`);
     }
     const calls = existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : [];
     const running = (name: string) => existsSync(join(state, name));
     rmSync(dir, { recursive: true, force: true });
-    return { calls, running };
+    return { calls, running, stdout: stdout.trim() };
   }
 
   it("is valid sh and targets the XFCE panels, docks and notifications", () => {
@@ -159,6 +165,24 @@ describe("agent computer clean desktop", () => {
     // Quit, not kill: a killed panel is restarted by xfce4-session.
     expect(run.calls).not.toContain("pkill -x xfce4-panel");
     expect(run.calls.filter((c) => c.startsWith("xdotool"))).toEqual([]);
+    expect(run.stdout).toBe("desktop: panels hidden and xfce4-panel quit (attempts: 1)");
+  });
+
+  it("does not wait for a panel when no desktop session is running", () => {
+    const run = runDesktopScript({ panelRunning: false, session: false, sessionAge: 0 });
+    expect(run.calls).not.toContain("sleep 1");
+    expect(run.stdout).toBe("desktop: no panel running (waited 0s)");
+  });
+
+  it("stops waiting soon after xfdesktop is up without a panel (a session that starts none)", () => {
+    const run = runDesktopScript({ panelRunning: false, sessionAge: 0, xfdesktop: true });
+    expect(run.calls.filter((c) => c === "sleep 1")).toHaveLength(2);
+    expect(run.stdout).toBe("desktop: no panel running (waited 2s)");
+  });
+
+  it("waits up to the limit for a just-started session's panel", () => {
+    const run = runDesktopScript({ panelRunning: false, sessionAge: 0 });
+    expect(run.calls.filter((c) => c === "sleep 1")).toHaveLength(15);
   });
 
   it("is a cheap no-op once the panels are gone (re-bootstrap, every Chromium start)", () => {
@@ -174,6 +198,7 @@ describe("agent computer clean desktop", () => {
     expect(run.calls.some((c) => c.startsWith("xfconf-query"))).toBe(false);
     expect(run.calls).toContain("xdotool search --class xfce4-panel");
     expect(run.calls).toContain("xdotool windowunmap 77");
+    expect(run.stdout).toBe("desktop: xfce4-panel is still running; its windows were unmapped where possible");
   });
 
   it("runs after the desktop starts and before Chromium launches; a failure never blocks the computer", async () => {

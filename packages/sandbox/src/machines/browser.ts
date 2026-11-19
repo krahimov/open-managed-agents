@@ -192,14 +192,20 @@ export function buildAgentDesktopCleanScript(): string {
     "fi",
     ...DESKTOP_DOCKS.map((name) => `pkill -x ${quote(name)} >/dev/null 2>&1 || true`),
     // xfce4-session starts the panel shortly after computerUse.start(); a
-    // session that has been up longer than the wait already quit it.
+    // session that has been up longer than the wait already quit it. No
+    // session means no panel is coming; nor once xfdesktop (launched after
+    // the panel) has been up a couple of seconds without one.
     'session_age=0',
     'session_pid="$(pgrep -x xfce4-session 2>/dev/null | head -n 1)"',
-    'if [ -n "$session_pid" ]; then session_age="$(ps -o etimes= -p "$session_pid" 2>/dev/null | tr -d " ")"; fi',
+    'if [ -n "$session_pid" ]; then session_age="$(ps -o etimes= -p "$session_pid" 2>/dev/null | tr -d " ")"; else wait_for=0; fi',
     'case "$session_age" in ""|*[!0-9]*) session_age=0 ;; esac',
     'waited=0',
-    'while ! pgrep -x xfce4-panel >/dev/null 2>&1 && [ $((session_age + waited)) -lt "$wait_for" ]; do sleep 1; waited=$((waited + 1)); done',
-    'pgrep -x xfce4-panel >/dev/null 2>&1 || exit 0',
+    'settled=0',
+    'while ! pgrep -x xfce4-panel >/dev/null 2>&1 && [ $((session_age + waited)) -lt "$wait_for" ] && [ "$settled" -lt 2 ]; do',
+    '  if pgrep -x xfdesktop >/dev/null 2>&1; then settled=$((settled + 1)); fi',
+    '  sleep 1; waited=$((waited + 1))',
+    'done',
+    'pgrep -x xfce4-panel >/dev/null 2>&1 || { echo "desktop: no panel running (waited ${waited}s)"; exit 0; }',
     // xfconf-query and `xfce4-panel --quit` must reach the desktop session's
     // own bus, which the toolbox shell does not inherit.
     'for pid in $(pgrep -x xfce4-session 2>/dev/null) $(pgrep -x xfce4-panel 2>/dev/null) $(pgrep -x xfwm4 2>/dev/null); do',
@@ -225,7 +231,9 @@ export function buildAgentDesktopCleanScript(): string {
     'if pgrep -x xfce4-panel >/dev/null 2>&1; then',
     // Last resort: keep the process (no respawn) but unmap its windows.
     '  if command -v xdotool >/dev/null 2>&1; then xdotool search --class xfce4-panel 2>/dev/null | while read -r w; do xdotool windowunmap "$w" >/dev/null 2>&1 || true; done; fi',
-    '  echo "xfce4-panel is still running; its windows were unmapped where possible" >&2',
+    '  echo "desktop: xfce4-panel is still running; its windows were unmapped where possible"',
+    "else",
+    '  echo "desktop: panels hidden and xfce4-panel quit (attempts: $attempt)"',
     "fi",
     "exit 0",
     "",
@@ -332,9 +340,14 @@ async function cleanDesktop(sb: DaytonaSandboxInstance): Promise<void> {
   try {
     await sb.fs.uploadFile(Buffer.from(buildAgentDesktopCleanScript()), DESKTOP_SCRIPT);
     const result = await sb.process.executeCommand(`sh ${quote(DESKTOP_SCRIPT)} ${DESKTOP_PANEL_WAIT_SEC}`, undefined, undefined, DESKTOP_PANEL_WAIT_SEC + 30);
-    const output = (result.result ?? "").trim();
-    if (result.exitCode !== 0 || output) {
-      console.warn("[agent-computer] desktop cleanup", { sandboxId: sb.id, exitCode: result.exitCode, output: output.slice(-1000) });
+    const output = (result.result ?? "").trim().slice(-1000);
+    // Always logged: the status line is the only sign of what the live view
+    // should now show (a strip left on screen with "panels hidden" here is
+    // something other than the XFCE panel).
+    if (result.exitCode !== 0 || /still running/.test(output)) {
+      console.warn("[agent-computer] desktop cleanup", { sandboxId: sb.id, exitCode: result.exitCode, output });
+    } else {
+      console.info("[agent-computer] desktop cleanup", { sandboxId: sb.id, output });
     }
   } catch (err) {
     console.warn("[agent-computer] desktop cleanup failed; panels may show", { sandboxId: sb.id, error: String(err) });
