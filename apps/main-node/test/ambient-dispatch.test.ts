@@ -8,6 +8,7 @@ import { createInMemoryAmbientRuleService } from "@open-managed-agents/agents-st
 import type { AgentService } from "@open-managed-agents/agents-store";
 import type { SessionService } from "@open-managed-agents/sessions-store";
 import {
+  AmbientRunError,
   NodeAmbientDispatcher,
   buildWakePrompt,
   computeNextWake,
@@ -20,7 +21,7 @@ function build(opts?: { agentMissing?: boolean; agentMetadata?: Record<string, u
     clock: { nowMs: () => T0 },
   });
   const created: Array<{ agentId: string; title?: string; metadata?: unknown; vaultIds?: string[]; environmentId?: string; environmentSnapshot?: unknown }> = [];
-  const appended: Array<{ sessionId: string; text: string }> = [];
+  const appended: Array<{ sessionId: string; text: string; id?: string; metadata?: Record<string, unknown> }> = [];
   let now = T0;
 
   const agents = {
@@ -45,7 +46,12 @@ function build(opts?: { agentMissing?: boolean; agentMetadata?: Record<string, u
     sessions,
     appendUserEvent: async (sessionId, _t, _a, event) => {
       const content = (event as { content: Array<{ text: string }> }).content;
-      appended.push({ sessionId, text: content[0]?.text ?? "" });
+      appended.push({
+        sessionId,
+        text: content[0]?.text ?? "",
+        id: (event as { id?: string }).id,
+        metadata: (event as { metadata?: Record<string, unknown> }).metadata,
+      });
     },
     resolveEnvironment: async (tenantId, id) => { expect(tenantId).toBe(TENANT); expect(id).toBe("env_desktop"); return opts?.environment as never ?? null; },
     now: () => now,
@@ -88,7 +94,8 @@ describe("NodeAmbientDispatcher", () => {
     const fired = await t.dispatcher.dispatchDue();
     expect(fired).toBe(1);
     expect(t.created).toHaveLength(1);
-    expect(t.created[0].title).toBe("Ambient: Morning sweep");
+    // Each run is titled by the occurrence it fired for, in the rule's zone.
+    expect(t.created[0].title).toBe("Morning sweep · Jul 2, 09:00 UTC");
     expect(t.appended[0].text).toContain('Rule "Morning sweep" fired');
     expect(t.appended[0].text).toContain("Check the inbox");
 
@@ -369,4 +376,115 @@ it("ambient sessions do not fall back to the host when their environment is miss
   await t.ambientRules.create({ tenantId: TENANT, agentId: AGENT, input: { name: 'Monitor', trigger: { source: 'schedule', config: { cron: '* * * * *' } }, wake_mode: 'act', next_wake_at: new Date(T0).toISOString() } });
   await t.dispatcher.dispatchDue();
   expect(t.created).toHaveLength(0);
+});
+
+describe("ambient run attribution", () => {
+  it("tags the session and the wake message with the rule, the source and the occurrence", async () => {
+    const t = build();
+    const rule = await t.ambientRules.create({
+      tenantId: TENANT,
+      agentId: AGENT,
+      input: {
+        name: "Standup digest",
+        trigger: { source: "schedule", config: { cron: "30 9 * * *", timezone: "Europe/Berlin", prompt: "Summarize." } },
+        wake_mode: "act",
+        next_wake_at: new Date(T0).toISOString(),
+      },
+    });
+    await t.dispatcher.dispatchDue();
+    // 09:00 UTC is 11:00 in Berlin (CEST) on Jul 2.
+    expect(t.created[0].title).toBe("Standup digest · Jul 2, 11:00 GMT+2");
+    const ambient = {
+      rule_id: rule.id,
+      rule_name: "Standup digest",
+      source: "schedule",
+      wake_mode: "act",
+      fired_at: new Date(T0).toISOString(),
+      scheduled_for: new Date(T0).toISOString(),
+    };
+    expect(t.created[0].metadata).toEqual({ ambient });
+    // The wake text stays in the log as an ordinary user turn …
+    expect(t.appended[0].text).toBe("Summarize.");
+    // … and its metadata says who sent it (legacy keys kept).
+    expect(t.appended[0].metadata).toMatchObject({ kind: "ambient_wake", ambient_rule_id: rule.id, ambient });
+  });
+
+  it("falls back to UTC for a rule without a valid time zone", async () => {
+    const t = build();
+    await t.ambientRules.create({
+      tenantId: TENANT,
+      agentId: AGENT,
+      input: { name: "Nightly", trigger: { source: "schedule", config: { cron: "0 9 * * *" } }, wake_mode: "act", next_wake_at: new Date(T0).toISOString() },
+    });
+    await t.dispatcher.dispatchDue();
+    expect(t.created[0].title).toBe("Nightly · Jul 2, 09:00 UTC");
+  });
+
+  it("runNow starts a run without moving the schedule", async () => {
+    const t = build();
+    const rule = await t.ambientRules.create({
+      tenantId: TENANT,
+      agentId: AGENT,
+      input: { name: "Morning sweep", trigger: { source: "schedule", config: { cron: "0 9 * * *", timezone: "UTC" } }, wake_mode: "decide" },
+    });
+    const armed = rule.next_wake_at;
+    expect(armed).toBe("2026-07-03T09:00:00.000Z");
+    t.setNow(T0 + 15 * 60_000);
+    const out = await t.dispatcher.runNow(rule, { runId: "run-abc" });
+    expect(out).toEqual({ session_id: "sess_1" });
+    expect(t.created[0].title).toBe("Morning sweep · Jul 2, 09:15 UTC");
+    expect(t.created[0].metadata).toMatchObject({ ambient: { manual: true, source: "schedule" } });
+    expect((t.created[0].metadata as { ambient: Record<string, unknown> }).ambient.scheduled_for).toBeUndefined();
+    // Keyed by the run id, so a retried request is a work-queue no-op.
+    expect(t.appended[0].id).toBe(`sevt_amb_${rule.id}_run_run-abc`);
+    const [after] = await t.ambientRules.listByAgent({ tenantId: TENANT, agentId: AGENT });
+    expect(after.next_wake_at).toBe(armed);
+    expect(after.last_decision).toMatchObject({ outcome: "create_session", session_id: "sess_1" });
+    expect(after.last_wake_at).toBe(new Date(T0 + 15 * 60_000).toISOString());
+  });
+
+  it("runNow on an observe rule records the wake and starts nothing", async () => {
+    const t = build();
+    const rule = await t.ambientRules.create({
+      tenantId: TENANT,
+      agentId: AGENT,
+      input: { name: "Heartbeat", trigger: { source: "schedule", config: { cron: "0 * * * *", timezone: "UTC" } }, wake_mode: "observe" },
+    });
+    expect(await t.dispatcher.runNow(rule, { runId: "r1" })).toEqual({ session_id: null });
+    expect(t.created).toHaveLength(0);
+    const [after] = await t.ambientRules.listByAgent({ tenantId: TENANT, agentId: AGENT });
+    expect(after.next_wake_at).toBe(rule.next_wake_at);
+    expect(after.last_decision?.outcome).toBe("observe");
+  });
+
+  it("runNow reports a missing agent without disabling the rule", async () => {
+    const t = build({ agentMissing: true });
+    const rule = await t.ambientRules.create({
+      tenantId: TENANT,
+      agentId: AGENT,
+      input: { name: "Orphan", trigger: { source: "schedule", config: { cron: "0 9 * * *", timezone: "UTC" } }, wake_mode: "act" },
+    });
+    await expect(t.dispatcher.runNow(rule, { runId: "r1" })).rejects.toThrow(/agent missing/);
+    const [after] = await t.ambientRules.listByAgent({ tenantId: TENANT, agentId: AGENT });
+    expect(after.enabled).toBe(true);
+  });
+
+  it("runNow carries the session id when the wake message cannot be sent", async () => {
+    const { service: ambientRules } = createInMemoryAmbientRuleService({ clock: { nowMs: () => T0 } });
+    const dispatcher = new NodeAmbientDispatcher({
+      ambientRules,
+      agents: { get: async () => ({ id: AGENT, name: "a", archived_at: null }) } as never,
+      sessions: { create: async () => ({ session: { id: "sess_x" }, resources: [] }) } as never,
+      appendUserEvent: async () => { throw new Error("queue down"); },
+      now: () => T0,
+    });
+    const rule = await ambientRules.create({
+      tenantId: TENANT,
+      agentId: AGENT,
+      input: { name: "Flaky", trigger: { source: "schedule", config: { cron: "0 9 * * *", timezone: "UTC" } }, wake_mode: "act" },
+    });
+    const err = await dispatcher.runNow(rule, { runId: "r1" }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AmbientRunError);
+    expect((err as AmbientRunError).session_id).toBe("sess_x");
+  });
 });

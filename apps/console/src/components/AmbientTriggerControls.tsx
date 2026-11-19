@@ -1,15 +1,16 @@
-import { useMemo } from "react";
+import { useEffect, useMemo } from "react";
 
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 
+import { useAmbientTriggerSources } from "../lib/server-features";
 import {
   AMBIENT_SCHEDULE_PRESETS,
-  AMBIENT_TRIGGER_SOURCES,
   WEEKDAYS,
   buildAmbientTrigger,
   eventOptionsForSource,
+  offeredTriggerSources,
   withAmbientTriggerSource,
   type AmbientSchedulePreset,
   type AmbientTriggerDraft,
@@ -35,11 +36,6 @@ const PRESET_LABEL: Record<AmbientSchedulePreset, string> = {
   custom: "Custom (cron)",
 };
 
-const SOURCE_OPTIONS = AMBIENT_TRIGGER_SOURCES.map((source) => ({
-  value: source,
-  label: TRIGGER_SOURCE[source].label,
-  icon: TRIGGER_SOURCE[source].icon,
-}));
 
 const PRESET_OPTIONS = AMBIENT_SCHEDULE_PRESETS.map((preset) => ({ value: preset, label: PRESET_LABEL[preset] }));
 const MINUTE_OPTIONS = ["00", "15", "30", "45"].map((m) => ({ value: m, label: `:${m} past the hour` }));
@@ -66,6 +62,22 @@ function timezones(): string[] {
 export function AmbientTriggerControls({ value, onChange }: AmbientTriggerControlsProps) {
   const eventOptions = eventOptionsForSource(value.source);
   const zones = useMemo(timezones, []);
+  // Only the sources this server fires: a Slack or GitHub rule on a server
+  // that never reads them would save and then wait forever.
+  const supported = useAmbientTriggerSources();
+  const sourceOptions = useMemo(
+    () =>
+      offeredTriggerSources(supported).map((source) => ({
+        value: source,
+        label: TRIGGER_SOURCE[source].label,
+        icon: TRIGGER_SOURCE[source].icon,
+      })),
+    [supported],
+  );
+  const offered = sourceOptions.some((o) => o.value === value.source);
+  useEffect(() => {
+    if (!offered && sourceOptions[0]) onChange(withAmbientTriggerSource(value, sourceOptions[0].value));
+  }, [offered, sourceOptions, value, onChange]);
 
   // A sentence that restates the choice, so the result is never a guess.
   const preview = useMemo(() => {
@@ -84,7 +96,7 @@ export function AmbientTriggerControls({ value, onChange }: AmbientTriggerContro
           label="Trigger source"
           value={value.source}
           onChange={(source) => onChange(withAmbientTriggerSource(value, source))}
-          options={SOURCE_OPTIONS}
+          options={sourceOptions}
         />
         <p className="mt-1.5 text-xs text-fg-subtle">{TRIGGER_SOURCE[value.source].hint}.</p>
       </div>

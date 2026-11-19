@@ -166,7 +166,11 @@ export function ActivityTab({
             const seconds = sessionSeconds(s);
             const outcome = outcomeLine(reading);
             const facts = [
-              source === "console" ? "Started in the console" : `Started from ${SESSION_SOURCE_LABEL[source]}`,
+              source === "console"
+                ? "Started in the console"
+                : source === "trigger"
+                  ? "Started by a trigger"
+                  : `Started from ${SESSION_SOURCE_LABEL[source]}`,
               s.agent?.version !== undefined && s.agent.version !== agent.version ? `as v${s.agent.version}` : null,
             ].filter(Boolean);
             // The title is the row's link (Tab + Enter, ⌘-click). A click

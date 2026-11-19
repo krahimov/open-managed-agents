@@ -122,11 +122,13 @@ export function sessionTitle(
 }
 
 /** Where a session was started from, read off its metadata. */
-export type SessionSource = "console" | "linear" | "slack" | "github" | "eval" | "api" | "setup";
+export type SessionSource = "console" | "linear" | "slack" | "github" | "eval" | "api" | "setup" | "trigger";
 
 export function sessionSource(s: Pick<SessionRecord, "metadata">): SessionSource {
   const m = s.metadata ?? {};
   if (m.oma_setup) return "setup";
+  // A trigger (ambient rule) started it: nobody did.
+  if (m.ambient && typeof m.ambient === "object") return "trigger";
   if (m.linear) return "linear";
   if (m.slack) return "slack";
   if (m.github) return "github";
@@ -145,7 +147,36 @@ export const SESSION_SOURCE_LABEL: Record<SessionSource, string> = {
   eval: "Eval run",
   api: "API",
   setup: "Agent setup",
+  trigger: "a trigger",
 };
+
+/** The trigger that started a session (`metadata.ambient`), or null when a person or another app did. */
+export interface SessionTrigger {
+  ruleId?: string;
+  /** Missing on sessions started before the rule's name was recorded. */
+  ruleName?: string;
+  source: "schedule" | "webhook";
+  /** Started from the console ("Run now", "Send test event"). */
+  manual: boolean;
+}
+
+export function sessionTrigger(s: Pick<SessionRecord, "metadata"> | null | undefined): SessionTrigger | null {
+  const a = s?.metadata?.ambient as Record<string, unknown> | undefined;
+  if (!a || typeof a !== "object") return null;
+  const text = (v: unknown) => (typeof v === "string" && v ? v : undefined);
+  return {
+    ruleId: text(a.rule_id),
+    ruleName: text(a.rule_name),
+    // Webhook runs always said so; schedule runs from before did not.
+    source: a.source === "webhook" ? "webhook" : "schedule",
+    manual: a.manual === true,
+  };
+}
+
+/** "Morning sweep" or, for an older run, "Schedule trigger". */
+export function sessionTriggerLabel(t: SessionTrigger): string {
+  return t.ruleName ?? (t.source === "webhook" ? "Webhook trigger" : "Schedule trigger");
+}
 
 /**
  * What a session needs from a person right now, derived from the

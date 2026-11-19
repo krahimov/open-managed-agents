@@ -138,6 +138,7 @@ export const FAMILY_KIND: Record<SpanFamily, SpanKind> = {
 export type TurnTriggerKind =
   | "user_message"
   | "wakeup"
+  | "trigger"
   | "tool_confirmation"
   | "custom_tool_result"
   | "init";
@@ -166,6 +167,7 @@ export interface Turn {
 export const TRIGGER_LABEL: Record<TurnTriggerKind, string> = {
   user_message: "You",
   wakeup: "Scheduled wake-up",
+  trigger: "Started by a trigger",
   tool_confirmation: "Approval decision",
   custom_tool_result: "Tool result returned",
   init: "Session start",

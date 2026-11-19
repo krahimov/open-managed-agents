@@ -16,6 +16,7 @@ import {
   UserRoundIcon,
   XIcon,
   UsersRoundIcon,
+  ZapIcon,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -344,6 +345,7 @@ function IdleDivider({ ms, nextKind }: { ms: number; nextKind: TurnTriggerKind }
       <MoonIcon className="size-3.5" />
       Idle for {formatElapsed(ms)}
       {nextKind === "wakeup" && ", then woke on schedule"}
+      {nextKind === "trigger" && ", then a trigger fired"}
     </div>
   );
 }
@@ -353,6 +355,7 @@ function IdleDivider({ ms, nextKind }: { ms: number; nextKind: TurnTriggerKind }
 const TRIGGER_ICON: Record<TurnTriggerKind, ComponentType<{ className?: string }>> = {
   user_message: UserRoundIcon,
   wakeup: AlarmClockIcon,
+  trigger: ZapIcon,
   tool_confirmation: ShieldAlertIcon,
   custom_tool_result: CircleDotIcon,
   init: CircleDotIcon,

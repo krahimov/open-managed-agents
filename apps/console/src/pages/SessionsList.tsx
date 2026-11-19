@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Link, useSearchParams } from "react-router";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { ArchiveIcon, BoxIcon, CodeXmlIcon, CopyIcon, FlaskConicalIcon, LinkIcon, SparklesIcon, Trash2Icon } from "lucide-react";
+import { ArchiveIcon, BoxIcon, CalendarClockIcon, CodeXmlIcon, CopyIcon, FlaskConicalIcon, LinkIcon, SparklesIcon, Trash2Icon, WebhookIcon } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { PopoverContent } from "@/components/ui/popover";
@@ -13,7 +13,7 @@ import { useApi } from "../lib/api";
 import { copyText } from "../lib/clipboard";
 import { useAgents, useEntityName } from "../lib/directory";
 import { formatSpan, plural, toDate } from "../lib/format";
-import { sessionSource, sessionTitle } from "../lib/sessions";
+import { sessionSource, sessionTitle, sessionTrigger, sessionTriggerLabel } from "../lib/sessions";
 import { startSession } from "../lib/shell-events";
 import { useApiQuery, useInfiniteApiQuery } from "../lib/useApiQuery";
 import { AgentAvatar } from "../components/AgentAvatar";
@@ -160,6 +160,16 @@ function SourceMark({ session }: { session: Session }) {
     );
   }
   if (source === "setup") return wrap(<SparklesIcon className={icon} />, "Agent setup", "The agent's own setup conversation");
+  if (source === "trigger") {
+    const t = sessionTrigger(session);
+    const label = t ? sessionTriggerLabel(t) : "Trigger";
+    const Icon = t?.source === "webhook" ? WebhookIcon : CalendarClockIcon;
+    return wrap(
+      <Icon className={icon} />,
+      label,
+      t?.manual ? `Run by hand from the trigger "${label}"` : `Started by the trigger "${label}", not by a person`,
+    );
+  }
   if (source === "api") return wrap(<CodeXmlIcon className={icon} />, "API", "Started over the API");
   return null;
 }

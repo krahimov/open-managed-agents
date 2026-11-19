@@ -17,7 +17,7 @@ import type { Event } from "../lib/events";
 import { refreshSessionOutputs } from "../lib/session-outputs";
 import { readFailure } from "../lib/failures";
 import { quietWords, readSession, STALLED_AFTER_MS } from "../lib/session-state";
-import { missionRef, missionTitle, sessionSource, sessionTitle, useMissionGoals } from "../lib/sessions";
+import { missionRef, missionTitle, sessionSource, sessionTitle, sessionTrigger, useMissionGoals } from "../lib/sessions";
 import { startSession } from "../lib/shell-events";
 import type { Trajectory } from "../lib/trajectory";
 import type { SessionRecord } from "../types/session";
@@ -1121,6 +1121,7 @@ export function SessionDetail() {
     slack,
     github,
     evalRunId: (session?.metadata?.eval as { run_id?: string } | undefined)?.run_id,
+    trigger: sessionTrigger(session),
   };
   const panelProps = {
     sessionId: id ?? "",

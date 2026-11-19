@@ -68,6 +68,9 @@ describe("requests an agent makes of a person", () => {
     const wake = say("Check the queue", { metadata: { harness: "schedule", kind: "wakeup" } });
     expect(isPersonMessage(wake as unknown as Event)).toBe(false);
     expect(openRequests(events([HUBSPOT, wake])).length).toBe(1);
+    const trigger = say("Summarize.", { metadata: { kind: "ambient_wake", ambient: { rule_id: "amb_1", source: "schedule" } } });
+    expect(isPersonMessage(trigger as unknown as Event)).toBe(false);
+    expect(openRequests(events([HUBSPOT, trigger])).length).toBe(1);
     expect(openRequests(events([HUBSPOT, { type: "session.status_terminated" }]))).toEqual([]);
   });
 

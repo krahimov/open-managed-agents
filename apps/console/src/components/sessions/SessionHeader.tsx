@@ -4,12 +4,14 @@ import { useOutletContext } from "react-router";
 import {
   ArchiveIcon,
   BoxIcon,
+  CalendarClockIcon,
   BracesIcon,
   CopyIcon,
   FlaskConicalIcon,
   FolderIcon,
   LaptopIcon,
   PanelRightCloseIcon,
+  WebhookIcon,
   PanelRightOpenIcon,
   SquareIcon,
   Trash2Icon,
@@ -21,6 +23,7 @@ import { MOD_KEY } from "@/lib/shell-events";
 import { cn } from "@/lib/utils";
 import { linkHitArea } from "@/lib/links";
 import type { SessionReading } from "@/lib/session-state";
+import { sessionTriggerLabel, type SessionTrigger } from "@/lib/sessions";
 
 import { AgentAvatar } from "../AgentAvatar";
 import type { AppOutletContext } from "../AppShell";
@@ -50,9 +53,11 @@ export interface SessionSourceInfo {
   linearUrl?: string | null;
   slack?: SlackSource | null;
   github?: GitHubSource | null;
-  /** "console" | "linear" | "slack" | "github" | "eval" | "api" | "setup" */
+  /** "console" | "linear" | "slack" | "github" | "eval" | "api" | "setup" | "trigger" */
   kind: string;
   evalRunId?: string;
+  /** The trigger that started it (kind "trigger"). */
+  trigger?: SessionTrigger | null;
 }
 
 /**
@@ -458,6 +463,23 @@ function SourceFact({ source }: { source: SessionSourceInfo }) {
         ) : (
           <span className="shrink-0">Eval run</span>
         )}
+      </>
+    );
+  }
+  if (kind === "trigger" && source.trigger) {
+    // A trigger started it, not a person: say which, as a chip.
+    const t = source.trigger;
+    const label = sessionTriggerLabel(t);
+    return (
+      <>
+        <Dot />
+        <Tip label={t.manual ? `Run by hand from the trigger "${label}"` : `Started by the trigger "${label}", not by a person`}>
+          <span className="inline-flex min-w-0 max-lg:shrink">
+            <Chip icon={t.source === "webhook" ? WebhookIcon : CalendarClockIcon} className="max-w-[16rem] min-w-0 shrink">
+              {label}
+            </Chip>
+          </span>
+        </Tip>
       </>
     );
   }
