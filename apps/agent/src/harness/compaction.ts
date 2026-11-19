@@ -52,6 +52,12 @@ export interface CompactionStrategy {
        * from the main agent's calls.
        */
       runtime?: HarnessRuntime;
+      /**
+       * The main loop's OpenAI promptCacheKey (the agent id). Requests
+       * without it are routed to other cache shards, so a prefix-sharing
+       * strategy passes it on.
+       */
+      promptCacheKey?: string;
     },
   ): Promise<CompactionResult | null>;
 }
@@ -142,7 +148,7 @@ export class SummarizeCompactionStrategy implements CompactionStrategy {
 
   async compact(
     events: SessionEvent[],
-    { model, systemPrompt, tools, applyCacheStrategy, runtime }: {
+    { model, systemPrompt, tools, applyCacheStrategy, runtime, promptCacheKey }: {
       model: LanguageModel;
       contextWindowTokens: number;
       systemPrompt: string;
@@ -155,6 +161,7 @@ export class SummarizeCompactionStrategy implements CompactionStrategy {
         messages: ModelMessage[],
       ) => CacheStrategyApplied;
       runtime?: HarnessRuntime;
+      promptCacheKey?: string;
     },
   ): Promise<CompactionResult | null> {
     const messages = eventsToMessages(events);
@@ -205,6 +212,7 @@ export class SummarizeCompactionStrategy implements CompactionStrategy {
         modelId,
         undefined,
         Object.keys(cached.tools ?? {}).length > 0,
+        promptCacheKey ? { promptCacheKey } : undefined,
       ),
     });
 
