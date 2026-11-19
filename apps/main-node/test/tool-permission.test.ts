@@ -3,6 +3,7 @@ import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import {
   anyToolsetAsks,
+  evaluatePolicy,
   mcpServerMayAsk,
   openAiSafeToolName,
   resolveConfirmedToolCall,
@@ -537,5 +538,41 @@ describe("claude-agent-sdk harness toolset gate", () => {
   it("is inactive when nothing asks (sessions keep bypassPermissions)", async () => {
     const { sdkToolsetGate } = await import("../src/lib/claude-agent-sdk-harness");
     expect(sdkToolsetGate({ tools: [agentToolset("always_allow"), mcpToolset("github", "always_allow")] } as never).active).toBe(false);
+  });
+});
+
+describe("the browser group governs browser_* and computer_*", () => {
+  it("an always_ask browser config gates browser_navigate and computer_click", () => {
+    const tools = [agentToolset("always_allow", [{ name: "browser", policy: "always_ask" }])];
+    for (const name of ["browser_navigate", "browser_screenshot", "computer_click"]) {
+      expect(resolveToolPermission(tools, name)).toBe("always_ask");
+      expect(resolveOwningToolsetPermission(tools, name)).toBe("always_ask");
+    }
+    expect(resolveToolPermission(tools, "bash")).toBe("always_allow");
+  });
+
+  it("an always_allow browser config beats an asking default; a tool's own config beats the group", () => {
+    const allow = [agentToolset("always_ask", [{ name: "browser", policy: "always_allow" }])];
+    expect(resolveToolPermission(allow, "browser_click")).toBe("always_allow");
+    expect(resolveToolPermission(allow, "bash")).toBe("always_ask");
+    const own = [agentToolset("always_allow", [{ name: "browser", policy: "always_allow" }, { name: "browser_eval", policy: "always_ask" }])];
+    expect(resolveToolPermission(own, "browser_eval")).toBe("always_ask");
+    expect(resolveToolPermission(own, "browser_navigate")).toBe("always_allow");
+  });
+
+  it("a browser config without a policy falls back to the default", () => {
+    const tools = [agentToolset("always_ask", [{ name: "browser" }])];
+    expect(resolveToolPermission(tools, "browser_navigate")).toBe("always_ask");
+  });
+
+  it("a policy selector naming the browser group matches its tools", () => {
+    const policy = { rules: [{ effect: "deny" as const, selector: "browser" }] } as never;
+    expect(evaluatePolicy(policy, "browser_navigate")).toMatchObject({ effect: "deny", selector: "browser" });
+    expect(evaluatePolicy(policy, "computer_click").effect).toBe("deny");
+    expect(evaluatePolicy(policy, "bash").effect).toBe("allow");
+    // A more specific rule still wins.
+    const narrowed = { rules: [{ effect: "deny" as const, selector: "browser" }, { effect: "allow" as const, selector: "browser_get_text" }] } as never;
+    expect(evaluatePolicy(narrowed, "browser_get_text").effect).toBe("allow");
+    expect(evaluatePolicy(narrowed, "browser_click").effect).toBe("deny");
   });
 });

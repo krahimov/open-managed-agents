@@ -55,12 +55,114 @@ server.on('upgrade', (req, socket, head) => {
 server.listen(listenPort, '0.0.0.0');
 `;
 
+// Camera-clean Chromium. The agent computer's browser is watched live (the
+// console's desktop view, demos), so nothing may pop over the page the agent
+// works on: no "unsupported command-line flag" infobar (--test-type), no
+// first-run / default-browser / translate / crash-restore bubbles, and no
+// "Save password?" prompt after the agent signs in somewhere. Flags and the
+// profile Preferences are re-applied on every Chromium launch and the policy
+// file on every bootstrap, so existing computers pick them up on their next
+// start.
+const PROFILE_DIR = `${BROWSER_DIR}/profile`;
+const PREFS_SCRIPT = `${BROWSER_DIR}/prefs.cjs`;
+const POLICY_STAGING = `${BROWSER_DIR}/policy.json`;
+/** Debian's chromium and Google Chrome read managed policy from these. */
+const POLICY_DIRS = ["/etc/chromium/policies/managed", "/etc/opt/chrome/policies/managed"];
+
+/** Exported for tests. Never weakens isolation: only UI noise is removed. */
+export function agentBrowserLaunchFlags(desktop = false): string[] {
+  return [
+    desktop ? "--start-maximized" : "--headless=new",
+    "--no-sandbox",
+    // Hides the "--no-sandbox is unsupported" infobar.
+    "--test-type",
+    "--disable-dev-shm-usage",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-search-engine-choice-screen",
+    "--disable-features=Translate,TranslateUI,PasswordLeakDetection,MediaRouter,DialMediaRouteProvider",
+    // No keyring on the box: without this Chromium asks to unlock one.
+    "--password-store=basic",
+    "--disable-session-crashed-bubble",
+    "--hide-crash-restore-bubble",
+    "--disable-background-timer-throttling",
+    "--disable-renderer-backgrounding",
+    "--remote-debugging-address=127.0.0.1",
+    `--remote-debugging-port=${AGENT_BROWSER_PORT}`,
+    `--user-data-dir=${quote(PROFILE_DIR)}`,
+    "--restore-last-session",
+  ];
+}
+
+/** Merged into `<profile>/Default/Preferences` before every launch. */
+export const AGENT_BROWSER_PREFERENCES = {
+  credentials_enable_service: false,
+  credentials_enable_autosignin: false,
+  profile: {
+    password_manager_enabled: false,
+    password_manager_leak_detection: false,
+    // A stopped computer kills Chromium; without this the next launch
+    // shows "Chromium didn't shut down correctly".
+    exit_type: "Normal",
+    exited_cleanly: true,
+    default_content_setting_values: { notifications: 2 },
+  },
+  autofill: { profile_enabled: false, credit_card_enabled: false },
+  translate: { enabled: false },
+  browser: { check_default_browser: false, has_seen_welcome_page: true },
+} as const;
+
+/** Chromium managed policy (best effort: needs root to install). */
+export const AGENT_BROWSER_POLICY = {
+  PasswordManagerEnabled: false,
+  PasswordLeakDetectionEnabled: false,
+  AutofillAddressEnabled: false,
+  AutofillCreditCardEnabled: false,
+  TranslateEnabled: false,
+  DefaultBrowserSettingEnabled: false,
+  PromotionalTabsEnabled: false,
+  DefaultNotificationsSetting: 2,
+  BrowserSignin: 0,
+  SyncDisabled: true,
+  MetricsReportingEnabled: false,
+} as const;
+
+/** `node prefs.cjs <Preferences> <policy staging file>`: deep-merges
+ *  AGENT_BROWSER_PREFERENCES into the profile (atomically; a corrupt file
+ *  is replaced) and writes the policy JSON for the start script to install. */
+export function buildAgentBrowserPrefsScript(): string {
+  return String.raw`
+const fs = require('node:fs');
+const path = require('node:path');
+const prefs = ${JSON.stringify(AGENT_BROWSER_PREFERENCES)};
+const policy = ${JSON.stringify(AGENT_BROWSER_POLICY)};
+function merge(into, from) {
+  for (const [key, value] of Object.entries(from)) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      if (!into[key] || typeof into[key] !== 'object' || Array.isArray(into[key])) into[key] = {};
+      merge(into[key], value);
+    } else into[key] = value;
+  }
+  return into;
+}
+const [prefsPath, policyPath] = process.argv.slice(2);
+let current = {};
+try { current = JSON.parse(fs.readFileSync(prefsPath, 'utf8')); } catch {}
+if (!current || typeof current !== 'object' || Array.isArray(current)) current = {};
+fs.mkdirSync(path.dirname(prefsPath), { recursive: true });
+fs.writeFileSync(prefsPath + '.oma-tmp', JSON.stringify(merge(current, prefs)));
+fs.renameSync(prefsPath + '.oma-tmp', prefsPath);
+if (policyPath) fs.writeFileSync(policyPath, JSON.stringify(policy));
+`;
+}
+
 /** Exported for shell syntax checks and a real local Chromium smoke test. */
 export function buildAgentBrowserStartScript(desktop = false): string {
   return [
     "#!/bin/sh",
     "set -eu",
     ...(desktop ? ['display_socket="$(find /tmp/.X11-unix -name "X*" -type s | head -n 1)"', '[ -n "$display_socket" ] || { echo "Daytona desktop display is not ready" >&2; exit 1; }', 'export DISPLAY=":${display_socket##*/X}"'] : []),
+    'as_root() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }',
     `mkdir -p ${quote(BROWSER_DIR)}`,
     // flock serializes concurrent sessions connecting after a stop/start.
     `exec 9>${quote(`${BROWSER_DIR}/start.lock`)}`,
@@ -68,7 +170,13 @@ export function buildAgentBrowserStartScript(desktop = false): string {
     `if ! curl -fsS --max-time 2 http://127.0.0.1:${AGENT_BROWSER_PORT}/json/version >/dev/null 2>&1; then`,
     '  browser_bin="$(command -v chromium || command -v chromium-browser || command -v google-chrome || true)"',
     '  if [ -z "$browser_bin" ]; then echo "Chromium is not installed in the agent computer" >&2; exit 127; fi',
-    `  nohup "$browser_bin" ${desktop ? "--start-maximized" : "--headless=new"} --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check --disable-background-timer-throttling --disable-renderer-backgrounding --remote-debugging-address=127.0.0.1 --remote-debugging-port=${AGENT_BROWSER_PORT} --user-data-dir=${quote(`${BROWSER_DIR}/profile`)} --restore-last-session about:blank >${quote(`${BROWSER_DIR}/chromium.log`)} 2>&1 </dev/null 9>&- &`,
+    // Preferences only while Chromium is down: it rewrites them on exit.
+    // Cosmetic, so a failure never blocks the browser.
+    `  node ${quote(PREFS_SCRIPT)} ${quote(`${PROFILE_DIR}/Default/Preferences`)} ${quote(POLICY_STAGING)} >/dev/null 2>&1 || echo "Chromium preferences were not applied" >&2`,
+    `  if [ -f ${quote(POLICY_STAGING)} ]; then`,
+    ...POLICY_DIRS.map((dir) => `    as_root sh -c 'mkdir -p "$1" && cp "$2" "$1/oma.json" && chmod 0644 "$1/oma.json"' sh ${quote(dir)} ${quote(POLICY_STAGING)} >/dev/null 2>&1 || true`),
+    "  fi",
+    `  nohup "$browser_bin" ${agentBrowserLaunchFlags(desktop).join(" ")} about:blank >${quote(`${BROWSER_DIR}/chromium.log`)} 2>&1 </dev/null 9>&- &`,
     "fi",
     // The proxy can survive a Chromium crash; checking its upstream would
     // wrongly launch a duplicate proxy while Chromium is still starting.
@@ -199,6 +307,9 @@ export async function bootstrapAgentComputer(sb: DaytonaSandboxInstance, spec: A
   if (!spec.browser) return;
   await execute(sb, `mkdir -p ${quote(BROWSER_DIR)} ${quote(`${spec.workdir}/downloads`)}`, 30);
   await sb.fs.uploadFile(Buffer.from(AGENT_BROWSER_PROXY_SCRIPT), `${BROWSER_DIR}/proxy.cjs`);
+  // Re-uploaded on every bootstrap (each start), so an existing computer
+  // gets the current launch flags and preferences on its next start.
+  await sb.fs.uploadFile(Buffer.from(buildAgentBrowserPrefsScript()), PREFS_SCRIPT);
   await sb.fs.uploadFile(Buffer.from(buildAgentBrowserStartScript(spec.desktop === true)), START_SCRIPT);
   await execute(sb, `sh ${quote(START_SCRIPT)}`, 90);
 }

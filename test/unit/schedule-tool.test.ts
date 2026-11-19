@@ -273,7 +273,8 @@ describe("event classification — schedule tool emits agent.tool_use, not agent
     // agent.custom_tool_use and break the wire contract for downstream
     // consumers.
     const { isBuiltinTool } = await import("../../apps/agent/src/harness/default-loop");
-    for (const name of ["schedule", "cancel_schedule", "list_schedules", "browser", "bash", "read"]) {
+    // Registered names: "browser" is the config group, its tools are browser_*.
+    for (const name of ["schedule", "cancel_schedule", "list_schedules", "browser_navigate", "computer_click", "bash", "read"]) {
       expect(isBuiltinTool(name), `${name} must be built-in`).toBe(true);
     }
     // Negative checks — verify the classifier hasn't gone too broad.

@@ -64,6 +64,39 @@ describe("persistent agent machines", () => {
     expect(bootstrap).toHaveBeenCalledTimes(1);
   });
 
+  it("keeps an already-running computer `running` while another session attaches", async () => {
+    const { provider, manager, store, bootstrap } = fixture();
+    await provider("sess-a").acquire();
+    const row = (await manager.get("tenant-a", "agent-a"))!;
+    expect(row.state).toBe("running");
+    const states: string[] = [];
+    const update = store.update.bind(store);
+    vi.spyOn(store, "update").mockImplementation(async (id, patch, now) => {
+      if (patch.state) states.push(patch.state);
+      return update(id, patch, now);
+    });
+    await provider("sess-b").acquire();
+    expect(states).not.toContain("starting");
+    expect(states).not.toContain("bootstrapping");
+    expect((await manager.get("tenant-a", "agent-a"))!.state).toBe("running");
+    expect(bootstrap).toHaveBeenCalledTimes(1);
+  });
+
+  it("still goes through starting and bootstrap when a stopped computer starts", async () => {
+    const { provider, manager, store, bootstrap } = fixture();
+    await provider("sess-a").acquire();
+    await manager.stop("tenant-a", "agent-a");
+    const states: string[] = [];
+    const update = store.update.bind(store);
+    vi.spyOn(store, "update").mockImplementation(async (id, patch, now) => {
+      if (patch.state) states.push(patch.state);
+      return update(id, patch, now);
+    });
+    await provider("sess-b").acquire();
+    expect(states).toEqual(["starting", "bootstrapping", "running"]);
+    expect(bootstrap).toHaveBeenCalledTimes(2);
+  });
+
   it("deduplicates concurrent creates across managers sharing a store", async () => {
     const { provider, makeManager, fake } = fixture();
     const boxes = await Promise.all([provider("sess-a").acquire(), provider("sess-b", makeManager()).acquire()]);

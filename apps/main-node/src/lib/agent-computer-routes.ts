@@ -9,10 +9,15 @@ interface MachineControl {
 
 export interface AgentComputerRouteDeps {
   machines: MachineControl;
-  supported: boolean;
+  /** Whether this agent gets a computer: its default environment (or the
+   *  deployment's sandbox settings) is a Daytona box scoped to the agent.
+   *  An agent that already has a computer is always supported. */
+  supported(tenantId: string, agentId: string): boolean | Promise<boolean>;
   spec(tenantId: string, agentId: string): AgentMachineSpec | Promise<AgentMachineSpec>;
   agentExists(tenantId: string, agentId: string): Promise<boolean>;
-  screenshot(tenantId: string, agentId: string): Promise<Uint8Array>;
+  /** PNG of the computer's desktop or browser; null when the box cannot be
+   *  reached right now (the route answers 409, as for a stopped computer). */
+  screenshot(tenantId: string, agentId: string, machine: AgentMachineRow): Promise<Uint8Array | null>;
   desktopTicket?(tenantId: string, agentId: string): string;
   logError?(error: unknown): void;
 }
@@ -30,6 +35,13 @@ export function publicMachine(row: AgentMachineRow | null) {
     errorReason: row.state === 'error' ? 'Computer operation failed. Check server logs and retry.' : null,
   };
 }
+
+/** States whose box may be up: a session attaching to a running computer
+ *  passes through `starting`/`bootstrapping`, and the picture must not
+ *  blink out meanwhile. `screenshot` decides whether the box answers. */
+const SCREENSHOT_STATES = new Set(['running', 'starting', 'bootstrapping']);
+
+const NOT_ENABLED = 'Agent computers are not enabled on this deployment.';
 
 export function buildAgentComputerRoutes(deps: AgentComputerRouteDeps) {
   const app = new Hono<{ Variables: { tenant_id: string; user_id?: string } }>();
@@ -52,17 +64,20 @@ export function buildAgentComputerRoutes(deps: AgentComputerRouteDeps) {
   });
   app.get('/:id/machine', async c => {
     const machine = await deps.machines.get(c.get('tenant_id'), c.req.param('id'));
-    return c.json({ supported: deps.supported || !!machine, machine: publicMachine(machine) });
+    const supported = !!machine || await deps.supported(c.get('tenant_id'), c.req.param('id'));
+    return c.json({ supported, machine: publicMachine(machine) });
   });
   app.post('/:id/machine/start', async c => {
     const existing = await deps.machines.get(c.get('tenant_id'), c.req.param('id'));
-    if (!deps.supported && !existing) return c.json({ error: 'Agent computers are not enabled on this deployment.' }, 501);
+    // A new computer agent has no row until something creates it: Start
+    // creates and starts it, as its first session would.
+    if (!existing && !await deps.supported(c.get('tenant_id'), c.req.param('id'))) return c.json({ error: NOT_ENABLED }, 501);
     const machine = await deps.machines.start(c.get('tenant_id'), c.req.param('id'), existing?.config ?? await deps.spec(c.get('tenant_id'), c.req.param('id')));
     return c.json({ machine: publicMachine(machine) });
   });
   app.post('/:id/machine/stop', async c => {
     const existing = await deps.machines.get(c.get('tenant_id'), c.req.param('id'));
-    if (!deps.supported && !existing) return c.json({ error: 'Agent computers are not enabled on this deployment.' }, 501);
+    if (!existing && !await deps.supported(c.get('tenant_id'), c.req.param('id'))) return c.json({ error: NOT_ENABLED }, 501);
     const machine = await deps.machines.stop(c.get('tenant_id'), c.req.param('id'));
     return c.json({ machine: publicMachine(machine) });
   });
@@ -73,9 +88,10 @@ export function buildAgentComputerRoutes(deps: AgentComputerRouteDeps) {
   });
   app.get('/:id/machine/screenshot', async c => {
     const machine = await deps.machines.get(c.get('tenant_id'), c.req.param('id'));
-    if (!machine || machine.state !== 'running') return c.json({ error: 'Computer is not running' }, 409);
+    if (!machine || !SCREENSHOT_STATES.has(machine.state)) return c.json({ error: 'Computer is not running' }, 409);
     if (!machine.browserEnabled) return c.json({ error: 'Browser is disabled on this computer' }, 409);
-    const bytes = await deps.screenshot(c.get('tenant_id'), c.req.param('id'));
+    const bytes = await deps.screenshot(c.get('tenant_id'), c.req.param('id'), machine);
+    if (!bytes) return c.json({ error: 'Computer is not running' }, 409);
     return new Response(Buffer.from(bytes), { headers: { 'Content-Type': 'image/png', 'Cache-Control': 'no-store' } });
   });
   return app;

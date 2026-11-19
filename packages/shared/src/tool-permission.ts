@@ -14,7 +14,11 @@
 //                            declares nothing, the built-in toolset's
 //                            policy applies.
 //   anything else          → the non-MCP toolsets in order; per-tool
-//                            config, then default_config.
+//                            config, then default_config. A tool of a
+//                            config GROUP (browser_* / computer_* belong
+//                            to "browser", see toolGroupOf) takes the
+//                            group's per-tool config when it has none of
+//                            its own.
 //
 // Unset → always_allow. The previous resolver returned the FIRST toolset's
 // policy for every tool, so an agent with GitHub on always_allow and
@@ -44,6 +48,19 @@ export const CALL_MCP_TOOL_NAME = "call_mcp_tool";
 
 const MCP_TOOL_PREFIX = "mcp__";
 
+/** The toolset config name of the browser group: one `{ name: "browser" }`
+ *  entry governs every browser_* tool and the computer_* desktop tools it
+ *  registers (packages/browser-harness BROWSER_TOOL_NAMES /
+ *  COMPUTER_TOOL_NAMES). */
+export const BROWSER_TOOL_GROUP = "browser";
+const BROWSER_GROUP_PREFIXES = ["browser_", "computer_"];
+
+/** The config group a registered tool belongs to (its per-tool config and
+ *  policy selectors can name the group), or null. */
+export function toolGroupOf(toolName: string): string | null {
+  return BROWSER_GROUP_PREFIXES.some((p) => toolName.startsWith(p)) ? BROWSER_TOOL_GROUP : null;
+}
+
 /** Split `mcp__<server>__<tool>`; null for non-MCP names. */
 export function parseMcpToolName(name: string): { server: string; tool: string } | null {
   if (!name.startsWith(MCP_TOOL_PREFIX)) return null;
@@ -68,11 +85,14 @@ function policyOf(c: { permission_policy?: { type?: string } } | undefined): Too
   return type === "always_ask" || type === "always_allow" ? type : null;
 }
 
-/** Legacy order over the given toolsets: first per-tool match, else first
- *  toolset that declares a default. */
-function fromToolsets(toolsets: Toolset[], names: string[]): ToolPermission | null {
+/** Legacy order over the given toolsets: first per-tool match (the tool's
+ *  own name, else its group's), else first toolset that declares a default. */
+function fromToolsets(toolsets: Toolset[], toolName: string): ToolPermission | null {
+  const group = toolGroupOf(toolName);
   for (const ts of toolsets) {
-    const perTool = policyOf(ts.configs?.find((c) => names.includes(c.name)));
+    const perTool =
+      policyOf(ts.configs?.find((c) => c.name === toolName)) ??
+      (group ? policyOf(ts.configs?.find((c) => c.name === group)) : null);
     if (perTool) return perTool;
     const dflt = policyOf(ts.default_config);
     if (dflt) return dflt;
@@ -98,15 +118,15 @@ export function resolveOwningToolsetPermission(
     }
     const ownDefault = owner ? policyOf(owner.default_config) : null;
     if (ownDefault) return ownDefault;
-    return fromToolsets(builtin, [toolName]) ?? "always_allow";
+    return fromToolsets(builtin, toolName) ?? "always_allow";
   }
-  return fromToolsets(builtin, [toolName]) ?? "always_allow";
+  return fromToolsets(builtin, toolName) ?? "always_allow";
 }
 
 /** The pre-fix rule: first toolset with a matching per-tool config or a
  *  default wins, for every tool. Kept only as the ratchet's floor. */
 function legacyFirstToolsetPermission(tools: ToolConfig[] | undefined, toolName: string): ToolPermission {
-  return fromToolsets(toolsetsOf(tools), [toolName]) ?? "always_allow";
+  return fromToolsets(toolsetsOf(tools), toolName) ?? "always_allow";
 }
 
 /**

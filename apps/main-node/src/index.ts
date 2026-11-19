@@ -17,7 +17,7 @@ import { createSandboxBrowserHarness } from "@open-managed-agents/browser-harnes
 import { NodeAgentMachineStore } from "./lib/agent-machine-store.js";
 import { agentComputerOutputsAdapter } from "./lib/agent-computer-outputs.js";
 import { computerBackupExecutor } from "./lib/agent-computer-backup.js";
-import { agentComputerSpec, agentComputerEnabled } from "./lib/agent-computer-config.js";
+import { agentComputerSpec, agentComputerEnabled, agentComputerBrowserEnabled, agentComputerPromptOptions } from "./lib/agent-computer-config.js";
 import { buildAgentComputerRoutes } from "./lib/agent-computer-routes.js";
 import { createAgentComputerCleanup } from "./lib/agent-computer-cleanup.js";
 import { resolveDeploymentIdentity } from "./lib/deployment-identity.js";
@@ -954,6 +954,16 @@ function outputsPathFor(
   return path ? path.replace(/\/?$/, "/") : undefined;
 }
 
+/** The deployment's sandbox env with the agent's default environment
+ *  applied: what a new session of this agent would run on. */
+async function agentDefaultSandboxEnv(tenantId: string, agent: AgentConfig): Promise<Record<string, string | undefined>> {
+  const environmentId = agent.metadata?.default_environment_id;
+  const environment = typeof environmentId === 'string'
+    ? await environmentsService.get({ tenantId, environmentId }) : null;
+  if (typeof environmentId === 'string' && !environment) throw new Error('Agent environment not found');
+  return buildSandboxEnvForEnvironment(process.env, environment ? toEnvironmentConfig(environment) : null);
+}
+
 // ─── Session registry ───────────────────────────────────────────────────
 
 const sessionBrowsers = new Map<string, ReturnType<typeof createSandboxBrowserHarness>>();
@@ -1046,7 +1056,11 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
       });
     }
     const creds = await resolveNodeModelCredentials(agent, context.tenantId);
-    const browser = sandbox.sandboxCapabilities?.().scope === "agent"
+    // An agent computer with its browser on: browser tools are part of the
+    // agent's default toolset (unless it switched them off), since the
+    // computer exists for visible work. computer_* ride along on a desktop.
+    const capabilities = sandbox.sandboxCapabilities?.();
+    const browser = capabilities?.scope === "agent" && capabilities.browser
       ? createSandboxBrowserHarness(sandbox) : undefined;
     if (browser) sessionBrowsers.set(context.sessionId, browser);
     return buildTools(agent, sandbox, {
@@ -1057,6 +1071,7 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
       TAVILY_API_KEY: process.env.TAVILY_API_KEY,
       toMarkdown: toMarkdownProvider,
       browser,
+      browserByDefault: !!browser,
       computer: browser && buildSandboxEnvForEnvironment(process.env, context.environment).MACHINE_DESKTOP === 'true' ? {
         screenshot: () => withDesktop(context.tenantId, agent.id, async desktop => {
           const shot = await desktop.screenshot.takeFullScreen();
@@ -1352,6 +1367,9 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
             // harnesses and the subprocess provider run commands in the
             // main-node container, which has no python.
             pythonTooling: !hostWorkdirMemory && typeof input.sandbox?.sandboxCapabilities === "function",
+            // Read off the registered tools, so the steering names only
+            // what this session can actually call.
+            agentComputer: agentComputerPromptOptions(input.sandbox, input.tools),
           }),
       rawSystemPrompt,
       platformReminders: isSetup ? [] : memoryContext.reminders,
@@ -1881,29 +1899,42 @@ v1.use("*", async (c, next) => {
 
 v1.route("/agents", buildAgentComputerRoutes({
   machines: agentMachines,
-  supported: agentComputerEnabled(process.env),
+  // Per agent: a computer environment works before its first session too.
+  supported: async (tenantId, agentId) => {
+    const agent = await agentsService.get({ tenantId, agentId });
+    if (!agent) return false;
+    return agentComputerEnabled(await agentDefaultSandboxEnv(tenantId, agent).catch(() => ({})));
+  },
   spec: async (tenantId, agentId) => {
     const agent = await agentsService.get({ tenantId, agentId });
     if (!agent) throw new Error('Agent not found');
-    const environmentId = agent.metadata?.default_environment_id;
-    const environment = typeof environmentId === 'string'
-      ? await environmentsService.get({ tenantId, environmentId }) : null;
-    if (typeof environmentId === 'string' && !environment) throw new Error('Agent environment not found');
-    return agentComputerSpec(buildSandboxEnvForEnvironment(process.env, environment ? toEnvironmentConfig(environment) : null));
+    return agentComputerSpec(await agentDefaultSandboxEnv(tenantId, agent));
   },
   agentExists: async (tenantId, agentId) => !!await agentsService.get({ tenantId, agentId }).catch(() => null),
   desktopTicket: (tenantId, agentId) => desktopGateway.issue(tenantId, agentId),
-  screenshot: async (tenantId, agentId) => {
-    const row = await agentMachines.get(tenantId, agentId);
-    if (!row) throw new Error("Computer is not running");
-    if (row.config.desktop) return withDesktop(tenantId, agentId, async desktop => {
-      const shot = await desktop.screenshot.takeFullScreen();
-      if (!shot.screenshot) throw new Error('Daytona returned an empty desktop screenshot');
-      return Buffer.from(shot.screenshot.replace(/^data:image\/png;base64,/, ''), 'base64');
-    });
+  screenshot: async (tenantId, agentId, row) => {
+    if (row.config.desktop) {
+      // Read-only and outside the lifecycle lease: a session attaching to
+      // this running computer holds the lease while it checks the box, and
+      // the picture must not wait for (or fail on) that.
+      const box = await agentMachines.getBox(tenantId, agentId);
+      if (!box?.sb.computerUse) return null;
+      try {
+        const shot = await box.sb.computerUse.screenshot.takeFullScreen();
+        if (!shot.screenshot) throw new Error('Daytona returned an empty desktop screenshot');
+        await machineStore.update(row.id, { lastActiveAt: Date.now() }, Date.now());
+        return Buffer.from(shot.screenshot.replace(/^data:image\/png;base64,/, ''), 'base64');
+      } catch (err) {
+        // Mid-start the desktop may not answer yet: not running, not a failure.
+        if (row.state !== 'running') return null;
+        throw err;
+      }
+    }
+    // Chromium's start script must not run while a start restores its profile.
+    if (row.state !== 'running') return null;
     return agentMachines.withLock(row.id, async () => {
     const box = await agentMachines.getBox(tenantId, agentId);
-    if (!box) throw new Error("Computer is not running");
+    if (!box) return null;
     await machineStore.update(row.id, { lastActiveAt: Date.now() }, Date.now());
     const browser = createSandboxBrowserHarness({
       getBrowserEndpoint: () => resolveAgentComputerBrowser(box.sb, box.generation),
@@ -1942,9 +1973,12 @@ v1.get("/agents/:id/evidence/capability", async (c) => {
     // agent's ACTUAL registered surface: toolset config can disable defaults
     // and opt into browser. Intersect with ALL_TOOLS — unknown names in a
     // config never register, so they must not appear as capabilities.
-    builtinTools: [...getEnabledTools(agent.tools)].filter((n) =>
-      ALL_TOOLS.includes(n),
-    ),
+    builtinTools: [...getEnabledTools(agent.tools, {
+      // An agent computer's browser is on unless the agent turned it off.
+      browserByDefault: agentComputerBrowserEnabled(
+        await agentDefaultSandboxEnv(tenantId, agent).catch(() => ({})),
+      ),
+    })].filter((n) => ALL_TOOLS.includes(n)),
     agent,
     policy,
   });

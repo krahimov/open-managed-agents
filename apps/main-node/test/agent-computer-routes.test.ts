@@ -9,10 +9,14 @@ function setup() {
   const row = newAgentMachineRow({ id: 'machine-1', tenantId: 'tenant-a', agentId: 'agent-a', provider: 'daytona', spec, now: 1 });
   row.state = 'running'; row.providerRef = 'private-provider-reference';
   const deps = {
-    supported: true, spec: () => spec,
+    supported: vi.fn(async (_tenant: string, _agent: string) => true), spec: vi.fn(() => spec),
     agentExists: vi.fn(async (tenant: string, agent: string) => tenant === 'tenant-a' && agent === 'agent-a'),
-    machines: { get: vi.fn(async () => row), start: vi.fn(async () => row), stop: vi.fn(async () => row) },
-    screenshot: vi.fn(async () => Uint8Array.from([137, 80, 78, 71])),
+    machines: {
+      get: vi.fn(async (): Promise<typeof row | null> => row),
+      start: vi.fn(async () => row),
+      stop: vi.fn(async (): Promise<typeof row | null> => row),
+    },
+    screenshot: vi.fn(async (): Promise<Uint8Array | null> => Uint8Array.from([137, 80, 78, 71])),
     desktopTicket: vi.fn(() => "/v1/computer-desktop/ws?ticket=test"),
   };
   const app = new Hono<{Variables: {tenant_id: string}}>();
@@ -73,4 +77,65 @@ it('issues desktop tickets only for the owning running desktop', async () => {
   expect(response.status).toBe(200);
   expect(response.headers.get('cache-control')).toBe('no-store');
   expect(deps.desktopTicket).toHaveBeenCalledWith('tenant-a', 'agent-a');
+});
+
+describe('agent computer support is decided per agent', () => {
+  it('lets a new computer agent start its computer before any session created it', async () => {
+    const { app, deps, row } = setup();
+    deps.machines.get.mockResolvedValue(null);
+    const status = await app.request('/agents/agent-a/machine');
+    expect(await status.json()).toEqual({ supported: true, machine: null });
+    expect(deps.supported).toHaveBeenCalledWith('tenant-a', 'agent-a');
+    const response = await app.request('/agents/agent-a/machine/start', { method: 'POST' });
+    expect(response.status).toBe(200);
+    expect(deps.spec).toHaveBeenCalledWith('tenant-a', 'agent-a');
+    expect(deps.machines.start).toHaveBeenCalledWith('tenant-a', 'agent-a', row.config);
+  });
+
+  it('refuses Start for an agent whose environment has no computer', async () => {
+    const { app, deps } = setup();
+    deps.machines.get.mockResolvedValue(null);
+    deps.supported.mockResolvedValue(false);
+    expect(await (await app.request('/agents/agent-a/machine')).json()).toEqual({ supported: false, machine: null });
+    expect((await app.request('/agents/agent-a/machine/start', { method: 'POST' })).status).toBe(501);
+    expect((await app.request('/agents/agent-a/machine/stop', { method: 'POST' })).status).toBe(501);
+    expect(deps.machines.start).not.toHaveBeenCalled();
+  });
+
+  it('keeps an existing computer supported whatever the environment says now', async () => {
+    const { app, deps } = setup();
+    deps.supported.mockResolvedValue(false);
+    expect((await (await app.request('/agents/agent-a/machine')).json()).supported).toBe(true);
+    expect((await app.request('/agents/agent-a/machine/start', { method: 'POST' })).status).toBe(200);
+  });
+});
+
+describe('screenshots while a session attaches', () => {
+  it('serves the picture while the computer is starting or setting up', async () => {
+    const { app, deps, row } = setup();
+    for (const state of ['starting', 'bootstrapping'] as const) {
+      row.state = state;
+      const response = await app.request('/agents/agent-a/machine/screenshot');
+      expect(response.status).toBe(200);
+      expect(deps.screenshot).toHaveBeenLastCalledWith('tenant-a', 'agent-a', row);
+    }
+  });
+
+  it('answers 409, not a failure, when the box does not answer yet', async () => {
+    const { app, deps, row } = setup();
+    row.state = 'starting';
+    deps.screenshot.mockResolvedValue(null);
+    const response = await app.request('/agents/agent-a/machine/screenshot');
+    expect(response.status).toBe(409);
+    expect((await response.json()).error).toBe('Computer is not running');
+  });
+
+  it('never wakes a computer that is being created or stopped', async () => {
+    const { app, deps, row } = setup();
+    for (const state of ['creating', 'recreating', 'stopping', 'stopped', 'error'] as const) {
+      row.state = state;
+      expect((await app.request('/agents/agent-a/machine/screenshot')).status).toBe(409);
+    }
+    expect(deps.screenshot).not.toHaveBeenCalled();
+  });
 });

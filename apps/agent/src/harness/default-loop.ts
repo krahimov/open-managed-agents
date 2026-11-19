@@ -6,7 +6,7 @@ import { generateEventId, classifyExternalError, ModelError } from "@open-manage
 import { eventsToMessagesAsync } from "../runtime/history";
 import { SummarizeCompactionStrategy, resolveCompactionStrategy } from "./compaction";
 import type { CompactionStrategy } from "./compaction";
-import { ALL_TOOLS } from "./tools";
+import { BUILTIN_TOOL_NAMES } from "./tools";
 import { llmLoggingMiddleware, llmLogKey } from "./llm-logging-middleware";
 import { isOpenAiCompatModel, isOpenAiResponsesModel, sanitizeOpenAiToolNames, reasoningProviderOptions } from "./provider";
 import { applyOpenAiStrictSchemas } from "./openai-tool-schema";
@@ -32,12 +32,14 @@ import {
   type ToolSettlement,
 } from "./durable-tools";
 
-// Single source of truth lives in ./tools.ts (ALL_TOOLS). Importing here so
-// adding a new toolset entry can't drift the event-classification list — the
-// previous hard-coded duplicate caused `browser`, `schedule`,
-// `cancel_schedule`, and `list_schedules` to mis-emit as
-// `agent.custom_tool_use` instead of `agent.tool_use`.
-const BUILTIN_TOOLS = new Set(ALL_TOOLS);
+// Single source of truth lives in ./tools.ts (BUILTIN_TOOL_NAMES). Importing
+// here so adding a new tool can't drift the event-classification list — the
+// previous hard-coded duplicate caused `schedule`, `cancel_schedule`, and
+// `list_schedules` to mis-emit as `agent.custom_tool_use` instead of
+// `agent.tool_use`. It holds REGISTERED names: ALL_TOOLS holds config names,
+// where "browser" is a group, so every browser_* / computer_* call was
+// emitted as a client-owned custom tool.
+const BUILTIN_TOOLS = new Set(BUILTIN_TOOL_NAMES);
 const isMcpTool = (name: string) => name.startsWith("mcp_");
 // Exported so tests can assert classification directly. Returning true here
 // makes `runtime.broadcast` emit `agent.tool_use`; false routes to
