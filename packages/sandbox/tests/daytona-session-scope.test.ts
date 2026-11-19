@@ -224,11 +224,63 @@ describe("DaytonaSandbox (session scope) — box lifecycle", () => {
       "session-outputs/t1/sess-1/report.txt",
     ]);
     await a.writeFile("/mnt/session/outputs/second.txt", "2");
+    // A file-tool write puts only the file it wrote.
     expect(sends.filter((s) => s.type === "PutObject").map((s) => s.input.Key)).toEqual([
-      "session-outputs/t1/sess-1/report.txt",
       "session-outputs/t1/sess-1/report.txt",
       "session-outputs/t1/sess-1/second.txt",
     ]);
+  });
+
+  it("writes a file into outputs back with one put of the bytes in hand, not a resync of the mount", async () => {
+    const fake = new FakeDaytona();
+    const a = makeSandbox(fake, { memoryBucket: bucket });
+    const sends = fakeS3(a);
+    await a.mountSessionOutputs({ tenantId: "t1", sessionId: "sess-1" });
+    const sb = onlyBox(fake);
+    for (let i = 0; i < 5; i++) sb.writeText(`/mnt/session/outputs/old-${i}.png`, "x".repeat(1000));
+    const download = vi.spyOn(sb.fs, "downloadFile");
+    const createFolder = vi.spyOn(sb.fs, "createFolder");
+    const execsBefore = sb.execLog.length;
+    const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+
+    expect(await a.writeFileBytes("/mnt/session/outputs/shot-1.png", png)).toBe("/mnt/session/outputs/shot-1.png");
+    expect(await a.writeFileBytes("/mnt/session/outputs/shot-2.png", png)).toBe("/mnt/session/outputs/shot-2.png");
+
+    const puts = sends.filter((s) => s.type === "PutObject");
+    expect(puts.map((s) => s.input.Key)).toEqual([
+      "session-outputs/t1/sess-1/shot-1.png",
+      "session-outputs/t1/sess-1/shot-2.png",
+    ]);
+    expect([...(puts[0].input.Body as Buffer)]).toEqual([...png]);
+    // No listing exec, no download of earlier outputs, one createFolder.
+    expect(sb.execLog.length).toBe(execsBefore);
+    expect(download).not.toHaveBeenCalled();
+    expect(createFolder).toHaveBeenCalledTimes(1);
+    expect(sb.readText("/mnt/session/outputs/shot-2.png")).toBe(Buffer.from(png).toString("utf8"));
+  });
+
+  it("recreates a parent directory the agent removed after it was created once", async () => {
+    const fake = new FakeDaytona();
+    const a = makeSandbox(fake);
+    await a.writeFile("/workspace/out/a.txt", "a");
+    const sb = onlyBox(fake);
+    const upload = vi.spyOn(sb.fs, "uploadFile").mockRejectedValueOnce(new Error("open /workspace/out/b.txt: no such file or directory"));
+    const createFolder = vi.spyOn(sb.fs, "createFolder");
+    expect(await a.writeFile("/workspace/out/b.txt", "b")).toBe("/workspace/out/b.txt");
+    expect(upload).toHaveBeenCalledTimes(2);
+    expect(createFolder).toHaveBeenCalledTimes(1);
+    expect(await a.readFile("/workspace/out/b.txt")).toBe("b");
+  });
+
+  it("never writes a read-only memory store back", async () => {
+    const fake = new FakeDaytona();
+    const a = makeSandbox(fake, { memoryBucket: bucket });
+    const sends = fakeS3(a);
+    await a.mountMemoryStore({ storeName: "notes", storeId: "store-1", readOnly: false });
+    await a.mountMemoryStore({ storeName: "docs", storeId: "store-2", readOnly: true });
+    await a.writeFile("/mnt/memory/notes/fact.md", "f").catch(() => {});
+    await a.writeFile("/mnt/memory/docs/fact.md", "f").catch(() => {});
+    expect(sends.filter((s) => s.type === "PutObject").map((s) => s.input.Key)).toEqual(["store-1/fact.md"]);
   });
 
   it("destroy() deletes the box via daytona.delete and is a no-op before any box exists", async () => {

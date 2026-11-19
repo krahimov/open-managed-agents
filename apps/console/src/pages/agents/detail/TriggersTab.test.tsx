@@ -127,6 +127,50 @@ describe("Run now", () => {
   });
 });
 
+describe("Send test event with an event ID", () => {
+  it("sends the ID given, trimmed, and says when that ID already ran", async () => {
+    features(["ambient_run_now"], ["schedule", "webhook"]);
+    server.use(
+      http.post("*/v1/agents/agent_1/ambient-rules/:ruleId/run", async ({ params, request }) => {
+        runs.push({ ruleId: String(params.ruleId), body: await request.json() });
+        return HttpResponse.json({ event_id: "deploy-1287", session_id: "sess_run", duplicate: runs.length > 1 }, { status: runs.length > 1 ? 200 : 202 });
+      }),
+    );
+    const user = userEvent.setup();
+    show([rule({ name: "Deploys", trigger: { source: "webhook", config: { method: "POST" } }, next_wake_at: undefined })]);
+    await user.click(await screen.findByRole("button", { name: "Send test event" }));
+    let dialog = await screen.findByRole("dialog");
+    await user.type(within(dialog).getByLabelText("Event ID"), "  deploy-1287 ");
+    await user.click(within(dialog).getByRole("button", { name: "Send test event" }));
+    await waitFor(() => expect(runs).toHaveLength(1));
+    expect(runs[0].body).toEqual({ event_id: "deploy-1287", data: { message: "Test event from the console" } });
+    expect(toast.success).toHaveBeenCalledWith("Test event sent", expect.anything());
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    await user.click(screen.getByRole("button", { name: "Send test event" }));
+    dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect((within(dialog).getByLabelText("Event ID") as HTMLInputElement).value).toBe(""));
+    await user.type(within(dialog).getByLabelText("Event ID"), "deploy-1287");
+    await user.click(within(dialog).getByRole("button", { name: "Send test event" }));
+    await waitFor(() => expect(runs).toHaveLength(2));
+    expect(toast.success).toHaveBeenLastCalledWith("Event already delivered", expect.anything());
+  });
+
+  it("refuses an ID longer than the server accepts", async () => {
+    features(["ambient_run_now"], ["schedule", "webhook"]);
+    const user = userEvent.setup();
+    show([rule({ name: "Deploys", trigger: { source: "webhook", config: { method: "POST" } }, next_wake_at: undefined })]);
+    await user.click(await screen.findByRole("button", { name: "Send test event" }));
+    const dialog = await screen.findByRole("dialog");
+    const field = within(dialog).getByLabelText("Event ID");
+    await user.click(field);
+    await user.paste("x".repeat(201));
+    await user.click(within(dialog).getByRole("button", { name: "Send test event" }));
+    expect(await within(dialog).findByText("Event ID is at most 200 characters")).toBeInTheDocument();
+    expect(runs).toHaveLength(0);
+  });
+});
+
 describe("a trigger this deployment never fires", () => {
   it("says so instead of waiting for the next event", async () => {
     features(["ambient_run_now"], ["schedule", "webhook"]);

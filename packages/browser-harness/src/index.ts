@@ -19,7 +19,7 @@ import { tool } from "ai";
 export interface BrowserPage {
   goto(url: string, opts?: { waitUntil?: string; timeout?: number }): Promise<{ status?(): number } | null>;
   url(): string;
-  screenshot(opts?: { fullPage?: boolean; type?: "png" | "jpeg" }): Promise<Uint8Array | { toString(enc: string): string }>;
+  screenshot(opts?: { fullPage?: boolean; type?: "png" | "jpeg"; quality?: number }): Promise<Uint8Array | { toString(enc: string): string }>;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   locator(selector: string): any;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -63,6 +63,8 @@ export class NotSupportedError extends Error {
 }
 
 const DEFAULT_TIMEOUT = 30_000;
+/** Screenshots saved as .jpg/.jpeg: still sharp for text, a fraction of the PNG. */
+const JPEG_QUALITY = 80;
 
 /** Every tool name `buildBrowserTools` registers. Hosts classify these as
  *  built-in (server-executed) tools — the toolset config names the group
@@ -177,15 +179,16 @@ export function buildBrowserTools(
       "when text extraction (browser_get_text) isn't enough — e.g. images, PDFs " +
       "rendered in browser, charts, complex layout." +
       (options.saveFile
-        ? " Pass save_path to also write the PNG to a file on this machine (e.g. in " +
-          "the session outputs directory) so you can attach it to a report."
+        ? " Pass save_path to also write the image to a file on this machine (e.g. in " +
+          "the session outputs directory) so you can attach it to a report. A path " +
+          "ending in .jpg or .jpeg saves a smaller, faster JPEG."
         : ""),
     inputSchema: z.object({
       full_page: z.boolean().optional().describe("If true, capture the entire scrollable page (slower)."),
       save_path: z
         .string()
         .optional()
-        .describe("Optional file path ending in .png to also save the screenshot to, e.g. <outputs dir>/checkout.png"),
+        .describe("Optional file path ending in .png (or .jpg) to also save the screenshot to, e.g. <outputs dir>/checkout.png"),
     }),
     execute: async ({ full_page, save_path }: { full_page?: boolean; save_path?: string }) => {
       try {
@@ -196,13 +199,21 @@ export function buildBrowserTools(
           }
           if (!target || target.endsWith("/")) return "Screenshot error: save_path must be a file path, e.g. /workspace/shot.png";
         }
+        const jpeg = !!target && /\.jpe?g$/i.test(target);
         const page = await ensurePage();
-        const buf = await page.screenshot({ fullPage: full_page === true, type: "png" });
-        const data = bufferToBase64(buf);
-        const saved = target ? await options.saveFile!(target, base64ToBytes(data)) : undefined;
+        // One capture serves both the file and the model: the bytes go to
+        // the host as captured and are base64-encoded once, while they upload.
+        const buf = await page.screenshot({
+          fullPage: full_page === true,
+          ...(jpeg ? { type: "jpeg" as const, quality: JPEG_QUALITY } : { type: "png" as const }),
+        });
+        const bytes = toBytes(buf);
+        const saving = target ? options.saveFile!(target, bytes) : undefined;
+        const data = bytesToBase64(bytes);
+        const saved = await saving;
         return {
           type: "image" as const,
-          source: { type: "base64" as const, media_type: "image/png", data },
+          source: { type: "base64" as const, media_type: jpeg ? "image/jpeg" : "image/png", data },
           ...(saved ? { saved_path: saved } : {}),
         };
       } catch (err) {
@@ -338,19 +349,23 @@ export function buildBrowserTools(
   return tools;
 }
 
-/** Playwright Page.screenshot returns Buffer on Node and Uint8Array on
- *  workerd; both convert to base64 below. Node's Buffer has toString,
- *  Uint8Array we wrap in btoa. */
-function bufferToBase64(buf: Uint8Array | { toString(enc: string): string }): string {
-  if (typeof (buf as { toString?: unknown }).toString === "function" && "byteLength" in (buf as object) === false) {
-    return (buf as { toString: (enc: string) => string }).toString("base64");
+/** Playwright Page.screenshot returns a Buffer on Node and a Uint8Array on
+ *  workerd (a Buffer is a Uint8Array too). */
+function toBytes(buf: Uint8Array | { toString(enc: string): string }): Uint8Array {
+  if (buf instanceof Uint8Array) return buf;
+  return base64ToBytes(buf.toString("base64"));
+}
+
+/** Node's Buffer encodes natively; elsewhere btoa over 32 KiB chunks
+ *  (a byte-at-a-time string build is slow for a multi-MB PNG). */
+function bytesToBase64(bytes: Uint8Array): string {
+  const NodeBuffer = (globalThis as { Buffer?: { from(b: ArrayBufferLike, o: number, l: number): { toString(enc: string): string } } }).Buffer;
+  if (NodeBuffer) return NodeBuffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
+  let binary = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
   }
-  if (buf instanceof Uint8Array) {
-    let binary = "";
-    for (let i = 0; i < buf.length; i++) binary += String.fromCharCode(buf[i]!);
-    return btoa(binary);
-  }
-  return (buf as { toString: (enc: string) => string }).toString("base64");
+  return btoa(binary);
 }
 
 function base64ToBytes(data: string): Uint8Array {

@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { describe, expect, it, vi } from "vitest";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -10,6 +10,7 @@ import {
   buildAgentBrowserPrefsScript,
   buildAgentBrowserStartScript,
   buildAgentComputerPythonScript,
+  buildAgentDesktopCleanScript,
   resolveAgentComputerBrowser,
 } from "../src/machines/browser";
 import { FakeDaytona, type FakeSandboxInstance } from "./fake-daytona.js";
@@ -99,6 +100,108 @@ it('uses the native Daytona desktop and starts headed Chromium on its display', 
   expect(script).toContain('export DISPLAY');
   expect(script).not.toContain('--headless');
   expect(() => execFileSync('sh', ['-n'], { input: script })).not.toThrow();
+});
+
+describe("agent computer clean desktop", () => {
+  /**
+   * Runs the generated script against stub binaries: a process "runs"
+   * while <state>/<name> exists, and every stub call is logged.
+   */
+  function runDesktopScript(opts: { panelRunning?: boolean; quitWorks?: boolean; respawns?: boolean; dbus?: boolean; docks?: string[] }) {
+    const dir = mkdtempSync(join(tmpdir(), "oma-desktop-"));
+    const bin = join(dir, "bin");
+    const state = join(dir, "state");
+    mkdirSync(bin);
+    mkdirSync(state);
+    const log = join(dir, "calls.log");
+    const stub = (name: string, body: string) => {
+      writeFileSync(join(bin, name), `#!/bin/sh\necho "${name} $*" >> '${log}'\n${body}\n`);
+      chmodSync(join(bin, name), 0o755);
+    };
+    stub("sleep", "exit 0");
+    stub("ps", "echo 120");
+    stub("pgrep", `[ -f '${state}'/"$2" ] && echo 999999999`); // no such /proc entry
+    stub("pkill", `[ -f '${state}'/"$2" ] || exit 1\nrm -f '${state}'/"$2"\n${opts.respawns ? `[ "$2" = xfce4-panel ] && touch '${state}/xfce4-panel'` : ""}\nexit 0`);
+    stub("xfconf-query", `case "$*" in *"-p /panels") printf 'Value is an array with 2 items:\\n\\n1\\n2\\n' ;; esac`);
+    stub("xfce4-panel", opts.quitWorks ? `rm -f '${state}/xfce4-panel'` : "exit 1");
+    stub("xdotool", `case "$1" in search) echo 77 ;; esac`);
+    for (const name of ["xfce4-session", ...(opts.panelRunning === false ? [] : ["xfce4-panel"]), ...(opts.docks ?? [])]) {
+      writeFileSync(join(state, name), "");
+    }
+    const env: NodeJS.ProcessEnv = { PATH: `${bin}:/usr/bin:/bin`, DISPLAY: ":0" };
+    if (opts.dbus !== false) env.DBUS_SESSION_BUS_ADDRESS = "unix:path=/tmp/bus";
+    try {
+      execFileSync("sh", ["-c", buildAgentDesktopCleanScript(), "desktop.sh", "15"], { env, stdio: ["ignore", "pipe", "pipe"] });
+    } catch (err) {
+      throw new Error(`desktop script failed: ${String((err as { stderr?: unknown }).stderr ?? err)}`);
+    }
+    const calls = existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : [];
+    const running = (name: string) => existsSync(join(state, name));
+    rmSync(dir, { recursive: true, force: true });
+    return { calls, running };
+  }
+
+  it("is valid sh and targets the XFCE panels, docks and notifications", () => {
+    const script = buildAgentDesktopCleanScript();
+    expect(() => execFileSync("sh", ["-n"], { input: script })).not.toThrow();
+    expect(script).toContain("xfce4-panel --quit");
+    expect(script).toContain("autohide-behavior");
+    for (const dock of ["plank", "xfce4-notifyd"]) expect(script).toContain(`pkill -x '${dock}'`);
+  });
+
+  it("always-hides every panel in xfconf, then quits the panel through the session", () => {
+    const run = runDesktopScript({ quitWorks: true, docks: ["plank"] });
+    expect(run.running("xfce4-panel")).toBe(false);
+    expect(run.running("plank")).toBe(false);
+    expect(run.calls).toContain("xfconf-query -c xfce4-panel -p /panels/panel-1/autohide-behavior -n -t uint -s 2");
+    expect(run.calls).toContain("xfconf-query -c xfce4-panel -p /panels/panel-2/autohide-behavior -n -t uint -s 2");
+    expect(run.calls).toContain("xfce4-panel --quit");
+    // Quit, not kill: a killed panel is restarted by xfce4-session.
+    expect(run.calls).not.toContain("pkill -x xfce4-panel");
+    expect(run.calls.filter((c) => c.startsWith("xdotool"))).toEqual([]);
+  });
+
+  it("is a cheap no-op once the panels are gone (re-bootstrap, every Chromium start)", () => {
+    const run = runDesktopScript({ panelRunning: false });
+    expect(run.calls.some((c) => c.startsWith("xfconf-query") || c.startsWith("xfce4-panel"))).toBe(false);
+    // The session has been up longer than the wait: no sleeping for a panel.
+    expect(run.calls).not.toContain("sleep 1");
+  });
+
+  it("falls back to a signal, then to unmapping the panel windows, and still exits 0", () => {
+    const run = runDesktopScript({ dbus: false, respawns: true });
+    expect(run.calls).toContain("pkill -x xfce4-panel");
+    expect(run.calls.some((c) => c.startsWith("xfconf-query"))).toBe(false);
+    expect(run.calls).toContain("xdotool search --class xfce4-panel");
+    expect(run.calls).toContain("xdotool windowunmap 77");
+  });
+
+  it("runs after the desktop starts and before Chromium launches; a failure never blocks the computer", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const f = fakeSandbox();
+      const order: string[] = [];
+      const start = vi.fn(async () => { order.push("computerUse.start"); return {}; });
+      Object.assign(f.sb, { computerUse: { start } });
+      f.executeCommand.mockImplementation(async (command: string) => {
+        order.push(command);
+        if (command.startsWith("sh '/var/lib/oma/desktop.sh'")) return { exitCode: 1, result: "boom" };
+        return { exitCode: 0, result: "" };
+      });
+      await bootstrapAgentComputer(f.sb, { ...spec, desktop: true, snapshot: "daytona-medium", bootstrapTools: false });
+      const uploaded = f.uploadFile.mock.calls.find(([, path]) => path === "/var/lib/oma/desktop.sh");
+      expect(uploaded?.[0].toString()).toBe(buildAgentDesktopCleanScript());
+      const clean = order.indexOf("sh '/var/lib/oma/desktop.sh' 15");
+      expect(clean).toBeGreaterThan(order.indexOf("computerUse.start"));
+      expect(clean).toBeLessThan(order.indexOf("sh '/var/lib/oma/browser/start.sh'"));
+      expect(warn).toHaveBeenCalledWith("[agent-computer] desktop cleanup", expect.objectContaining({ exitCode: 1 }));
+      // Every Chromium start re-checks (cheaply) for a restarted session's panel.
+      expect(buildAgentBrowserStartScript(true)).toContain("sh '/var/lib/oma/desktop.sh' 0");
+      expect(buildAgentBrowserStartScript(false)).not.toContain("desktop.sh");
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });
 
 describe("agent computer python setup", () => {

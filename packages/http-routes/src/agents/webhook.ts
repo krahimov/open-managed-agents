@@ -5,6 +5,7 @@ import { resolveServices } from "../types";
 import type { HonoFetchable } from "../deployments";
 import {
   ambientRunTitle,
+  webhookRunSuffix,
   type AmbientRuleRow,
   type AmbientWakeMetadata,
 } from "@open-managed-agents/agents-store";
@@ -237,7 +238,8 @@ async function deliver(c: RouteContext, deps: AmbientWebhookDeps, d: Delivery): 
       };
       const created = await dispatch("/", {
         agent: agentId,
-        title: ambientRunTitle(rule.name, { at: Date.parse(firedAt), suffix: eventId }),
+        // "Deploy finished · v2.4.1", not "· test-3842931265d9".
+        title: ambientRunTitle(rule.name, { at: Date.parse(firedAt), suffix: webhookRunSuffix(eventId, d.data) }),
         // source_event_id is kept for callers that already read it.
         metadata: { ambient: { ...ambient, source_event_id: eventId } },
       });
