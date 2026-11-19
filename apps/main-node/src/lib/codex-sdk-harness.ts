@@ -54,6 +54,7 @@ import {
   OMA_SETUP_HARNESS,
   OMA_SETUP_KIND_HARNESS_UPDATED,
   openAiReasoningEffort,
+  type ContentBlock,
   type ReasoningLevel,
   type SessionEvent,
 } from "@open-managed-agents/api-types";
@@ -262,6 +263,27 @@ async function hostCodexMcpServerNames(): Promise<string[]> {
 function sandboxModeFromEnv(): "read-only" | "workspace-write" | "danger-full-access" {
   const v = process.env.OMA_CODEX_SANDBOX_MODE;
   return v === "read-only" || v === "danger-full-access" ? v : "workspace-write";
+}
+
+/**
+ * An MCP call's result as stored: its text, and — when the tool returned
+ * pictures (a computer_screenshot / browser_screenshot through oma_platform)
+ * — the pictures too, as wire image blocks, the same shape DefaultHarness
+ * stores, so the console can show what the agent saw. Text-only results
+ * stay the plain string they always were.
+ */
+export function contentOfMcpResult(item: Extract<ThreadItem, { type: "mcp_tool_call" }>): string | ContentBlock[] {
+  const text = textOfMcpResult(item);
+  if (item.error) return text;
+  const images: ContentBlock[] = [];
+  for (const b of item.result?.content ?? []) {
+    const part = b as { type?: unknown; data?: unknown; mimeType?: unknown };
+    if (part?.type === "image" && typeof part.data === "string" && part.data && typeof part.mimeType === "string") {
+      images.push({ type: "image", source: { type: "base64", media_type: part.mimeType, data: part.data } } as ContentBlock);
+    }
+  }
+  if (images.length === 0) return text;
+  return [...(text && text !== "(no output)" ? [{ type: "text", text } as ContentBlock] : []), ...images];
 }
 
 function textOfMcpResult(item: Extract<ThreadItem, { type: "mcp_tool_call" }>): string {
@@ -816,7 +838,7 @@ export class CodexSdkHarness {
         input,
       } as SessionEvent);
     };
-    const broadcastToolResult = (item: ThreadItem, content: string) => {
+    const broadcastToolResult = (item: ThreadItem, content: string | ContentBlock[]) => {
       runtime.broadcast({
         type: "agent.tool_result",
         tool_use_id: omaIdFor(item),
@@ -863,7 +885,7 @@ export class CodexSdkHarness {
           broadcastToolUse(item, `mcp__${item.server}__${item.tool}`, {
             arguments: item.arguments ?? {},
           });
-          if (event === "completed") broadcastToolResult(item, textOfMcpResult(item));
+          if (event === "completed") broadcastToolResult(item, contentOfMcpResult(item));
           break;
         case "file_change":
           if (event === "completed") {

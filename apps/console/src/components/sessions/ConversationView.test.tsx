@@ -257,6 +257,76 @@ describe("tool calls in the conversation", () => {
   });
 });
 
+describe("a screenshot", () => {
+  const png = "iVBORw0KGgo=";
+
+  it("shows the picture the tool returned, open, instead of its bytes, and opens it larger", async () => {
+    show([
+      ev({ type: "user.message", id: "u1", content: [{ type: "text", text: "what's on screen?" }] }),
+      ev({ type: "agent.tool_use", id: "s1", name: "browser_screenshot", input: {} }),
+      ev({
+        type: "agent.tool_result",
+        tool_use_id: "s1",
+        content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: png } }],
+      }),
+    ]);
+    // The row opens on the picture by itself.
+    const thumb = screen.getByRole("img", { name: "Picture from browser_screenshot" });
+    expect(thumb).toHaveAttribute("src", `data:image/png;base64,${png}`);
+    expect(screen.queryByText(new RegExp(png.slice(0, 8)))).toBeNull();
+    expect(screen.queryByText("No output.")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open picture from browser_screenshot larger" }));
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByRole("img", { name: "Picture from browser_screenshot" })).toHaveAttribute("src", `data:image/png;base64,${png}`);
+  });
+
+  it("opens on the picture when it arrives after the call, in a live session", () => {
+    const calling = [
+      ev({ type: "user.message", id: "u1", content: [{ type: "text", text: "what's on screen?" }] }),
+      ev({ type: "agent.tool_use", id: "s1", name: "browser_screenshot", input: {} }),
+    ];
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (events: Event[]) => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <View events={events} running />
+        </MemoryRouter>
+      </QueryClientProvider>
+    );
+    const view = render(tree(calling));
+    expect(screen.queryByRole("img", { name: "Picture from browser_screenshot" })).toBeNull();
+    view.rerender(
+      tree([
+        ...calling,
+        ev({
+          type: "agent.tool_result",
+          tool_use_id: "s1",
+          content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: png } }],
+        }),
+      ]),
+    );
+    expect(screen.getByRole("img", { name: "Picture from browser_screenshot" })).toHaveAttribute("src", `data:image/png;base64,${png}`);
+  });
+
+  it("keeps the text that came with the picture, and names a desktop screenshot in words", () => {
+    show([
+      ev({ type: "user.message", id: "u1", content: [{ type: "text", text: "look" }] }),
+      ev({ type: "agent.tool_use", id: "s1", name: "computer_screenshot", input: {} }),
+      ev({
+        type: "agent.tool_result",
+        tool_use_id: "s1",
+        content: [
+          { type: "text", text: "1280x800 desktop" },
+          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: png } },
+        ],
+      }),
+    ]);
+    expect(screen.getByRole("img", { name: "Picture from computer_screenshot" })).toHaveAttribute("src", `data:image/jpeg;base64,${png}`);
+    expect(screen.getByText("1280x800 desktop")).toBeInTheDocument();
+  });
+});
+
 describe("long output", () => {
   it("is cut with a control to show every line", () => {
     const text = Array.from({ length: 50 }, (_, i) => `line ${i + 1}`).join("\n");

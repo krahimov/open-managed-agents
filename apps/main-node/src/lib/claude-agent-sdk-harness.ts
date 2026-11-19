@@ -32,6 +32,7 @@ import type { HarnessContext } from "@open-managed-agents/agent/harness/interfac
 import {
   OMA_SETUP_HARNESS,
   OMA_SETUP_KIND_HARNESS_UPDATED,
+  type ContentBlock,
   type SessionEvent,
   claudeReasoning,
   type ReasoningLevel,
@@ -421,6 +422,32 @@ function textOfToolResult(content: unknown): string {
       .join("\n");
   }
   return JSON.stringify(content ?? "");
+}
+
+/**
+ * A tool result as stored: its text, and — when the tool returned pictures
+ * (a screenshot, an image file it read) — the pictures too, as wire image
+ * blocks, the same shape DefaultHarness stores, so the console can show what
+ * the agent saw. Both the Messages API form (`source: { type: "base64" }`)
+ * and the MCP form (`data` + `mimeType`) are kept. Text-only results stay
+ * the plain string they always were.
+ */
+export function contentOfToolResult(content: unknown): string | ContentBlock[] {
+  const text = textOfToolResult(content);
+  if (!Array.isArray(content)) return text;
+  const images: ContentBlock[] = [];
+  for (const b of content) {
+    const part = b as { type?: unknown; data?: unknown; mimeType?: unknown; source?: { type?: unknown; media_type?: unknown; data?: unknown } };
+    if (part?.type !== "image") continue;
+    const src = part.source;
+    if (src?.type === "base64" && typeof src.media_type === "string" && typeof src.data === "string" && src.data) {
+      images.push({ type: "image", source: { type: "base64", media_type: src.media_type, data: src.data } } as ContentBlock);
+    } else if (typeof part.data === "string" && part.data && typeof part.mimeType === "string") {
+      images.push({ type: "image", source: { type: "base64", media_type: part.mimeType, data: part.data } } as ContentBlock);
+    }
+  }
+  if (images.length === 0) return text;
+  return [...(text ? [{ type: "text", text } as ContentBlock] : []), ...images];
 }
 
 /**
@@ -1043,7 +1070,7 @@ export class ClaudeAgentSdkHarness {
                 runtime.broadcast({
                   type: "agent.tool_result",
                   tool_use_id: tr.tool_use_id,
-                  content: textOfToolResult(tr.content),
+                  content: contentOfToolResult(tr.content),
                 } as SessionEvent);
               }
             }

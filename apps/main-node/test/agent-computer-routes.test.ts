@@ -66,6 +66,30 @@ describe('agent computer routes', () => {
     expect(response.headers.get('cache-control')).toBe('no-store');
     expect(new Uint8Array(await response.arrayBuffer())).toEqual(Uint8Array.from([137,80,78,71]));
   });
+  it('takes a desktop picture with the browser disabled, and refuses only with neither', async () => {
+    const {app,deps,row} = setup();
+    row.browserEnabled = false;
+    expect((await app.request('/agents/agent-a/machine/screenshot')).status).toBe(409);
+    expect(deps.screenshot).not.toHaveBeenCalled();
+    row.config.desktop = true;
+    expect((await app.request('/agents/agent-a/machine/screenshot')).status).toBe(200);
+    expect(deps.screenshot).toHaveBeenCalledOnce();
+  });
+  it('shares one picture between viewers asking at once, and retries after a failure', async () => {
+    const {app,deps} = setup();
+    const [a, b] = await Promise.all([
+      app.request('/agents/agent-a/machine/screenshot'),
+      app.request('/agents/agent-a/machine/screenshot'),
+    ]);
+    expect([a.status, b.status]).toEqual([200, 200]);
+    expect(deps.screenshot).toHaveBeenCalledOnce();
+
+    const fresh = setup();
+    fresh.deps.screenshot.mockRejectedValueOnce(new Error('daytona down'));
+    expect((await fresh.app.request('/agents/agent-a/machine/screenshot')).status).toBe(502);
+    expect((await fresh.app.request('/agents/agent-a/machine/screenshot')).status).toBe(200);
+    expect(fresh.deps.screenshot).toHaveBeenCalledTimes(2);
+  });
 });
 
 it('issues desktop tickets only for the owning running desktop', async () => {

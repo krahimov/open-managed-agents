@@ -5,12 +5,25 @@ import WebSocket, { WebSocketServer } from 'ws';
 interface Ticket { tenantId: string; agentId: string; expires: number }
 export interface DesktopConnection { url: string; headers: Record<string, string>; release(): Promise<void> }
 
+export interface DesktopGatewayOptions {
+  /** How often an open viewer is pinged. One missed pong closes it. */
+  keepaliveMs?: number;
+}
+
 /** Short-lived, single-use tickets bridge authenticated HTTP to browser WS.
- * Daytona preview credentials never reach the browser or URL logs. */
+ * Daytona preview credentials never reach the browser or URL logs.
+ *
+ * Every open viewer is counted on the machine (it blocks idle stop), so a
+ * viewer that vanished without a close frame (a laptop lid shut, a dropped
+ * network) must not keep counting: each client is pinged and dropped when
+ * it stops answering. */
 export class DesktopGateway {
   private tickets = new Map<string, Ticket>();
   private sockets = new Set<WebSocket>();
-  constructor(private connect: (tenantId: string, agentId: string) => Promise<DesktopConnection>, private origin: string, private now = Date.now) {}
+  private keepaliveMs: number;
+  constructor(private connect: (tenantId: string, agentId: string) => Promise<DesktopConnection>, private origin: string, private now = Date.now, options: DesktopGatewayOptions = {}) {
+    this.keepaliveMs = options.keepaliveMs ?? 30_000;
+  }
 
   issue(tenantId: string, agentId: string): string {
     for (const [key, ticket] of this.tickets) if (ticket.expires <= this.now()) this.tickets.delete(key);
@@ -41,9 +54,11 @@ export class DesktopGateway {
         let upstream: WebSocket | undefined;
         let client: WebSocket | undefined;
         let released = false;
+        let keepalive: ReturnType<typeof setInterval> | undefined;
         const cleanup = () => {
           if (released) return;
           released = true;
+          if (keepalive) clearInterval(keepalive);
           upstream?.terminate();
           client?.terminate();
           if (client) this.sockets.delete(client);
@@ -57,6 +72,14 @@ export class DesktopGateway {
           wss.handleUpgrade(req, socket, head, ws => { client = ws; });
           if (!client) throw new Error('Desktop websocket upgrade failed');
           this.sockets.add(client);
+          let answered = true;
+          client.on('pong', () => { answered = true; });
+          keepalive = setInterval(() => {
+            if (!answered) { cleanup(); return; }
+            answered = false;
+            try { client?.ping(); } catch { cleanup(); }
+          }, this.keepaliveMs);
+          keepalive.unref?.();
           upstream = new WebSocket(connection.url, ['binary'], { headers: connection.headers, handshakeTimeout: 15000, maxPayload: 16 * 1024 * 1024 });
           this.sockets.add(upstream);
           client.on('close', cleanup); client.on('error', cleanup);

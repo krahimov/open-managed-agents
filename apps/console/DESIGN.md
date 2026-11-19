@@ -1077,6 +1077,22 @@ model calls as a small `PropertyList`) · **Outcome** (evaluation result as `Sta
 **Session id** (`IdChip full`). The panel is `bg-bg` with a left hairline, not a card. Each group is a
 `PanelGroup`; long names wrap to two lines instead of truncating.
 
+**Computer view** (`components/sessions/ComputerPane.tsx`): when the session runs on the agent's persistent
+computer (its environment's sandbox scope is `agent`), a monitor toggle sits beside the details toggle and a
+right pane can show the computer between the conversation and the context panel (from 1024px; resizable from
+its left edge, 320px up, the conversation keeps 400px; below 1024px it is a right `Sheet`). With it open, the
+details panel stays inline only from 1600px and is a `Sheet` below that. The pane is `bg-bg` with a left
+hairline: a 48px head (monitor icon, "Computer", the computer's `StatusBadge`, a ghost close), then the screen
+in a `bg-bg-inset` rounded-lg well. A desktop is shown live over noVNC, **view-only** until **Take control**
+(outline, `aria-pressed`; the well gets a plum ring while you have control, and a reconnect gives control
+back). Without a desktop, or when the live view cannot connect after four retries, it is a picture retaken
+every 2s while the session runs ("Try live view again"). A stopped computer offers **Start computer**. It
+opens by itself the first time the running agent uses a `browser_*` or `computer_*` tool, unless the person
+closed it before; open/closed and width are remembered. Nothing is held while it cannot be seen: the desktop
+is connected (and counted as a viewer, which blocks idle stop) only while the pane is shown and the tab is in
+front, each connection with a fresh single-use ticket. A tool call that returned a picture (a screenshot)
+opens on it as a thumbnail that opens larger in a `Modal`, never as base64 text.
+
 **Timeline view**: the same session bar; the body is a `Page width="wide"`-like container with the
 waterfall. Left column: one row per event with the `EventCard` icon for its kind, a mono name and its
 duration; right: bars on a time axis (ticks from `pickTickStep`, `--chart-grid` lines, 11px
