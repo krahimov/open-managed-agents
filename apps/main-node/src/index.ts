@@ -1,5 +1,7 @@
+import { IMessageOnboarding, sendblueEnabled } from "./lib/imessage-onboarding.js";
 import { buildTelegramConnectRoutes } from "./lib/telegram-connect-routes.js";
 import { TelegramOnboarding } from "./lib/telegram-onboarding.js";
+import { ChannelKeyLinks, KEY_PAGE_PATH } from "./lib/channel-key-links.js";
 import { DesktopGateway } from "./lib/desktop-gateway.js";
 /**
  * apps/main-node — self-host Node entry for the Open Managed Agents API.
@@ -2302,18 +2304,26 @@ const sessionRouter = new NodeSessionRouter({
   workQueue: sessionWorkQueue,
 });
 
-// Telegram's public webhook has its own secret-header authentication.
-// Linking and account management below remain behind normal tenant/user auth.
-if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_USERNAME && process.env.TELEGRAM_WEBHOOK_SECRET) {
-  telegram = new TelegramOnboarding({
+const channelMembership = async (userId: string, tenantId: string) =>
+  !!await sql.prepare("SELECT 1 AS one FROM membership WHERE user_id=? AND tenant_id=?").bind(userId, tenantId).first();
+// One-time API-key pages for chat channels (mcp_api_key access requests).
+// Public, token-authenticated; mounted below at KEY_PAGE_PATH when a channel is enabled.
+const channelKeyLinks = new ChannelKeyLinks({
+  sql, router: sessionRouter, sessions: sessionsService, agents: agentsService,
+  vaults: vaultService, credentials: credentialService,
+  hasMembership: channelMembership,
+  publicBaseUrl: process.env.PUBLIC_BASE_URL,
+  log: (op, fields) => logger.info({ op, ...fields }, op),
+});
+
+function channelDependencies(label: string): import("./lib/channel-onboarding.js").ChannelDeps {
+  return {
+    keyLinks: channelKeyLinks,
     sql, agents: agentsService, sessions: sessionsService, router: sessionRouter,
     attachAgentMemory: attachAgentMemoryQuietly,
     prepareAgentSnapshot: prepareVaultSessionSnapshot,
-    token: process.env.TELEGRAM_BOT_TOKEN,
-    username: process.env.TELEGRAM_BOT_USERNAME.replace(/^@/, ""),
-    webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET,
     publicBaseUrl: process.env.PUBLIC_BASE_URL,
-    requestAccess: (tenantId, sessionId, service, requestId) => postAccessRequest(tenantId, sessionId, { service, reason: `Connect ${service} to this Telegram agent.` }, requestId),
+    requestAccess: (tenantId, sessionId, service, requestId) => postAccessRequest(tenantId, sessionId, { service, reason: `Connect ${service} to this ${label} agent.` }, requestId),
     hasVault: async (tenantId, vaultId) => (await vaultService.list({ tenantId, includeArchived: false })).some(v => v.id === vaultId),
     model: process.env.OMA_ONBOARDING_MODEL ?? "gpt-6-astra",
     harness: process.env.OMA_ONBOARDING_HARNESS ?? "default",
@@ -2323,13 +2333,24 @@ if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_USERNAME && proce
       if (!raw) return undefined;
       const config = JSON.parse(raw);
       const existing = await environmentsService.listPage({ tenantId, status: "active", limit: 100 });
-      const found = existing.items.find(e => e.name === "Telegram computer");
+      const found = existing.items.find(e => e.name === `${label} computer`);
       if (found) return found.id;
-      const created = await environmentsService.create({ tenantId, name: "Telegram computer", config, status: "ready", sandboxWorkerName: config.sandbox?.provider ?? process.env.SANDBOX_PROVIDER ?? "subprocess" });
+      const created = await environmentsService.create({ tenantId, name: `${label} computer`, config, status: "ready", sandboxWorkerName: config.sandbox?.provider ?? process.env.SANDBOX_PROVIDER ?? "subprocess" });
       return created.id;
     },
     environment: async (tenantId, environmentId) => { const row = await environmentsService.get({ tenantId, environmentId }); return row ? toEnvironmentConfig(row) : null; },
-    hasMembership: async (userId, tenantId) => !!await sql.prepare("SELECT 1 AS one FROM membership WHERE user_id=? AND tenant_id=?").bind(userId,tenantId).first(),
+    hasMembership: channelMembership,
+  };
+}
+
+// Telegram's public webhook has its own secret-header authentication.
+// Linking and account management below remain behind normal tenant/user auth.
+if (process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_BOT_USERNAME && process.env.TELEGRAM_WEBHOOK_SECRET) {
+  telegram = new TelegramOnboarding({
+    ...channelDependencies("Telegram"),
+    token: process.env.TELEGRAM_BOT_TOKEN,
+    username: process.env.TELEGRAM_BOT_USERNAME.replace(/^@/, ""),
+    webhookSecret: process.env.TELEGRAM_WEBHOOK_SECRET,
   });
   app.route("/integrations/telegram/webhook", telegram.webhookRoutes());
   app.route("/integrations/telegram/connect", buildTelegramConnectRoutes({
@@ -2345,6 +2366,26 @@ telegramTick?.unref();
 
 if (telegram) v1.route("/telegram", telegram.routes());
 else v1.get("/telegram/status", c => c.json({ enabled: false, connected: false }));
+
+const imessage = sendblueEnabled(process.env) ? new IMessageOnboarding({
+  ...channelDependencies("iMessage"),
+  apiKeyId: process.env.SENDBLUE_API_KEY_ID!,
+  apiSecretKey: process.env.SENDBLUE_API_SECRET_KEY!,
+  webhookSecret: process.env.SENDBLUE_WEBHOOK_SECRET!,
+  number: process.env.SENDBLUE_NUMBER!,
+  webhookSecretHeader: process.env.SENDBLUE_WEBHOOK_SECRET_HEADER,
+}) : null;
+if (imessage) {
+  app.route("/integrations/imessage/webhook", imessage.webhookRoutes());
+  v1.route("/imessage", imessage.routes());
+} else v1.get("/imessage/status", c => c.json({ enabled: false, connected: false }));
+const imessageTick = imessage ? setInterval(() => {
+  void imessage.tick().catch(() => logger.warn({ op: "imessage.delivery_tick_failed" }, "iMessage delivery tick failed; will retry"));
+}, 2000) : null;
+imessageTick?.unref();
+// Serves only the one-time key page: GET/POST /integrations/channel-key?t=<token>.
+if (telegram || imessage) app.route(KEY_PAGE_PATH, channelKeyLinks.routes());
+
 
 
 /**
@@ -4166,6 +4207,7 @@ const shutdown = async (signal: string) => {
   // process exits; the next owner resumes them once the lease goes stale.
   sessionWorkQueue.stop();
   if (telegramTick) clearInterval(telegramTick);
+  if (imessageTick) clearInterval(imessageTick);
   await agentMachines.dispose();
   desktopGateway.close();
   try { await scheduler.stop(); } catch (err) { logger.warn({ err, op: "main-node.shutdown.scheduler_stop_failed" }, "scheduler stop failed"); }

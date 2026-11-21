@@ -57,6 +57,27 @@
    "when": 1788820062357,
    "tag": "0008_telegram_setup",
    "breakpoints": true
+  },
+  {
+   "idx": 8,
+   "version": "7",
+   "when": 1795132800000,
+   "tag": "0009_imessage_onboarding",
+   "breakpoints": true
+  },
+  {
+   "idx": 9,
+   "version": "7",
+   "when": 1795219200000,
+   "tag": "0010_shared_channel_conversations",
+   "breakpoints": true
+  },
+  {
+   "idx": 10,
+   "version": "7",
+   "when": 1795305600000,
+   "tag": "0011_channel_key_links",
+   "breakpoints": true
   }
  ]
 }

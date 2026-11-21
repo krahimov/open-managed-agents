@@ -17,12 +17,41 @@ Commands:
 - Setup uses `update_harness` and `request_access` to save the agent configuration and request connections. It does not begin the actual work.
 - `/run` creates a working session from the latest saved configuration, including selected vaults and connected tools.
 - `/connect <app>` sends a connection button, for example `/connect linear` or `/connect gmail`. Agents can also request a connection during setup.
-- `/agents` lists the user's Telegram agents.
-- `/use <agent ID>` switches the conversation to another of those agents.
+- `/agents` lists all non-archived workspace agents, numbered with the active one marked (up to 20, with an omitted count).
+- `/use <ID, number or name>` switches agents. Numbers use your most recent `/agents` list; names match case-insensitively, exact first, then a unique prefix. Ambiguous names show candidates. Archived agents cannot be selected.
 - `/status` reports the active agent's session status.
 - `/stop` interrupts the active agent.
 - `/unlink` disconnects Telegram; the agents and their files remain available.
 - `/help` shows the commands.
+
+## Shared conversations
+
+Console-created agents and agents created through either chat channel are available
+through both channels within the workspace. The owner marker records provenance;
+it does not restrict access. Active agent selection remains independent per channel.
+
+For each workspace user and agent, Telegram and iMessage use one session, setup/work
+mode and output cursor. Open that session in the console to inspect the same event
+history. `/new` still creates another agent in setup mode; `/run` replaces that
+agent's shared session with a fresh snapshot. `/status` and `/stop` operate on the
+shared session. Session titles use “Chat” rather than a channel name.
+
+Messages and commands make their channel the reply destination for that conversation.
+Agent replies, errors and access requests go only to that destination. If it is
+unlinked, delivery falls back to the other linked channel; without any linked channel,
+output is retained and the cursor is held. Queued output also survives unlinking.
+Access requests use a Mini App button on Telegram and a signed-in console link on
+iMessage; API-key requests use a one-time key page on both. Telegram's existing conversation routes and ownership checks work for
+shared sessions, including sessions first used from iMessage.
+
+The new migrations leave the old conversation tables in place, unused by the server.
+If both contain a conversation for the same user and agent, Telegram's session wins.
+The displaced iMessage session drains remaining output from its own preserved cursor;
+new input goes to the shared session. Already queued output parts are preserved.
+Atomic event enqueue/cursor updates and shared in-process serialization prevent
+both channel ticks from delivering the same event. Provider acceptance followed by
+a crash before local acknowledgement can still cause a duplicate send; this is
+not an end-to-end exactly-once transport guarantee. Run one Node replica.
 
 ## Deployment
 
@@ -86,7 +115,21 @@ new session with the saved tools and vaults. Complete connections before `/run`.
 
 Old ordinary browser links cannot supply Telegram identity. Send `/connect <app>`
 again to receive a Mini App button. Provider sign-in and consent still happen at
-the provider. API-key integrations require adding the key in Orrery's vault.
+the provider. API-key integrations (`auth_kind: "mcp_api_key"`) get a URL
+button to a one-time secure page instead of the Mini App; the key is stored in the
+workspace vault and never enters the chat. Text that looks like a pasted key is not
+sent to the agent, and the bot replies with guidance and, when a key is pending, a
+fresh secure link. The inbox stores only the update and message IDs, chat ID and
+type, sender ID and bot flag, and the message text; captions, quoted replies,
+entities and media are never persisted (rows stored by an older version, holding
+the full update, still decode, and are reduced to this shape at the start of
+processing, before anything that can fail). `/start <code>` is exempt from
+screening only when the code matches a live link code; unlinked users' other
+messages are not stored. Links with a 16+ character value in a secret-named query
+or fragment parameter (`?token=…`, `?api_key=…`, reset and magic links) are
+treated as credentials on purpose. Details, limits and the public route
+(`/integrations/channel-key?t=<token>`) are in
+[iMessage: API keys](imessage-onboarding.md#api-keys-secure-one-time-page).
 Composio needs a workspace key or operator `COMPOSIO_API_KEY`; the Mini App shows
 an explicit configuration error if neither is available. Google services use
 individual toolkit slugs such as `gmail` and `googledrive`.
@@ -98,5 +141,6 @@ GitHub login, accounts, cookies, or provider configuration. `/auth-info` reports
 the providers enabled on the service being opened.
 
 This version supports text and explicit creation commands. Attachments, voice,
-Telegram group workspaces and iMessage are not implemented. Existing Clerk accounts can link from the console; automatic
+and Telegram group workspaces are not implemented. iMessage is available in the Node
+deployment through [Sendblue](imessage-onboarding.md). Existing Clerk accounts can link from the console; automatic
 creation at signup currently uses the Better Auth signup hook.

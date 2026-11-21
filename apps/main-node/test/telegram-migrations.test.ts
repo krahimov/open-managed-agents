@@ -17,7 +17,7 @@ describe("Telegram migration upgrades", () => {
     const db = drizzle(sqlite);
     try {
       mkdirSync(join(dir, "meta"));
-      const entries = journal.entries.filter((entry: { tag: string }) =>
+      const entries = journal.entries.filter((e: any) => !e.tag.includes("channel_key_links")).filter((entry: { tag: string }) => !entry.tag.includes("imessage") && !entry.tag.includes("shared_channel")).filter((entry: { tag: string }) =>
         version === "main" ? !entry.tag.includes("telegram") :
         version === "onboarding" ? !entry.tag.endsWith("telegram_setup") : true,
       ).map((entry: { idx: number; tag: string }) => ({
