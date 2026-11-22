@@ -95,6 +95,11 @@ export interface OAuthAppRequirement {
   setup_steps: string[];
   /** Provider app manifest (Slack) pre-filled with the callback URL. */
   manifest?: Record<string, unknown>;
+  /** Server-side hint, never put on events: the issuer offers no Dynamic
+   *  Client Registration and has no preset, so /authorize has no client to
+   *  use and an OAuth popup can only fail ("OAuth client unavailable").
+   *  Access requests fall back to collecting an API key instead. */
+  no_client_registration?: boolean;
 }
 
 export interface NodeOAuthRoutesDeps {
@@ -867,6 +872,7 @@ export async function describeOAuthAppRequirement(input: {
       callback_uri: callbackUri,
       env: { client_id: preset?.clientIdEnv ?? "", client_secret: preset?.clientSecretEnv ?? "" },
       setup_steps: [],
+      ...(!meta.authServer.registration_endpoint ? { no_client_registration: true } : {}),
     };
   }
   const stored = await loadTenantOAuthApp(input.deps, input.tenantId, issuer);

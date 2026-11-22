@@ -455,7 +455,12 @@ export class ChannelOnboarding<D extends ChannelDeps = ChannelDeps> {
       const prior = await this.d.router.getEvents(sid, { limit: 10000 });
       const requestId = `acreq-${this.t.channel}-${u.id}`;
       if (!prior.data.some(e => (e as unknown as { request_id?: string }).request_id === requestId)) {
-        await this.d.requestAccess(a.tenant_id, sid, service, requestId);
+        const res = await this.d.requestAccess(a.tenant_id, sid, service, requestId);
+        // No card was posted (no one-click app for this service), so there is
+        // no access_request event to relay — answer here instead of silently.
+        if ((res as { status?: string } | null | undefined)?.status === "unavailable") {
+          return this.queue(a, id, `${service} isn't available as a one-click connection. If it has a hosted MCP server, add that server to your agent in Orrery, then send /connect ${service} again.`);
+        }
       }
       return;
     }

@@ -19,6 +19,7 @@ export type { AgentRoutesDeps } from "./agents";
 export {
   buildVaultRoutes,
   listComposioToolkits,
+  getComposioToolkit,
   createComposioToolRouterSession,
   listComposioConnectedAccounts,
   listAllComposioConnectedAccounts,

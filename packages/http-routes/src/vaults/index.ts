@@ -28,6 +28,7 @@ import {
   ComposioRouterRefresher,
   composioRequest,
   composioRouterAuth,
+  getComposioToolkit,
   isTenantScopedComposioUserId,
   listComposioConnectedAccounts,
   normalizeComposioToolkitSlug,
@@ -43,6 +44,7 @@ export {
   ComposioRouterRefresher,
   composioRouterAuth,
   createComposioToolRouterSession,
+  getComposioToolkit,
   isTenantScopedComposioUserId,
   listAllComposioConnectedAccounts,
   listComposioConnectedAccounts,
@@ -861,7 +863,33 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
 
       return c.json({ ...link, toolkits_expanded: toolkitsExpanded }, 201);
     } catch (err) {
-      return c.json({ error: (err as Error).message }, 502);
+      const message = (err as Error).message;
+      // An app Composio doesn't carry makes the auth-config create 404 with
+      // a raw JSON body ("Could not find toolkit …"). Confirm it really is an
+      // unknown toolkit (checked only on failure, so the happy path costs no
+      // extra call) and answer in words the connect card can show as-is.
+      if (/^Composio API 404\b/.test(message) && !body.auth_config_id) {
+        const composio = await resolveComposioForVault({
+          routeDeps: deps.composio,
+          services,
+          tenantId,
+          vaultId,
+          explicitApiKey: body.api_key,
+        }).catch(() => null);
+        const toolkit = composio
+          ? await getComposioToolkit(composio.creds, body.toolkit).catch(() => undefined)
+          : undefined;
+        if (toolkit === null) {
+          return c.json(
+            {
+              error: `Composio has no "${body.toolkit}" integration, so it can't be connected with one click. If it has a hosted MCP server, add that server to the agent instead.`,
+              code: "COMPOSIO_TOOLKIT_NOT_FOUND",
+            },
+            404,
+          );
+        }
+      }
+      return c.json({ error: message }, 502);
     }
   });
 

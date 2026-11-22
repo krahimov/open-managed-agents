@@ -126,6 +126,7 @@ import {
   buildAgentRoutes,
   buildVaultRoutes,
   listComposioToolkits,
+  getComposioToolkit,
   listAllComposioConnectedAccounts,
   provisionComposioToolRouter,
   composioRouterAuth,
@@ -209,6 +210,7 @@ import {
   describeOAuthAppRequirement,
   type GrantNotification,
 } from "./lib/node-oauth-routes.js";
+import { matchMcpServerUrl, resolveAccessRoute, unsupportedAccessNote } from "./lib/access-request-route.js";
 import {
   credentialMatchesMcpServerUrl,
   orderMatchingCredentials,
@@ -2323,7 +2325,18 @@ function channelDependencies(label: string): import("./lib/channel-onboarding.js
     attachAgentMemory: attachAgentMemoryQuietly,
     prepareAgentSnapshot: prepareVaultSessionSnapshot,
     publicBaseUrl: process.env.PUBLIC_BASE_URL,
-    requestAccess: (tenantId, sessionId, service, requestId) => postAccessRequest(tenantId, sessionId, { service, reason: `Connect ${service} to this ${label} agent.` }, requestId),
+    requestAccess: async (tenantId, sessionId, service, requestId) => {
+      // Point /connect at the agent's own MCP server when it has one, so the
+      // card is that server's sign-in / API-key card, not a Composio guess.
+      const session = await sessionsService.get({ tenantId, sessionId }).catch(() => null);
+      const snapshot = session?.agent_snapshot as { mcp_servers?: Array<{ name?: string; type?: string; url?: string }> } | undefined;
+      return postAccessRequest(
+        tenantId,
+        sessionId,
+        { service, reason: `Connect ${service} to this ${label} agent.`, mcp_server_url: matchMcpServerUrl(snapshot?.mcp_servers, service) },
+        requestId,
+      );
+    },
     hasVault: async (tenantId, vaultId) => (await vaultService.list({ tenantId, includeArchived: false })).some(v => v.id === vaultId),
     model: process.env.OMA_ONBOARDING_MODEL ?? "gpt-6-astra",
     harness: process.env.OMA_ONBOARDING_HARNESS ?? "default",
@@ -2500,13 +2513,6 @@ async function postMemoryEnabledCard(
  * Composio link/callback popup flow. Function declaration (hoisted) so the
  * buildTools/buildHarness closures above can reference it.
  */
-/** Model providers are keyed via Model Cards, not connectable apps — a
- *  request_access for one of these must not dead-end in a Composio 400
- *  (observed live: "connect openai" → code 306). */
-const LLM_PROVIDER_SLUGS = new Set([
-  "openai", "anthropic", "google", "gemini", "google-gemini",
-  "openrouter", "mistral", "groq", "xai", "deepseek",
-]);
 
 /**
  * Classify how a direct MCP server authenticates. RFC 9728: OAuth-capable
@@ -2548,31 +2554,33 @@ async function postAccessRequest(
 ): Promise<{ request_id: string; status: string; note?: string }> {
   const service = args.service.trim().toLowerCase();
   const mcpServerUrl = args.mcp_server_url?.trim() || undefined;
-  const isLlmProvider = LLM_PROVIDER_SLUGS.has(service);
-  const authKind = isLlmProvider
-    ? "llm_provider"
-    : mcpServerUrl
-      ? await probeMcpAuthKind(mcpServerUrl)
-      : "composio";
-  const key =
-    authKind === "composio" ? await composioKeyForTenant(tenantId).catch(() => null) : null;
-  // Providers without Dynamic Client Registration (Slack, GitHub) need a
-  // one-time OAuth app before the popup can work — tell the card (guided
-  // setup) and the agent (so it sets the user's expectations) up front.
-  const oauthApp =
-    authKind === "mcp_oauth" && mcpServerUrl
-      ? await Promise.race([
-          describeOAuthAppRequirement({
-            deps: { services, env: process.env },
-            tenantId,
-            mcpServerUrl,
-            baseUrl: process.env.PUBLIC_BASE_URL ?? `http://localhost:${port}`,
-          }).catch(() => null),
-          new Promise<null>((resolve) => setTimeout(() => resolve(null), 6000)),
-        ])
-      : null;
-  const needsAppSetup = !!oauthApp?.required && !oauthApp.configured;
   const requestId = suppliedRequestId ?? `acreq-${generateEventId().replace(/^sevt-/, "")}`;
+  const route = await resolveAccessRoute(service, mcpServerUrl, {
+    probeMcpAuthKind,
+    // Providers without Dynamic Client Registration (Slack, GitHub) need a
+    // one-time OAuth app before the popup can work — tell the card (guided
+    // setup) and the agent (so it sets the user's expectations) up front.
+    describeOAuthApp: (url) =>
+      Promise.race([
+        describeOAuthAppRequirement({
+          deps: { services, env: process.env },
+          tenantId,
+          mcpServerUrl: url,
+          baseUrl: process.env.PUBLIC_BASE_URL ?? `http://localhost:${port}`,
+        }).catch(() => null),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 6000)),
+      ]),
+    composioKey: () => composioKeyForTenant(tenantId),
+    getComposioToolkit: (apiKey, slug) => getComposioToolkit({ apiKey, timeoutMs: 5000 }, slug),
+  });
+  if (route.kind === "unsupported") {
+    // No card: one the user can only click into an error helps nobody.
+    return { request_id: requestId, status: "unavailable", note: unsupportedAccessNote(service) };
+  }
+  const authKind = route.authKind;
+  const oauthApp = route.oauthApp ?? null;
+  const needsAppSetup = !!oauthApp?.required && !oauthApp.configured;
+  const { no_client_registration: _serverOnly, ...oauthAppForEvent } = oauthApp ?? {};
   await sessionRouter.appendEvent(sessionId, {
     type: "system.access_request",
     id: generateEventId(),
@@ -2580,9 +2588,9 @@ async function postAccessRequest(
     service,
     reason: args.reason,
     auth_kind: authKind,
-    ...(mcpServerUrl ? { mcp_server_url: mcpServerUrl } : {}),
-    ...(authKind === "composio" ? { composio_configured: !!key } : {}),
-    ...(oauthApp?.required ? { oauth_app: oauthApp } : {}),
+    ...(route.mcpServerUrl ? { mcp_server_url: route.mcpServerUrl } : {}),
+    ...(authKind === "composio" ? { composio_configured: !!route.composioConfigured } : {}),
+    ...(oauthApp?.required ? { oauth_app: oauthAppForEvent } : {}),
   } as SessionEvent);
   const note =
     authKind === "llm_provider"
@@ -2591,7 +2599,7 @@ async function postAccessRequest(
         ? `"${service}" authenticates with an API key, not OAuth. The user is being asked to paste the key into the credential vault (it never enters this conversation) — you'll receive a message when it's saved.`
         : needsAppSetup
           ? `Connect card for "${service}" posted, but ${oauthApp?.label ?? service} requires a one-time OAuth app registration first (its MCP server has no automatic client registration). The card walks the user through creating the app and pasting its Client ID/Secret — tell the user it's a one-time setup step, then wait; you'll receive a message when access is granted.`
-        : authKind === "mcp_oauth" || key
+        : authKind === "mcp_oauth" || route.composioConfigured
           ? `Connect card for "${service}" posted to the user's session view. You'll receive a message when access is granted — continue any work that doesn't need it, or end your turn and wait.`
           : `Request posted, but this workspace has no Composio account connected yet — the user is being guided to connect one (Console → Apps) before authorizing "${service}".`;
   return { request_id: requestId, status: "pending", note };
@@ -2604,11 +2612,7 @@ function matchAgentMcpServer(
   agent: { mcp_servers?: Array<{ name?: string; type?: string; url?: string }> } | null | undefined,
   service: string,
 ): string | undefined {
-  const slug = service.trim().toLowerCase();
-  const hit = (agent?.mcp_servers ?? []).find(
-    (s) => s?.name?.trim().toLowerCase() === slug && s.type !== "stdio" && !!s.url,
-  );
-  return hit?.url;
+  return matchMcpServerUrl(agent?.mcp_servers, service);
 }
 /** Keyword search over installed skills + curated catalog (installed wins
  *  name conflicts). The discovery half of agent skill acquisition. */

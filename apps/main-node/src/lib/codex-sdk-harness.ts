@@ -37,6 +37,7 @@
  * attached skills are materialized under <cwd>/skills/ and referenced there.
  */
 
+import { matchMcpServerUrl } from "./access-request-route.js";
 import { mkdir, readFile, writeFile, chmod } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
@@ -434,14 +435,11 @@ export class CodexSdkHarness {
           // Requested service that names one of the agent's own URL MCP
           // servers → the card runs vault MCP OAuth against that URL rather
           // than the Composio connected-account flow.
-          const slug = a.service.trim().toLowerCase();
-          const matched = (ctx.agent.mcp_servers ?? []).find(
-            (s) => s?.name?.trim().toLowerCase() === slug && s.type !== "stdio" && !!s.url,
-          );
+          const matchedUrl = matchMcpServerUrl(ctx.agent.mcp_servers, a.service);
           const result = await deps.requestServiceAccess!(tenantId, sessionId, {
             service: a.service,
             reason: a.reason?.trim() || "The agent needs this service for the current task.",
-            ...(matched?.url ? { mcp_server_url: matched.url } : {}),
+            ...(matchedUrl ? { mcp_server_url: matchedUrl } : {}),
           });
           return { text: JSON.stringify(result) };
         },
