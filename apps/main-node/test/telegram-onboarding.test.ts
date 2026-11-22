@@ -22,6 +22,9 @@ async function fixture() {
     ),
   );
   db.exec(readFileSync(new URL("../migrations-sqlite/0005_telegram_setup.sql", import.meta.url), "utf8"));
+  db.exec(readFileSync(new URL("../migrations-sqlite/0006_imessage_onboarding.sql", import.meta.url), "utf8"));
+  db.exec("CREATE TABLE sessions (id TEXT,tenant_id TEXT,agent_id TEXT)");
+  db.exec(readFileSync(new URL("../migrations-sqlite/0007_shared_channel_conversations.sql", import.meta.url), "utf8"));
   db.exec(
     "CREATE TABLE agents (id TEXT,tenant_id TEXT,config TEXT,archived_at INTEGER)",
   );
@@ -295,4 +298,206 @@ it("binds signed Mini App identity to the exact owned request and rechecks membe
   f.deps.hasMembership.mockResolvedValue(true);
   await f.post(701, "/unlink"); await f.service.tick();
   expect(await verify()).toBeNull();
+});
+
+// Both real adapters share this fixture's SQL and session services; only providers are fake.
+import { IMessageOnboarding } from "../src/lib/imessage-onboarding.js";
+async function bothChannels() {
+  const f = await fixture();
+  await f.link();
+  const imessages: any[] = [];
+  const ideps = { ...f.deps, apiKeyId: "fake", apiSecretKey: "fake", number: "+15550009999",
+    fetch: vi.fn(async (_url: string, o: any) => { imessages.push(JSON.parse(o.body)); return Response.json({ status: "SENT", message_handle: "fake-sent-id" }); }) };
+  const imessage = new IMessageOnboarding(ideps);
+  // Link the same workspace user, retaining independently selected agents.
+  const link = await imessage.link("tenant-u", "u");
+  const ipost = (id: string, content: string) => imessage.webhookRoutes().request("/", {
+    method: "POST", headers: { "content-type": "application/json", "sb-signing-secret": ideps.webhookSecret },
+    body: JSON.stringify({ message_handle: id, content, from_number: "+15550000101", to_number: ideps.number, is_outbound: false, status: "RECEIVED" }),
+  });
+  await ipost("link", link.code!); await imessage.tick();
+  await ipost("select", "/use agent-1"); await imessage.tick();
+  f.messages.length = 0; imessages.length = 0;
+  const ticks = () => Promise.all([f.service.tick(), imessage.tick()]);
+  return { ...f, imessage, ideps, imessages, ipost, ticks };
+}
+describe("workspace agents and shared conversations", () => {
+  it("lists console agents, saves numbering across restart/list changes, and resolves IDs, exact names and prefixes", async () => {
+    const f = await fixture(); await f.link();
+    const alpha = await f.create({ tenantId: "tenant-u", input: { name: "Alpha", metadata: {} } });
+    await f.create({ tenantId: "tenant-u", input: { name: "Alphabet", metadata: {} } });
+    await f.post(800, "/agents"); await f.service.tick();
+    expect(f.messages.at(-1).text).toContain(`1. Alpha — ${alpha.id}`);
+    expect(f.messages.at(-1).text).toContain("(active)");
+    await f.create({ tenantId: "tenant-u", input: { name: "Aardvark", metadata: {} } });
+    await f.post(801, "/use 1"); await new TelegramOnboarding(f.deps).tick();
+    expect(f.messages.at(-1).text).toBe("Now talking to Alpha.");
+    await f.post(802, "/use aLpHa"); await f.service.tick();
+    expect(f.messages.at(-1).text).toBe("Now talking to Alpha.");
+    await f.post(803, "/use alphab"); await f.service.tick();
+    expect(f.messages.at(-1).text).toBe("Now talking to Alphabet.");
+    await f.post(804, `/use ${alpha.id}`); await f.service.tick();
+    expect(f.messages.at(-1).text).toBe("Now talking to Alpha.");
+    await f.post(805, "/use alph"); await f.service.tick();
+    expect(f.messages.at(-1).text).toContain("Several agents match");
+    expect(f.messages.at(-1).text).toContain("Alphabet");
+    f.db.prepare("UPDATE agents SET archived_at=1 WHERE id=?").run(alpha.id);
+    await f.post(806, `/use ${alpha.id}`); await f.service.tick();
+    expect(f.messages.at(-1).text).toContain("not available");
+    await f.post(807, "/use 1"); await f.service.tick();
+    expect(f.messages.at(-1).text).toContain("not available");
+    await f.create({ tenantId: "tenant-u", input: { name: "Alphabet", metadata: {} } });
+    await f.post(808, "/use Alphabet"); await f.service.tick();
+    expect(f.messages.at(-1).text).toContain("Several agents match");
+  });
+  it("caps long phone lists and does not gate agents on another user's provenance", async () => {
+    const f = await fixture(); await f.link();
+    for (let i=0; i<24; i++) await f.create({ tenantId: "tenant-u", input: { name: `Agent ${i}`, metadata: { imessage_owner: "other-member" } } });
+    await f.post(810, "/agents"); await f.service.tick();
+    expect(f.messages.at(-1).text).toContain("5 more omitted");
+    expect(f.messages.at(-1).text.split("\n")).toHaveLength(21);
+    await f.post(811, "/use agent-2"); await f.service.tick();
+    expect(f.messages.at(-1).text).toBe("Now talking to Agent 0.");
+  });
+  it("uses the same session, namespaces inbound IDs, and sends each output only to the last used channel", async () => {
+    const f = await bothChannels();
+    await f.post(900, "from Telegram"); await f.service.tick();
+    await f.ipost("900", "from iMessage"); await f.imessage.tick();
+    const es = f.events.get("sess-1")!;
+    expect(es.filter(e => e.content?.[0]?.text?.startsWith("from "))).toHaveLength(2);
+    expect(new Set(es.map(e => e.id)).size).toBe(es.length);
+    expect(f.db.prepare("SELECT COUNT(*) AS n FROM channel_conversations WHERE agent_id='agent-1'").get()).toEqual({ n: 1 });
+    es.push({ seq: es.length, type: "agent.message", content: [{ type: "text", text: "only iMessage" }] });
+    await f.ticks(); await f.ticks();
+    expect(f.imessages.filter(m => m.content === "only iMessage")).toHaveLength(1);
+    expect(f.messages.filter(m => m.text === "only iMessage")).toHaveLength(0);
+    await f.post(901, "/status"); await f.service.tick();
+    es.push({ seq: es.length, type: "agent.message", content: [{ type: "text", text: "only Telegram" }] });
+    await Promise.all([new TelegramOnboarding(f.deps).tick(), new IMessageOnboarding(f.ideps).tick(), f.service.tick()]);
+    expect(f.messages.filter(m => m.text === "only Telegram")).toHaveLength(1);
+    expect(f.imessages.filter(m => m.content === "only Telegram")).toHaveLength(0);
+    expect(f.deps.sessions.create.mock.calls.every(([o]: any) => !/Telegram|iMessage/.test(o.title))).toBe(true);
+  });
+  it("holds cursors without links and falls back, including already queued replies after a failed send", async () => {
+    const f = await bothChannels();
+    f.ideps.fetch.mockResolvedValueOnce(Response.json({ status: "ERROR" }, { status: 500 }));
+    const es = f.events.get("sess-1")!;
+    es.push({ seq: es.length, type: "agent.message", content: [{ type: "text", text: "queued reply" }] });
+    await f.imessage.tick();
+    expect(f.db.prepare("SELECT sent FROM channel_deliveries").get()).toEqual({ sent: 0 });
+    await f.ipost("unlink", "/unlink"); await f.imessage.tick();
+    f.db.exec("UPDATE channel_deliveries SET next_at=0");
+    await f.service.tick();
+    expect(f.messages.filter(m => m.text === "queued reply")).toHaveLength(1);
+    await f.post(910, "/unlink"); await f.service.tick();
+    const before = f.db.prepare("SELECT last_seq FROM channel_conversations WHERE session_id='sess-1'").get();
+    es.push({ seq: es.length, type: "session.error", error: "failed" });
+    await f.ticks();
+    expect(f.db.prepare("SELECT last_seq FROM channel_conversations WHERE session_id='sess-1'").get()).toEqual(before);
+    const link = await f.service.link("tenant-u", "u");
+    await f.post(911, `/start ${new URL(link.url!).searchParams.get("start")}`); await f.ticks();
+    expect(f.messages.filter(m => m.text.includes("encountered an error"))).toHaveLength(1);
+  });
+  it("keeps shared /run and /stop state and Mini App access checks, with channel-specific access rendering", async () => {
+    const f = await bothChannels();
+    await f.ipost("connect", "/connect linear"); await f.imessage.tick();
+    expect(f.imessages.at(-1).content).toContain("/sessions/sess-1#needs-you");
+    expect(await f.service.miniAppConnection(signedLaunch(101), "sess-1", "acreq-imessage-connect")).toMatchObject({ userId: "u" });
+    expect(f.db.prepare("SELECT COUNT(*) AS n FROM telegram_conversations").get()).toEqual({ n: 0 });
+    await f.post(920, "/connect gmail"); await f.service.tick();
+    expect(f.messages.at(-1).reply_markup.inline_keyboard[0][0].web_app.url).toContain("/telegram/connect/sess-1/");
+    f.deps.sessions.get = async () => ({ status: "idle" });
+    await f.post(921, "/run"); await f.service.tick();
+    const work = f.db.prepare("SELECT session_id FROM channel_conversations WHERE agent_id='agent-1'").get() as any;
+    expect(work.session_id).not.toBe("sess-1");
+    await f.ipost("stop", "/stop"); await f.imessage.tick();
+    expect(f.deps.router.appendEvent.mock.calls.at(-1)).toMatchObject([work.session_id, { type: "user.interrupt" }]);
+  });
+  it("rolls back event enqueue and cursor together and recovers on restart", async () => {
+    const f = await bothChannels();
+    const es = f.events.get("sess-1")!;
+    es.push({ seq: es.length, type: "agent.message", content: [{ type: "text", text: "atomic" }] });
+    const cursor = f.db.prepare("SELECT last_seq FROM channel_conversations WHERE session_id='sess-1'").get();
+    f.db.exec("CREATE TRIGGER fail_cursor BEFORE UPDATE OF last_seq ON channel_conversations BEGIN SELECT RAISE(ABORT, 'injected failure'); END");
+    await expect(f.imessage.tick()).rejects.toThrow("injected failure");
+    expect(f.db.prepare("SELECT last_seq FROM channel_conversations WHERE session_id='sess-1'").get()).toEqual(cursor);
+    expect(f.db.prepare("SELECT COUNT(*) AS n FROM channel_deliveries").get()).toEqual({ n: 0 });
+    f.db.exec("DROP TRIGGER fail_cursor");
+    await Promise.all([new TelegramOnboarding(f.deps).tick(), new IMessageOnboarding(f.ideps).tick()]);
+    expect(f.imessages.filter(m => m.content === "atomic")).toHaveLength(1);
+  });
+});
+
+it("drains a displaced session without replaying its delivered prefix", async () => {
+  const f = await bothChannels();
+  f.events.set("displaced", [
+    { seq: 4, type: "agent.message", content: [{ type: "text", text: "already delivered" }] },
+    { seq: 5, type: "agent.message", content: [{ type: "text", text: "remaining legacy output" }] },
+  ]);
+  f.db.exec("INSERT INTO channel_conversation_drains VALUES ('displaced','tenant-u','u','agent-1',4)");
+  await f.ticks(); await new IMessageOnboarding(f.ideps).tick();
+  expect(f.imessages.filter(m => m.content === "remaining legacy output")).toHaveLength(1);
+  expect(f.imessages.some(m => m.content === "already delivered")).toBe(false);
+  expect(f.db.prepare("SELECT last_seq FROM channel_conversation_drains WHERE session_id='displaced'").get()).toEqual({ last_seq: 5 });
+});
+it("resumes partial output after restart and falls back on permanent contact failure", async () => {
+  const f = await bothChannels();
+  const es = f.events.get("sess-1")!;
+  const content = "a".repeat(18996) + "remaining";
+  es.push({ seq: es.length, type: "agent.message", content: [{ type: "text", text: content }] });
+  f.ideps.fetch.mockImplementationOnce(async (_url: string, o: any) => { f.imessages.push(JSON.parse(o.body)); return Response.json({ status: "SENT", message_handle: "fake-sent-id" }); });
+  f.ideps.fetch.mockResolvedValueOnce(Response.json({ status: "DECLINED", error_key: "OPTED_OUT" }));
+  await f.imessage.tick();
+  expect(f.imessages.map(m => m.content).join("")).toBe("a".repeat(18996));
+  expect((await f.imessage.status("tenant-u", "u")).connected).toBe(false);
+  await new TelegramOnboarding(f.deps).tick();
+  expect(f.messages.map(m => m.text).join("")).toBe("remaining");
+  await f.ticks();
+  expect(f.messages).toHaveLength(1);
+});
+it("recovers a channel-created agent by its original creation key", async () => {
+  const f = await fixture(); await f.link();
+  await f.create({ tenantId: "tenant-u", input: { name: "Recovered", metadata: { telegram_creation_key: "u:950", telegram_owner: "u" } } });
+  await f.post(950, "/new Recovered"); await f.service.tick();
+  expect(f.create).toHaveBeenCalledTimes(2);
+  expect(f.messages.at(-1).text).toContain("Created Recovered");
+});
+it("serializes first-session creation across simultaneous channel inputs and keeps selection independent", async () => {
+  const f = await bothChannels();
+  const agent = await f.create({ tenantId: "tenant-u", input: { name: "Console Research", metadata: {} } });
+  await f.post(960, `/use ${agent.id}`);
+  await f.ipost("list-console", "/agents"); await f.ticks();
+  expect(f.imessages.at(-1).content).toContain("1. Console Research");
+  await f.ipost("use-number", "/use 1"); await f.imessage.tick();
+  expect(f.imessages.at(-1).content).toBe("Now talking to Console Research.");
+  await f.ipost("use-name", "/use console res"); await f.imessage.tick();
+  await f.post(961, "simultaneous Telegram"); await f.ipost("961", "simultaneous iMessage");
+  await f.ticks();
+  const c = f.db.prepare("SELECT session_id FROM channel_conversations WHERE agent_id=?").get(agent.id) as any;
+  expect(f.events.get(c.session_id)!.map(e => e.content[0].text)).toEqual(["simultaneous Telegram", "simultaneous iMessage"]);
+  expect(f.deps.sessions.create.mock.calls.filter(([o]: any) => o.agentId === agent.id)).toHaveLength(1);
+  await f.ipost("select-original", "/use agent-1"); await f.imessage.tick();
+  expect(f.db.prepare("SELECT active_agent_id FROM telegram_accounts").get()).toEqual({ active_agent_id: agent.id });
+});
+it("authorizes Telegram access buttons for a drained session through the shared ownership mapping", async () => {
+  const f = await bothChannels();
+  f.events.set("drained-access", [{ seq: 0, type: "system.access_request", request_id: "old-request", service: "gmail" }]);
+  f.db.exec("INSERT INTO channel_conversation_drains VALUES ('drained-access','tenant-u','u','agent-1',-1)");
+  await f.post(970, "/status"); await f.ticks();
+  expect(f.messages.some(m => m.reply_markup?.inline_keyboard[0][0].web_app.url.includes("drained-access"))).toBe(true);
+  expect(await f.service.miniAppConnection(signedLaunch(101), "drained-access", "old-request")).toMatchObject({ userId: "u" });
+  expect(await f.service.miniAppConnection(signedLaunch(102), "drained-access", "old-request")).toBeNull();
+});
+it("does not repeat interrupted pre-upgrade inputs or /run transitions", async () => {
+  const f = await fixture(); await f.link();
+  f.deps.sessions.get = async () => ({ status: "idle", metadata: { telegram_user: "u" } });
+  const es = f.events.get("sess-1")!;
+  es.push({ seq: es.length, type: "user.message", id: "update:0000000000000980", content: [{ type: "text", text: "old input" }] });
+  await f.post(980, "old input"); await f.service.tick();
+  expect(es.filter(e => e.content?.[0]?.text === "old input")).toHaveLength(1);
+  f.db.exec("UPDATE channel_conversations SET transition_id='update:0000000000000981'");
+  es.push({ seq: es.length, type: "user.message", id: "update:0000000000000981", content: [{ type: "text", text: "old run" }] });
+  await f.post(981, "/run"); await f.service.tick();
+  expect(f.deps.sessions.create).not.toHaveBeenCalled();
+  expect(f.deps.router.appendEvent).not.toHaveBeenCalled();
 });

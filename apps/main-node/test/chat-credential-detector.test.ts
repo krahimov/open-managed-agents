@@ -1,0 +1,172 @@
+import { describe, expect, it } from "vitest";
+import { credentialRejectedText, looksLikeCredential } from "../src/lib/chat-credential-detector.js";
+
+// Synthetic, non-functional values shaped like real credentials.
+const positives: [string, string][] = [
+  ["OpenAI project key", "sk-proj-Ab3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3z"],
+  ["Anthropic key in a sentence", "here you go: sk-ant-api03-Zx9Yw8Vu7Ts6Rq5Po4Nm3Lk2Jh1Gf0"],
+  ["legacy sk- key", "sk-4f9Kx2mPq8Rt5Wv1Yz7Ab3Cd6Ef0Gh"],
+  ["Stripe live key", "sk_" + "live_51HqLyjWDarjtT1zdp7dcXyZ"],
+  ["Stripe test key", "my stripe key rk_" + "test_4eC39HqLyjWDarjtT1zdp7dc"],
+  ["GitHub classic PAT", "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"],
+  ["GitHub fine-grained PAT", "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ"],
+  ["Slack bot token", "xox" + "b-1234567890-0987654321-AbCdEfGhIjKlMnOp"],
+  ["Slack user token", "use xox" + "p-2468013579-1357924680-ZyXwVuTsRqPo please"],
+  ["AWS access key ID", "AKIAIOSFODNN7EXAMPLE"],
+  ["Google API key", "AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY"],
+  ["Bearer header", "Authorization: Bearer 4f9Kx2mPq8Rt5Wv1Yz7Ab3Cd"],
+  ["PEM private key", "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----"],
+  ["PEM RSA private key", "-----BEGIN RSA PRIVATE KEY-----"],
+  ["OpenSSH private key", "-----BEGIN OPENSSH PRIVATE KEY-----"],
+  ["JWT", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"],
+  ["keyword + mixed token", "the api key is Q7xV2mN9pL4kR8tW3zY6bC1d"],
+  ["keyword + hex token", "token: 9f8e7d6c5b4a39281706f5e4d3c2b1a0"],
+  ["password next to random string", "password = 7Hq2Lx9Vw4Kp8Rz3Mn6T"],
+  ["lone random token", "Zq8Wn3Kx7Vb2Lm9Pr4Ts6Yh1"],
+  ["long random token without keyword", "please use 8fKq2LxN9vWp4RzT3mY6bC1dHs5Gj7Ae0Qu in the config"],
+  ["secret beside a URL", "the secret for https://api.example.com is Pk8Lw3Qz7Rv2Mx9Tn4Ys"],
+  // Known syntaxes match on syntax alone, without digits (QA finding 2).
+  ["alphabetic Bearer header", "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz"],
+  ["alphabetic Bearer value", "Bearer AbCdEfGhIjKlMnOpQrStUvWxYz"],
+  ["alphabetic sk- key", "sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"],
+  ["Basic authorization header", "Authorization: Basic dXNlcjpwYXNzd29yZA=="],
+  ["32-character Stripe key (link-code length)", "sk_" + "live_AbCdEfGhIjKlMnOpQrStUvWx"],
+  ["known key disguised as a start command", "/start sk_" + "live_AbCdEfGhIjKlMnOpQrStUvWx"],
+  ["known key disguised as a link code", "ORRERY sk_" + "live_AbCdEfGhIjKlMnOpQrStUvWx"],
+  // URLs that carry a credential (QA finding 6).
+  ["key in a query string", "try https://api.example.com/v1?api_key=sk-proj-Ab3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3z"],
+  ["secret-named query parameter", "open https://example.com/reset?token=Ab3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3z"],
+  ["token in a URL fragment", "https://app.example.com/cb#access_token=Q7xV2mN9pL4kR8tW3zY6bC1d&type=bearer"],
+  ["password in URL userinfo", "clone https://user:Q7xV2mN9pL4kR8tW3z@git.example.com/repo.git"],
+  // Non-English keyword next to a random token (QA finding 6 limitation, fixed).
+  ["Chinese keyword", "我的密钥是 Q7xV2mN9pL4kR8tW3zY6bC1d"],
+  ["Arabic keyword", "مفتاحي Q7xV2mN9pL4kR8tW3zY6bC1d"],
+];
+const negatives: [string, string][] = [
+  ["empty", ""],
+  ["greeting", "hello, can you check my calendar for tomorrow?"],
+  ["long prose", "I would like you to summarize the quarterly planning document and send the key takeaways to the team by Friday."],
+  ["talking about keys", "Where do I find my API key for Linear? I lost the token."],
+  ["password word only", "what's a good password manager?"],
+  ["URL with random path", "https://docs.google.com/document/d/1aBcD3fGh5JkL7mN9pQ1rS3tU5vW7xY9z/edit"],
+  ["URL with ordinary query", "https://example.com/page?utm_source=newsletter2024&ref=spring_sale&id=42"],
+  ["agent ID", "/use agent-k3j9x8w2m1n4b5v6"],
+  ["agent ID in prose with keyword", "the key agent is agent-k3j9x8w2m1n4b5v6"],
+  ["session ID", "look at sess-a1b2c3d4e5f6g7h8 please"],
+  ["request ID", "acreq-imessage-0000000000000042"],
+  ["UUID", "order 550e8400-e29b-41d4-a716-446655440000 failed"],
+  ["UUID with keyword", "idempotency key 550e8400-e29b-41d4-a716-446655440000"],
+  ["phone number", "+15550000101"],
+  ["long number", "my order number is 12345678901234567890123456"],
+  ["email", "send it to alice.smith1984@example.com"],
+  ["iMessage link code", "ORRERY Ab3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY"],
+  ["Telegram start", "/start Ab3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY"],
+  ["Telegram start with bot", "/start@test_bot Ab3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY"],
+  ["commands", "/connect linear"],
+  ["new command", "/new Build a weekly report from our Stripe dashboard"],
+  ["git SHA", "revert commit 3f2a9c8b7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a"],
+  ["lone git SHA", "3f2a9c8b7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a"],
+  ["hyphenated ticket", "the token for PROJ-1234-backend-migration-cleanup is ready"],
+  ["snake case words", "rename release_2024_q3_planning_notes_final"],
+  ["sk-learn word", "should I use sk-learn-tutorials-for-beginners"],
+  ["Bearer words", "Bearer token-based-authentication-flow explained"],
+  ["file path", "/home/karim/projects/app2024/src/components/Header.tsx"],
+  ["version strings", "upgrade node from v22.16.0 to v24.1.0 and pnpm 9.12.3"],
+  ["base64-ish prose word", "Supercalifragilisticexpialidocious"],
+  // Readable identifiers and known prefixes inside URLs/IDs (QA finding 6).
+  ["camelCase identifier in code", 'const cacheKey = "customerAccount2024BillingRegion2025";'],
+  ["lone camelCase identifier", "getUserAccountById2024Handler"],
+  ["snake_case identifier with keyword", "the token name is session_token_2024_rotation_v2"],
+  ["known prefix inside a URL path", "open https://example.com/docs/sk-proj-Ab3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3z"],
+  ["known prefix inside an agent ID", "use agent-sk-proj-Ab3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3z"],
+  ["known prefix inside a session ID", "open sess-sk-live-Ab3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3z"],
+  ["URL userinfo without password", "ssh://git@github.com/org/repo and https://user@example.com/"],
+  ["Authorization prose", "Authorization: required for admins"],
+  ["Chinese prose", "请帮我总结一下明天的会议安排"],
+  ["Arabic prose", "هل يمكنك تلخيص جدول اجتماعات الغد؟"],
+];
+
+// QA round 2 table (38 rows), labelled as decided: Authorization documentation is
+// ordinary prose; reset links carry bearer secrets (decision C).
+const qaRound2: [string, boolean, string][] = [
+  ["alphabetic sk", true, "sk-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"],
+  ["alphabetic auth", true, "Authorization: Bearer AbCdEfGhIjKlMnOpQrStUvWxYz"],
+  ["stripe", true, "sk_" + "live_AbCdEfGhIjKlMnOpQrStUvWx"],
+  ["AWS", true, "AKIAIOSFODNN7EXAMPLE"],
+  ["GitLab", true, "glpat-qwertyuiopasdfghjklzxcvbn"],
+  ["Slack", true, "xox" + "b-1234567890-0987654321-AbCdEfGhIjKlMnOp"],
+  ["JWT", true, "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJxYXRlc3QifQ.SyntheticSignatureAbCdEfGh"],
+  ["PEM", true, "-----BEGIN PRIVATE KEY-----"],
+  ["hex password", true, "password: deadbeef1234567890abcdef12345678"],
+  ["lowercase random", true, "api key: qjzvbtmkcxwplrdnsfhy82964175"],
+  ["UUID token", true, "api_key=550e8400-e29b-41d4-a716-446655440000"],
+  ["generic mixed", true, "secret Q7xV2mN9pL4kR8tW3zY6bC1d"],
+  ["Chinese key", true, "我的密钥是 Q7xV2mN9pL4kR8tW3zY6bC1d"],
+  ["Arabic key", true, "مفتاحي Q7xV2mN9pL4kR8tW3zY6bC1d"],
+  ["French key", true, "mon mot de passe est Q7xV2mN9pL4kR8tW3zY6bC1d"],
+  ["AWS secret", true, "secret: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"],
+  ["URL key", true, "https://api.example.com/?api_key=sk-proj-Ab3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3z"],
+  ["userinfo", true, "https://user:syntheticpass@example.com"],
+  ["prose", false, "Please summarize the key points of our planning meeting."],
+  ["cache code", false, 'const cacheKey = "customerAccount2024BillingRegion2025";'],
+  ["auth documentation", false, "Authorization: Bearer token-based-authentication"],
+  ["bearer prose", false, "Bearer token-based-auth"],
+  ["sk learn", false, "sk-learn-for-beginners"],
+  ["Chinese prose", false, "请把今天的会议记录翻译成英文"],
+  ["Arabic prose", false, "هل يمكنك تلخيص الاجتماع؟"],
+  ["French prose", false, "Voici les points clés de notre réunion."],
+  ["ordinary URL", false, "https://example.com/docs/sk-proj-Ab3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3z"],
+  ["reset URL", true, "https://example.com/reset?token=Q7xV2mN9pL4kR8tW3zY6bC1d"],
+  ["reset hex URL", true, "https://example.com/reset?token=deadbeef1234567890abcdef12345678"],
+  ["tracking URL", false, "https://example.com/?utm_source=weekly&campaign=spring2026"],
+  ["agent id", false, "agent-sk-proj-Ab3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3z"],
+  ["session id", false, "sess-Q7xV2mN9pL4kR8tW3zY6bC1d"],
+  ["UUID id", false, "idempotency key 550e8400-e29b-41d4-a716-446655440000"],
+  ["phone", false, "+15551234567"],
+  ["code", false, "const retryCount = 3; return user.accountId;"],
+  ["snake", false, "session_token_2024_rotation_v2"],
+  ["numbers", false, "123456789012345678901234567890"],
+  ["link command", false, "ORRERY Ab3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY"],
+];
+// Decision A: explicitly introduced values, keyword compounds, other languages.
+const introduced: [string, boolean, string][] = [
+  ["my token is", true, "my token is qjzvbtmkcxwplrdnsfhy82964175"],
+  ["secret =", true, "secret = deadbeef1234567890abcdef"],
+  ["quoted password", true, 'password: "correcthorsebatterystaple"'],
+  ["client secret", true, "client_secret=abcdefghijklmnopqrstuvwx"],
+  ["Spanish", true, "mi contraseña es qjzvbtmkcxwplrdnsfhy82964175"],
+  ["Spanish API key", true, "la clave de API: qjzvbtmkcxwplrdnsfhy8296"],
+  ["German", true, "Mein Passwort ist qjzvbtmkcxwplrdnsfhy82964175"],
+  ["German key", true, "API-Schlüssel: qjzvbtmkcxwplrdnsfhy82964175"],
+  ["Portuguese", true, "minha senha é qjzvbtmkcxwplrdnsfhy82964175"],
+  ["French key", true, "ma clé API: qjzvbtmkcxwplrdnsfhy82964175"],
+  ["Chinese colon", true, "令牌：qjzvbtmkcxwplrdnsfhy82964175"],
+  ["key colon", true, "key: qjzvbtmkcxwplrdnsfhy82964175"],
+  ["cache key colon", false, "cache key: customer-account-2024-billing"],
+  ["primary key", false, "primary key = order_id_and_line_number_2024"],
+  ["sort key", false, "sort key: createdAt#customerId#2024"],
+  ["partition key", false, "partition key is tenant_id_shard_bucket"],
+  ["foreign key", false, "foreign key: orders.customer_id_reference"],
+  ["idempotency key colon", false, "idempotency key: 550e8400-e29b-41d4-a716-446655440000"],
+  ["past tense is not an introducer", false, "The key was customer-account-identifier"],
+  ["introduced platform id", false, "token: agent-k3j9x8w2m1n4b5v6abc"],
+  ["short value", false, "password: hunter2"],
+  ["camelCase keyword", false, "cacheKey = customerAccount2024BillingRegion2025"],
+  ["Authorization prose", false, "Authorization: required for admins"],
+  ["Basic header", true, "Authorization: Basic dXNlcjpwYXNzd29yZA=="],
+  ["short query value", false, "https://example.com/reset?token=abc123"],
+  ["non-secret query names", false, "https://example.com/search?q=deadbeef1234567890abcdef&page=2&id=550e8400e29b41d4a716&ref=newsletter_spring_2026"],
+];
+
+describe("looksLikeCredential", () => {
+  it.each(qaRound2)("QA round 2 table: %s → %s", (_name, expected, text) => expect(looksLikeCredential(text)).toBe(expected));
+  it.each(introduced)("introduced values: %s → %s", (_name, expected, text) => expect(looksLikeCredential(text)).toBe(expected));
+  it.each(positives)("flags %s", (_name, text) => expect(looksLikeCredential(text)).toBe(true));
+  it.each(negatives)("allows %s", (_name, text) => expect(looksLikeCredential(text)).toBe(false));
+  it("reply never echoes input and points to the secure link only when one exists", () => {
+    expect(credentialRejectedText(null)).toMatch(/rotate/i);
+    expect(credentialRejectedText(null)).toMatch(/secure one-time link/);
+    expect(credentialRejectedText("https://x.test/integrations/channel-key?t=abc")).toContain("https://x.test/integrations/channel-key?t=abc");
+    expect(credentialRejectedText("https://x.test/k", false)).not.toContain("https://x.test/k");
+  });
+});

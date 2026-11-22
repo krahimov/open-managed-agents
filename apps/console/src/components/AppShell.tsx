@@ -21,6 +21,7 @@ import { NavigationProgress } from "./NavigationProgress";
 import { pageColumn, type PageWidth } from "./Page";
 import { useNavigation } from "./navigation";
 import { NewSessionHost } from "./sessions/NewSessionDialog";
+import { IMessageOnboarding } from "./IMessageOnboarding";
 import { TelegramOnboarding } from "./TelegramOnboarding";
 import { Tip } from "./Tip";
 
@@ -227,6 +228,7 @@ function ShellPanel() {
         />
 
         <TelegramOnboarding />
+        <IMessageOnboarding />
 
         <div
           className={cn(
