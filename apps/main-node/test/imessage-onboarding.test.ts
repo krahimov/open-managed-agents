@@ -189,6 +189,13 @@ describe("iMessage channel", () => {
     expect(sent.map(m => m.content).join("")).toContain("Done\nGreat link (https://example.com)");
     expect(plainText("```js\nconst n = 1;\n```\n`code` ~~old~~")).toBe("const n = 1;\n\ncode old");
   });
+  it("answers /connect for a service with no one-click app instead of going silent", async () => {
+    const f = await fixture(); await f.link();
+    f.deps.requestAccess.mockImplementationOnce(async () => ({ request_id: "r", status: "unavailable", note: "No connect card was posted" }));
+    await f.post("connect-origami", "/connect origami"); await f.service.tick();
+    expect(f.messages.at(-1).content).toContain("origami isn't available as a one-click connection");
+    expect(f.messages.at(-1).content).toContain("/connect origami");
+  });
   it("retries temporary errors with backoff, honors Retry-After and unlinks only contact failures", async () => {
     const f = await fixture(); await f.link();
     f.deps.fetch.mockResolvedValueOnce(Response.json({ status: "ERROR" }, { status: 500 }));

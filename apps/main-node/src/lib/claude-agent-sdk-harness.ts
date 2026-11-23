@@ -24,6 +24,7 @@
  * login) is the only path left.
  */
 
+import { matchMcpServerUrl } from "./access-request-route.js";
 import { mkdir, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { createSdkMcpServer, query, tool } from "@anthropic-ai/claude-agent-sdk";
@@ -654,14 +655,11 @@ export class ClaudeAgentSdkHarness {
         // servers (e.g. the github/notion/linear servers it added during
         // setup) → the card runs vault MCP OAuth against that URL rather
         // than the Composio connected-account flow.
-        const slug = a.service.trim().toLowerCase();
-        const matched = (ctx.agent.mcp_servers ?? []).find(
-          (s) => s?.name?.trim().toLowerCase() === slug && s.type !== "stdio" && !!s.url,
-        );
+        const matchedUrl = matchMcpServerUrl(ctx.agent.mcp_servers, a.service);
         const result = await this.#deps.requestServiceAccess!(tenantId, sessionId, {
           service: a.service,
           reason: a.reason?.trim() || "The agent needs this service for the current task.",
-          ...(matched?.url ? { mcp_server_url: matched.url } : {}),
+          ...(matchedUrl ? { mcp_server_url: matchedUrl } : {}),
         });
         return { content: [{ type: "text" as const, text: JSON.stringify(result) }] };
       },

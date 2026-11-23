@@ -9,6 +9,7 @@ import {
   buildVaultRoutes,
   createComposioConnectedAccountLink,
   createComposioToolRouterSession,
+  getComposioToolkit,
   getOrCreateComposioManagedAuthConfig,
 } from "../../packages/http-routes/src/vaults";
 import { createInMemoryCredentialService } from "../../packages/credentials-store/src/test-fakes";
@@ -534,5 +535,87 @@ describe("resolveProxyTargetByTenant — Composio MCP", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].method).toBe("GET");
     expect(new URL(calls[0].url).searchParams.get("toolkit_slug")).toBe("slack");
+  });
+});
+
+describe("unknown Composio toolkits", () => {
+  // Composio answers an app it doesn't carry with 404 on both the toolkit
+  // lookup and the auth-config create ("Could not find toolkit …").
+  const unknownToolkitFetcher = (calls: string[]): typeof fetch => async (input, init) => {
+    const req = input instanceof Request ? input : new Request(input as never, init);
+    calls.push(`${req.method} ${new URL(req.url).pathname}`);
+    if (req.url.includes("/api/v3.1/auth_configs?")) {
+      return Response.json({ items: [] });
+    }
+    if (req.url.endsWith("/api/v3.1/auth_configs")) {
+      return Response.json(
+        { error: { message: 'Could not find toolkit "origami".', slug: "Auth_Config_NotFound", status: 404 } },
+        { status: 404 },
+      );
+    }
+    if (req.url.includes("/api/v3.1/toolkits/")) {
+      const slug = decodeURIComponent(req.url.split("/api/v3.1/toolkits/")[1]);
+      if (["gmail", "googledrive", "microsoft_teams"].includes(slug)) return Response.json({ slug, name: slug });
+      return Response.json({ error: { message: `Toolkit ${slug} not found`, slug: "Toolkit_ToolkitNotFound" } }, { status: 404 });
+    }
+    return new Response("unexpected", { status: 500 });
+  };
+
+  it("getComposioToolkit resolves null for an unknown slug and finds the canonical form of human variants", async () => {
+    const calls: string[] = [];
+    const fetcher = unknownToolkitFetcher(calls);
+    expect(await getComposioToolkit({ apiKey: "k", fetcher }, "origami")).toBeNull();
+    expect(calls).toEqual(["GET /api/v3.1/toolkits/origami"]);
+    calls.length = 0;
+    expect(await getComposioToolkit({ apiKey: "k", fetcher }, "Google-Drive")).toMatchObject({ slug: "googledrive" });
+    expect(calls).toEqual(["GET /api/v3.1/toolkits/google_drive", "GET /api/v3.1/toolkits/googledrive"]);
+  });
+
+  it("getComposioToolkit keeps underscores that are part of the canonical slug", async () => {
+    // Live Composio: microsoft_teams → 200, microsoftteams → 404.
+    const calls: string[] = [];
+    const fetcher = unknownToolkitFetcher(calls);
+    expect(await getComposioToolkit({ apiKey: "k", fetcher }, "microsoft_teams")).toMatchObject({ slug: "microsoft_teams" });
+    expect(await getComposioToolkit({ apiKey: "k", fetcher }, "Microsoft Teams")).toMatchObject({ slug: "microsoft_teams" });
+    expect(calls).toEqual(["GET /api/v3.1/toolkits/microsoft_teams", "GET /api/v3.1/toolkits/microsoft_teams"]);
+  });
+
+  it("getComposioToolkit still throws on non-404 failures", async () => {
+    const fetcher: typeof fetch = async () => new Response("down", { status: 503 });
+    await expect(getComposioToolkit({ apiKey: "k", fetcher }, "gmail")).rejects.toThrow(/Composio API 503/);
+  });
+
+  it("the link route answers a readable 404 instead of Composio's raw JSON", async () => {
+    const calls: string[] = [];
+    const { app, vaultService } = makeVaultRoutesHarness({ fetcher: unknownToolkitFetcher(calls), apiKey: "cmp_platform" });
+    const vault = await vaultService.create({ tenantId: TENANT, name: "Connected Apps" });
+    const res = await app.request(`/${vault.id}/credentials/composio_accounts/link`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ toolkit: "origami", callback_url: "http://localhost/cb" }),
+    });
+    expect(res.status).toBe(404);
+    const body = await res.json();
+    expect(body.code).toBe("COMPOSIO_TOOLKIT_NOT_FOUND");
+    expect(body.error).toContain('Composio has no "origami" integration');
+    expect(body.error).not.toContain("{");
+    expect(calls).toContain("GET /api/v3.1/toolkits/origami");
+  });
+
+  it("other link failures still surface as 502 with the upstream message", async () => {
+    const fetcher: typeof fetch = async (input, init) => {
+      const req = input instanceof Request ? input : new Request(input as never, init);
+      if (req.url.includes("/api/v3.1/auth_configs?")) return Response.json({ items: [] });
+      return new Response("upstream down", { status: 503 });
+    };
+    const { app, vaultService } = makeVaultRoutesHarness({ fetcher, apiKey: "cmp_platform" });
+    const vault = await vaultService.create({ tenantId: TENANT, name: "Connected Apps" });
+    const res = await app.request(`/${vault.id}/credentials/composio_accounts/link`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ toolkit: "gmail", callback_url: "http://localhost/cb" }),
+    });
+    expect(res.status).toBe(502);
+    expect((await res.json()).error).toMatch(/Composio API 503/);
   });
 });

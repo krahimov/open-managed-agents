@@ -146,6 +146,40 @@ export async function composioRequest<T>(
   return data as T;
 }
 
+/**
+ * Look up one Composio toolkit by slug. Resolves to null when Composio has
+ * no such toolkit (every candidate 404s with Toolkit_ToolkitNotFound), so
+ * callers can tell "this app can't be connected through Composio" apart
+ * from transient failures, which still throw. Canonical slugs are not
+ * uniform — "microsoft_teams" and "one_drive" keep their underscore while
+ * "googledrive" has none — so the slug is tried as written first, then
+ * with separators as underscores, then with separators stripped.
+ */
+export async function getComposioToolkit(
+  deps: ComposioClientDeps,
+  slug: string,
+): Promise<{ slug: string; name?: string } | null> {
+  const lowered = slug.trim().toLowerCase();
+  const candidates = [
+    ...new Set([
+      lowered,
+      lowered.replace(/[-.\s]+/g, "_"),
+      normalizeComposioToolkitSlug(lowered),
+    ]),
+  ].filter((c) => /^[a-z0-9_]+$/.test(c));
+  for (const candidate of candidates) {
+    try {
+      return await composioRequest<{ slug: string; name?: string }>(
+        deps,
+        `/api/v3.1/toolkits/${encodeURIComponent(candidate)}`,
+      );
+    } catch (err) {
+      if (!/^Composio API 404\b/.test((err as Error).message)) throw err;
+    }
+  }
+  return null;
+}
+
 export async function listComposioConnectedAccounts(
   deps: ComposioClientDeps,
   opts: { userId: string; toolkit?: string; limit?: number; cursor?: string },
