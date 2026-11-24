@@ -22,6 +22,24 @@
  * ANTHROPIC_AUTH_TOKEN / ANTHROPIC_BASE_URL so the child cannot silently
  * bill API credits — subscription auth (CLAUDE_CODE_OAUTH_TOKEN or keychain
  * login) is the only path left.
+ *
+ * Where the tools run (claudeSdkToolsOn):
+ *   - "host": Claude Code's own tools (Bash, Read, Edit…) on this machine,
+ *     with this process's environment. Single-operator self-hosting only.
+ *   - "sandbox": Claude Code is the model loop and nothing else. Its
+ *     built-in tools are off, it reads no settings, skills or MCP config
+ *     from disk, its environment is cut down to what it needs to start and
+ *     sign in, and its only tools are the session's prepared ones
+ *     (ctx.tools: shell, files, browser, MCP, platform), which execute on
+ *     the session's cloud sandbox and reach it over a loopback MCP bridge.
+ *     Used for agent computers, and for every session once the operator
+ *     restricts the engine with OMA_CLAUDE_ALLOWED_AGENTS (a hosted,
+ *     multi-tenant deployment), where host tools would hand any tenant's
+ *     agent this server's secrets.
+ *
+ * A setup session under either of those conditions is isolated the same
+ * way, except that its only tools are the in-process oma_setup and
+ * oma_platform ones (it needs no sandbox). "Isolated" below means both.
  */
 
 import { matchMcpServerUrl } from "./access-request-route.js";
@@ -64,6 +82,11 @@ import {
   type MaterializedMemory,
   type SdkMemoryPort,
 } from "./sdk-harness-memory.js";
+import { startMcpHttpBridge, type McpHttpBridge } from "./mcp-http-bridge.js";
+import { codexComputerTools } from "./codex-computer-tools.js";
+import { claudeSdkAllowed } from "./engine-allowlist.js";
+
+export { claudeSdkAllowed };
 
 /** Fields a setup session may change on its own harness. */
 export interface HarnessPatch {
@@ -106,6 +129,8 @@ export interface McpTarget {
 }
 
 export interface ClaudeAgentSdkHarnessDeps {
+  /** Test seam: stands in for the SDK's `query` (no Claude Code spawned). */
+  query?: typeof query;
   /**
    * Resolve an agent MCP server (by session + name) to its upstream URL and
    * auth — same resolution the OMA MCP proxy uses (vault credentials,
@@ -394,6 +419,111 @@ function workdirFor(sessionId: string): string {
   return path.resolve(root, "agent-sdk", sessionId);
 }
 
+/** The MCP server the session's sandbox tools ride under in sandbox mode. */
+export const SANDBOX_TOOLS_SERVER = "oma";
+const SANDBOX_TOOL_PREFIX = `mcp__${SANDBOX_TOOLS_SERVER}__`;
+/**
+ * What an isolated turn allows of the in-process (oma_setup / oma_platform)
+ * tools. Their handlers run in THIS process and change real things (the
+ * agent's config, access requests), so the handlers themselves check the
+ * turn, not only Claude Code's permission callback: `open` is false before
+ * the turn's init is validated, after it ends, and for a tool the pinned
+ * policy does not allow. `names` collects the exact tool names served.
+ */
+interface InProcessGate {
+  /** `omaToolName`: the tool's own name ("create_ambient_rule"), which is
+   *  what a policy written for any other harness calls it. */
+  open: (ccToolName: string, omaToolName: string) => boolean;
+  /** Claude Code's name for each tool served → the tool's own name. */
+  names: Map<string, string>;
+}
+
+type SdkTool = ReturnType<typeof tool>;
+
+/** createSdkMcpServer, with every handler behind `gate` when there is one. */
+function inProcessServer(name: string, tools: SdkTool[], gate?: InProcessGate) {
+  const served = !gate
+    ? tools
+    : tools.map((t) => {
+        const ccName = `mcp__${name}__${t.name}`;
+        gate.names.set(ccName, t.name);
+        return {
+          ...t,
+          handler: (async (args: unknown, extra: unknown) =>
+            gate.open(ccName, t.name)
+              ? (t.handler as (a: unknown, e: unknown) => Promise<unknown>)(args, extra)
+              : {
+                  content: [{ type: "text" as const, text: "This tool is not available in this session right now." }],
+                  isError: true,
+                }) as SdkTool["handler"],
+        };
+      });
+  return createSdkMcpServer({ name, version: "1", tools: served });
+}
+/** Claude Code replaces characters outside this set in MCP tool names. */
+const ccMcpName = (name: string) => name.replace(/[^A-Za-z0-9_-]/g, "_");
+/** How long a failed turn waits for tool calls it already accepted to stop. */
+const TOOL_DRAIN_MS = 10_000;
+
+type SandboxLike = { sandboxCapabilities?: () => { scope?: string } | undefined } | null | undefined;
+type EnvLike = Record<string, string | undefined>;
+
+/**
+ * Where a claude-agent-sdk session's tools run (see the file header).
+ * "sandbox" for an agent computer, and for any remote sandbox once the
+ * operator has restricted the engine (OMA_CLAUDE_ALLOWED_AGENTS is set).
+ * Otherwise "host", as before.
+ */
+export function claudeSdkToolsOn(sandbox: SandboxLike, env: EnvLike = process.env): "host" | "sandbox" {
+  if (typeof sandbox?.sandboxCapabilities !== "function") return "host";
+  if (sandbox.sandboxCapabilities()?.scope === "agent") return "sandbox";
+  return env.OMA_CLAUDE_ALLOWED_AGENTS !== undefined ? "sandbox" : "host";
+}
+
+/**
+ * The whole environment of a Claude Code process that must not see this
+ * server's secrets: enough to start, verify TLS and sign in to the
+ * subscription. No database URL, platform secret, provider key or
+ * API-credit variable is inherited.
+ */
+export function isolatedClaudeEnv(base: EnvLike): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of [
+    "PATH", "HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL",
+    "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+    "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR",
+  ]) {
+    if (base[key]) out[key] = base[key]!;
+  }
+  return out;
+}
+
+/**
+ * Claude Code's built-in tools, removed by name in sandbox mode on top of
+ * `tools: []`. That option alone is not enough: signed in with a
+ * subscription token, Claude Code 0.3.170 still offered RemoteTrigger (which
+ * drives scheduled cloud agents on the signed-in account). The init check
+ * in run() stops the turn if any tool outside the bridge is still offered,
+ * so a built-in this list does not know fails the session instead of
+ * reaching the model.
+ */
+export const CLAUDE_CODE_BUILTIN_TOOLS = [
+  "Agent", "Task", "TaskOutput", "TaskStop", "TaskCreate", "TaskGet", "TaskUpdate", "TaskList",
+  "Bash", "BashOutput", "KillShell", "KillBash", "REPL", "Monitor",
+  "Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "Glob", "Grep", "LS", "LSP",
+  "WebFetch", "WebSearch", "ToolSearch", "Skill", "SlashCommand", "Workflow",
+  "TodoWrite", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
+  "CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger", "PushNotification",
+  "ListMcpResourcesTool", "ReadMcpResourceTool", "ListMcpResources", "ReadMcpResource", "Mcp",
+] as const;
+
+/** Appended to the agent's prompt in sandbox mode: this model was trained on
+ *  Claude Code's own tool names, which are not here. */
+const SANDBOX_TOOLS_NOTE =
+  `All of your tools are the ${SANDBOX_TOOL_PREFIX}* tools. Shell commands, files, the browser and the desktop ` +
+  "run on your cloud sandbox, not on the machine running this conversation; paths are the sandbox's. " +
+  "You have no other tools.";
+
 /** process.env minus every var that could route billing to API credits. */
 function curatedEnv(): Record<string, string> {
   const env: Record<string, string> = {};
@@ -507,7 +637,7 @@ export class ClaudeAgentSdkHarness {
    *  handler runs in THIS process (the SDK child calls back over the in-process
    *  MCP transport), so it can apply the change to the real agent and broadcast
    *  the new harness to the session's SSE stream. */
-  #setupServer(ctx: HarnessContext, runtime: HarnessContext["runtime"]) {
+  #setupServer(ctx: HarnessContext, runtime: HarnessContext["runtime"], gate?: InProcessGate) {
     const tenantId = ctx.tenant_id ?? "default";
     const agentId = ctx.agent.id;
 
@@ -616,18 +746,14 @@ export class ClaudeAgentSdkHarness {
       );
     }
 
-    return createSdkMcpServer({
-      name: "oma_setup",
-      version: "1",
-      tools,
-    });
+    return inProcessServer("oma_setup", tools, gate);
   }
 
   /** In-process MCP server exposing platform tools (request_access,
    *  create_ambient_rule) to the SDK child in both setup and working
    *  sessions. The child calls back over the in-process transport, so the
    *  handlers run HERE and can append session events directly. */
-  #platformServer(ctx: HarnessContext, sessionId: string) {
+  #platformServer(ctx: HarnessContext, sessionId: string, gate?: InProcessGate) {
     const tenantId = ctx.tenant_id ?? "default";
     const requestAccess = tool(
       "request_access",
@@ -768,11 +894,7 @@ export class ClaudeAgentSdkHarness {
       );
     }
 
-    return createSdkMcpServer({
-      name: "oma_platform",
-      version: "1",
-      tools,
-    });
+    return inProcessServer("oma_platform", tools, gate);
   }
 
   async run(ctx: HarnessContext): Promise<void> {
@@ -795,12 +917,55 @@ export class ClaudeAgentSdkHarness {
         ? ctx.agent.model
         : undefined;
 
-    const mcpServers = await this.#mcpServersFor(ctx, sessionId);
+    // Setup sessions (the agent's first session, refining its own harness) run
+    // a focused planning conversation with an in-process toolset and NO
+    // built-in/coding tools. Flagged via session metadata at creation.
+    const sessionMeta = await this.#deps.readSessionMetadata?.(
+      ctx.tenant_id ?? "default",
+      sessionId,
+    );
+    const isSetup = sessionMeta?.["oma_setup"] === true && !!this.#deps.updateAgent;
+
+    const fail = (message: string): never => {
+      runtime.broadcast({ type: "session.error", error: message } as SessionEvent);
+      throw new Error(message);
+    };
+
+    // Operator restriction (a hosted deployment): only approved agents bill
+    // the server's subscription, and none of them gets tools on this host.
+    // A setup session has no tools but the in-process oma_setup ones, so it
+    // needs no sandbox.
+    const toolsOn = claudeSdkToolsOn(runtime.sandbox);
+    const restricted = process.env.OMA_CLAUDE_ALLOWED_AGENTS !== undefined;
+    if (restricted) {
+      if (!claudeSdkAllowed(process.env, ctx.tenant_id, ctx.agent.id ?? "")) {
+        fail("Claude subscription access on this server is restricted to operator-approved agents.");
+      }
+      if (!isSetup && toolsOn !== "sandbox") {
+        fail(
+          "Claude subscription access on this server needs a cloud sandbox for the agent's tools. " +
+            "Give the agent a cloud environment.",
+        );
+      }
+    }
+    /** Nothing of this host for Claude Code: setup and working sessions alike. */
+    const isolated = restricted || toolsOn === "sandbox";
+    /** Isolated working session: its only tools are the sandbox's. */
+    const sandboxed = isolated && !isSetup;
+    const childEnv = isolated ? isolatedClaudeEnv(process.env) : curatedEnv();
+
+    // Isolated: Claude Code is given no upstream MCP server (and so none of
+    // the agent's credentials). A working session reaches them through
+    // ctx.tools; a setup session designs the config and does not call them.
+    const mcpServers = isolated ? undefined : await this.#mcpServersFor(ctx, sessionId);
 
     // Materialize attached skills into <cwd>/.claude/skills/<name>/SKILL.md.
     // Idempotent per turn (overwrite) so skill edits apply on the next turn.
+    // Never when isolated: a skill is the tenant's own text, Claude Code can
+    // run shell lines embedded in one, and loading them needs project
+    // settings read from disk.
     const skillNames: string[] = [];
-    if (this.#deps.resolveSkills && ctx.tenant_id) {
+    if (!isolated && this.#deps.resolveSkills && ctx.tenant_id) {
       try {
         const skills = await this.#deps.resolveSkills(ctx.tenant_id, ctx.agent.skills);
         for (const s of skills) {
@@ -814,26 +979,92 @@ export class ClaudeAgentSdkHarness {
       }
     }
 
-    // Setup sessions (the agent's first session, refining its own harness) run
-    // a focused planning conversation with an in-process toolset and NO
-    // built-in/coding tools. Flagged via session metadata at creation.
-    const sessionMeta = await this.#deps.readSessionMetadata?.(
-      ctx.tenant_id ?? "default",
-      sessionId,
-    );
-    const isSetup = sessionMeta?.["oma_setup"] === true && !!this.#deps.updateAgent;
     // request_access rides along in BOTH modes: in setup it's how the agent
     // hands the user the OAuth popups for the servers it just added to its
     // own harness; in working sessions it covers services hit mid-task.
     type SdkMcpEntry =
       | ReturnType<typeof createSdkMcpServer>
-      | { type: "http"; url: string; headers: Record<string, string> };
+      | { type: "http"; url: string; headers: Record<string, string>; alwaysLoad?: boolean };
     let mcpServersForTurn: Record<string, SdkMcpEntry> | undefined = mcpServers;
-    if (isSetup || this.#deps.requestServiceAccess) {
+    // Sandbox mode: one MCP server, the loopback bridge to ctx.tools (which
+    // already carries request_access, scheduling and the agent's MCP tools).
+    // alwaysLoad: with the built-ins off there is no ToolSearch to load a
+    // deferred tool, so every tool must be in the prompt from the first turn.
+    // The pinned access policy (snapshot enrichment set at session create).
+    const policy = ctx.agent.effective_policy;
+    const hasPolicy = !!policy?.rules?.length;
+    /** Isolated: anything the policy does not plainly allow is refused, since
+     *  this path cannot ask. A tool is refused under ANY of the names given:
+     *  an in-process tool is `create_ambient_rule` to a policy written for
+     *  the other harnesses and `mcp__oma_platform__create_ambient_rule` to
+     *  one written for this one, and a deny under either must hold. */
+    const policyRefuses = (...toolNames: string[]): string | null => {
+      if (!hasPolicy) return null;
+      for (const name of toolNames) {
+        const decision = evaluatePolicy(policy, name);
+        if (decision.effect !== "allow") return decision.selector ?? "default";
+      }
+      return null;
+    };
+
+    let bridge: McpHttpBridge | null = null;
+    // A tool call (bridged or in-process) runs only between a validated init
+    // (see the stream loop) and the end of the turn, and is cancelled with
+    // the turn.
+    let acceptingCalls = false;
+    const outstandingCalls = new Set<Promise<unknown>>();
+    /** Exactly the tool names Claude Code may report in sandbox mode, each
+     *  with the platform's own name for it ("mcp__oma__bash" → "bash"). */
+    const bridgedNames = new Map<string, string>();
+    /** Exactly the in-process tool names an isolated setup session serves. */
+    const setupGate: InProcessGate | undefined = isolated
+      ? {
+          names: new Map(),
+          open: (ccName, omaName) => acceptingCalls && policyRefuses(omaName, ccToolNameToOma(ccName)) === null,
+        }
+      : undefined;
+    if (sandboxed) {
+      const tools = await codexComputerTools(ctx, {
+        label: "The claude-agent-sdk harness",
+        signal: abort.signal,
+      }).catch((err) => fail(err instanceof Error ? err.message : String(err)));
+      for (const t of tools) {
+        // Claude Code would fold two such names into one, and a call could
+        // then be recorded (and judged) as the other tool.
+        const ccName = ccMcpName(`${SANDBOX_TOOL_PREFIX}${t.name}`);
+        const twin = bridgedNames.get(ccName);
+        if (twin !== undefined) {
+          fail(`Two of this agent's tools, "${twin}" and "${t.name}", have the same name in Claude Code. Rename or remove one.`);
+        }
+        bridgedNames.set(ccName, t.name);
+      }
+      const gated = tools.map((t) => ({
+        ...t,
+        handler: async (args: Record<string, unknown>) => {
+          if (!acceptingCalls) {
+            return { text: "This tool is not available: the turn has not started or has ended.", isError: true };
+          }
+          if (policyRefuses(t.name) !== null) {
+            return { text: "Denied by access policy. This tool is not available in this session.", isError: true };
+          }
+          const call = t.handler(args);
+          outstandingCalls.add(call);
+          try {
+            return await call;
+          } finally {
+            outstandingCalls.delete(call);
+          }
+        },
+      }));
+      bridge = gated.length > 0 ? await startMcpHttpBridge(SANDBOX_TOOLS_SERVER, gated) : null;
+      mcpServersForTurn = bridge
+        ? { [SANDBOX_TOOLS_SERVER]: { type: "http", url: bridge.url, headers: bridge.headers, alwaysLoad: true } }
+        : {};
+    } else if (isSetup || this.#deps.requestServiceAccess) {
       const withInProcess: Record<string, SdkMcpEntry> = { ...(mcpServers ?? {}) };
-      if (isSetup) withInProcess.oma_setup = this.#setupServer(ctx, runtime);
+      if (isSetup) withInProcess.oma_setup = this.#setupServer(ctx, runtime, setupGate);
       if (this.#deps.requestServiceAccess) {
-        withInProcess.oma_platform = this.#platformServer(ctx, sessionId);
+        withInProcess.oma_platform = this.#platformServer(ctx, sessionId, setupGate);
       }
       mcpServersForTurn = withInProcess;
     }
@@ -846,7 +1077,8 @@ export class ClaudeAgentSdkHarness {
       storeByName: new Map(),
       guidance: "",
     };
-    if (!isSetup && this.#deps.memory && ctx.tenant_id) {
+    // (Sandbox mode mounts the stores in the sandbox at /mnt/memory instead.)
+    if (!isSetup && !sandboxed && this.#deps.memory && ctx.tenant_id) {
       try {
         materializedMemory = await materializeMemory(this.#deps.memory, ctx.tenant_id, sessionId, cwd);
       } catch (err) {
@@ -865,16 +1097,18 @@ export class ClaudeAgentSdkHarness {
     // the OMA namespace (covers glob selectors and dynamically-discovered
     // MCP tools). Phase 1 enforces deny only on this path — "ask" passes
     // through until the SDK confirmation round-trip lands (plan Phase 4).
-    const policy = ctx.agent.effective_policy;
-    const hasPolicy = !!policy?.rules?.length;
-
     // Toolset always_ask (see sdkToolsetGate): refused per call, since this
     // path has no confirmation round-trip.
-    const toolsetGate = sdkToolsetGate(ctx.agent);
+    // Sandbox mode has none of the tools this gate names: ctx.tools arrives
+    // with ask-gated tools already stripped (see codexComputerTools), and the
+    // policy is re-checked per call below.
+    const toolsetGate = isolated
+      ? { active: false, disallowedTools: [] as string[], asks: () => false }
+      : sdkToolsetGate(ctx.agent);
     const gated = hasPolicy || toolsetGate.active;
-    const disallowedTools = [
-      ...new Set([...compileSdkDisallowedTools(policy), ...toolsetGate.disallowedTools]),
-    ];
+    const disallowedTools = isolated
+      ? [...new Set([...CLAUDE_CODE_BUILTIN_TOOLS, ...compileSdkDisallowedTools(policy)])]
+      : [...new Set([...compileSdkDisallowedTools(policy), ...toolsetGate.disallowedTools])];
     if (toolsetGate.disallowedTools.length > 0) {
       // canUseTool never runs for removed tools, so say it once per turn.
       runtime.broadcast({
@@ -886,12 +1120,44 @@ export class ClaudeAgentSdkHarness {
       } as SessionEvent);
     }
 
+    /** The tools an isolated session may be offered and may call: the bridged
+     *  ones by exact name (sandbox), the in-process setup ones (setup). */
+    const isolatedToolAllowed = (toolName: unknown): toolName is string =>
+      typeof toolName === "string" && (isSetup ? !!setupGate?.names.has(toolName) : bridgedNames.has(toolName));
+
+    // Isolated: every call is checked. Only a tool this session serves may
+    // run, and the pinned policy is evaluated on its OMA name (the handlers
+    // check it again: see setupGate and the bridge).
+    const isolatedCanUseTool = async (toolName: string, input: Record<string, unknown>) => {
+      if (!isolatedToolAllowed(toolName)) {
+        return { behavior: "deny" as const, message: "This tool is not available in this session." };
+      }
+      // A bridged tool has one name; an in-process one has two (see policyRefuses).
+      const bridged = bridgedNames.get(toolName);
+      const omaName = bridged ?? setupGate?.names.get(toolName) ?? ccToolNameToOma(toolName);
+      const refusedBy = bridged !== undefined ? policyRefuses(bridged) : policyRefuses(omaName, ccToolNameToOma(toolName));
+      if (refusedBy !== null) {
+        runtime.broadcast({
+          type: "system.policy_decision",
+          tool_name: omaName,
+          effect: "deny",
+          selector: refusedBy,
+          reason: "tool call denied by pinned access policy",
+        } as SessionEvent);
+        return {
+          behavior: "deny" as const,
+          message: `Denied by access policy (rule: ${refusedBy}). This tool is not available in this session.`,
+        };
+      }
+      return { behavior: "allow" as const, updatedInput: input };
+    };
+
     try {
-      const stream = query({
+      const stream = (this.#deps.query ?? query)({
         prompt: textOfUserMessage(ctx),
         options: {
           cwd,
-          env: curatedEnv(),
+          env: childEnv,
           abortController: abort,
           resume: sdkSessions.get(sessionId),
           model,
@@ -907,7 +1173,11 @@ export class ClaudeAgentSdkHarness {
                     )
                   : undefined,
               })
-            : {
+            : sandboxed
+              ? // Not the claude_code preset: it describes tools and a working
+                // directory this session does not have.
+                [ctx.systemPrompt, SANDBOX_TOOLS_NOTE].filter(Boolean).join("\n\n")
+              : {
                 type: "preset",
                 preset: "claude_code",
                 // CLI_NOTES: observed footguns in headless sessions (e.g. `gh
@@ -923,9 +1193,11 @@ export class ClaudeAgentSdkHarness {
           // permissionMode "default" and the callback below answers every
           // check (deny per policy / always_ask, allow otherwise), keeping
           // the turn headless while enforcing the gate.
-          permissionMode: gated ? "default" : "bypassPermissions",
+          permissionMode: gated || isolated ? "default" : "bypassPermissions",
           ...(disallowedTools.length > 0 ? { disallowedTools } : {}),
-          ...(gated
+          ...(isolated
+            ? { canUseTool: isolatedCanUseTool }
+            : gated
             ? {
                 canUseTool: async (
                   toolName: string,
@@ -977,7 +1249,8 @@ export class ClaudeAgentSdkHarness {
           skills: skillNames.length > 0 ? skillNames : undefined,
           // Setup: disable every built-in tool so the only callable tool is the
           // oma_setup MCP closure, and lock out any on-disk MCP config.
-          ...(isSetup ? { tools: [], strictMcpConfig: true } : {}),
+          // Isolated: the same, so the only tools are the ones we serve.
+          ...(isSetup || isolated ? { tools: [], strictMcpConfig: true } : {}),
           maxTurns: isSetup ? 30 : 50,
           // Token-level partial events so text streams into the console
           // instead of landing as one block per assistant message.
@@ -1001,7 +1274,20 @@ export class ClaudeAgentSdkHarness {
         await runtime.broadcastStreamEnd(id, status).catch(() => {});
       };
 
+      // Isolated: nothing Claude Code sends is acted on, and no bridged tool
+      // runs, until its init message has shown that it offers only the
+      // tools we serve.
+      let initValidated = !isolated;
       for await (const msg of stream) {
+        const isInit = msg.type === "system" && "subtype" in msg && msg.subtype === "init";
+        if (!initValidated && !isInit) {
+          // Other system notices may come first; anything else may not.
+          if (msg.type === "system") continue;
+          abort.abort();
+          throw new Error(
+            "claude-agent-sdk isolation: Claude Code produced output before reporting its tools. The turn was stopped.",
+          );
+        }
         if (msg.type === "stream_event") {
           const ev = (msg as { event?: { type?: string; content_block?: { type?: string }; delta?: { type?: string; text?: string } } }).event;
           if (!ev) continue;
@@ -1027,7 +1313,27 @@ export class ClaudeAgentSdkHarness {
           }
           continue;
         }
-        if (msg.type === "system" && "subtype" in msg && msg.subtype === "init") {
+        if (isInit) {
+          if (isolated) {
+            // Fail closed. The list must be there, and every tool on it must
+            // be one we serve: anything else means the built-ins did not
+            // switch off (an SDK change, a setting we do not know), and this
+            // turn must not go on. The session id is kept only after this,
+            // so a rejected session is never resumed.
+            const offered = (msg as { tools?: unknown }).tools;
+            const outside = Array.isArray(offered) ? offered.filter((name) => !isolatedToolAllowed(name)) : null;
+            if (outside === null || outside.length > 0) {
+              abort.abort();
+              throw new Error(
+                outside === null
+                  ? "claude-agent-sdk isolation: Claude Code did not report its tools. The turn was stopped."
+                  : `claude-agent-sdk isolation: Claude Code offered tools outside this session's own ` +
+                    `(${outside.slice(0, 5).map(String).join(", ")}). The turn was stopped before any ran.`,
+              );
+            }
+            initValidated = true;
+            acceptingCalls = true;
+          }
           sdkSessions.set(sessionId, (msg as { session_id: string }).session_id);
           continue;
         }
@@ -1046,7 +1352,9 @@ export class ClaudeAgentSdkHarness {
               runtime.broadcast({
                 type: "agent.tool_use",
                 id: block.id,
-                name: block.name,
+                // Sandbox mode: the platform's own tool name ("bash"), as
+                // the DefaultHarness records it.
+                name: bridgedNames.get(block.name) ?? block.name,
                 input: (block.input ?? {}) as Record<string, unknown>,
               } as SessionEvent);
             } else if (block.type === "thinking" && block.thinking) {
@@ -1090,10 +1398,26 @@ export class ClaudeAgentSdkHarness {
           }
         }
       }
+      if (!initValidated) {
+        throw new Error("claude-agent-sdk isolation: Claude Code ended without reporting its tools.");
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       runtime.broadcast({ type: "session.error", error: message } as SessionEvent);
       throw err;
+    } finally {
+      // No new bridged call from here on. One still running (the turn failed
+      // or was stopped under it) is cancelled and given a moment to stop
+      // before the bridge goes, so it cannot outlive the turn into a retry.
+      acceptingCalls = false;
+      if (outstandingCalls.size > 0) {
+        abort.abort();
+        await Promise.race([
+          Promise.allSettled([...outstandingCalls]),
+          new Promise((resolve) => setTimeout(resolve, TOOL_DRAIN_MS)),
+        ]);
+      }
+      if (bridge) await bridge.close().catch(() => {});
     }
 
     // The endLiveText closure lives inside the try; any stream that died
@@ -1103,7 +1427,7 @@ export class ClaudeAgentSdkHarness {
     // Turn finished cleanly (the catch above re-throws) — sync memory edits
     // back to their stores. Best-effort: a write-back failure must not fail
     // the turn the agent already completed.
-    if (!isSetup && this.#deps.memory && ctx.tenant_id) {
+    if (!isSetup && !sandboxed && this.#deps.memory && ctx.tenant_id) {
       await writeBackMemory(this.#deps.memory, ctx.tenant_id, sessionId, cwd, materializedMemory)
         .then(({ saved, conflicts }) => {
           if (saved > 0 || conflicts.length > 0) {

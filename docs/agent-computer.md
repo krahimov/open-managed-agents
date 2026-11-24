@@ -32,7 +32,8 @@ OMA_DEFAULT_HARNESS=default
 Keep authentication enabled for a public deployment. Set an API model credential
 or create a model card through the console. Use the default OMA harness for API
 billing, or the opt-in Codex subscription path below for single-operator testing.
-The Claude Code SDK harness runs tools on the API host and is rejected for agent computers.
+The Claude Agent SDK harness can use an agent computer too: its own tools are switched
+off there and it works through the computer's tools (see "Claude subscription engine" below).
 
 An environment can opt in instead of setting `SANDBOX_SCOPE` globally:
 
@@ -297,3 +298,61 @@ Screenshots are returned as MCP image blocks. Native `apply_patch` cannot write
 in the read-only local sandbox; use OMA `write` / `edit` / `bash` on the computer.
 Tools awaiting approval are omitted, and pinned access policies are rejected.
 The Codex thread ID and auth cache persist across API-server restarts.
+
+### Claude subscription engine
+
+`harness: "claude-agent-sdk"` runs headless Claude Code on the API host and bills the
+host's Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`, from `claude setup-token`). It
+needs `OMA_ENABLE_CLAUDE_AGENT_SDK=1` and has two modes:
+
+- **Host tools** (the default, single operator): Claude Code's own Bash, Read, Edit and
+  the rest run on the API host with the server's environment. Never expose this to
+  tenants you do not trust with the host.
+- **Sandbox tools**: Claude Code is the model loop and nothing else. Its built-in tools
+  are off (`tools: []`, plus every built-in removed by name), it reads no settings,
+  skills or MCP config from disk, and its environment is cut down to `PATH`, `HOME`,
+  locale, TLS and the subscription token. Its only tools are the session's prepared OMA
+  tools (`bash`, file tools, browser, the agent's MCP servers, scheduling), served over
+  a loopback MCP bridge and executed on the session's Daytona sandbox. If Claude Code
+  still reports a tool outside the bridge, the turn stops before any tool runs.
+
+Sandbox tools are used for an agent computer, and for every session once
+`OMA_CLAUDE_ALLOWED_AGENTS` is set. That variable is the switch for a hosted deployment:
+a comma-separated list of `tenant_id/agent_id` pairs, or `tenant_id/*` for every agent
+of a workspace. Only those agents can use the engine, a session of theirs without a
+cloud sandbox is refused, and the console offers the engine only to workspaces that
+have an entry. An empty value denies every agent.
+
+Limits of sandbox mode: tools awaiting approval are omitted (a tool that needs
+approval at call time fails the session, as with Codex), a pinned access policy is
+enforced per call (anything but allow is refused), and attached skills are not loaded.
+Memory stores are mounted in the sandbox at `/mnt/memory`.
+
+Setup sessions need no sandbox, and under the same conditions are isolated the same
+way: no built-in tools, no skills, no upstream MCP servers, the cut-down environment,
+and only the in-process setup tools (`update_harness`, `request_access` and the like).
+Those tools check the turn and the pinned access policy themselves, so one called
+before Claude Code's tools are validated, after the turn, or against the policy does
+nothing.
+
+Claude Code must report its tools before anything it sends is acted on. If the report
+is missing, or lists a tool the session does not serve, the turn stops, no bridged tool
+runs, and that Claude Code session is not resumed. A tool call still running when a
+turn ends is cancelled before the bridge closes.
+
+One session tool does not run on the sandbox: `web_fetch` downloads the page in the
+API process so it can be converted to markdown. On Node that download refuses private
+and reserved addresses (loopback, private ranges, link-local metadata) at connect time
+and on every redirect, and holds redirects to the environment's allowed hosts. A
+redirect out of the allowed hosts is final. A private address may still be the
+sandbox's own (a dev server the agent started), so it is retried with `curl` on the
+sandbox, but only where the sandbox has a network of its own (Daytona); the
+local-subprocess provider shares the host's network, and there the refusal is final.
+A page over 15 MB is an error, not a document cut short.
+`WEBHOOKS_ALLOW_PRIVATE=1` lifts the address checks for local development.
+
+`GET /v1/server_features` tells the console which of these engines a workspace can
+use: `engines` lists the ones a new agent could run on (the engine is on, and either
+unrestricted or the workspace has a `tenant_id/*` entry), and `engine_agents` lists,
+per engine, the workspace's agents approved one by one. Codex takes exact pairs only,
+so while `OMA_CODEX_ALLOWED_AGENTS` is set no new agent is offered Codex.

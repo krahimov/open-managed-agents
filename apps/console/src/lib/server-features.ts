@@ -94,6 +94,13 @@ export interface ServerFeatures {
    * the server said none is on.
    */
   hostEngines: ReadonlySet<string> | null;
+  /**
+   * Per host engine, this workspace's existing agents the operator approved
+   * one by one (`engine_agents` in the answer). Such an agent can run on the
+   * engine although a new agent could not, so the engine is not in
+   * `hostEngines`.
+   */
+  engineAgents: Readonly<Record<string, ReadonlySet<string>>>;
   /** Where the answer came from: the server's own list, or the console's probes. */
   source: "server" | "probe";
 }
@@ -106,7 +113,7 @@ type Api = ReturnType<typeof useApi>["api"];
 
 export async function loadServerFeatures(api: Api, signal?: AbortSignal): Promise<ServerFeatures> {
   try {
-    const body = await api<{ features?: unknown; ambient_trigger_sources?: unknown; engines?: unknown }>("/v1/server_features", { signal, silentErrors: true });
+    const body = await api<{ features?: unknown; ambient_trigger_sources?: unknown; engines?: unknown; engine_agents?: unknown }>("/v1/server_features", { signal, silentErrors: true });
     const list = Array.isArray(body?.features) ? body.features.filter(isFeature) : [];
     const sources = Array.isArray(body?.ambient_trigger_sources)
       ? new Set(body.ambient_trigger_sources.filter((s): s is string => typeof s === "string"))
@@ -119,7 +126,13 @@ export async function loadServerFeatures(api: Api, signal?: AbortSignal): Promis
     const engines = Array.isArray(body?.engines)
       ? new Set(body.engines.filter((e): e is string => typeof e === "string"))
       : null;
-    return { features: new Set(list), ambientTriggerSources: sources, hostEngines: engines, source: "server" };
+    const engineAgents: Record<string, ReadonlySet<string>> = {};
+    if (body?.engine_agents && typeof body.engine_agents === "object") {
+      for (const [harness, ids] of Object.entries(body.engine_agents as Record<string, unknown>)) {
+        if (Array.isArray(ids)) engineAgents[harness] = new Set(ids.filter((id): id is string => typeof id === "string"));
+      }
+    }
+    return { features: new Set(list), ambientTriggerSources: sources, hostEngines: engines, engineAgents, source: "server" };
   } catch (err) {
     if (!isNotOnServer(err)) throw err;
   }
@@ -138,6 +151,7 @@ export async function loadServerFeatures(api: Api, signal?: AbortSignal): Promis
     features: new Set(results.filter((k): k is ServerFeature => k !== null)),
     ambientTriggerSources: null,
     hostEngines: null,
+    engineAgents: {},
     source: "probe",
   };
 }
@@ -171,8 +185,11 @@ export function useServerFeature(key: ServerFeature): boolean {
 /** The engines (an agent's `harness`) a server runs only where its operator opted in. */
 export const HOST_ENGINES: readonly string[] = ["claude-agent-sdk", "codex-sdk"];
 
-function engineIsOff(data: ServerFeatures | undefined, harness: string): boolean {
-  return HOST_ENGINES.includes(harness) && !!data?.hostEngines && !data.hostEngines.has(harness);
+/** `agentId`: the existing agent in question, when there is one. A new
+ *  agent has none, and an approval of another agent does not cover it. */
+function engineIsOff(data: ServerFeatures | undefined, harness: string, agentId?: string): boolean {
+  if (!HOST_ENGINES.includes(harness) || !data?.hostEngines || data.hostEngines.has(harness)) return false;
+  return !(agentId && data.engineAgents[harness]?.has(agentId));
 }
 
 /**
@@ -183,9 +200,9 @@ function engineIsOff(data: ServerFeatures | undefined, harness: string): boolean
  *
  * Not enough on its own to create an agent: use `useConfirmEngine` there.
  */
-export function useEngineOff(): (harness: string) => boolean {
+export function useEngineOff(): (harness: string, agentId?: string) => boolean {
   const { data } = useServerFeatures();
-  return (harness) => engineIsOff(data, harness);
+  return (harness, agentId) => engineIsOff(data, harness, agentId);
 }
 
 /** "unconfirmed": the server could not be asked (offline, 5xx). */
@@ -199,10 +216,10 @@ export type EngineCheck = "on" | "off" | "unconfirmed";
  * the cached one, so the form updates too. Engines every server has need
  * no call.
  */
-export function useConfirmEngine(): (harness: string) => Promise<EngineCheck> {
+export function useConfirmEngine(): (harness: string, agentId?: string) => Promise<EngineCheck> {
   const { api } = useApi();
   const client = useQueryClient();
-  return async (harness) => {
+  return async (harness, agentId) => {
     if (!HOST_ENGINES.includes(harness)) return "on";
     try {
       const fresh = await client.fetchQuery<ServerFeatures>({
@@ -211,7 +228,7 @@ export function useConfirmEngine(): (harness: string) => Promise<EngineCheck> {
         staleTime: 0,
         retry: false,
       });
-      return engineIsOff(fresh, harness) ? "off" : "on";
+      return engineIsOff(fresh, harness, agentId) ? "off" : "on";
     } catch {
       return "unconfirmed";
     }

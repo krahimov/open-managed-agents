@@ -159,7 +159,8 @@ export function AgentFormDialog({
    */
   const engineCanRun = async (harness: unknown): Promise<boolean> => {
     if (typeof harness !== "string") return true;
-    const check = await confirmEngine(harness);
+    // An existing agent may have been approved for the engine by name.
+    const check = await confirmEngine(harness, editAgent?.id);
     if (check === "on") return true;
     setCreateError(
       check === "off"
@@ -1639,6 +1640,7 @@ export function AgentFormDialog({
                         modelCards={modelCards}
                         runtimes={runtimes}
                         selectedCardId={selectedCardId}
+                        agentId={editAgent?.id}
                       />
                     )}
                     {tab === "tools" && <ToolsSection form={form} setForm={setForm} />}

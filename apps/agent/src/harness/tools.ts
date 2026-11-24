@@ -640,6 +640,19 @@ export async function buildTools(
      *  turndown/pdf-parse/mammoth. Optional — when absent the tool falls
      *  back to raw curl + a warning to the model. */
     toMarkdown?: ToMarkdownProvider;
+    /**
+     * The fetch web_fetch downloads a page with, in the process that runs
+     * this tool. Node passes one that refuses private and reserved
+     * destinations on every hop (main-node public-fetch.ts): the URL is the
+     * model's choice, and that process sits on the operator's network.
+     * `hostAllowed` carries the environment's allowed hosts, so a redirect
+     * cannot leave them. Absent (Workers, which have no private network to
+     * reach), the global fetch is used.
+     */
+    webFetch?: (
+      url: string,
+      init: { headers: Record<string, string>; signal: AbortSignal; hostAllowed?: (hostname: string) => boolean },
+    ) => Promise<Response>;
     delegateToAgent?: (
       agentId: string,
       message: string,
@@ -1149,7 +1162,23 @@ export async function buildTools(
           .optional()
           .describe("Truncate returned markdown to this many chars (default 50000)"),
       }),
-      execute: safe(async ({ url, max_length }) => {
+      execute: safe(async ({ url, max_length }, options) => {
+        // The call's own cancellation (the turn was stopped): the download
+        // and the fallback below both stop with it.
+        const turnSignal = options?.abortSignal;
+        const within = (ms: number) =>
+          turnSignal ? AbortSignal.any([turnSignal, AbortSignal.timeout(ms)]) : AbortSignal.timeout(ms);
+        // A web page, nothing else: this tool also shells out to curl, which
+        // would read file:// (or gopher://, dict://…) for an agent that was
+        // given web access and no file or shell tool.
+        try {
+          const scheme = new URL(url).protocol;
+          if (scheme !== "http:" && scheme !== "https:") {
+            return `Error: only http and https URLs can be fetched (${scheme})`;
+          }
+        } catch {
+          return "Error: Invalid URL";
+        }
         // Networking restriction enforcement (limited mode)
         if (env?.environmentConfig?.networking?.type === "limited") {
           const allowedHosts = env.environmentConfig.networking.allowed_hosts || [];
@@ -1178,14 +1207,26 @@ export async function buildTools(
         let isRaw = false;
         if (env?.toMarkdown) {
           try {
-            const r = await fetch(url, {
-              headers: {
-                "User-Agent": "OMA-Agent/1.0 (+web_fetch)",
-                Accept: "text/html, application/xhtml+xml, application/xml;q=0.9, */*;q=0.8",
-              },
-              redirect: "follow",
-              signal: AbortSignal.timeout(20_000),
-            });
+            const pageHeaders = {
+              "User-Agent": "OMA-Agent/1.0 (+web_fetch)",
+              Accept: "text/html, application/xhtml+xml, application/xml;q=0.9, */*;q=0.8",
+            };
+            const limitedHosts =
+              env.environmentConfig?.networking?.type === "limited"
+                ? env.environmentConfig.networking.allowed_hosts || []
+                : null;
+            const r = env.webFetch
+              ? await env.webFetch(url, {
+                  headers: pageHeaders,
+                  signal: within(20_000),
+                  // Re-checked on every redirect, not just the first URL
+                  // (the same rule, on the same spelling of the host, as
+                  // the check above).
+                  ...(limitedHosts
+                    ? { hostAllowed: (host: string) => limitedHosts.some((h) => host === h || host.endsWith(`.${h}`)) }
+                    : {}),
+                })
+              : await fetch(url, { headers: pageHeaders, redirect: "follow", signal: within(20_000) });
             if (r.ok) {
               const buf = await r.arrayBuffer();
               const ct = r.headers.get("content-type") || "text/html";
@@ -1208,7 +1249,23 @@ export async function buildTools(
               console.warn(`[web_fetch] origin returned HTTP ${r.status} for ${url}`);
             }
           } catch (err) {
-            const e = err as Error & { cause?: unknown };
+            if (turnSignal?.aborted) throw err;
+            const e = err as Error & { cause?: unknown; code?: unknown };
+            // The guarded fetch refused the destination. A host outside
+            // the environment's allowed hosts (the first URL passed the
+            // check above, so this was a redirect) is final: the curl
+            // fallback follows redirects with no such rule. A private
+            // address may still be the sandbox's own (a dev server the
+            // agent started), so it is tried from there, but only where
+            // the sandbox has a network of its own. A local-subprocess
+            // "sandbox" shares this host's, and curl there would reach
+            // exactly what was just refused.
+            if (e.code === "host_not_allowed" || e.code === "scheme" || e.code === "invalid_url") {
+              return `Error: ${e.message}`;
+            }
+            if (e.code === "private_address" && typeof (sandbox as { sandboxCapabilities?: unknown }).sandboxCapabilities !== "function") {
+              return `Error: ${e.message}. It cannot be fetched from here.`;
+            }
             console.warn(
               `[web_fetch] toMarkdown threw for ${url}: ${e.message}` +
                 (e.cause ? ` (cause: ${JSON.stringify(e.cause)})` : ""),
@@ -1216,10 +1273,14 @@ export async function buildTools(
           }
         }
         if (markdown === null) {
-          // Fallback: raw curl from sandbox (last-resort, model gets warning)
+          if (turnSignal?.aborted) throw new Error("web_fetch was cancelled");
+          // Fallback: raw curl from sandbox (last-resort, model gets warning).
+          // http(s) only, on the first URL and on every redirect; stopped
+          // with the call.
           const raw = await sandbox.exec(
-            `curl -sL -m 30 '${url.replace(/'/g, "'\\''")}' | head -c ${cap}`,
+            `curl -sL -m 30 --proto '=http,https' --proto-redir '=http,https' '${url.replace(/'/g, "'\\''")}' | head -c ${cap}`,
             35000,
+            turnSignal ? { signal: turnSignal } : undefined,
           );
           markdown = `[NOTE: markdown extraction unavailable for this URL — returning raw response. Look for the actual content between HTML tags.]\n\n${truncateResult(raw)}`;
           isRaw = true;
@@ -1248,7 +1309,7 @@ export async function buildTools(
               prompt: `URL: ${url}\n\nPAGE CONTENT (markdown):\n\n${markdown}`,
               maxOutputTokens: 1500,
               temperature: 0.1,
-              abortSignal: AbortSignal.timeout(60_000),
+              abortSignal: within(60_000),
             });
             const summary = (summarizeResult.text || "").trim();
             if (summary.length === 0) throw new Error("aux model returned empty summary");

@@ -98,12 +98,16 @@ export function ModelSection({
   modelCards,
   runtimes,
   selectedCardId,
+  agentId,
 }: {
   form: FormState;
   setForm: FormSetter;
   modelCards: ModelCard[];
   runtimes: RuntimeLite[];
   selectedCardId: string;
+  /** The agent being edited, when there is one: the operator may have
+   *  approved it for an engine a new agent could not use. */
+  agentId?: string;
 }) {
   const runtimeRows = Array.isArray(runtimes) ? runtimes : [];
   const selectedCard = modelCards.find((mc) => mc.id === selectedCardId);
@@ -112,7 +116,8 @@ export function ModelSection({
   // An engine this server has switched off is not on offer. An agent already
   // on one (an older agent, a restored draft) keeps its card, marked, so the
   // form shows what is saved and why it cannot run.
-  const engineOff = useEngineOff();
+  const engineOffFor = useEngineOff();
+  const engineOff = (candidate: Engine) => engineOffFor(candidate, agentId);
   const offers = (candidate: Engine) => !engineOff(candidate) || engine === candidate;
   const offChip = (candidate: Engine) => (engineOff(candidate) ? <Chip>Off on this server</Chip> : undefined);
   // The managed loop and Pi both run on one of the workspace's model keys.

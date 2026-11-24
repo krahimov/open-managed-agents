@@ -3,11 +3,21 @@ import type { ContentBlock } from "@modelcontextprotocol/sdk/types.js";
 import type { HarnessContext } from "@open-managed-agents/agent/harness/interface";
 import type { BridgeTool } from "./mcp-http-bridge.js";
 
-/** Keep model execution on the host and every computer operation on the session sandbox. */
-export async function codexComputerTools(ctx: HarnessContext): Promise<BridgeTool[]> {
+/**
+ * Keep model execution on the host and every computer operation on the session sandbox.
+ * `label` names the caller in the one error, and `signal` replaces the session's abort
+ * signal for the tools' execution (the claude-agent-sdk harness serves the same tools to
+ * Claude Code when its own tools are off, and cancels them with its turn).
+ */
+export async function codexComputerTools(
+  ctx: HarnessContext,
+  opts: { label?: string; signal?: AbortSignal } = {},
+): Promise<BridgeTool[]> {
+  const label = opts.label ?? "Codex computer tools";
+  const abortSignal = opts.signal ?? ctx.runtime.abortSignal;
   return Promise.all(Object.entries(ctx.tools ?? {}).filter(([, t]) => typeof t.execute === "function").map(async ([name, t]) => {
     const schema = asSchema(t.inputSchema);
-    if (t.needsApproval) throw new Error(`Codex computer tools cannot enforce approval for ${name}; use the default harness.`);
+    if (t.needsApproval) throw new Error(`${label} cannot enforce approval for ${name}; use the default harness.`);
     return {
       name, description: t.description ?? name, inputSchema: {},
       jsonSchema: await schema.jsonSchema as Record<string, unknown>,
@@ -15,7 +25,7 @@ export async function codexComputerTools(ctx: HarnessContext): Promise<BridgeToo
         const validated = schema.validate ? await schema.validate(input) : { success: true as const, value: input };
         if (!validated.success) throw new Error(`Invalid arguments for ${name}: ${validated.error}`);
         const toolCallId = crypto.randomUUID();
-        const output = await t.execute(validated.value, { toolCallId, messages: [], abortSignal: ctx.runtime.abortSignal });
+        const output = await t.execute(validated.value, { toolCallId, messages: [], abortSignal });
         const result = t.toModelOutput ? await t.toModelOutput({ toolCallId, input, output }) : null;
         if (result?.type === "content") {
           const content: ContentBlock[] = result.value.map((part: { type: string; text?: string; data?: string; mediaType?: string }) => {

@@ -143,6 +143,7 @@ describe("GET /v1/server_features", () => {
       ambient_trigger_sources: ["schedule", "webhook"],
       // No host engine is on unless the operator opted in.
       engines: [],
+      engine_agents: {},
     });
   });
 
@@ -165,5 +166,34 @@ describe("GET /v1/server_features", () => {
       "claude-agent-sdk",
       "codex-sdk",
     ]);
+  });
+
+  it("a restricted engine: new agents only where a workspace was approved whole, existing ones by id", () => {
+    const env = {
+      OMA_ENABLE_CLAUDE_AGENT_SDK: "1",
+      OMA_CLAUDE_ALLOWED_AGENTS: "tnt-ops/*, tnt-one/ agent-7 , tnt-half/, tnt-one/agent-7",
+      OMA_ENABLE_CODEX_SDK: "1",
+      OMA_CODEX_ALLOWED_AGENTS: "tnt-ops/agent-1, tnt-b/agent-2, tnt-star/*",
+    };
+    const of = (tenant?: string) => {
+      const body = serverFeaturesBody(env, tenant);
+      return { engines: body.engines, engine_agents: body.engine_agents };
+    };
+    // Approved whole for Claude; one agent approved for Codex (exact pairs only).
+    expect(of("tnt-ops")).toEqual({ engines: ["claude-agent-sdk"], engine_agents: { "codex-sdk": ["agent-1"] } });
+    // One agent approved: a new agent could not run, so the engine is not offered for one.
+    expect(of("tnt-one")).toEqual({ engines: [], engine_agents: { "claude-agent-sdk": ["agent-7"] } });
+    expect(of("tnt-b")).toEqual({ engines: [], engine_agents: { "codex-sdk": ["agent-2"] } });
+    // What a harness would refuse is not offered: `tenant/` approves no
+    // agent, and `tenant/*` means nothing to Codex.
+    expect(of("tnt-half")).toEqual({ engines: [], engine_agents: {} });
+    expect(of("tnt-star")).toEqual({ engines: [], engine_agents: {} });
+    // Another workspace, a prefix of an id, no caller.
+    expect(of("tnt-customer")).toEqual({ engines: [], engine_agents: {} });
+    expect(of("tnt")).toEqual({ engines: [], engine_agents: {} });
+    expect(of()).toEqual({ engines: [], engine_agents: {} });
+    expect(
+      serverFeaturesBody({ OMA_ENABLE_CLAUDE_AGENT_SDK: "1", OMA_CLAUDE_ALLOWED_AGENTS: "" }, "tnt-ops").engines,
+    ).toEqual([]);
   });
 });

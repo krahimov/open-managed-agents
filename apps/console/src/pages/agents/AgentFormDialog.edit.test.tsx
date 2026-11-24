@@ -268,6 +268,40 @@ describe("AgentFormDialog edit mode — engines", () => {
     expect(onSaved).not.toHaveBeenCalled();
   });
 
+  it("an agent the operator approved by name can move onto an engine no new agent could use", async () => {
+    // engines: what a new agent could run on. engine_agents: approved one by one.
+    server.use(
+      http.get("*/v1/server_features", () =>
+        HttpResponse.json({ features: [], engines: [], engine_agents: { "codex-sdk": ["agent_1"] } }),
+      ),
+    );
+    const onSaved = vi.fn();
+    renderEdit({ onSaved });
+    await settle();
+    fireEvent.click(screen.getByRole("tab", { name: /Model and engine/ }));
+    const engines = within(await screen.findByRole("radiogroup", { name: "Engine" }));
+    // Codex is on offer for this agent; Claude Agent SDK, approved for nobody, is not.
+    const codex = await engines.findByRole("radio", { name: /Codex SDK/ });
+    expect(engines.queryByRole("radio", { name: /Claude Agent SDK/ })).not.toBeInTheDocument();
+    fireEvent.click(codex);
+    expect(screen.queryByText(/is off on this server/)).not.toBeInTheDocument();
+    const body = await saveAndRead(onSaved);
+    expect((body._oma as Record<string, unknown>).harness).toBe("codex-sdk");
+  });
+
+  it("an approval of one agent does not put the engine on offer for another", async () => {
+    server.use(
+      http.get("*/v1/server_features", () =>
+        HttpResponse.json({ features: [], engines: [], engine_agents: { "codex-sdk": ["agent_other"] } }),
+      ),
+    );
+    renderEdit();
+    await settle();
+    fireEvent.click(screen.getByRole("tab", { name: /Model and engine/ }));
+    const engines = within(await screen.findByRole("radiogroup", { name: "Engine" }));
+    await waitFor(() => expect(engines.queryByRole("radio", { name: /Codex SDK/ })).not.toBeInTheDocument());
+  });
+
   it("an agent already on a switched-off engine can still have something else edited", async () => {
     serverHas([]);
     const onSaved = vi.fn();
