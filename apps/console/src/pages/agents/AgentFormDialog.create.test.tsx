@@ -292,6 +292,12 @@ describe("New agent — engines this server has", () => {
     fireEvent.change(editor, { target: { value: JSON.stringify({ ...config, _oma: { harness } }) } });
   };
 
+  /** Like pasteHarness, from another section: go to Basics for the name first. */
+  const pasteHarnessFrom = async (harness: string) => {
+    fireEvent.click(screen.getByRole("tab", { name: /Basics/ }));
+    await pasteHarness(harness);
+  };
+
   it("offers a host engine only where the server switched it on", async () => {
     serverHas(["codex-sdk"]);
     renderCreate();
@@ -300,6 +306,23 @@ describe("New agent — engines this server has", () => {
     expect(await engines.findByRole("radio", { name: /Codex SDK/ })).toBeInTheDocument();
     await waitFor(() => expect(engines.queryByRole("radio", { name: /Claude Agent SDK/ })).not.toBeInTheDocument());
     expect(engines.getByRole("radio", { name: /Managed loop/ })).toBeChecked();
+  });
+
+  it("does not offer a new agent an engine only some existing agents were approved for", async () => {
+    server.use(
+      http.get("*/v1/server_features", () =>
+        HttpResponse.json({ features: [], engines: [], engine_agents: { "codex-sdk": ["agent_existing"] } }),
+      ),
+    );
+    renderCreate();
+    await pickBlank();
+    const engines = await openEngines();
+    await waitFor(() => expect(engines.queryByRole("radio", { name: /Codex SDK/ })).not.toBeInTheDocument());
+    // …and a pasted config on it is not created either.
+    await pasteHarnessFrom("codex-sdk");
+    fireEvent.click(screen.getByRole("button", { name: "Create agent" }));
+    expect(await screen.findByText(/Codex SDK is off on this server/)).toBeInTheDocument();
+    expect(created).toHaveLength(0);
   });
 
   it("offers every engine on a server that lists them", async () => {

@@ -331,6 +331,9 @@ Memory stores are mounted in the sandbox at `/mnt/memory`.
 Setup sessions need no sandbox, and under the same conditions are isolated the same
 way: no built-in tools, no skills, no upstream MCP servers, the cut-down environment,
 and only the in-process setup tools (`update_harness`, `request_access` and the like).
+Those tools check the turn and the pinned access policy themselves, so one called
+before Claude Code's tools are validated, after the turn, or against the policy does
+nothing.
 
 Claude Code must report its tools before anything it sends is acted on. If the report
 is missing, or lists a tool the session does not serve, the turn stops, no bridged tool
@@ -341,5 +344,15 @@ One session tool does not run on the sandbox: `web_fetch` downloads the page in 
 API process so it can be converted to markdown. On Node that download refuses private
 and reserved addresses (loopback, private ranges, link-local metadata) at connect time
 and on every redirect, and holds redirects to the environment's allowed hosts. A
-refused URL falls back to `curl` on the sandbox's own network.
+redirect out of the allowed hosts is final. A private address may still be the
+sandbox's own (a dev server the agent started), so it is retried with `curl` on the
+sandbox, but only where the sandbox has a network of its own (Daytona); the
+local-subprocess provider shares the host's network, and there the refusal is final.
+A page over 15 MB is an error, not a document cut short.
 `WEBHOOKS_ALLOW_PRIVATE=1` lifts the address checks for local development.
+
+`GET /v1/server_features` tells the console which of these engines a workspace can
+use: `engines` lists the ones a new agent could run on (the engine is on, and either
+unrestricted or the workspace has a `tenant_id/*` entry), and `engine_agents` lists,
+per engine, the workspace's agents approved one by one. Codex takes exact pairs only,
+so while `OMA_CODEX_ALLOWED_AGENTS` is set no new agent is offered Codex.

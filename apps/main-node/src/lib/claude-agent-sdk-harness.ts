@@ -422,8 +422,41 @@ function workdirFor(sessionId: string): string {
 /** The MCP server the session's sandbox tools ride under in sandbox mode. */
 export const SANDBOX_TOOLS_SERVER = "oma";
 const SANDBOX_TOOL_PREFIX = `mcp__${SANDBOX_TOOLS_SERVER}__`;
-/** The in-process servers an isolated setup session may call. */
-const SETUP_TOOL_PREFIXES = ["mcp__oma_setup__", "mcp__oma_platform__"];
+/**
+ * What an isolated turn allows of the in-process (oma_setup / oma_platform)
+ * tools. Their handlers run in THIS process and change real things (the
+ * agent's config, access requests), so the handlers themselves check the
+ * turn, not only Claude Code's permission callback: `open` is false before
+ * the turn's init is validated, after it ends, and for a tool the pinned
+ * policy does not allow. `names` collects the exact tool names served.
+ */
+interface InProcessGate {
+  open: (ccToolName: string) => boolean;
+  names: Set<string>;
+}
+
+type SdkTool = ReturnType<typeof tool>;
+
+/** createSdkMcpServer, with every handler behind `gate` when there is one. */
+function inProcessServer(name: string, tools: SdkTool[], gate?: InProcessGate) {
+  const served = !gate
+    ? tools
+    : tools.map((t) => {
+        const ccName = `mcp__${name}__${t.name}`;
+        gate.names.add(ccName);
+        return {
+          ...t,
+          handler: (async (args: unknown, extra: unknown) =>
+            gate.open(ccName)
+              ? (t.handler as (a: unknown, e: unknown) => Promise<unknown>)(args, extra)
+              : {
+                  content: [{ type: "text" as const, text: "This tool is not available in this session right now." }],
+                  isError: true,
+                }) as SdkTool["handler"],
+        };
+      });
+  return createSdkMcpServer({ name, version: "1", tools: served });
+}
 /** Claude Code replaces characters outside this set in MCP tool names. */
 const ccMcpName = (name: string) => name.replace(/[^A-Za-z0-9_-]/g, "_");
 /** How long a failed turn waits for tool calls it already accepted to stop. */
@@ -601,7 +634,7 @@ export class ClaudeAgentSdkHarness {
    *  handler runs in THIS process (the SDK child calls back over the in-process
    *  MCP transport), so it can apply the change to the real agent and broadcast
    *  the new harness to the session's SSE stream. */
-  #setupServer(ctx: HarnessContext, runtime: HarnessContext["runtime"]) {
+  #setupServer(ctx: HarnessContext, runtime: HarnessContext["runtime"], gate?: InProcessGate) {
     const tenantId = ctx.tenant_id ?? "default";
     const agentId = ctx.agent.id;
 
@@ -710,18 +743,14 @@ export class ClaudeAgentSdkHarness {
       );
     }
 
-    return createSdkMcpServer({
-      name: "oma_setup",
-      version: "1",
-      tools,
-    });
+    return inProcessServer("oma_setup", tools, gate);
   }
 
   /** In-process MCP server exposing platform tools (request_access,
    *  create_ambient_rule) to the SDK child in both setup and working
    *  sessions. The child calls back over the in-process transport, so the
    *  handlers run HERE and can append session events directly. */
-  #platformServer(ctx: HarnessContext, sessionId: string) {
+  #platformServer(ctx: HarnessContext, sessionId: string, gate?: InProcessGate) {
     const tenantId = ctx.tenant_id ?? "default";
     const requestAccess = tool(
       "request_access",
@@ -862,11 +891,7 @@ export class ClaudeAgentSdkHarness {
       );
     }
 
-    return createSdkMcpServer({
-      name: "oma_platform",
-      version: "1",
-      tools,
-    });
+    return inProcessServer("oma_platform", tools, gate);
   }
 
   async run(ctx: HarnessContext): Promise<void> {
@@ -962,25 +987,53 @@ export class ClaudeAgentSdkHarness {
     // already carries request_access, scheduling and the agent's MCP tools).
     // alwaysLoad: with the built-ins off there is no ToolSearch to load a
     // deferred tool, so every tool must be in the prompt from the first turn.
+    // The pinned access policy (snapshot enrichment set at session create).
+    const policy = ctx.agent.effective_policy;
+    const hasPolicy = !!policy?.rules?.length;
+    /** Isolated: anything the policy does not plainly allow is refused, since
+     *  this path cannot ask. */
+    const policyRefuses = (omaToolName: string): string | null => {
+      if (!hasPolicy) return null;
+      const decision = evaluatePolicy(policy, omaToolName);
+      return decision.effect === "allow" ? null : (decision.selector ?? "default");
+    };
+
     let bridge: McpHttpBridge | null = null;
-    // A bridged call runs only between a validated init (see the stream
-    // loop) and the end of the turn, and is cancelled with the turn.
+    // A tool call (bridged or in-process) runs only between a validated init
+    // (see the stream loop) and the end of the turn, and is cancelled with
+    // the turn.
     let acceptingCalls = false;
     const outstandingCalls = new Set<Promise<unknown>>();
     /** Exactly the tool names Claude Code may report in sandbox mode, each
      *  with the platform's own name for it ("mcp__oma__bash" → "bash"). */
     const bridgedNames = new Map<string, string>();
+    /** Exactly the in-process tool names an isolated setup session serves. */
+    const setupGate: InProcessGate | undefined = isolated
+      ? { names: new Set(), open: (ccName) => acceptingCalls && policyRefuses(ccToolNameToOma(ccName)) === null }
+      : undefined;
     if (sandboxed) {
       const tools = await codexComputerTools(ctx, {
         label: "The claude-agent-sdk harness",
         signal: abort.signal,
       }).catch((err) => fail(err instanceof Error ? err.message : String(err)));
-      for (const t of tools) bridgedNames.set(ccMcpName(`${SANDBOX_TOOL_PREFIX}${t.name}`), t.name);
+      for (const t of tools) {
+        // Claude Code would fold two such names into one, and a call could
+        // then be recorded (and judged) as the other tool.
+        const ccName = ccMcpName(`${SANDBOX_TOOL_PREFIX}${t.name}`);
+        const twin = bridgedNames.get(ccName);
+        if (twin !== undefined) {
+          fail(`Two of this agent's tools, "${twin}" and "${t.name}", have the same name in Claude Code. Rename or remove one.`);
+        }
+        bridgedNames.set(ccName, t.name);
+      }
       const gated = tools.map((t) => ({
         ...t,
         handler: async (args: Record<string, unknown>) => {
           if (!acceptingCalls) {
             return { text: "This tool is not available: the turn has not started or has ended.", isError: true };
+          }
+          if (policyRefuses(t.name) !== null) {
+            return { text: "Denied by access policy. This tool is not available in this session.", isError: true };
           }
           const call = t.handler(args);
           outstandingCalls.add(call);
@@ -997,9 +1050,9 @@ export class ClaudeAgentSdkHarness {
         : {};
     } else if (isSetup || this.#deps.requestServiceAccess) {
       const withInProcess: Record<string, SdkMcpEntry> = { ...(mcpServers ?? {}) };
-      if (isSetup) withInProcess.oma_setup = this.#setupServer(ctx, runtime);
+      if (isSetup) withInProcess.oma_setup = this.#setupServer(ctx, runtime, setupGate);
       if (this.#deps.requestServiceAccess) {
-        withInProcess.oma_platform = this.#platformServer(ctx, sessionId);
+        withInProcess.oma_platform = this.#platformServer(ctx, sessionId, setupGate);
       }
       mcpServersForTurn = withInProcess;
     }
@@ -1032,9 +1085,6 @@ export class ClaudeAgentSdkHarness {
     // the OMA namespace (covers glob selectors and dynamically-discovered
     // MCP tools). Phase 1 enforces deny only on this path — "ask" passes
     // through until the SDK confirmation round-trip lands (plan Phase 4).
-    const policy = ctx.agent.effective_policy;
-    const hasPolicy = !!policy?.rules?.length;
-
     // Toolset always_ask (see sdkToolsetGate): refused per call, since this
     // path has no confirmation round-trip.
     // Sandbox mode has none of the tools this gate names: ctx.tools arrives
@@ -1045,7 +1095,7 @@ export class ClaudeAgentSdkHarness {
       : sdkToolsetGate(ctx.agent);
     const gated = hasPolicy || toolsetGate.active;
     const disallowedTools = isolated
-      ? [...CLAUDE_CODE_BUILTIN_TOOLS]
+      ? [...new Set([...CLAUDE_CODE_BUILTIN_TOOLS, ...compileSdkDisallowedTools(policy)])]
       : [...new Set([...compileSdkDisallowedTools(policy), ...toolsetGate.disallowedTools])];
     if (toolsetGate.disallowedTools.length > 0) {
       // canUseTool never runs for removed tools, so say it once per turn.
@@ -1061,30 +1111,28 @@ export class ClaudeAgentSdkHarness {
     /** The tools an isolated session may be offered and may call: the bridged
      *  ones by exact name (sandbox), the in-process setup ones (setup). */
     const isolatedToolAllowed = (toolName: unknown): toolName is string =>
-      typeof toolName === "string" &&
-      (isSetup ? SETUP_TOOL_PREFIXES.some((prefix) => toolName.startsWith(prefix)) : bridgedNames.has(toolName));
+      typeof toolName === "string" && (isSetup ? !!setupGate?.names.has(toolName) : bridgedNames.has(toolName));
 
-    // Isolated: every call is checked. Only an allowed tool may run, and a
-    // bridged tool's pinned policy is evaluated on its OMA name.
+    // Isolated: every call is checked. Only a tool this session serves may
+    // run, and the pinned policy is evaluated on its OMA name (the handlers
+    // check it again: see setupGate and the bridge).
     const isolatedCanUseTool = async (toolName: string, input: Record<string, unknown>) => {
       if (!isolatedToolAllowed(toolName)) {
         return { behavior: "deny" as const, message: "This tool is not available in this session." };
       }
-      if (isSetup) return { behavior: "allow" as const, updatedInput: input };
-      const omaName = bridgedNames.get(toolName) ?? toolName;
-      // Anything but allow is refused: this path cannot ask either.
-      const decision = hasPolicy ? evaluatePolicy(policy, omaName) : null;
-      if (decision && decision.effect !== "allow") {
+      const omaName = bridgedNames.get(toolName) ?? ccToolNameToOma(toolName);
+      const refusedBy = policyRefuses(omaName);
+      if (refusedBy !== null) {
         runtime.broadcast({
           type: "system.policy_decision",
           tool_name: omaName,
           effect: "deny",
-          selector: decision.selector,
+          selector: refusedBy,
           reason: "tool call denied by pinned access policy",
         } as SessionEvent);
         return {
           behavior: "deny" as const,
-          message: `Denied by access policy (rule: ${decision.selector ?? "default"}). This tool is not available in this session.`,
+          message: `Denied by access policy (rule: ${refusedBy}). This tool is not available in this session.`,
         };
       }
       return { behavior: "allow" as const, updatedInput: input };

@@ -10,7 +10,7 @@
 //
 // Add a key here in the same change that ships its endpoints.
 
-import { claudeSdkAllowed, codexSdkTenantAllowed } from "./engine-allowlist";
+import { claudeSdkApprovals, codexSdkApprovals } from "./engine-allowlist";
 
 export const SERVER_FEATURES = [
   /** GET /v1/workspace/access (read-only role shim, workspace-access-routes.ts). */
@@ -34,24 +34,25 @@ export const AMBIENT_TRIGGER_SOURCES = ["schedule", "webhook"] as const;
 /**
 /**
  * The engines (an agent's `harness`) that run a vendor CLI on the API host.
- * Each is on only where the operator opted in (`flag`) and, where the
- * operator also restricted it to approved agents, only for a workspace
- * that has an agent the engine would run (`allowed`). These are the checks
- * the harnesses make before a turn. The answer names the engines that are
- * ON for the caller, so the console offers an engine only where a session
- * on it can run (prod 2026-11-24: an agent created on "Claude Agent SDK" on
- * a server with it switched off failed its first turn instead).
+ * Each is on only where the operator opted in (`flag`). Where the operator
+ * also restricted it to approved agents, `approvals` says what the caller's
+ * workspace was granted. These are the checks the harnesses make before a
+ * turn, so the console offers an engine only where a session on it can run
+ * (prod 2026-11-24: an agent created on "Claude Agent SDK" on a server with
+ * it switched off failed its first turn instead).
  *
- * Its own field, not feature keys: an empty list means "both off", while a
- * server that predates the field leaves it out and the console then offers
- * every engine, as it always did.
+ * Two answers, because creating and editing differ:
+ *   - `engines`: the engines a NEW agent of this workspace could run on.
+ *   - `engine_agents`: per engine, the workspace's existing agents approved
+ *     one by one. Such an approval does not cover an agent created next.
+ *
+ * Their own fields, not feature keys: an empty `engines` means "none",
+ * while a server that predates the field leaves it out and the console
+ * then offers every engine, as it always did.
  */
 export const HOST_ENGINES = {
-  "claude-agent-sdk": {
-    flag: "OMA_ENABLE_CLAUDE_AGENT_SDK",
-    allowed: (env: Env, tenantId: string | undefined) => claudeSdkAllowed(env, tenantId),
-  },
-  "codex-sdk": { flag: "OMA_ENABLE_CODEX_SDK", allowed: codexSdkTenantAllowed },
+  "claude-agent-sdk": { flag: "OMA_ENABLE_CLAUDE_AGENT_SDK", approvals: claudeSdkApprovals },
+  "codex-sdk": { flag: "OMA_ENABLE_CODEX_SDK", approvals: codexSdkApprovals },
 } as const;
 
 type Env = Record<string, string | undefined>;
@@ -59,12 +60,24 @@ type Env = Record<string, string | undefined>;
 export function serverFeaturesBody(
   env: Env = process.env,
   tenantId?: string,
-): { features: string[]; ambient_trigger_sources: string[]; engines: string[] } {
+): {
+  features: string[];
+  ambient_trigger_sources: string[];
+  engines: string[];
+  engine_agents: Record<string, string[]>;
+} {
+  const engines: string[] = [];
+  const engineAgents: Record<string, string[]> = {};
+  for (const [harness, engine] of Object.entries(HOST_ENGINES)) {
+    if (env[engine.flag] !== "1") continue;
+    const approvals = engine.approvals(env, tenantId);
+    if (approvals.all) engines.push(harness);
+    else if (approvals.agents.length > 0) engineAgents[harness] = approvals.agents;
+  }
   return {
     features: [...SERVER_FEATURES],
     ambient_trigger_sources: [...AMBIENT_TRIGGER_SOURCES],
-    engines: Object.entries(HOST_ENGINES)
-      .filter(([, engine]) => env[engine.flag] === "1" && engine.allowed(env, tenantId))
-      .map(([harness]) => harness),
+    engines,
+    engine_agents: engineAgents,
   };
 }

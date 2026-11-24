@@ -64,6 +64,7 @@ import { generateId, mcpServerMayAsk } from "@open-managed-agents/shared";
 import type { HarnessPatch, McpTarget } from "./claude-agent-sdk-harness.js";
 import { startMcpHttpBridge, type BridgeTool, type McpHttpBridge } from "./mcp-http-bridge.js";
 import { codexComputerTools, computerCodexEnv, COMPUTER_CODEX_FEATURES } from "./codex-computer-tools.js";
+import { codexSdkAllowed } from "./engine-allowlist.js";
 import {
   buildSetupPrompt,
   harnessView,
@@ -597,10 +598,9 @@ export class CodexSdkHarness {
 
     // Optional operator restriction for subscription-backed acceptance runs.
     // Bind both tenant and agent, and require the isolated computer path.
-    const allowedAgents = process.env.OMA_CODEX_ALLOWED_AGENTS;
-    if (allowedAgents !== undefined) {
-      const allowed = new Set(allowedAgents.split(",").map(value => value.trim()).filter(Boolean));
-      if (!ctx.tenant_id || !ctx.agent.id || !allowed.has(`${ctx.tenant_id}/${ctx.agent.id}`) || !computer) {
+    // (engine-allowlist.ts: the same parse the console's engine list uses.)
+    if (process.env.OMA_CODEX_ALLOWED_AGENTS !== undefined) {
+      if (!codexSdkAllowed(process.env, ctx.tenant_id, ctx.agent.id) || !computer) {
         fail("Codex subscription access is restricted to operator-approved agents with a cloud computer.");
       }
     }

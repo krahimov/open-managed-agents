@@ -6,7 +6,7 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import http from "node:http";
 import zlib from "node:zlib";
 import type { AddressInfo } from "node:net";
-import { createPublicFetch, PublicFetchBlockedError } from "../src/lib/public-fetch.js";
+import { createPublicFetch, PublicFetchBlockedError, PublicFetchTooLargeError } from "../src/lib/public-fetch.js";
 
 // One local server stands in for both a public site and an internal one.
 // The resolver below gives them different addresses; the test's `isPrivate`
@@ -30,6 +30,9 @@ beforeAll(async () => {
       return void res.writeHead(200, { "content-encoding": "gzip", "content-type": "text/plain" }).end(zlib.gzipSync("zipped body"));
     }
     if (url === "/big") return void res.writeHead(200).end("x".repeat(5000));
+    if (url === "/headers") return void res.writeHead(200).end(JSON.stringify(req.headers));
+    if (url === "/to-headers") return void res.writeHead(302, { location: `http://other.test:${port}/headers` }).end();
+    if (url === "/bad-gzip") return void res.writeHead(200, { "content-encoding": "gzip" }).end("not gzip at all");
     res.writeHead(404).end("no");
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -68,7 +71,10 @@ describe("createPublicFetch", () => {
 
   it("refuses a redirect to a private destination, by name or by address", async () => {
     hits.length = 0;
-    await expect(fetcher()(`http://public.test:${port}/to-internal`)).rejects.toThrow(/private or reserved/);
+    await expect(fetcher()(`http://public.test:${port}/to-internal`)).rejects.toMatchObject({
+      name: "PublicFetchBlockedError",
+      code: "private_address",
+    });
     await expect(fetcher()(`http://public.test:${port}/to-metadata`)).rejects.toBeInstanceOf(PublicFetchBlockedError);
     // Only the two public hops were ever requested.
     expect(hits.map((h) => h.split(" ")[1])).toEqual(["/to-internal", "/to-metadata"]);
@@ -94,14 +100,46 @@ describe("createPublicFetch", () => {
   it("applies the caller's host rule to every hop, so a redirect cannot leave the allowed hosts", async () => {
     const hostAllowed = (host: string) => host === "public.test";
     expect((await fetcher()(`http://public.test:${port}/to-page`, { hostAllowed })).status).toBe(200);
-    await expect(fetcher()(`http://public.test:${port}/to-other`, { hostAllowed })).rejects.toThrow(/other\.test is not allowed/);
+    await expect(fetcher()(`http://public.test:${port}/to-other`, { hostAllowed })).rejects.toMatchObject({
+      message: expect.stringMatching(/other\.test is not allowed/),
+      code: "host_not_allowed",
+    });
     await expect(fetcher()(`http://other.test:${port}/page`, { hostAllowed })).rejects.toThrow(/not allowed/);
   });
 
-  it("stops a redirect loop, decodes gzip and caps the body", async () => {
+  it("gives the caller's host rule the host as URL.hostname spells it, brackets and all", async () => {
+    const seen: string[] = [];
+    const hostAllowed = (host: string) => (seen.push(host), false);
+    await expect(createPublicFetch()("http://[2001:db8::1]/", { hostAllowed })).rejects.toMatchObject({ code: "host_not_allowed" });
+    expect(seen).toEqual([new URL("http://[2001:db8::1]/").hostname]);
+  });
+
+  it("sends only the page-reading headers, to every hop", async () => {
+    const res = await fetcher()(`http://public.test:${port}/to-headers`, {
+      headers: { "User-Agent": "OMA-Agent/1.0", Accept: "text/html", Authorization: "Bearer secret", Cookie: "s=1" },
+    });
+    const sent = (await res.json()) as Record<string, string>;
+    expect(sent["user-agent"]).toBe("OMA-Agent/1.0");
+    expect(sent.accept).toBe("text/html");
+    expect(sent.authorization).toBeUndefined();
+    expect(sent.cookie).toBeUndefined();
+  });
+
+  it("stops a redirect loop and decodes gzip", async () => {
     await expect(fetcher()(`http://public.test:${port}/loop`)).rejects.toThrow(/too many redirects/);
     expect(await (await fetcher()(`http://public.test:${port}/gzip`)).text()).toBe("zipped body");
-    expect((await (await fetcher({ maxBytes: 100 })(`http://public.test:${port}/big`)).text()).length).toBe(100);
+  });
+
+  it("a page over the size limit is an error, never a document cut short and passed off as whole", async () => {
+    await expect(fetcher({ maxBytes: 100 })(`http://public.test:${port}/big`)).rejects.toBeInstanceOf(PublicFetchTooLargeError);
+    expect((await (await fetcher({ maxBytes: 5000 })(`http://public.test:${port}/big`)).text()).length).toBe(5000);
+  });
+
+  it("a body that does not decode, or a cancelled request, rejects instead of hanging", async () => {
+    await expect(fetcher()(`http://public.test:${port}/bad-gzip`)).rejects.toThrow();
+    const cancelled = new AbortController();
+    cancelled.abort();
+    await expect(fetcher()(`http://public.test:${port}/page`, { signal: cancelled.signal })).rejects.toThrow();
   });
 
   it("allowPrivate (local development) lifts the address checks only", async () => {
@@ -151,20 +189,74 @@ describe("web_fetch downloads through the guarded fetch", () => {
     }
   });
 
-  it("a refused destination is not fetched from this process: the tool falls back to the sandbox's own network", async () => {
+  const run = async (
+    url: string,
+    opts2: { remote: boolean; webFetch: any; environmentConfig?: any; abortSignal?: AbortSignal },
+  ) => {
     const globalFetch = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("global fetch must not be used"));
     const sandboxCommands: string[] = [];
-    const sandbox = { exec: async (cmd: string) => { sandboxCommands.push(cmd); return "exit=0\nfrom the sandbox"; }, readFile: async () => "", writeFile: async () => "ok" } as never;
+    const sandbox = {
+      exec: async (cmd: string) => { sandboxCommands.push(cmd); return "exit=0\nfrom the sandbox"; },
+      readFile: async () => "", writeFile: async () => "ok",
+      // Only a sandbox with a network of its own (Daytona) reports this.
+      ...(opts2.remote ? { sandboxCapabilities: () => ({ scope: "session" }) } : {}),
+    } as never;
     try {
       const { buildTools } = await import("@open-managed-agents/agent/harness/tools");
-      const tools = await buildTools(agent, sandbox, { toMarkdown: toMarkdown as never, webFetch: createPublicFetch() });
-      const out = await (tools.web_fetch as any).execute({ url: "http://169.254.169.254/latest/meta-data/" }, opts);
-      expect(JSON.stringify(out)).toContain("from the sandbox");
-      expect(sandboxCommands).toHaveLength(1);
-      expect(sandboxCommands[0]).toContain("curl");
+      const tools = await buildTools(agent, sandbox, {
+        toMarkdown: toMarkdown as never, webFetch: opts2.webFetch, environmentConfig: opts2.environmentConfig,
+      });
+      const settled = await (tools.web_fetch as any)
+        .execute({ url }, { ...(opts as object), abortSignal: opts2.abortSignal })
+        .then((value: unknown) => ({ value: JSON.stringify(value) }), (error: Error) => ({ error }));
       expect(globalFetch).not.toHaveBeenCalled();
+      return { ...settled, sandboxCommands } as { value?: string; error?: Error; sandboxCommands: string[] };
     } finally {
       globalFetch.mockRestore();
     }
+  };
+
+  it("a private address is not fetched from this process; a sandbox with its own network may try it", async () => {
+    const out = await run("http://169.254.169.254/latest/meta-data/", { remote: true, webFetch: createPublicFetch() });
+    expect(out.value).toContain("from the sandbox");
+    expect(out.sandboxCommands).toHaveLength(1);
+    expect(out.sandboxCommands[0]).toContain("curl");
+  });
+
+  it("…but a local-subprocess sandbox shares this host's network, so there the refusal is final", async () => {
+    const out = await run("http://169.254.169.254/latest/meta-data/", { remote: false, webFetch: createPublicFetch() });
+    expect(out.value).toContain("private or reserved address");
+    expect(out.sandboxCommands).toEqual([]);
+  });
+
+  it("a redirect out of the environment's allowed hosts is final everywhere: curl would just follow it", async () => {
+    const out = await run(`http://public.test:${port}/to-other`, {
+      remote: true,
+      webFetch: fetcher(),
+      environmentConfig: { networking: { type: "limited", allowed_hosts: ["public.test"] } },
+    });
+    expect(out.value).toContain("other.test is not allowed");
+    expect(out.sandboxCommands).toEqual([]);
+  });
+
+  it("a page over the size limit falls back to the sandbox, which returns only its head", async () => {
+    const out = await run(`http://public.test:${port}/big`, { remote: true, webFetch: fetcher({ maxBytes: 100 }) });
+    expect(out.value).toContain("from the sandbox");
+    expect(out.sandboxCommands[0]).toContain("head -c");
+  });
+
+  it("a cancelled call stops: no download is finished and no fallback is started", async () => {
+    const cancel = new AbortController();
+    let sawSignal: AbortSignal | undefined;
+    const webFetch = (_url: string, init: { signal: AbortSignal }) =>
+      new Promise<Response>((_resolve, reject) => {
+        sawSignal = init.signal;
+        init.signal.addEventListener("abort", () => reject(new Error("aborted")));
+        setTimeout(() => cancel.abort(), 10);
+      });
+    const out = await run(`http://public.test:${port}/page`, { remote: true, webFetch, abortSignal: cancel.signal });
+    expect(sawSignal?.aborted).toBe(true);
+    expect(out.error).toBeInstanceOf(Error);
+    expect(out.sandboxCommands).toEqual([]);
   });
 });

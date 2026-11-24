@@ -25,18 +25,41 @@ import { lookup as dnsLookup, type LookupAddress } from "node:dns";
 import { isIP, type LookupFunction } from "node:net";
 import { isPrivateOrReservedIp } from "@open-managed-agents/shared";
 
+/** Why a fetch was not made. Read by the web_fetch tool (by `code`, across
+ *  the package boundary) to decide whether another route may be tried. */
+export type PublicFetchRefusal = "invalid_url" | "scheme" | "host_not_allowed" | "private_address";
+
 export class PublicFetchBlockedError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly code: PublicFetchRefusal,
+  ) {
     super(message);
     this.name = "PublicFetchBlockedError";
   }
 }
 
+/** The page is larger than this fetch keeps. Never a silently cut document. */
+export class PublicFetchTooLargeError extends Error {
+  readonly code = "too_large";
+  constructor(maxBytes: number) {
+    super(`the response is larger than ${maxBytes} bytes`);
+    this.name = "PublicFetchTooLargeError";
+  }
+}
+
+/** Request headers a caller may set. They are sent to every hop, so nothing
+ *  that identifies or authorises the caller to one origin belongs here. */
+const FORWARDED_HEADERS = new Set(["accept", "accept-language", "user-agent"]);
+
 export interface PublicFetchInit {
   headers?: Record<string, string>;
   signal?: AbortSignal;
   /** The caller's own rule for which hosts may be read, applied to every
-   *  hop. A redirect to a host it refuses is not followed. */
+   *  hop. A redirect to a host it refuses is not followed. Given
+   *  `URL.hostname` as is (an IPv6 literal keeps its brackets), so the
+   *  caller's rule sees the same spelling here as when it checks a URL
+   *  itself. */
   hostAllowed?: (hostname: string) => boolean;
 }
 
@@ -51,7 +74,7 @@ export interface PublicFetchOptions {
   /** Skip the private-address checks (local development). */
   allowPrivate?: boolean;
   maxRedirects?: number;
-  /** Bytes of (decoded) body kept; the rest is dropped. */
+  /** Largest (decoded) body accepted; a larger one is an error. */
   maxBytes?: number;
   /** Test seams. */
   resolve?: Resolve;
@@ -83,7 +106,10 @@ export function createPublicFetch(options: PublicFetchOptions = {}): PublicFetch
       const bad = allowPrivate ? undefined : addresses.find((a) => isPrivate(a.address));
       if (bad) {
         return callback(
-          new PublicFetchBlockedError(`${hostname} resolves to a private or reserved address (${bad.address})`),
+          new PublicFetchBlockedError(
+            `${hostname} resolves to a private or reserved address (${bad.address})`,
+            "private_address",
+          ),
         );
       }
       if (typeof lookupOptions === "object" && lookupOptions?.all) return callback(null, addresses);
@@ -93,14 +119,14 @@ export function createPublicFetch(options: PublicFetchOptions = {}): PublicFetch
 
   const checkHop = (url: URL, init: PublicFetchInit | undefined) => {
     if (url.protocol !== "http:" && url.protocol !== "https:") {
-      throw new PublicFetchBlockedError(`only http and https URLs can be fetched (${url.protocol})`);
+      throw new PublicFetchBlockedError(`only http and https URLs can be fetched (${url.protocol})`, "scheme");
+    }
+    if (init?.hostAllowed && !init.hostAllowed(url.hostname)) {
+      throw new PublicFetchBlockedError(`host ${url.hostname} is not allowed in this environment`, "host_not_allowed");
     }
     const host = url.hostname.replace(/^\[|\]$/g, "");
-    if (init?.hostAllowed && !init.hostAllowed(host)) {
-      throw new PublicFetchBlockedError(`host ${host} is not allowed in this environment`);
-    }
     if (!allowPrivate && isIP(host) && isPrivate(host)) {
-      throw new PublicFetchBlockedError(`${host} is a private or reserved address`);
+      throw new PublicFetchBlockedError(`${host} is a private or reserved address`, "private_address");
     }
   };
 
@@ -111,15 +137,20 @@ export function createPublicFetch(options: PublicFetchOptions = {}): PublicFetch
         url.toString(),
         {
           method: "GET",
-          headers: { "accept-encoding": "gzip, deflate, br", ...(init?.headers ?? {}) },
+          headers: {
+            "accept-encoding": "gzip, deflate, br",
+            ...Object.fromEntries(
+              Object.entries(init?.headers ?? {}).filter(([name]) => FORWARDED_HEADERS.has(name.toLowerCase())),
+            ),
+          },
           lookup: guardedLookup,
           signal: init?.signal,
         },
         (res) => {
           const status = res.statusCode ?? 0;
-          // A redirect's body is never read.
+          // A redirect's body is never read: drop the connection with it.
           if (status >= 300 && status < 400 && res.headers.location) {
-            res.resume();
+            res.destroy();
             return resolveResponse({ status, headers: res.headers, body: Buffer.alloc(0) });
           }
           const encoding = String(res.headers["content-encoding"] ?? "").trim().toLowerCase();
@@ -134,27 +165,28 @@ export function createPublicFetch(options: PublicFetchOptions = {}): PublicFetch
           const chunks: Buffer[] = [];
           let size = 0;
           let done = false;
-          const finish = () => {
+          // Any failure tears down both the response and its decoder.
+          const failWith = (err: Error) => {
             if (done) return;
             done = true;
-            resolveResponse({ status, headers: res.headers, body: Buffer.concat(chunks) });
+            res.destroy();
+            if (decoded !== res) decoded.destroy();
+            req.destroy();
+            reject(err);
           };
           decoded.on("data", (chunk: Buffer) => {
             if (done) return;
-            const room = maxBytes - size;
-            if (chunk.length >= room) {
-              chunks.push(chunk.subarray(0, room));
-              size = maxBytes;
-              finish();
-              req.destroy();
-              return;
-            }
-            chunks.push(chunk);
             size += chunk.length;
+            if (size > maxBytes) return failWith(new PublicFetchTooLargeError(maxBytes));
+            chunks.push(chunk);
           });
-          decoded.on("end", finish);
-          decoded.on("error", (err) => (done ? undefined : reject(err)));
-          res.on("error", (err) => (done ? undefined : reject(err)));
+          decoded.on("end", () => {
+            if (done) return;
+            done = true;
+            resolveResponse({ status, headers: res.headers, body: Buffer.concat(chunks) });
+          });
+          decoded.on("error", failWith);
+          res.on("error", failWith);
         },
       );
       req.on("error", reject);
@@ -166,7 +198,7 @@ export function createPublicFetch(options: PublicFetchOptions = {}): PublicFetch
     try {
       url = new URL(rawUrl);
     } catch {
-      throw new PublicFetchBlockedError("invalid URL");
+      throw new PublicFetchBlockedError("invalid URL", "invalid_url");
     }
     for (let hop = 0; ; hop++) {
       checkHop(url, init);

@@ -1162,7 +1162,12 @@ export async function buildTools(
           .optional()
           .describe("Truncate returned markdown to this many chars (default 50000)"),
       }),
-      execute: safe(async ({ url, max_length }) => {
+      execute: safe(async ({ url, max_length }, options) => {
+        // The call's own cancellation (the turn was stopped): the download
+        // and the fallback below both stop with it.
+        const turnSignal = options?.abortSignal;
+        const within = (ms: number) =>
+          turnSignal ? AbortSignal.any([turnSignal, AbortSignal.timeout(ms)]) : AbortSignal.timeout(ms);
         // Networking restriction enforcement (limited mode)
         if (env?.environmentConfig?.networking?.type === "limited") {
           const allowedHosts = env.environmentConfig.networking.allowed_hosts || [];
@@ -1202,13 +1207,15 @@ export async function buildTools(
             const r = env.webFetch
               ? await env.webFetch(url, {
                   headers: pageHeaders,
-                  signal: AbortSignal.timeout(20_000),
-                  // Re-checked on every redirect, not just the first URL.
+                  signal: within(20_000),
+                  // Re-checked on every redirect, not just the first URL
+                  // (the same rule, on the same spelling of the host, as
+                  // the check above).
                   ...(limitedHosts
                     ? { hostAllowed: (host: string) => limitedHosts.some((h) => host === h || host.endsWith(`.${h}`)) }
                     : {}),
                 })
-              : await fetch(url, { headers: pageHeaders, redirect: "follow", signal: AbortSignal.timeout(20_000) });
+              : await fetch(url, { headers: pageHeaders, redirect: "follow", signal: within(20_000) });
             if (r.ok) {
               const buf = await r.arrayBuffer();
               const ct = r.headers.get("content-type") || "text/html";
@@ -1231,7 +1238,21 @@ export async function buildTools(
               console.warn(`[web_fetch] origin returned HTTP ${r.status} for ${url}`);
             }
           } catch (err) {
-            const e = err as Error & { cause?: unknown };
+            if (turnSignal?.aborted) throw err;
+            const e = err as Error & { cause?: unknown; code?: unknown };
+            // The guarded fetch refused the destination. A host outside
+            // the environment's allowed hosts (the first URL passed the
+            // check above, so this was a redirect) is final: the curl
+            // fallback follows redirects with no such rule. A private
+            // address may still be the sandbox's own (a dev server the
+            // agent started), so it is tried from there, but only where
+            // the sandbox has a network of its own. A local-subprocess
+            // "sandbox" shares this host's, and curl there would reach
+            // exactly what was just refused.
+            if (e.code === "host_not_allowed") return `Error: ${e.message}`;
+            if (e.code === "private_address" && typeof (sandbox as { sandboxCapabilities?: unknown }).sandboxCapabilities !== "function") {
+              return `Error: ${e.message}. It cannot be fetched from here.`;
+            }
             console.warn(
               `[web_fetch] toMarkdown threw for ${url}: ${e.message}` +
                 (e.cause ? ` (cause: ${JSON.stringify(e.cause)})` : ""),
@@ -1239,6 +1260,7 @@ export async function buildTools(
           }
         }
         if (markdown === null) {
+          if (turnSignal?.aborted) throw new Error("web_fetch was cancelled");
           // Fallback: raw curl from sandbox (last-resort, model gets warning)
           const raw = await sandbox.exec(
             `curl -sL -m 30 '${url.replace(/'/g, "'\\''")}' | head -c ${cap}`,
