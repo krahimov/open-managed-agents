@@ -362,6 +362,31 @@ describe("New agent — engines this server has", () => {
     expect(created).toHaveLength(0);
   });
 
+  it("checks the field the API reads: a top-level harness does not vouch for _oma.harness", async () => {
+    serverHas(["codex-sdk"]);
+    renderCreate();
+    await pickBlank();
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Loan processor" } });
+    const config = await currentConfig();
+    const editor = screen.getByRole("textbox", { name: "Agent config as JSON" });
+    fireEvent.change(editor, {
+      target: { value: JSON.stringify({ ...config, harness: "default", _oma: { harness: "claude-agent-sdk" } }) },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create agent" }));
+    expect(await screen.findByText(/Claude Agent SDK is off on this server/)).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+  });
+
+  it("a feature list with a broken engines field is not read as every engine being on", async () => {
+    server.use(http.get("*/v1/server_features", () => HttpResponse.json({ features: ["usage"], engines: null })));
+    renderCreate();
+    await pickBlank();
+    await pasteHarness("claude-agent-sdk");
+    fireEvent.click(screen.getByRole("button", { name: "Create agent" }));
+    expect(await screen.findByText(/Could not confirm that this server runs Claude Agent SDK/)).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+  });
+
   it("asks the server again at create: an engine switched off since the form opened is not used", async () => {
     serverHas(["claude-agent-sdk"]);
     renderCreate();

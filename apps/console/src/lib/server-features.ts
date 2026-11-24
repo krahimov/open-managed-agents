@@ -111,6 +111,11 @@ export async function loadServerFeatures(api: Api, signal?: AbortSignal): Promis
     const sources = Array.isArray(body?.ambient_trigger_sources)
       ? new Set(body.ambient_trigger_sources.filter((s): s is string => typeof s === "string"))
       : null;
+    // Absent: a server that does not name its engines. Present but not a
+    // list: a broken answer, which must not read as "every engine is on".
+    if (body && "engines" in body && !Array.isArray(body.engines)) {
+      throw new Error("The server's feature list is malformed (engines).");
+    }
     const engines = Array.isArray(body?.engines)
       ? new Set(body.engines.filter((e): e is string => typeof e === "string"))
       : null;

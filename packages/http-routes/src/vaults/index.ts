@@ -88,6 +88,7 @@ interface ComposioAuthConfig {
   is_composio_managed?: boolean;
   /** "OAUTH2", "API_KEY", … */
   auth_scheme?: string;
+  name?: string;
   toolkit?: { slug?: string };
 }
 
@@ -337,14 +338,24 @@ export async function listComposioToolkits(
 export interface ComposioAuthConfigOptions {
   /**
    * The key is the platform's, whose one Composio project every tenant
-   * shares. A custom config there that carries an OAuth app (the operator's
-   * X client, say) is then NOT picked up by toolkit name: any tenant could
-   * sign in through that client and spend its quota. It still works when
-   * the caller names it (`auth_config_id`). Configs that hold no
-   * credentials (API key, bearer, basic) are shared freely.
+   * shares. A custom config the operator put there (their X client, say)
+   * is then NOT picked up by toolkit name: any tenant could sign in through
+   * it and spend its quota. It still works when the caller names it
+   * (`auth_config_id`). The only custom configs shared by name are the ones
+   * this code created, which hold no credentials (see KEYLESS_CONFIG_NAME).
    */
   sharedProject?: boolean;
 }
+
+/**
+ * The name given to every custom config created here. Composio says which
+ * fields a scheme REQUIRES at creation, not what an existing config holds,
+ * so a shared project recognises a credential-free config by having made
+ * it, not by guessing from its scheme.
+ */
+const KEYLESS_CONFIG_NAME = "openma-keyless";
+const isKeylessConfig = (cfg: ComposioAuthConfig) =>
+  typeof cfg.name === "string" && cfg.name.startsWith(KEYLESS_CONFIG_NAME);
 
 /** In-flight resolutions for toolkits without managed credentials, per
  *  Composio project and toolkit: two first connects at once would both see
@@ -357,15 +368,27 @@ async function listComposioAuthConfigs(
   slug: string,
   managed: boolean,
 ): Promise<ComposioAuthConfig[]> {
-  const params = new URLSearchParams({
-    toolkit_slug: slug,
-    is_composio_managed: String(managed),
-    limit: "50",
-  });
-  const listed = await composioRequest<{ items?: ComposioAuthConfig[] }>(
-    deps,
-    `/api/v3.1/auth_configs?${params.toString()}`,
-  );
+  // Every page (bounded): with an honoured filter there is one, but an
+  // ignored filter returns the whole project, and the config we want must
+  // not be missed for sitting on page two.
+  const items: ComposioAuthConfig[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < 20; page++) {
+    const params = new URLSearchParams({
+      toolkit_slug: slug,
+      is_composio_managed: String(managed),
+      limit: "50",
+    });
+    if (cursor) params.set("cursor", cursor);
+    const listed = await composioRequest<{ items?: ComposioAuthConfig[]; next_cursor?: string | null }>(
+      deps,
+      `/api/v3.1/auth_configs?${params.toString()}`,
+    );
+    items.push(...(listed.items ?? []));
+    const next = typeof listed.next_cursor === "string" ? listed.next_cursor : "";
+    if (!next || next === cursor) break;
+    cursor = next;
+  }
   // Composio silently IGNORES an unrecognized toolkit_slug filter and
   // returns the full config list — picking the first item then hands the
   // caller a random provider's OAuth (observed live: "google-drive" →
@@ -373,7 +396,7 @@ async function listComposioAuthConfigs(
   // truly unknown slug falls through to the create call, which fails
   // loudly instead of misrouting.
   const wanted = normalizeComposioToolkitSlug(slug);
-  return (listed.items ?? []).filter(
+  return items.filter(
     (cfg) =>
       cfg.id &&
       cfg.status !== "DISABLED" &&
@@ -430,23 +453,34 @@ async function resolveComposioAuthConfig(
       listComposioAuthConfigs(deps, slug, false),
     ]);
     // Schemes whose auth config needs nothing from its creator: the person
-    // connecting types the key in on Composio's connect page.
+    // connecting types the key in on Composio's connect page. Only when
+    // Composio says so outright: a scheme with no field list is unknown,
+    // not keyless.
     const keyless = (toolkit.auth_config_details ?? [])
-      .filter(
-        (detail) =>
+      .filter((detail) => {
+        const required = detail.fields?.auth_config_creation?.required;
+        return (
           typeof detail.mode === "string" &&
           detail.mode !== "NO_AUTH" &&
-          (detail.fields?.auth_config_creation?.required ?? []).length === 0,
-      )
+          Array.isArray(required) &&
+          required.length === 0
+        );
+      })
       .map((detail) => detail.mode as string);
-    const holdsNoCredentials = (cfg: ComposioAuthConfig) =>
-      typeof cfg.auth_scheme === "string" && keyless.includes(cfg.auth_scheme);
-    const custom = opts.sharedProject
-      ? customs.find(holdsNoCredentials)
-      : (customs.find((cfg) => !holdsNoCredentials(cfg)) ?? customs[0]);
+    const ours = customs.find(
+      (cfg) => isKeylessConfig(cfg) && typeof cfg.auth_scheme === "string" && keyless.includes(cfg.auth_scheme),
+    );
+    // Own project: the owner's config (their OAuth app) first, then ours.
+    // Shared project: ours only.
+    const custom = opts.sharedProject ? ours : (customs.find((cfg) => !isKeylessConfig(cfg)) ?? ours);
     if (custom) return custom;
     if (keyless.length === 0) throw new ComposioCustomAuthRequiredError(slug, opts.sharedProject === true);
-    return create({ type: "use_custom_auth", authScheme: keyless[0], credentials: {} });
+    return create({
+      type: "use_custom_auth",
+      authScheme: keyless[0],
+      credentials: {},
+      name: `${KEYLESS_CONFIG_NAME}-${normalizeComposioToolkitSlug(slug)}`,
+    });
   })();
   unmanagedAuthConfigInFlight.set(key, resolution);
   try {

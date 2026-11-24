@@ -1066,6 +1066,13 @@ export function AgentFormDialog({
     setConfirmDiscard(false);
     setCreating(true);
     try {
+      // Moving the agent onto a host engine is checked like creating one
+      // on it, before anything else is saved.
+      const nextHarness = form.runtimeId ? "acp-proxy" : form.harness || "default";
+      if (nextHarness !== (editAgent._oma?.harness ?? "default") && !(await engineCanRun(nextHarness))) {
+        setTab("model");
+        return;
+      }
       const ambientRuleBody = form.ambientEnabled ? buildAmbientRuleBody(form) : null;
       const defaultVaultIds = await ensureComposioCredentialForAgent();
       const mcpServers = mergedMcpServersForCreate();
@@ -1317,11 +1324,11 @@ export function AgentFormDialog({
         return;
       }
       // The editor posts the config as written, so the engine is checked
-      // here too. An edit that leaves the agent on the engine it already
-      // has is let through: it changes something else.
-      const codeHarness =
-        (parsed as { harness?: unknown }).harness ??
-        (parsed as { _oma?: { harness?: unknown } })._oma?.harness;
+      // here too: `_oma.harness`, the one field the API reads it from (a
+      // top-level `harness` is ignored there and must not vouch for it).
+      // An edit that leaves the agent on the engine it already has is let
+      // through: it changes something else.
+      const codeHarness = (parsed as { _oma?: { harness?: unknown } })._oma?.harness;
       const keepsEngine = !!editAgent && (codeHarness ?? "default") === (editAgent._oma?.harness ?? "default");
       if (!keepsEngine && !(await engineCanRun(codeHarness))) return;
       if (editAgent) {

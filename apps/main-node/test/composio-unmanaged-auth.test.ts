@@ -18,6 +18,7 @@ const TENANT = "tnt_unmanaged";
 
 interface FakeAuthConfig {
   id: string;
+  name?: string;
   auth_scheme?: string;
   is_composio_managed: boolean;
   status?: string;
@@ -39,6 +40,8 @@ const TOOLKITS: Record<string, FakeToolkit> = {
   hackernews: { managed: [], schemes: { NO_AUTH: [] } },
   // Canonical slug keeps its underscore: "microsoftteams" is unknown.
   microsoft_teams: { managed: ["OAUTH2"], schemes: { OAUTH2: ["client_id", "client_secret"] } },
+  // Composio sends this scheme with no field list at all.
+  vague: { managed: [], schemes: {} },
 };
 
 /** Fake Composio with the real API's answers for auth configs (probed
@@ -61,7 +64,11 @@ function fakeComposio(initial: FakeAuthConfig[] = []) {
       const slug = url.searchParams.get("toolkit_slug") ?? "";
       const managed = url.searchParams.get("is_composio_managed");
       const ofKind = configs.filter((cfg) => managed === null || String(cfg.is_composio_managed) === managed);
-      return json({ items: TOOLKITS[slug] ? ofKind.filter((cfg) => cfg.toolkit.slug === slug) : ofKind });
+      const all = TOOLKITS[slug] ? ofKind.filter((cfg) => cfg.toolkit.slug === slug) : ofKind;
+      // Paged like the real listing.
+      const limit = Number(url.searchParams.get("limit") ?? 20);
+      const start = Number(url.searchParams.get("cursor") ?? 0);
+      return json({ items: all.slice(start, start + limit), next_cursor: start + limit < all.length ? String(start + limit) : null });
     }
     if (url.pathname === "/api/v3.1/auth_configs" && method === "POST") {
       const slug = body?.toolkit?.slug as string;
@@ -70,7 +77,7 @@ function fakeComposio(initial: FakeAuthConfig[] = []) {
       if (toolkit.schemes.NO_AUTH) {
         return fail(400, 303, "Auth_Config_NoAuthApp", `Cannot create an auth config for toolkit "${slug}" because it does not require authentication.`);
       }
-      const custom = body.auth_config as { type?: string; authScheme?: string } | undefined;
+      const custom = body.auth_config as { type?: string; authScheme?: string; name?: string } | undefined;
       if (!custom) {
         if (toolkit.managed.length === 0) {
           return fail(404, 306, "Auth_Config_DefaultAuthConfigNotFound", `Default auth config not found for toolkit "${slug}". Composio does not have managed credentials for this toolkit.`);
@@ -83,7 +90,7 @@ function fakeComposio(initial: FakeAuthConfig[] = []) {
       if (custom.type !== "use_custom_auth" || !required || required.length > 0) {
         return fail(400, 301, "Auth_Config_InvalidCredentials", "missing required fields");
       }
-      const created = { id: `ac_custom_${slug}_${configs.length}`, auth_scheme: custom.authScheme, is_composio_managed: false, toolkit: { slug } };
+      const created = { id: `ac_custom_${slug}_${configs.length}`, name: custom.name, auth_scheme: custom.authScheme, is_composio_managed: false, toolkit: { slug } };
       configs.push(created);
       return json({ toolkit: { slug }, auth_config: created }, 201);
     }
@@ -92,6 +99,9 @@ function fakeComposio(initial: FakeAuthConfig[] = []) {
       const slug = decodeURIComponent(toolkitMatch[1]);
       const toolkit = TOOLKITS[slug];
       if (!toolkit) return fail(404, 1803, "Toolkit_ToolkitNotFound", `Could not find toolkit "${slug}"`);
+      if (slug === "vague") {
+        return json({ slug, composio_managed_auth_schemes: [], auth_config_details: [{ mode: "API_KEY" }] });
+      }
       return json({
         slug,
         composio_managed_auth_schemes: toolkit.managed,
@@ -157,7 +167,10 @@ describe("composio_accounts/link for apps without Composio-managed sign-in", () 
     // Managed first (Composio says no), then the custom one.
     expect(composio.authConfigCreates().map((c) => c.body)).toEqual([
       { toolkit: { slug: "posthog" } },
-      { toolkit: { slug: "posthog" }, auth_config: { type: "use_custom_auth", authScheme: "API_KEY", credentials: {} } },
+      {
+        toolkit: { slug: "posthog" },
+        auth_config: { type: "use_custom_auth", authScheme: "API_KEY", credentials: {}, name: "openma-keyless-posthog" },
+      },
     ]);
   });
 
@@ -179,6 +192,7 @@ describe("composio_accounts/link for apps without Composio-managed sign-in", () 
       type: "use_custom_auth",
       authScheme: "BEARER_TOKEN",
       credentials: {},
+      name: "openma-keyless-exa",
     });
   });
 
@@ -244,6 +258,48 @@ describe("composio_accounts/link for apps without Composio-managed sign-in", () 
     expect(res.body.error).toContain("in your Composio project");
     expect(res.body.error).not.toContain("{");
     expect(composio.calls.some((c) => c.path === "/api/v3.1/connected_accounts/link")).toBe(false);
+  });
+
+  it("under the platform key, only a config this code made is shared: not an operator's, whatever its scheme", async () => {
+    // An API_KEY config the operator made by hand. Its scheme REQUIRES no
+    // credentials, which says nothing about what this one holds.
+    const composio = fakeComposio([
+      { id: "ac_operator_posthog", name: "ops posthog", auth_scheme: "API_KEY", is_composio_managed: false, toolkit: { slug: "posthog" } },
+    ]);
+    const r = await rig(composio);
+    const shared = await r.link("posthog");
+    expect(shared.status).toBe(201);
+    expect(shared.body.auth_config_id).not.toBe("ac_operator_posthog");
+    expect(composio.configs.find((c) => c.id === shared.body.auth_config_id)?.name).toBe("openma-keyless-posthog");
+    // The next shared connect reuses ours.
+    expect((await r.link("posthog")).body.auth_config_id).toBe(shared.body.auth_config_id);
+    // In a tenant's own project, the owner's config comes first.
+    expect((await r.link("posthog", { api_key: "tenant-own-key" })).body.auth_config_id).toBe("ac_operator_posthog");
+  });
+
+  it("a scheme Composio describes without its fields is not assumed to need no credentials", async () => {
+    TOOLKITS.vague.schemes = { API_KEY: [] };
+    const composio = fakeComposio();
+    const r = await rig(composio);
+    const res = await r.link("vague");
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("COMPOSIO_CUSTOM_AUTH_REQUIRED");
+    // Only the managed attempt was made.
+    expect(composio.authConfigCreates().map((c) => c.body)).toEqual([{ toolkit: { slug: "vague" } }]);
+  });
+
+  it("finds its config on a later page instead of creating another", async () => {
+    const disabled = Array.from({ length: 60 }, (_, i) => ({
+      id: `ac_old_${i}`, name: "openma-keyless-posthog", auth_scheme: "API_KEY", is_composio_managed: false,
+      status: "DISABLED", toolkit: { slug: "posthog" },
+    }));
+    const composio = fakeComposio([
+      ...disabled,
+      { id: "ac_live", name: "openma-keyless-posthog", auth_scheme: "API_KEY", is_composio_managed: false, toolkit: { slug: "posthog" } },
+    ]);
+    const r = await rig(composio);
+    expect((await r.link("posthog")).body.auth_config_id).toBe("ac_live");
+    expect(composio.configs).toHaveLength(61);
   });
 
   it("two first connects at once create one config, not two", async () => {
