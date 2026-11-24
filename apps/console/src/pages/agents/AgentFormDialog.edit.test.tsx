@@ -248,3 +248,34 @@ describe("AgentFormDialog edit mode", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 });
+
+describe("AgentFormDialog edit mode — engines", () => {
+  const serverHas = (engines: string[]) =>
+    server.use(http.get("*/v1/server_features", () => HttpResponse.json({ features: [], engines })));
+
+  it("moving an agent onto an engine the server has since switched off is not saved", async () => {
+    serverHas(["claude-agent-sdk"]);
+    const onSaved = vi.fn();
+    renderEdit({ onSaved });
+    await settle();
+    fireEvent.click(screen.getByRole("tab", { name: /Model and engine/ }));
+    const engines = within(await screen.findByRole("radiogroup", { name: "Engine" }));
+    fireEvent.click(await engines.findByRole("radio", { name: /Claude Agent SDK/ }));
+    serverHas([]); // the operator switched it off
+    fireEvent.click(screen.getByRole("button", { name: "Save changes" }));
+    expect(await screen.findByText(/Claude Agent SDK is off on this server\. Choose another engine/)).toBeInTheDocument();
+    expect(saved).toHaveLength(0);
+    expect(onSaved).not.toHaveBeenCalled();
+  });
+
+  it("an agent already on a switched-off engine can still have something else edited", async () => {
+    serverHas([]);
+    const onSaved = vi.fn();
+    renderEdit({ onSaved, editAgent: { ...agent, _oma: { ...agent._oma, harness: "claude-agent-sdk" } } });
+    await settle();
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Triage Bot 2" } });
+    const body = await saveAndRead(onSaved);
+    expect(body.name).toBe("Triage Bot 2");
+    expect((body._oma as Record<string, unknown> | undefined)?.harness).toBeUndefined();
+  });
+});

@@ -141,6 +141,8 @@ describe("GET /v1/server_features", () => {
       features: ["workspace_access", "usage", "ambient_run_now"],
       // Only the sources Node dispatches; the console hides the rest.
       ambient_trigger_sources: ["schedule", "webhook"],
+      // No host engine is on unless the operator opted in.
+      engines: [],
     });
   });
 
@@ -151,5 +153,17 @@ describe("GET /v1/server_features", () => {
       "ambient_run_now",
     ];
     for (const key of SERVER_FEATURES) expect(known).toContain(key);
+  });
+
+  it("names the host engines the operator switched on, and always answers the field", () => {
+    expect(serverFeaturesBody({}).engines).toEqual([]);
+    // Prod 2026-11: Codex on, Claude Agent SDK off.
+    expect(serverFeaturesBody({ OMA_ENABLE_CODEX_SDK: "1" }).engines).toEqual(["codex-sdk"]);
+    // Only the exact opt-in the harness router checks.
+    expect(serverFeaturesBody({ OMA_ENABLE_CLAUDE_AGENT_SDK: "true" }).engines).toEqual([]);
+    expect(serverFeaturesBody({ OMA_ENABLE_CLAUDE_AGENT_SDK: "1", OMA_ENABLE_CODEX_SDK: "1" }).engines).toEqual([
+      "claude-agent-sdk",
+      "codex-sdk",
+    ]);
   });
 });

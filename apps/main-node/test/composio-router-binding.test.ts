@@ -83,7 +83,7 @@ function fakeComposio(initial: ComposioConnectedAccount[] = []) {
     }
     if (url.pathname === "/api/v3.1/auth_configs") {
       const slug = url.searchParams.get("toolkit_slug") || "airtable";
-      return json({ items: [{ id: `ac_${slug}`, toolkit: { slug } }] });
+      return json({ items: [{ id: `ac_${slug}`, is_composio_managed: true, toolkit: { slug } }] });
     }
     if (url.pathname === "/api/v3.1/connected_accounts/link") {
       return json({ link_token: "lt", redirect_url: "https://composio.example/consent", connected_account_id: "ca_pending" });

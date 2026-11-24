@@ -1243,9 +1243,9 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
           // so it's opt-in via env rather than reachable by agent config.
           if (process.env.OMA_ENABLE_CLAUDE_AGENT_SDK !== "1") {
             const msg =
-              "claude-agent-sdk harness is disabled on this deployment — " +
-              "it runs Claude Code on the host and is intended for " +
-              "single-operator self-hosting. Set OMA_ENABLE_CLAUDE_AGENT_SDK=1 to enable.";
+              "This server has the Claude Agent SDK engine switched off. Choose another " +
+              "engine in the agent's settings. (It runs Claude Code on the API host, for " +
+              "single-operator self-hosting: an operator enables it with OMA_ENABLE_CLAUDE_AGENT_SDK=1.)";
             c.runtime.broadcast({ type: "session.error", error: msg } as SessionEvent);
             return Promise.reject(new Error(msg));
           }
@@ -1261,9 +1261,9 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
           // HOST with approvals disabled — single-operator/self-host only.
           if (process.env.OMA_ENABLE_CODEX_SDK !== "1") {
             const msg =
-              "codex-sdk harness is disabled on this deployment — it runs the " +
-              "OpenAI Codex CLI on the host and is intended for " +
-              "single-operator self-hosting. Set OMA_ENABLE_CODEX_SDK=1 to enable.";
+              "This server has the Codex SDK engine switched off. Choose another " +
+              "engine in the agent's settings. (It runs the OpenAI Codex CLI on the API host, for " +
+              "single-operator self-hosting: an operator enables it with OMA_ENABLE_CODEX_SDK=1.)";
             c.runtime.broadcast({ type: "session.error", error: msg } as SessionEvent);
             return Promise.reject(new Error(msg));
           }

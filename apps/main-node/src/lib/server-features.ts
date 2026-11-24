@@ -29,6 +29,31 @@ export type ServerFeatureKey = (typeof SERVER_FEATURES)[number];
  */
 export const AMBIENT_TRIGGER_SOURCES = ["schedule", "webhook"] as const;
 
-export function serverFeaturesBody(): { features: string[]; ambient_trigger_sources: string[] } {
-  return { features: [...SERVER_FEATURES], ambient_trigger_sources: [...AMBIENT_TRIGGER_SOURCES] };
+/**
+ * The engines (an agent's `harness`) that run a vendor CLI on the API host,
+ * each on only where the operator opted in: the same env checks the harness
+ * router makes before a turn. The answer names the ones that are ON, so the
+ * console offers an engine only where a session on it can run (prod
+ * 2026-11-24: an agent created on "Claude Agent SDK" on a server with it
+ * switched off failed its first turn instead).
+ *
+ * Its own field, not feature keys: an empty list means "both off", while a
+ * server that predates the field leaves it out and the console then offers
+ * every engine, as it always did.
+ */
+export const HOST_ENGINES = {
+  "claude-agent-sdk": "OMA_ENABLE_CLAUDE_AGENT_SDK",
+  "codex-sdk": "OMA_ENABLE_CODEX_SDK",
+} as const;
+
+export function serverFeaturesBody(
+  env: Record<string, string | undefined> = process.env,
+): { features: string[]; ambient_trigger_sources: string[]; engines: string[] } {
+  return {
+    features: [...SERVER_FEATURES],
+    ambient_trigger_sources: [...AMBIENT_TRIGGER_SOURCES],
+    engines: Object.entries(HOST_ENGINES)
+      .filter(([, flag]) => env[flag] === "1")
+      .map(([harness]) => harness),
+  };
 }

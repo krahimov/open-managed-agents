@@ -86,7 +86,67 @@ interface ComposioAuthConfig {
   id: string;
   status?: string;
   is_composio_managed?: boolean;
+  /** "OAUTH2", "API_KEY", … */
+  auth_scheme?: string;
+  name?: string;
   toolkit?: { slug?: string };
+}
+
+/** One way a toolkit can authenticate (GET /toolkits/:slug →
+ *  `auth_config_details`). `auth_config_creation.required` is what the
+ *  auth config itself needs (an OAuth app's client_id/client_secret);
+ *  what the person connecting types in (an API key) is asked for later, on
+ *  Composio's connect page. */
+interface ComposioToolkitAuthDetail {
+  mode?: string;
+  fields?: { auth_config_creation?: { required?: unknown[] } };
+}
+
+/** The app has no Composio-managed sign-in and every scheme it offers
+ *  needs a developer app of the operator's own (X/twitter, Snowflake,
+ *  Shopify): nothing we can set up for them. */
+export class ComposioCustomAuthRequiredError extends Error {
+  readonly code = "COMPOSIO_CUSTOM_AUTH_REQUIRED";
+  /** `sharedProject`: the lookup ran in the platform's Composio project,
+   *  where an auth config in the person's own Composio account changes
+   *  nothing, so the message must not send them there. */
+  constructor(readonly toolkit: string, sharedProject = false) {
+    super(
+      `Composio has no ready-made sign-in for "${toolkit}": it needs a developer app of your own. ` +
+        (sharedProject
+          ? `This workspace uses the platform's Composio connection, which has none for "${toolkit}". ` +
+            `Add your own Composio API key in Apps, create an auth config for "${toolkit}" in that ` +
+            `Composio project (app.composio.dev, Auth Configs, with your app's client ID and secret), ` +
+            `then connect again.`
+          : `Create an auth config for "${toolkit}" in your Composio project (app.composio.dev, Auth ` +
+            `Configs, with your app's client ID and secret), then connect again. It is picked up automatically.`),
+    );
+    this.name = "ComposioCustomAuthRequiredError";
+  }
+}
+
+/** The app works without an account (Hacker News): there is no auth
+ *  config to create and nothing to connect. */
+export class ComposioNoAuthToolkitError extends Error {
+  readonly code = "COMPOSIO_TOOLKIT_NO_AUTH";
+  constructor(readonly toolkit: string) {
+    super(`"${toolkit}" works without an account, so there is nothing to connect.`);
+    this.name = "ComposioNoAuthToolkitError";
+  }
+}
+
+/** Composio's answer when a toolkit has no managed credentials
+ *  (Auth_Config_DefaultAuthConfigNotFound, code 306, HTTP 404). */
+function isNoManagedAuthError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : "";
+  return /^Composio API 4\d\d\b/.test(message) && /DefaultAuthConfigNotFound|"code":\s*306\b/.test(message);
+}
+
+/** Composio's answer when a toolkit needs no authentication at all
+ *  (Auth_Config_NoAuthApp, code 303, HTTP 400). */
+function isNoAuthToolkitError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : "";
+  return /^Composio API 4\d\d\b/.test(message) && /Auth_Config_NoAuthApp|"code":\s*303\b/.test(message);
 }
 
 interface ComposioAuthLink {
@@ -275,47 +335,201 @@ export async function listComposioToolkits(
   return composioRequest(deps, `/api/v3.1/toolkits?${params.toString()}`);
 }
 
-export async function getOrCreateComposioManagedAuthConfig(
+export interface ComposioAuthConfigOptions {
+  /**
+   * The key is the platform's, whose one Composio project every tenant
+   * shares. A custom config the operator put there (their X client, say)
+   * is then NOT picked up by toolkit name: any tenant could sign in through
+   * it and spend its quota. It still works when the caller names it
+   * (`auth_config_id`). The only custom configs shared by name are the ones
+   * this code created, which hold no credentials (see keylessConfigName).
+   */
+  sharedProject?: boolean;
+}
+
+/**
+ * The name given to every custom config created here. Composio says which
+ * fields a scheme REQUIRES at creation, not what an existing config holds,
+ * so a shared project recognises a credential-free config by having made
+ * it, not by guessing from its scheme.
+ */
+const keylessConfigName = (slug: string) => `openma-keyless-${normalizeComposioToolkitSlug(slug)}`;
+
+/** In-flight resolutions for toolkits without managed credentials, per
+ *  Composio project and toolkit: two first connects at once would both see
+ *  no custom config and each create one. (One process; a second replica can
+ *  still race, which costs a spare config and nothing else.) */
+const unmanagedAuthConfigInFlight = new Map<string, Promise<ComposioAuthConfig>>();
+
+async function listComposioAuthConfigs(
   deps: NonNullable<VaultRoutesDeps["composio"]>,
-  toolkitSlug: string,
-): Promise<ComposioAuthConfig> {
-  const slug = normalizeComposioToolkitSlug(toolkitSlug);
-  const params = new URLSearchParams({
-    toolkit_slug: slug,
-    is_composio_managed: "true",
-    limit: "50",
-  });
-  const listed = await composioRequest<{ items?: ComposioAuthConfig[] }>(
-    deps,
-    `/api/v3.1/auth_configs?${params.toString()}`,
-  );
+  slug: string,
+  managed: boolean,
+): Promise<ComposioAuthConfig[]> {
+  // Every page (bounded): with an honoured filter there is one, but an
+  // ignored filter returns the whole project, and the config we want must
+  // not be missed for sitting on page two.
+  const items: ComposioAuthConfig[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < 20; page++) {
+    const params = new URLSearchParams({
+      toolkit_slug: slug,
+      is_composio_managed: String(managed),
+      limit: "50",
+    });
+    if (cursor) params.set("cursor", cursor);
+    const listed = await composioRequest<{ items?: ComposioAuthConfig[]; next_cursor?: string | null }>(
+      deps,
+      `/api/v3.1/auth_configs?${params.toString()}`,
+    );
+    items.push(...(listed.items ?? []));
+    const next = typeof listed.next_cursor === "string" ? listed.next_cursor : "";
+    if (!next || next === cursor) break;
+    cursor = next;
+  }
   // Composio silently IGNORES an unrecognized toolkit_slug filter and
   // returns the full config list — picking the first item then hands the
   // caller a random provider's OAuth (observed live: "google-drive" →
   // LinkedIn). Only accept configs whose toolkit actually matches; a
-  // truly unknown slug falls through to the create call below, which
-  // fails loudly instead of misrouting.
-  const existing = (listed.items ?? []).find(
+  // truly unknown slug falls through to the create call, which fails
+  // loudly instead of misrouting.
+  const wanted = normalizeComposioToolkitSlug(slug);
+  return items.filter(
     (cfg) =>
       cfg.id &&
       cfg.status !== "DISABLED" &&
-      normalizeComposioToolkitSlug(cfg.toolkit?.slug ?? "") === slug,
+      // The filter is honoured for a known slug, but not trusted.
+      (cfg.is_composio_managed === undefined || cfg.is_composio_managed === managed) &&
+      normalizeComposioToolkitSlug(cfg.toolkit?.slug ?? "") === wanted,
   );
-  if (existing) return existing;
+}
 
-  const created = await composioRequest<{
-    auth_config?: ComposioAuthConfig;
-    toolkit?: { slug?: string };
-  }>(deps, "/api/v3.1/auth_configs", {
-    method: "POST",
-    body: JSON.stringify({
-      toolkit: { slug },
-    }),
-  });
-  if (!created.auth_config?.id) {
-    throw new Error("Composio auth config response did not include auth_config.id");
+/** `slug` is sent to Composio as given (see getOrCreateComposioManagedAuthConfig). */
+async function resolveComposioAuthConfig(
+  deps: NonNullable<VaultRoutesDeps["composio"]>,
+  slug: string,
+  opts: ComposioAuthConfigOptions,
+): Promise<ComposioAuthConfig> {
+  const [managed] = await listComposioAuthConfigs(deps, slug, true);
+  if (managed) return managed;
+
+  const create = async (authConfig?: Record<string, unknown>): Promise<ComposioAuthConfig> => {
+    const created = await composioRequest<{
+      auth_config?: ComposioAuthConfig;
+      toolkit?: { slug?: string };
+    }>(deps, "/api/v3.1/auth_configs", {
+      method: "POST",
+      body: JSON.stringify({
+        toolkit: { slug },
+        ...(authConfig ? { auth_config: authConfig } : {}),
+      }),
+    });
+    if (!created.auth_config?.id) {
+      throw new Error("Composio auth config response did not include auth_config.id");
+    }
+    return created.auth_config;
+  };
+
+  try {
+    return await create();
+  } catch (err) {
+    if (isNoAuthToolkitError(err)) throw new ComposioNoAuthToolkitError(slug);
+    if (!isNoManagedAuthError(err)) throw err;
   }
-  return created.auth_config;
+
+  // No managed credentials for this toolkit. One resolution at a time per
+  // project and toolkit, each starting from a fresh listing.
+  const key = `${deps.baseUrl ?? ""}|${deps.apiKey ?? ""}|${normalizeComposioToolkitSlug(slug)}|${opts.sharedProject ? "shared" : "own"}`;
+  const inFlight = unmanagedAuthConfigInFlight.get(key);
+  if (inFlight) return inFlight;
+  const resolution = (async () => {
+    const [toolkit, customs] = await Promise.all([
+      composioRequest<{ auth_config_details?: ComposioToolkitAuthDetail[] }>(
+        deps,
+        `/api/v3.1/toolkits/${encodeURIComponent(slug)}`,
+      ),
+      listComposioAuthConfigs(deps, slug, false),
+    ]);
+    // Schemes whose auth config needs nothing from its creator: the person
+    // connecting types the key in on Composio's connect page. Only when
+    // Composio says so outright: a scheme with no field list is unknown,
+    // not keyless.
+    const keyless = (toolkit.auth_config_details ?? [])
+      .filter((detail) => {
+        const required = detail.fields?.auth_config_creation?.required;
+        return (
+          typeof detail.mode === "string" &&
+          detail.mode !== "NO_AUTH" &&
+          Array.isArray(required) &&
+          required.length === 0
+        );
+      })
+      .map((detail) => detail.mode as string);
+    // The exact name this code gives, not anything that merely starts like it.
+    const isOurs = (cfg: ComposioAuthConfig) => cfg.name === keylessConfigName(slug);
+    const ours = customs.find(
+      (cfg) => isOurs(cfg) && typeof cfg.auth_scheme === "string" && keyless.includes(cfg.auth_scheme),
+    );
+    // Own project: the owner's config (their OAuth app) first, then ours.
+    // Shared project: ours only.
+    const custom = opts.sharedProject ? ours : (customs.find((cfg) => !isOurs(cfg)) ?? ours);
+    if (custom) return custom;
+    if (keyless.length === 0) throw new ComposioCustomAuthRequiredError(slug, opts.sharedProject === true);
+    return create({
+      type: "use_custom_auth",
+      authScheme: keyless[0],
+      credentials: {},
+      name: keylessConfigName(slug),
+    });
+  })();
+  unmanagedAuthConfigInFlight.set(key, resolution);
+  try {
+    return await resolution;
+  } finally {
+    unmanagedAuthConfigInFlight.delete(key);
+  }
+}
+
+/**
+ * The auth config a connect link for `toolkitSlug` uses. Despite the name
+ * it is not always a managed one:
+ *
+ *   1. an existing Composio-managed config, else
+ *   2. a new managed config, when Composio has managed credentials, else
+ *   3. an existing custom config: the project owner's own OAuth app, or one
+ *      that holds no credentials (see ComposioAuthConfigOptions.sharedProject
+ *      for which of the two a shared project may pick up), else
+ *   4. a new custom config, for a scheme that needs nothing from us: API
+ *      key, bearer token, basic auth. Composio's connect page asks the
+ *      person for the key. Most of the catalog is like this (PostHog,
+ *      Firecrawl, Apollo…), and Composio answers step 2 for all of them
+ *      with a 404 "Default auth config not found".
+ *
+ * A toolkit with managed credentials never gets past step 2, with the same
+ * calls as before steps 3 and 4 existed.
+ *
+ * Canonical slugs are not uniform ("googledrive", but "microsoft_teams"),
+ * so the separator-stripped spelling is tried first and, when Composio does
+ * not know it, the toolkit's canonical slug is looked up and used instead.
+ *
+ * Throws ComposioCustomAuthRequiredError when every scheme needs a
+ * developer app we don't have, ComposioNoAuthToolkitError when the app
+ * needs no account at all.
+ */
+export async function getOrCreateComposioManagedAuthConfig(
+  deps: NonNullable<VaultRoutesDeps["composio"]>,
+  toolkitSlug: string,
+  opts: ComposioAuthConfigOptions = {},
+): Promise<ComposioAuthConfig> {
+  const stripped = normalizeComposioToolkitSlug(toolkitSlug);
+  try {
+    return await resolveComposioAuthConfig(deps, stripped, opts);
+  } catch (err) {
+    if (!(err instanceof Error) || !/^Composio API 404\b/.test(err.message)) throw err;
+    const toolkit = await getComposioToolkit(deps, toolkitSlug).catch(() => null);
+    if (!toolkit?.slug || toolkit.slug === stripped) throw err;
+    return resolveComposioAuthConfig(deps, toolkit.slug, opts);
+  }
 }
 
 export async function createComposioConnectedAccountLink(
@@ -326,12 +540,18 @@ export async function createComposioConnectedAccountLink(
     callbackUrl?: string;
     alias?: string;
     authConfigId?: string;
+    /** See ComposioAuthConfigOptions.sharedProject. */
+    sharedProject?: boolean;
   },
 ): Promise<ComposioAuthLink & { auth_config_id: string; toolkit: string; user_id: string }> {
   const toolkit = normalizeComposioToolkitSlug(input.toolkitSlug);
   const authConfig = input.authConfigId
     ? ({ id: input.authConfigId } satisfies ComposioAuthConfig)
-    : await getOrCreateComposioManagedAuthConfig(deps, toolkit);
+    : // As written: the helper needs the caller's spelling to find a
+      // canonical slug that keeps its underscore.
+      await getOrCreateComposioManagedAuthConfig(deps, input.toolkitSlug, {
+        sharedProject: input.sharedProject,
+      });
   const payload: Record<string, unknown> = {
     auth_config_id: authConfig.id,
     user_id: input.userId,
@@ -789,6 +1009,7 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
         callbackUrl: body.callback_url,
         alias: body.alias,
         authConfigId: body.auth_config_id,
+        sharedProject: composio.source === "platform",
       });
 
       // Toolkit-locked tool-router sessions in this vault won't expose the
@@ -888,6 +1109,9 @@ export function buildVaultRoutes(deps: VaultRoutesDeps) {
             404,
           );
         }
+      }
+      if (err instanceof ComposioCustomAuthRequiredError || err instanceof ComposioNoAuthToolkitError) {
+        return c.json({ error: message, code: err.code }, 422);
       }
       return c.json({ error: message }, 502);
     }
