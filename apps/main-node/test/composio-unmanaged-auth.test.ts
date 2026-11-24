@@ -273,6 +273,11 @@ describe("composio_accounts/link for apps without Composio-managed sign-in", () 
     expect(composio.configs.find((c) => c.id === shared.body.auth_config_id)?.name).toBe("openma-keyless-posthog");
     // The next shared connect reuses ours.
     expect((await r.link("posthog")).body.auth_config_id).toBe(shared.body.auth_config_id);
+    // A name that only starts like ours is still the operator's.
+    const lookalike = fakeComposio([
+      { id: "ac_lookalike", name: "openma-keyless-posthog-backup", auth_scheme: "API_KEY", is_composio_managed: false, toolkit: { slug: "posthog" } },
+    ]);
+    expect((await (await rig(lookalike)).link("posthog")).body.auth_config_id).not.toBe("ac_lookalike");
     // In a tenant's own project, the owner's config comes first.
     expect((await r.link("posthog", { api_key: "tenant-own-key" })).body.auth_config_id).toBe("ac_operator_posthog");
   });

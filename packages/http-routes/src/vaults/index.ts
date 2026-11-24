@@ -342,7 +342,7 @@ export interface ComposioAuthConfigOptions {
    * is then NOT picked up by toolkit name: any tenant could sign in through
    * it and spend its quota. It still works when the caller names it
    * (`auth_config_id`). The only custom configs shared by name are the ones
-   * this code created, which hold no credentials (see KEYLESS_CONFIG_NAME).
+   * this code created, which hold no credentials (see keylessConfigName).
    */
   sharedProject?: boolean;
 }
@@ -353,9 +353,7 @@ export interface ComposioAuthConfigOptions {
  * so a shared project recognises a credential-free config by having made
  * it, not by guessing from its scheme.
  */
-const KEYLESS_CONFIG_NAME = "openma-keyless";
-const isKeylessConfig = (cfg: ComposioAuthConfig) =>
-  typeof cfg.name === "string" && cfg.name.startsWith(KEYLESS_CONFIG_NAME);
+const keylessConfigName = (slug: string) => `openma-keyless-${normalizeComposioToolkitSlug(slug)}`;
 
 /** In-flight resolutions for toolkits without managed credentials, per
  *  Composio project and toolkit: two first connects at once would both see
@@ -467,19 +465,21 @@ async function resolveComposioAuthConfig(
         );
       })
       .map((detail) => detail.mode as string);
+    // The exact name this code gives, not anything that merely starts like it.
+    const isOurs = (cfg: ComposioAuthConfig) => cfg.name === keylessConfigName(slug);
     const ours = customs.find(
-      (cfg) => isKeylessConfig(cfg) && typeof cfg.auth_scheme === "string" && keyless.includes(cfg.auth_scheme),
+      (cfg) => isOurs(cfg) && typeof cfg.auth_scheme === "string" && keyless.includes(cfg.auth_scheme),
     );
     // Own project: the owner's config (their OAuth app) first, then ours.
     // Shared project: ours only.
-    const custom = opts.sharedProject ? ours : (customs.find((cfg) => !isKeylessConfig(cfg)) ?? ours);
+    const custom = opts.sharedProject ? ours : (customs.find((cfg) => !isOurs(cfg)) ?? ours);
     if (custom) return custom;
     if (keyless.length === 0) throw new ComposioCustomAuthRequiredError(slug, opts.sharedProject === true);
     return create({
       type: "use_custom_auth",
       authScheme: keyless[0],
       credentials: {},
-      name: `${KEYLESS_CONFIG_NAME}-${normalizeComposioToolkitSlug(slug)}`,
+      name: keylessConfigName(slug),
     });
   })();
   unmanagedAuthConfigInFlight.set(key, resolution);
