@@ -9,7 +9,7 @@ import type { ToMarkdownProvider } from "@open-managed-agents/markdown";
 import type { SandboxExecutor, ProcessHandle } from "./interface";
 import { nanoid } from "nanoid";
 import { idempotencyKeyFor } from "@open-managed-agents/session-runtime";
-import { mcpModelOutput, mcpResultForModel, truncateResult } from "./mcp-output";
+import { mcpModelOutput, mcpResultForModel, mcpResultPreviewChars, mcpResultWithSpill, truncateResult, type McpResultSpill } from "./mcp-output";
 // Browser tools depend on the runtime-agnostic BrowserHarness interface.
 // Concrete adapters (CF / Node / CDP / Disabled) live in the package and
 // dynamic-import their workerd / Node peers only at first launch().
@@ -1650,6 +1650,15 @@ export async function buildTools(
       attachToolsRelease(tools, async () => {
         await Promise.allSettled(mcpClients.splice(0).map((c) => c.close()));
       });
+      // Oversized text results go to the sandbox in full, the model gets a
+      // preview (mcp-output.ts) — only when a file tool can reach the copy.
+      // `tools` is read at call time: the gates below may still drop one.
+      const previewChars = mcpResultPreviewChars(agentConfig.metadata);
+      const spill = (): McpResultSpill | undefined => {
+        const readers = ["read", "grep", "bash"].filter((name) => name in tools);
+        if (previewChars <= 0 || readers.length === 0) return undefined;
+        return { maxChars: previewChars, readers, write: (path, content) => sandbox.writeFile(path, content) };
+      };
       for (const server of agentConfig.mcp_servers) {
         if (!server.url) {
           // stdio MCP whose sandbox-side spawn hasn't recorded a URL yet
@@ -1719,8 +1728,9 @@ export async function buildTools(
               ...baseTool,
               ...(annotationsByName.has(toolName) ? { annotations: annotationsByName.get(toolName) } : {}),
               // execute returns the model-facing form (string, or
-              // ContentBlock[] with images), capped like built-ins — the
-              // same value is persisted and replayed (see mcp-output.ts).
+              // ContentBlock[] with images), capped like built-ins or
+              // spilled to the sandbox — the same value is persisted and
+              // replayed (see mcp-output.ts).
               toModelOutput: mcpModelOutput,
               ...(origExecute
                 ? {
@@ -1732,7 +1742,7 @@ export async function buildTools(
                       queue.push(key);
                       pendingKeys.set(sig, queue);
                       try {
-                        return mcpResultForModel(await origExecute(args, options));
+                        return await mcpResultWithSpill(await origExecute(args, options), options.toolCallId, spill());
                       } finally {
                         const q = pendingKeys.get(sig);
                         if (q) {

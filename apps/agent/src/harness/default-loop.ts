@@ -431,7 +431,7 @@ export class DefaultHarness implements HarnessInterface {
     const ctxWindow = resolveContextWindowTokens(model);
     if (this.shouldCompact && this.compact && this.shouldCompact(allEvents, { contextWindowTokens: ctxWindow })) {
       try {
-        await this.compact(allEvents, runtime, { model, systemPrompt, tools: turnTools });
+        await this.compact(allEvents, runtime, { model, systemPrompt, tools: turnTools, promptCacheKey: agent.id });
       } catch (err) {
         // Compaction is best-effort. Log and continue — the next turn will
         // try again. Don't fail the whole turn over a summarize error.
@@ -471,15 +471,7 @@ export class DefaultHarness implements HarnessInterface {
     // in replayed history tool_calls. Long MCP names (Composio) 400 the
     // whole turn otherwise. Deterministic mangle; no-op for other providers.
     if (isOpenAiCompatModel(model)) {
-      // The Responses API applies strict mode on its own when `strict` is
-      // omitted, forcing every optional argument to be filled ("" / 0 /
-      // null → MCP servers reject the call). Send strict explicitly, with
-      // optionals encoded as nullable and placeholder nulls stripped before
-      // the tool runs (see openai-tool-schema.ts). chat/completions defaults
-      // to non-strict and fronts third-party gateways — left as is.
-      if (cached.tools && isOpenAiResponsesModel(model)) {
-        cached.tools = applyOpenAiStrictSchemas(cached.tools as ToolSet) as typeof cached.tools;
-      }
+      cached.tools = openAiWireTools(model, cached.tools);
       const safe = sanitizeOpenAiToolNames({ tools: cached.tools, messages: cached.messages });
       if (safe.tools) cached.tools = safe.tools as typeof cached.tools;
       if (safe.messages) cached.messages = safe.messages as typeof cached.messages;
@@ -1336,7 +1328,7 @@ export class DefaultHarness implements HarnessInterface {
   async compact(
     events: SessionEvent[],
     runtime: HarnessRuntime,
-    ctx: { model: LanguageModel; systemPrompt: string; tools: Record<string, any> },
+    ctx: { model: LanguageModel; systemPrompt: string; tools: Record<string, any>; promptCacheKey?: string },
   ): Promise<void> {
     const ctxWindow = resolveContextWindowTokens(ctx.model);
     const result = await this.compactionStrategy.compact(events, {
@@ -1344,7 +1336,15 @@ export class DefaultHarness implements HarnessInterface {
       contextWindowTokens: ctxWindow,
       systemPrompt: ctx.systemPrompt,
       tools: ctx.tools,
-      applyCacheStrategy: (sys, tls, msgs) => applyProviderCacheStrategy(ctx.model, sys, tls, msgs),
+      // The main loop's request prefix, so the summarize call reads it from
+      // the provider cache: on OpenAI that is the strict-mode tool schemas
+      // and the agent's promptCacheKey too (without them the 2026-11 churn
+      // eval's compaction re-sent 157k input tokens uncached).
+      applyCacheStrategy: (sys, tls, msgs) => {
+        const applied = applyProviderCacheStrategy(ctx.model, sys, tls, msgs);
+        return isOpenAiCompatModel(ctx.model) ? { ...applied, tools: openAiWireTools(ctx.model, applied.tools) } : applied;
+      },
+      ...(ctx.promptCacheKey ? { promptCacheKey: ctx.promptCacheKey } : {}),
       runtime,
     });
     if (!result) return;
@@ -1447,6 +1447,20 @@ function resolveContextWindowTokens(model: LanguageModel): number {
 //
 // Adding a provider later: add a case below; the calling harness code
 // doesn't change.
+
+/**
+ * The Responses API applies strict mode on its own when `strict` is
+ * omitted, forcing every optional argument to be filled ("" / 0 / null →
+ * MCP servers reject the call). Send strict explicitly, with optionals
+ * encoded as nullable and placeholder nulls stripped before the tool runs
+ * (see openai-tool-schema.ts). chat/completions defaults to non-strict and
+ * fronts third-party gateways — left as is. Shared by the main loop and
+ * compaction so both send the same tools (part of the cached prefix).
+ */
+function openAiWireTools<T extends Record<string, any> | undefined>(model: LanguageModel, tools: T): T {
+  if (!tools || !isOpenAiResponsesModel(model)) return tools;
+  return applyOpenAiStrictSchemas(tools as ToolSet) as unknown as T;
+}
 
 interface CacheStrategyResult {
   system: string | SystemModelMessage | SystemModelMessage[];

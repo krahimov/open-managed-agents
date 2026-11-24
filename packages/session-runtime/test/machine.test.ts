@@ -228,6 +228,29 @@ describe("SessionStateMachine human-in-the-loop", () => {
     expect(lastIdle(f.log).stop_reason).toEqual({ type: "end_turn" });
   });
 
+  it("a repeated confirmation for a call the turn already went past does not resume the model", async () => {
+    // Clients that re-send ids an intermediate idle still listed (their
+    // first answers were queued) must not trigger a second model run over
+    // the whole context once the turn has finished.
+    const h = gatedToolHarness(["toolu_1"]);
+    const execute = vi.fn(async () => "hi\n");
+    const f = createMachine(h.run, {
+      runtime: () => ({ pendingConfirmations: [] }),
+      tools: (agent) => ({ bash: JSON.stringify(agent.tools).includes("always_ask") ? {} : { execute } }),
+    });
+    await f.machine.runTurn("agent_test", userMessage);
+    const confirm = { type: "user.tool_confirmation", tool_use_id: "toolu_1", result: "allow" } as never;
+    await f.machine.runTurn("agent_test", confirm);
+    expect(h.calls()).toBe(2);
+
+    const again = await f.machine.runTurn("agent_test", { ...(confirm as object) } as never);
+    expect(again.status).toBe("completed");
+    expect(h.calls()).toBe(2);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect((f.log.getEvents() as SessionEvent[]).filter((e) => e.type === "agent.message")).toHaveLength(1);
+    expect(lastIdle(f.log).stop_reason).toEqual({ type: "end_turn" });
+  });
+
   it("an approved call_mcp_tool runs the deferred MCP tool it names, with its arguments", async () => {
     let calls = 0;
     const run = async (ctx: HarnessInput) => {

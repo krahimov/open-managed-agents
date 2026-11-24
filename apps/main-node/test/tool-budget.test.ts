@@ -331,6 +331,45 @@ describe("search_mcp_tools — finding the right deferred tool", () => {
   });
 });
 
+describe("search_mcp_tools — a deferred router that duplicates a loaded one", () => {
+  // A second Composio router mounted from another vault carries the same
+  // meta tools as the declared one; its definitions are already in the
+  // request, so a search hit points at the loaded twin instead of repeating
+  // the ~1.5k-token schema.
+  const meta = (srv: string) => ({
+    [`mcp__${srv}__COMPOSIO_SEARCH_TOOLS`]: bigTool("search Composio toolkits", 1_500),
+    [`mcp__${srv}__COMPOSIO_MULTI_EXECUTE_TOOL`]: bigTool("run Composio tools", 1_500),
+  });
+  const budget = () =>
+    applyToolBudget({ ...builtins(3), ...meta("composio"), ...meta("composio_gmail") }, { maxMcpTokens: 4_000, serverOrder: ["composio"] });
+
+  it("returns a pointer for an identical tool and says so in the catalog", async () => {
+    const r = budget();
+    expect([...r.deferred.keys()]).toEqual(["mcp__composio_gmail__COMPOSIO_SEARCH_TOOLS", "mcp__composio_gmail__COMPOSIO_MULTI_EXECUTE_TOOL"]);
+    const search = r.tools[SEARCH_TOOL_NAME] as { description: string; execute: (a: unknown, o: unknown) => Promise<string> };
+    expect(search.description).toContain("composio_gmail (same tools and schemas as the loaded mcp__composio__*): COMPOSIO_SEARCH_TOOLS");
+    const out = await search.execute({ query: "COMPOSIO_SEARCH_TOOLS", server: "composio_gmail", limit: 1 }, {});
+    const hits = JSON.parse(out) as Array<Record<string, unknown>>;
+    expect(hits).toEqual([
+      expect.objectContaining({ name: "mcp__composio_gmail__COMPOSIO_SEARCH_TOOLS", same_as: "mcp__composio__COMPOSIO_SEARCH_TOOLS" }),
+    ]);
+    expect(hits[0]).not.toHaveProperty("input_schema");
+    expect(out.length).toBeLessThan(400);
+    // Deterministic: the next turn sends the same description (cached prefix).
+    expect((budget().tools[SEARCH_TOOL_NAME] as { description: string }).description).toBe(search.description);
+  });
+
+  it("a tool that differs in description or schema still gets its full definition", async () => {
+    const tools = { ...builtins(3), ...meta("composio"), mcp__composio_gmail__COMPOSIO_SEARCH_TOOLS: bigTool("search Gmail toolkits", 1_500) };
+    const r = applyToolBudget(tools, { maxMcpTokens: 4_000, serverOrder: ["composio"] });
+    const search = r.tools[SEARCH_TOOL_NAME] as { description: string; execute: (a: unknown, o: unknown) => Promise<string> };
+    expect(search.description).not.toContain("same tools and schemas");
+    const [hit] = JSON.parse(await search.execute({ query: "mcp__composio_gmail__COMPOSIO_SEARCH_TOOLS" }, {})) as Array<Record<string, unknown>>;
+    expect(hit).not.toHaveProperty("same_as");
+    expect(hit.input_schema).toBeTruthy();
+  });
+});
+
 describe("promptCacheKey", () => {
   const model = (provider: string, modelId: string) => ({ provider, modelId, specificationVersion: "v3" }) as never;
   it("is set per agent on the OpenAI Responses path only", () => {
@@ -437,4 +476,47 @@ describe("DefaultHarness applies the size budget for every provider", () => {
       }
     });
   }
+});
+
+describe("DefaultHarness compaction shares the main loop's request prefix", () => {
+  // The summarize call re-sends the whole conversation; it only reads it
+  // from the provider cache when tools + cache routing match the main
+  // loop's. On OpenAI Responses that means the strict-mode tool schemas
+  // and the agent's promptCacheKey (the 2026-11 churn eval's compaction
+  // sent 157k input tokens with 0 cached).
+  it("openai.responses: same tools and promptCacheKey as the main call", async () => {
+    const { MockLanguageModelV3 } = await import("ai/test");
+    const { DefaultHarness } = await import("@open-managed-agents/agent/harness/default-loop");
+    const model = new MockLanguageModelV3({
+      provider: "openai.responses",
+      modelId: "gpt-6.1-sol",
+      doStream: async () => ({ stream: stream(textReply("hi")) }) as never,
+      doGenerate: async () =>
+        ({ content: [{ type: "text", text: "summary" }], finishReason: { unified: "stop", raw: "stop" }, usage, warnings: [] }) as never,
+    });
+    const say = (role: "user" | "agent", text: string) =>
+      role === "user"
+        ? { type: "user.message", content: [{ type: "text", text }] }
+        : { type: "agent.message", content: [{ type: "text", text }] };
+    const events: Array<Record<string, any>> = [say("user", "a"), say("agent", "b"), say("user", "c"), say("agent", "d"), say("user", "e")];
+    await new DefaultHarness().run({
+      agent: {
+        id: "agent_compact",
+        model: "gpt-6.1-sol",
+        tools: [],
+        mcp_servers: [{ name: "sentry", type: "url", url: "https://mcp.sentry.test" }],
+        metadata: { compaction_trigger_fraction: 0.000001 },
+      },
+      model, systemPrompt: "Test", env: {}, session_id: "sess-compact",
+      userMessage: events[4],
+      tools: { ...builtins(2), ...bigServer("sentry", 2, 200) }, runtime: harnessRuntime(events),
+    } as never);
+    expect(events.some((e) => e.type === "agent.thread_context_compacted")).toBe(true);
+    const [summarize] = model.doGenerateCalls;
+    const [main] = model.doStreamCalls;
+    expect(summarize.tools).toEqual(main.tools);
+    expect((summarize.tools ?? []).some((t) => (t as { strict?: boolean }).strict !== undefined)).toBe(true);
+    expect(summarize.providerOptions).toMatchObject({ openai: { promptCacheKey: "agent_compact" } });
+    expect(main.providerOptions).toMatchObject({ openai: { promptCacheKey: "agent_compact" } });
+  });
 });
