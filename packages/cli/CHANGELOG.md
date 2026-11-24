@@ -1,5 +1,11 @@
 # @openma/cli
 
+## 0.5.1
+
+### Patch Changes
+
+- [#13](https://github.com/krahimov/open-managed-agents/pull/13) [`8c005cb`](https://github.com/krahimov/open-managed-agents/commit/8c005cba1d0a718ebad7657aaedb8d5289a9398b) Thanks [@krahimov](https://github.com/krahimov)! - Add agent manifest plan/apply commands, JSON file creation support, automatic Harness Studio CLI sign-in handoff, and Composio auth handoff for manifest apps.
+
 ## 0.5.0
 
 ### Minor Changes
