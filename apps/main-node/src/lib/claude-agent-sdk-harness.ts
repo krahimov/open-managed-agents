@@ -514,8 +514,54 @@ export const CLAUDE_CODE_BUILTIN_TOOLS = [
   "WebFetch", "WebSearch", "ToolSearch", "Skill", "SlashCommand", "Workflow",
   "TodoWrite", "AskUserQuestion", "EnterPlanMode", "ExitPlanMode", "EnterWorktree", "ExitWorktree",
   "CronCreate", "CronDelete", "CronList", "ScheduleWakeup", "RemoteTrigger", "PushNotification",
-  "ListMcpResourcesTool", "ReadMcpResourceTool", "ListMcpResources", "ReadMcpResource", "Mcp",
+  "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool", "ListMcpResources", "ReadMcpResource", "Mcp",
+  // Offered by account or feature flag, not by version: prod offered
+  // DesignSync where the same SDK on another machine did not.
+  "DesignSync", "Artifact", "ArtifactComments", "ArtifactData", "ArtifactCheck", "ReportFindings",
+  "SendMessage", "SendToProject", "SendToProjectContext", "ListAgents", "TeamCreate", "TeamDelete",
 ] as const;
+
+/**
+ * Tools Claude Code offered an isolated session that are neither served by
+ * the session nor on the list above. Which built-ins exist depends on the
+ * signed-in account and on flags Claude Code fetches at start, so no fixed
+ * list is ever complete. When a turn's FIRST init reports such a tool, this
+ * harness has done nothing with the attempt yet: no output was acted on, no
+ * session id kept, and no bridged or in-process handler accepted a call
+ * (see the stream loop). What Claude Code itself did before reporting is
+ * not ours to prove, and is the same as when the turn simply failed. So the
+ * turn is not failed: the name is kept here, removed by name on every later
+ * query, and the query is started again. A tool that is STILL offered after
+ * being removed by name fails the turn, as before, and so does one reported
+ * by a later init, after work was accepted. `mcp__…` names are never kept:
+ * this set is shared by every session, and a served tool of one must not
+ * be removable by another. In memory: after a restart the first turn
+ * learns again.
+ */
+const learnedForeignTools = new Set<string>();
+const MAX_LEARNED_FOREIGN_TOOLS = 500;
+/** One isolated turn restarts at most this many times to shed foreign tools. */
+const MAX_ISOLATION_RESTARTS = 2;
+
+/** Test seam. */
+export function forgetLearnedForeignTools(): void {
+  learnedForeignTools.clear();
+}
+
+/** Claude Code's init listed tools an isolated session does not serve. */
+class ForeignToolsError extends Error {
+  constructor(
+    readonly tools: unknown[],
+    /** Reported by the turn's first init, before anything was accepted. */
+    readonly beforeAnyWork: boolean,
+  ) {
+    super(
+      `claude-agent-sdk isolation: Claude Code offered tools outside this session's own ` +
+        `(${tools.slice(0, 5).map(String).join(", ")}). The turn was stopped before any ran.`,
+    );
+    this.name = "ForeignToolsError";
+  }
+}
 
 /** Appended to the agent's prompt in sandbox mode: this model was trained on
  *  Claude Code's own tool names, which are not here. */
@@ -897,7 +943,9 @@ export class ClaudeAgentSdkHarness {
     return inProcessServer("oma_platform", tools, gate);
   }
 
-  async run(ctx: HarnessContext): Promise<void> {
+  /** `restart`: how many times this turn has already been started again to
+   *  shed tools Claude Code offered and the session does not serve. */
+  async run(ctx: HarnessContext, restart = 0): Promise<void> {
     const runtime = ctx.runtime;
     // Typed optional on HarnessContext but always set by buildHarnessContext.
     const sessionId = ctx.session_id ?? "unknown-session";
@@ -905,9 +953,10 @@ export class ClaudeAgentSdkHarness {
     await mkdir(cwd, { recursive: true });
 
     const abort = new AbortController();
+    const onParentAbort = () => abort.abort();
     if (runtime.abortSignal) {
       if (runtime.abortSignal.aborted) abort.abort();
-      else runtime.abortSignal.addEventListener("abort", () => abort.abort(), { once: true });
+      else runtime.abortSignal.addEventListener("abort", onParentAbort, { once: true });
     }
 
     // Bare claude-* ids pass through; custom model-card ids mean nothing to
@@ -1107,7 +1156,7 @@ export class ClaudeAgentSdkHarness {
       : sdkToolsetGate(ctx.agent);
     const gated = hasPolicy || toolsetGate.active;
     const disallowedTools = isolated
-      ? [...new Set([...CLAUDE_CODE_BUILTIN_TOOLS, ...compileSdkDisallowedTools(policy)])]
+      ? [...new Set([...CLAUDE_CODE_BUILTIN_TOOLS, ...learnedForeignTools, ...compileSdkDisallowedTools(policy)])]
       : [...new Set([...compileSdkDisallowedTools(policy), ...toolsetGate.disallowedTools])];
     if (toolsetGate.disallowedTools.length > 0) {
       // canUseTool never runs for removed tools, so say it once per turn.
@@ -1152,6 +1201,7 @@ export class ClaudeAgentSdkHarness {
       return { behavior: "allow" as const, updatedInput: input };
     };
 
+    let restartTurn = false;
     try {
       const stream = (this.#deps.query ?? query)({
         prompt: textOfUserMessage(ctx),
@@ -1324,12 +1374,9 @@ export class ClaudeAgentSdkHarness {
             const outside = Array.isArray(offered) ? offered.filter((name) => !isolatedToolAllowed(name)) : null;
             if (outside === null || outside.length > 0) {
               abort.abort();
-              throw new Error(
-                outside === null
-                  ? "claude-agent-sdk isolation: Claude Code did not report its tools. The turn was stopped."
-                  : `claude-agent-sdk isolation: Claude Code offered tools outside this session's own ` +
-                    `(${outside.slice(0, 5).map(String).join(", ")}). The turn was stopped before any ran.`,
-              );
+              throw outside === null
+                ? new Error("claude-agent-sdk isolation: Claude Code did not report its tools. The turn was stopped.")
+                : new ForeignToolsError(outside, !initValidated);
             }
             initValidated = true;
             acceptingCalls = true;
@@ -1403,8 +1450,35 @@ export class ClaudeAgentSdkHarness {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      runtime.broadcast({ type: "session.error", error: message } as SessionEvent);
-      throw err;
+      // Foreign tools at init, nothing run yet: remove them by name and start
+      // the turn again instead of failing it (see learnedForeignTools). Only
+      // when every one is a name not already being removed: one that is
+      // still offered after that, or is not a name at all, is a failure.
+      if (
+        err instanceof ForeignToolsError &&
+        err.beforeAnyWork &&
+        restart < MAX_ISOLATION_RESTARTS &&
+        !runtime.abortSignal?.aborted &&
+        err.tools.every(
+          (name) =>
+            typeof name === "string" &&
+            name.length > 0 &&
+            name.length <= 200 &&
+            !name.startsWith("mcp__") &&
+            !disallowedTools.includes(name),
+        ) &&
+        new Set([...learnedForeignTools, ...(err.tools as string[])]).size <= MAX_LEARNED_FOREIGN_TOOLS
+      ) {
+        for (const name of err.tools as string[]) learnedForeignTools.add(name);
+        console.warn(
+          `[claude-agent-sdk] isolated session ${sessionId}: Claude Code offered ${(err.tools as string[]).join(", ")}; ` +
+            `removing by name and restarting the turn. Add to CLAUDE_CODE_BUILTIN_TOOLS.`,
+        );
+        restartTurn = true;
+      } else {
+        runtime.broadcast({ type: "session.error", error: message } as SessionEvent);
+        throw err;
+      }
     } finally {
       // No new bridged call from here on. One still running (the turn failed
       // or was stopped under it) is cancelled and given a moment to stop
@@ -1418,6 +1492,19 @@ export class ClaudeAgentSdkHarness {
         ]);
       }
       if (bridge) await bridge.close().catch(() => {});
+      // Each attempt hangs its own listener on the session's signal.
+      runtime.abortSignal?.removeEventListener("abort", onParentAbort);
+    }
+    // A fresh query, bridge and abort controller; the rejected Claude Code
+    // session was never saved, so nothing of it is resumed. Not if the turn
+    // was stopped while this attempt was being torn down.
+    if (restartTurn) {
+      if (runtime.abortSignal?.aborted) {
+        const message = "The turn was stopped.";
+        runtime.broadcast({ type: "session.error", error: message } as SessionEvent);
+        throw new Error(message);
+      }
+      return this.run(ctx, restart + 1);
     }
 
     // The endLiveText closure lives inside the try; any stream that died

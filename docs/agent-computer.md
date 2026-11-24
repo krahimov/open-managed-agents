@@ -336,8 +336,13 @@ before Claude Code's tools are validated, after the turn, or against the policy 
 nothing.
 
 Claude Code must report its tools before anything it sends is acted on. If the report
-is missing, or lists a tool the session does not serve, the turn stops, no bridged tool
-runs, and that Claude Code session is not resumed. A tool call still running when a
+is missing, the turn stops. If a turn's first report lists a built-in the session does
+not serve, the server has accepted nothing from that attempt yet (no output, no session
+id, no tool call), so the tool is removed by name and the turn is started again: which
+built-ins Claude Code offers depends on the signed-in account and on flags it fetches,
+and no fixed list is complete. The turn stops instead if the tool is still offered
+after being removed by name, if it is an `mcp__` tool, or if the report comes later in
+the turn. A rejected Claude Code session is never resumed. A tool call still running when a
 turn ends is cancelled before the bridge closes.
 
 One session tool does not run on the sandbox: `web_fetch` downloads the page in the
