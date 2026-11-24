@@ -3,11 +3,15 @@ import type { ContentBlock } from "@modelcontextprotocol/sdk/types.js";
 import type { HarnessContext } from "@open-managed-agents/agent/harness/interface";
 import type { BridgeTool } from "./mcp-http-bridge.js";
 
-/** Keep model execution on the host and every computer operation on the session sandbox. */
-export async function codexComputerTools(ctx: HarnessContext): Promise<BridgeTool[]> {
+/**
+ * Keep model execution on the host and every computer operation on the session sandbox.
+ * `label` names the caller in the one error (the claude-agent-sdk harness serves the
+ * same tools to Claude Code when its own tools are off).
+ */
+export async function codexComputerTools(ctx: HarnessContext, label = "Codex computer tools"): Promise<BridgeTool[]> {
   return Promise.all(Object.entries(ctx.tools ?? {}).filter(([, t]) => typeof t.execute === "function").map(async ([name, t]) => {
     const schema = asSchema(t.inputSchema);
-    if (t.needsApproval) throw new Error(`Codex computer tools cannot enforce approval for ${name}; use the default harness.`);
+    if (t.needsApproval) throw new Error(`${label} cannot enforce approval for ${name}; use the default harness.`);
     return {
       name, description: t.description ?? name, inputSchema: {},
       jsonSchema: await schema.jsonSchema as Record<string, unknown>,

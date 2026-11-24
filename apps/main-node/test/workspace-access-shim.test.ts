@@ -166,4 +166,26 @@ describe("GET /v1/server_features", () => {
       "codex-sdk",
     ]);
   });
+
+  it("a restricted engine is named only for a workspace with an agent it would run", () => {
+    const env = {
+      OMA_ENABLE_CLAUDE_AGENT_SDK: "1",
+      OMA_CLAUDE_ALLOWED_AGENTS: "tnt-ops/*, tnt-half/",
+      OMA_ENABLE_CODEX_SDK: "1",
+      OMA_CODEX_ALLOWED_AGENTS: "tnt-ops/agent-1, tnt-b/agent-2, tnt-star/*",
+    };
+    expect(serverFeaturesBody(env, "tnt-ops").engines).toEqual(["claude-agent-sdk", "codex-sdk"]);
+    expect(serverFeaturesBody(env, "tnt-b").engines).toEqual(["codex-sdk"]);
+    expect(serverFeaturesBody(env, "tnt-customer").engines).toEqual([]);
+    // What a harness would refuse is not offered: `tenant/` approves no
+    // agent, and Codex takes exact pairs only, so `tenant/*` means nothing there.
+    expect(serverFeaturesBody(env, "tnt-half").engines).toEqual([]);
+    expect(serverFeaturesBody(env, "tnt-star").engines).toEqual([]);
+    // No prefix match on the workspace id, no caller, empty list.
+    expect(serverFeaturesBody(env, "tnt").engines).toEqual([]);
+    expect(serverFeaturesBody(env).engines).toEqual([]);
+    expect(
+      serverFeaturesBody({ OMA_ENABLE_CLAUDE_AGENT_SDK: "1", OMA_CLAUDE_ALLOWED_AGENTS: "" }, "tnt-ops").engines,
+    ).toEqual([]);
+  });
 });

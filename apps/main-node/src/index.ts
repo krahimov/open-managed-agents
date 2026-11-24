@@ -103,7 +103,7 @@ import {
   type EnableMemoryResult,
 } from "./lib/agent-memory-mode.js";
 import { MemoryPromptBuilder, createSessionMemoryContext } from "./lib/memory-prompt.js";
-import { ClaudeAgentSdkHarness } from "./lib/claude-agent-sdk-harness.js";
+import { ClaudeAgentSdkHarness, claudeSdkToolsOn } from "./lib/claude-agent-sdk-harness.js";
 import type { PiHarness } from "@open-managed-agents/agent/harness/pi";
 import {
   buildSetupPrompt,
@@ -1237,10 +1237,12 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
         // never set one (e.g. console quick-create flows).
         const harness = c.agent?.harness ?? process.env.OMA_DEFAULT_HARNESS;
         if (harness === "claude-agent-sdk") {
-          // Hard gate: this harness spawns Claude Code ON THE HOST with
-          // tool permissions bypassed — single-operator/self-host only.
-          // A hosted multi-tenant deploy must never route tenants here,
-          // so it's opt-in via env rather than reachable by agent config.
+          // Hard gate: by default this harness spawns Claude Code ON THE
+          // HOST with tool permissions bypassed — single-operator/self-host
+          // only, so it's opt-in via env rather than reachable by agent
+          // config. A hosted multi-tenant deploy that opts in also sets
+          // OMA_CLAUDE_ALLOWED_AGENTS, which restricts who may use it and
+          // moves every tool onto the session's sandbox (see the harness).
           if (process.env.OMA_ENABLE_CLAUDE_AGENT_SDK !== "1") {
             const msg =
               "This server has the Claude Agent SDK engine switched off. Choose another " +
@@ -1275,10 +1277,6 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
   },
   buildHarnessContext: async (input) => {
     const harness = input.agent.harness ?? process.env.OMA_DEFAULT_HARNESS;
-    if (input.sandbox.sandboxCapabilities?.().scope === "agent" &&
-        harness === "claude-agent-sdk") {
-      throw new Error("Agent computers support default and codex-sdk harnesses. Claude SDK host tools cannot use an agent computer yet.");
-    }
     const creds = await resolveNodeModelCredentials(input.agent, input.tenantId);
     const runtime = new NodeHarnessRuntime({
       sessionId: input.sessionId,
@@ -1343,7 +1341,7 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
     // by sdk-harness-memory.ts, which also adds the usage guidance); every
     // sandboxed path — an agent computer included — mounts /mnt/memory.
     const hostWorkdirMemory =
-      harness === "claude-agent-sdk" ||
+      (harness === "claude-agent-sdk" && claudeSdkToolsOn(input.sandbox) === "host") ||
       (harness === "codex-sdk" && input.sandbox.sandboxCapabilities?.().scope !== "agent");
     // Setup sessions get no memory reminders (and no store attached), so
     // skip the listing work for them entirely.
@@ -3909,7 +3907,7 @@ v1.delete("/files/:id", async (c) => {
 
 // GET /v1/server_features — the console's one read of what this server
 // backs; surfaces whose endpoints are missing stay hidden.
-v1.get("/server_features", (c) => c.json(serverFeaturesBody()));
+v1.get("/server_features", (c) => c.json(serverFeaturesBody(process.env, c.var.tenant_id)));
 
 // GET /v1/usage?since=<ms>&until=<ms> — token/cost analytics. Cost figures
 // are API-price estimates (see node-usage-tracker.ts); subscription-harness
