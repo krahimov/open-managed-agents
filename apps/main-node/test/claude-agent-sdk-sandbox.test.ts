@@ -19,6 +19,7 @@ import {
   ClaudeAgentSdkHarness,
   claudeSdkAllowed,
   claudeSdkToolsOn,
+  forgetLearnedForeignTools,
   isolatedClaudeEnv,
 } from "../src/lib/claude-agent-sdk-harness.js";
 
@@ -31,10 +32,11 @@ const computer = { sandboxCapabilities: () => ({ scope: "agent" }) };
 /** A `query` that records its options and plays `script` (which may use the
  *  options, e.g. to call the bridge the way Claude Code would). */
 function fakeQuery(script: (options: Options) => AsyncGenerator<FakeMessage> | FakeMessage[]) {
-  const seen: { options?: Options; prompt?: unknown; calls: number } = { calls: 0 };
+  const seen: { options?: Options; prompt?: unknown; calls: number; all: Options[] } = { calls: 0, all: [] };
   const query = ((input: { prompt: unknown; options: Options }) => {
     seen.calls++;
     seen.options = input.options;
+    seen.all.push(input.options);
     seen.prompt = input.prompt;
     const out = script(input.options);
     return Array.isArray(out)
@@ -83,6 +85,7 @@ async function overBridge<T>(options: Options, fn: (client: Client) => Promise<T
 
 beforeEach(() => {
   process.env.SANDBOX_WORKDIR = mkdtempSync(path.join(tmpdir(), "claude-harness-test-"));
+  forgetLearnedForeignTools();
 });
 afterEach(() => vi.unstubAllEnvs());
 
@@ -580,6 +583,100 @@ describe("ClaudeAgentSdkHarness — sandbox mode", () => {
     await new ClaudeAgentSdkHarness({ query }).run(ctx);
     expect(result.isError).toBe(true);
     expect(t.ran).toEqual([]);
+  });
+
+  // Prod 2026-11-24: the first turn after the engine was switched on failed
+  // on "DesignSync", a built-in the block list did not know. Which built-ins
+  // Claude Code offers depends on the account and on flags it fetches, so
+  // an unknown one is removed by name and the turn started again.
+  describe("a built-in the block list does not know", () => {
+    it("is removed by name and the turn starts again, with nothing run in between", async () => {
+      vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/*");
+      const t = tools();
+      let earlyCall: any;
+      const { query, seen } = fakeQuery(async function* (options) {
+        const removed = (options.disallowedTools as string[]).includes("DesignSyncNext");
+        yield init(removed ? ["mcp__oma__bash"] : ["mcp__oma__bash", "DesignSyncNext"], removed ? "sdk-clean" : "sdk-dirty");
+        if (!removed) {
+          // What Claude Code would do if the harness kept going.
+          await overBridge(options, async (client) => {
+            earlyCall = await client.callTool({ name: "bash", arguments: { command: "id" } });
+          });
+          yield success;
+          return;
+        }
+        await overBridge(options, (client) => client.callTool({ name: "bash", arguments: { command: "ls" } }));
+        yield { type: "assistant", session_id: "sdk-clean", message: { content: [{ type: "text", text: "done" }] } };
+        yield success;
+      });
+      const { ctx, broadcasts } = makeCtx({ tools: t.set });
+      await new ClaudeAgentSdkHarness({ query }).run(ctx);
+
+      expect(seen.calls).toBe(2);
+      expect(seen.all[0].abortController.signal.aborted).toBe(true);
+      expect(seen.all[1].abortController.signal.aborted).toBe(false);
+      expect(seen.all[1].abortController).not.toBe(seen.all[0].abortController);
+      expect(seen.all[1].disallowedTools).toContain("DesignSyncNext");
+      // The rejected attempt ran nothing and is not what the turn resumed.
+      expect(earlyCall).toBeUndefined();
+      expect(t.ran).toEqual([{ command: "ls" }]);
+      expect(seen.all[1].resume).toBeUndefined();
+      // The person sees a normal turn.
+      expect(broadcasts.some((b) => b.type === "session.error")).toBe(false);
+      expect(broadcasts.some((b) => b.type === "agent.message")).toBe(true);
+
+      // The next turn removes it from the start: one query, resumed from the clean session.
+      const next = fakeQuery(() => [init(["mcp__oma__bash"]), success]);
+      await new ClaudeAgentSdkHarness({ query: next.query }).run(ctx);
+      expect(next.seen.calls).toBe(1);
+      expect(next.seen.options!.disallowedTools).toContain("DesignSyncNext");
+      expect(next.seen.options!.resume).toBe("sdk-clean");
+    });
+
+    it("that is still offered after being removed by name fails the turn", async () => {
+      vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/*");
+      const t = tools();
+      const { query, seen } = fakeQuery(() => [init(["mcp__oma__bash", "Stubborn"]), success]);
+      const { ctx, broadcasts } = makeCtx({ tools: t.set });
+      await expect(new ClaudeAgentSdkHarness({ query }).run(ctx)).rejects.toThrow(/outside this session's own \(Stubborn\)/);
+      expect(seen.calls).toBe(2);
+      expect(broadcasts.filter((b) => b.type === "session.error")).toHaveLength(1);
+      expect(t.ran).toEqual([]);
+    });
+
+    it("cannot keep a turn restarting: a new unknown tool every time fails after two restarts", async () => {
+      vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/*");
+      const t = tools();
+      let n = 0;
+      const { query, seen } = fakeQuery(() => [init(["mcp__oma__bash", `Fresh${++n}`]), success]);
+      await expect(new ClaudeAgentSdkHarness({ query }).run(makeCtx({ tools: t.set }).ctx)).rejects.toThrow(/Fresh3/);
+      expect(seen.calls).toBe(3);
+    });
+
+    it("is shed from a setup session the same way", async () => {
+      vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/*");
+      const { query, seen } = fakeQuery((options) =>
+        (options.disallowedTools as string[]).includes("DesignSyncNext")
+          ? [init(["mcp__oma_setup__update_harness"]), success]
+          : [init(["mcp__oma_setup__update_harness", "DesignSyncNext"]), success],
+      );
+      const harness = new ClaudeAgentSdkHarness({
+        query,
+        readSessionMetadata: async () => ({ oma_setup: true }),
+        updateAgent: async () => ({}) as never,
+      });
+      const { ctx, broadcasts } = makeCtx({ sandbox: null });
+      await harness.run(ctx);
+      expect(seen.calls).toBe(2);
+      expect(broadcasts.some((b) => b.type === "session.error")).toBe(false);
+    });
+
+    it("is not learned from a session that is not isolated (host mode never restarts)", async () => {
+      const { query, seen } = fakeQuery(() => [init(["Bash", "DesignSyncNext"]), success]);
+      await new ClaudeAgentSdkHarness({ query }).run(makeCtx({ tools: {} }).ctx);
+      expect(seen.calls).toBe(1);
+      expect(seen.options!.disallowedTools).toBeUndefined();
+    });
   });
 
   it("an agent computer gets sandbox tools even where nobody restricted the engine", async () => {
