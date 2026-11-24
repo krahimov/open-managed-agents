@@ -640,6 +640,19 @@ export async function buildTools(
      *  turndown/pdf-parse/mammoth. Optional — when absent the tool falls
      *  back to raw curl + a warning to the model. */
     toMarkdown?: ToMarkdownProvider;
+    /**
+     * The fetch web_fetch downloads a page with, in the process that runs
+     * this tool. Node passes one that refuses private and reserved
+     * destinations on every hop (main-node public-fetch.ts): the URL is the
+     * model's choice, and that process sits on the operator's network.
+     * `hostAllowed` carries the environment's allowed hosts, so a redirect
+     * cannot leave them. Absent (Workers, which have no private network to
+     * reach), the global fetch is used.
+     */
+    webFetch?: (
+      url: string,
+      init: { headers: Record<string, string>; signal: AbortSignal; hostAllowed?: (hostname: string) => boolean },
+    ) => Promise<Response>;
     delegateToAgent?: (
       agentId: string,
       message: string,
@@ -1178,14 +1191,24 @@ export async function buildTools(
         let isRaw = false;
         if (env?.toMarkdown) {
           try {
-            const r = await fetch(url, {
-              headers: {
-                "User-Agent": "OMA-Agent/1.0 (+web_fetch)",
-                Accept: "text/html, application/xhtml+xml, application/xml;q=0.9, */*;q=0.8",
-              },
-              redirect: "follow",
-              signal: AbortSignal.timeout(20_000),
-            });
+            const pageHeaders = {
+              "User-Agent": "OMA-Agent/1.0 (+web_fetch)",
+              Accept: "text/html, application/xhtml+xml, application/xml;q=0.9, */*;q=0.8",
+            };
+            const limitedHosts =
+              env.environmentConfig?.networking?.type === "limited"
+                ? env.environmentConfig.networking.allowed_hosts || []
+                : null;
+            const r = env.webFetch
+              ? await env.webFetch(url, {
+                  headers: pageHeaders,
+                  signal: AbortSignal.timeout(20_000),
+                  // Re-checked on every redirect, not just the first URL.
+                  ...(limitedHosts
+                    ? { hostAllowed: (host: string) => limitedHosts.some((h) => host === h || host.endsWith(`.${h}`)) }
+                    : {}),
+                })
+              : await fetch(url, { headers: pageHeaders, redirect: "follow", signal: AbortSignal.timeout(20_000) });
             if (r.ok) {
               const buf = await r.arrayBuffer();
               const ct = r.headers.get("content-type") || "text/html";

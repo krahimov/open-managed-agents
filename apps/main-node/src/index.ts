@@ -104,6 +104,7 @@ import {
 } from "./lib/agent-memory-mode.js";
 import { MemoryPromptBuilder, createSessionMemoryContext } from "./lib/memory-prompt.js";
 import { ClaudeAgentSdkHarness, claudeSdkToolsOn } from "./lib/claude-agent-sdk-harness.js";
+import { createPublicFetch } from "./lib/public-fetch.js";
 import type { PiHarness } from "@open-managed-agents/agent/harness/pi";
 import {
   buildSetupPrompt,
@@ -253,6 +254,8 @@ import { SessionRegistry } from "./registry.js";
 loadDotenvDefaults();
 
 const toMarkdownProvider = nodeToMarkdown();
+// The fetch behind the web_fetch tool (see lib/public-fetch.ts).
+const publicFetch = createPublicFetch({ allowPrivate: process.env.WEBHOOKS_ALLOW_PRIVATE === "1" });
 const MODEL_CARD_PROVIDERS = ["ant", "ant-compatible", "oai", "oai-compatible"] as const;
 const DEFAULT_OPENAI_MODEL = "gpt-5.5";
 const LEGACY_OPENAI_MODEL = "gpt-4o";
@@ -1074,6 +1077,8 @@ const sessionRegistry: SessionRegistry = new SessionRegistry({
       // rate-limit-prone DuckDuckGo scrape (see tools.ts web search block).
       TAVILY_API_KEY: process.env.TAVILY_API_KEY,
       toMarkdown: toMarkdownProvider,
+      // web_fetch downloads in THIS process: never to a private address.
+      webFetch: publicFetch,
       browser,
       browserByDefault: !!browser,
       computer: browser && buildSandboxEnvForEnvironment(process.env, context.environment).MACHINE_DESKTOP === 'true' ? {
