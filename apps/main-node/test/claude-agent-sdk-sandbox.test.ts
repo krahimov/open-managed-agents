@@ -596,12 +596,15 @@ describe("ClaudeAgentSdkHarness — sandbox mode", () => {
       let earlyCall: any;
       const { query, seen } = fakeQuery(async function* (options) {
         const removed = (options.disallowedTools as string[]).includes("DesignSyncNext");
-        yield init(removed ? ["mcp__oma__bash"] : ["mcp__oma__bash", "DesignSyncNext"], removed ? "sdk-clean" : "sdk-dirty");
         if (!removed) {
-          // What Claude Code would do if the harness kept going.
+          // A call in the attempt about to be rejected, made before the
+          // harness has read anything: the bridge itself must refuse it.
           await overBridge(options, async (client) => {
             earlyCall = await client.callTool({ name: "bash", arguments: { command: "id" } });
           });
+        }
+        yield init(removed ? ["mcp__oma__bash"] : ["mcp__oma__bash", "DesignSyncNext"], removed ? "sdk-clean" : "sdk-dirty");
+        if (!removed) {
           yield success;
           return;
         }
@@ -618,7 +621,7 @@ describe("ClaudeAgentSdkHarness — sandbox mode", () => {
       expect(seen.all[1].abortController).not.toBe(seen.all[0].abortController);
       expect(seen.all[1].disallowedTools).toContain("DesignSyncNext");
       // The rejected attempt ran nothing and is not what the turn resumed.
-      expect(earlyCall).toBeUndefined();
+      expect(earlyCall.isError).toBe(true);
       expect(t.ran).toEqual([{ command: "ls" }]);
       expect(seen.all[1].resume).toBeUndefined();
       // The person sees a normal turn.
@@ -642,6 +645,55 @@ describe("ClaudeAgentSdkHarness — sandbox mode", () => {
       expect(seen.calls).toBe(2);
       expect(broadcasts.filter((b) => b.type === "session.error")).toHaveLength(1);
       expect(t.ran).toEqual([]);
+    });
+
+    it("reported by a second init, after work was accepted, stops the turn: the prompt is not run twice", async () => {
+      vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/*");
+      const t = tools();
+      const { query, seen } = fakeQuery(async function* (options) {
+        yield init(["mcp__oma__bash"]);
+        await overBridge(options, (client) => client.callTool({ name: "bash", arguments: { command: "rm -rf build" } }));
+        yield init(["mcp__oma__bash", "LateTool"]);
+        yield success;
+      });
+      const { ctx, broadcasts } = makeCtx({ tools: t.set });
+      await expect(new ClaudeAgentSdkHarness({ query }).run(ctx)).rejects.toThrow(/outside this session's own \(LateTool\)/);
+      expect(seen.calls).toBe(1);
+      expect(t.ran).toEqual([{ command: "rm -rf build" }]);
+      expect(broadcasts.filter((b) => b.type === "session.error")).toHaveLength(1);
+      // …and it was not learned for anyone else.
+      const next = fakeQuery(() => [init(["mcp__oma__bash"]), success]);
+      await new ClaudeAgentSdkHarness({ query: next.query }).run(makeCtx({ tools: t.set }).ctx);
+      expect(next.seen.options!.disallowedTools).not.toContain("LateTool");
+    });
+
+    it("named like an MCP tool is never learned: the shared list must not be able to remove a session's own tool", async () => {
+      vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/*");
+      const t = tools();
+      const { query, seen } = fakeQuery(() => [init(["mcp__oma__bash", "mcp__oma__read"]), success]);
+      await expect(new ClaudeAgentSdkHarness({ query }).run(makeCtx({ tools: t.set }).ctx)).rejects.toThrow(/outside this session's own/);
+      expect(seen.calls).toBe(1);
+      // A session that does serve `read` is unaffected.
+      const other = fakeQuery(() => [init(["mcp__oma__bash", "mcp__oma__read"]), success]);
+      await new ClaudeAgentSdkHarness({ query: other.query }).run(
+        makeCtx({ tools: { ...t.set, read: { ...t.set.bash, description: "Read" } } }).ctx,
+      );
+      expect(other.seen.options!.disallowedTools).not.toContain("mcp__oma__read");
+    });
+
+    it("is not restarted once the turn was stopped by the person", async () => {
+      vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/*");
+      const t = tools();
+      const stop = new AbortController();
+      const { query, seen } = fakeQuery(async function* () {
+        stop.abort();
+        yield init(["mcp__oma__bash", "DesignSyncNext"]);
+        yield success;
+      });
+      const { ctx } = makeCtx({ tools: t.set });
+      (ctx as any).runtime.abortSignal = stop.signal;
+      await expect(new ClaudeAgentSdkHarness({ query }).run(ctx)).rejects.toThrow();
+      expect(seen.calls).toBe(1);
     });
 
     it("cannot keep a turn restarting: a new unknown tool every time fails after two restarts", async () => {
