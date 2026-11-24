@@ -55,6 +55,10 @@ export const SERVER_FEATURE_KEYS = [
   "cap_cli",
   /** POST /v1/agents/:id/ambient-rules/:ruleId/run ("Run now" / "Send test event"). */
   "ambient_run_now",
+  /** Sessions can run on the Claude Agent SDK engine (operator opt-in). */
+  "engine_claude_agent_sdk",
+  /** Sessions can run on the Codex SDK engine (operator opt-in). */
+  "engine_codex_sdk",
 ] as const;
 
 export type ServerFeature = (typeof SERVER_FEATURE_KEYS)[number];
@@ -150,6 +154,27 @@ export function useServerFeatures() {
 export function useServerFeature(key: ServerFeature): boolean {
   const { data } = useServerFeatures();
   return data?.features.has(key) ?? false;
+}
+
+/** The engines (an agent's `harness`) a server has only where its operator opted in. */
+const ENGINE_FEATURE: Record<string, ServerFeature> = {
+  "claude-agent-sdk": "engine_claude_agent_sdk",
+  "codex-sdk": "engine_codex_sdk",
+};
+
+/**
+ * Answers whether this server has `harness` switched off: a session on it
+ * would fail its first turn, so the agent form does not offer it. True only
+ * when the server's own list leaves the engine out. While the list is
+ * loading, and on an older server that has none, nothing counts as off and
+ * every engine is offered as before.
+ */
+export function useEngineOff(): (harness: string) => boolean {
+  const { data } = useServerFeatures();
+  return (harness) => {
+    const key = ENGINE_FEATURE[harness];
+    return !!key && data?.source === "server" && !data.features.has(key);
+  };
 }
 
 /**

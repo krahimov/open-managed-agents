@@ -9,6 +9,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { BRAND_NAME } from "@/lib/brand";
 import { describeModel } from "@/lib/models";
 import { inlineLink } from "@/lib/links";
+import { useEngineOff } from "@/lib/server-features";
 
 import { AvatarPicker } from "../../../components/agents/AvatarPicker";
 import { CheckRow, FormSection, OptionCard, PickSelect, RowBox } from "../../../components/agents/controls";
@@ -25,6 +26,7 @@ import {
 import { MemoryModeControl } from "../../../components/MemoryModeControl";
 import {
   cardSupportsReasoningLevel,
+  engineLabel,
   isSubscriptionHarness,
   reasoningLevelOptions,
   type FormSetter,
@@ -107,6 +109,12 @@ export function ModelSection({
   const selectedCard = modelCards.find((mc) => mc.id === selectedCardId);
   const engine: Engine = form.runtimeId ? "local" : form.harness;
   const subscription = isSubscriptionHarness(engine);
+  // An engine this server has switched off is not on offer. An agent already
+  // on one (an older agent, a restored draft) keeps its card, marked, so the
+  // form shows what is saved and why it cannot run.
+  const engineOff = useEngineOff();
+  const offers = (candidate: Engine) => !engineOff(candidate) || engine === candidate;
+  const offChip = (candidate: Engine) => (engineOff(candidate) ? <Chip>Off on this server</Chip> : undefined);
   // The managed loop and Pi both run on one of the workspace's model keys.
   const modelKey = engine === "default" || engine === "pi";
   const showReasoningLevel = modelKey && cardSupportsReasoningLevel(selectedCard);
@@ -150,20 +158,26 @@ export function ModelSection({
           title="Pi agent"
           description="The Pi agent runtime with the platform's tools. Billed to one of your model keys."
         />
-        <OptionCard
-          selected={engine === "claude-agent-sdk"}
-          onSelect={() => pickEngine("claude-agent-sdk")}
-          icon={BotIcon}
-          title="Claude Agent SDK"
-          description="Headless Claude Code on the server. Billed to its Claude subscription."
-        />
-        <OptionCard
-          selected={engine === "codex-sdk"}
-          onSelect={() => pickEngine("codex-sdk")}
-          icon={SquareTerminalIcon}
-          title="Codex SDK"
-          description="Headless Codex on the server. Billed to its ChatGPT subscription."
-        />
+        {offers("claude-agent-sdk") && (
+          <OptionCard
+            selected={engine === "claude-agent-sdk"}
+            onSelect={() => pickEngine("claude-agent-sdk")}
+            icon={BotIcon}
+            title="Claude Agent SDK"
+            description="Headless Claude Code on the server. Billed to its Claude subscription."
+            trailing={offChip("claude-agent-sdk")}
+          />
+        )}
+        {offers("codex-sdk") && (
+          <OptionCard
+            selected={engine === "codex-sdk"}
+            onSelect={() => pickEngine("codex-sdk")}
+            icon={SquareTerminalIcon}
+            title="Codex SDK"
+            description="Headless Codex on the server. Billed to its ChatGPT subscription."
+            trailing={offChip("codex-sdk")}
+          />
+        )}
         <OptionCard
           selected={engine === "local"}
           onSelect={() => pickEngine("local")}
@@ -287,15 +301,21 @@ export function ModelSection({
               />
             </Field>
           </div>
-          <Callout title="Self-hosted only">
-            Runs headless {engine === "codex-sdk" ? "Codex" : "Claude Code"} on the server host and bills its{" "}
-            {engine === "codex-sdk" ? "ChatGPT" : "Claude"} subscription, so no model key is needed. The deployment
-            must set{" "}
-            <code className="font-mono text-xs text-fg">
-              {engine === "codex-sdk" ? "OMA_ENABLE_CODEX_SDK=1" : "OMA_ENABLE_CLAUDE_AGENT_SDK=1"}
-            </code>
-            .
-          </Callout>
+          {engineOff(engine) ? (
+            <Callout tone="warning" title={`${engineLabel(engine)} is off on this server`}>
+              A session on this engine fails on its first turn. Choose another engine above. On a server you host
+              yourself, the operator turns it on with{" "}
+              <code className="font-mono text-xs text-fg">
+                {engine === "codex-sdk" ? "OMA_ENABLE_CODEX_SDK=1" : "OMA_ENABLE_CLAUDE_AGENT_SDK=1"}
+              </code>
+              .
+            </Callout>
+          ) : (
+            <Callout title="Runs on the server host">
+              Runs headless {engine === "codex-sdk" ? "Codex" : "Claude Code"} on the server host and bills its{" "}
+              {engine === "codex-sdk" ? "ChatGPT" : "Claude"} subscription, so no model key is needed.
+            </Callout>
+          )}
         </>
       )}
 

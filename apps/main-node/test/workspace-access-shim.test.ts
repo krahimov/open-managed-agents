@@ -152,4 +152,15 @@ describe("GET /v1/server_features", () => {
     ];
     for (const key of SERVER_FEATURES) expect(known).toContain(key);
   });
+
+  it("lists a host engine only where the operator switched it on", () => {
+    expect(serverFeaturesBody({}).features).not.toContain("engine_claude_agent_sdk");
+    expect(serverFeaturesBody({}).features).not.toContain("engine_codex_sdk");
+    // Prod 2026-11: Codex on, Claude Agent SDK off.
+    const prod = serverFeaturesBody({ OMA_ENABLE_CODEX_SDK: "1" }).features;
+    expect(prod).toContain("engine_codex_sdk");
+    expect(prod).not.toContain("engine_claude_agent_sdk");
+    expect(serverFeaturesBody({ OMA_ENABLE_CLAUDE_AGENT_SDK: "true" }).features).not.toContain("engine_claude_agent_sdk");
+    expect(serverFeaturesBody({ OMA_ENABLE_CLAUDE_AGENT_SDK: "1" }).features).toContain("engine_claude_agent_sdk");
+  });
 });

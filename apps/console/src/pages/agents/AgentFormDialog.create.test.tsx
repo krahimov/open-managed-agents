@@ -271,3 +271,60 @@ describe("New agent — sections and leaving", () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 });
+
+// Prod 2026-11-24: the form offered "Claude Agent SDK" on a server that has
+// it switched off. The agent was created and its first turn failed.
+describe("New agent — engines this server has", () => {
+  const serverHas = (features: string[]) =>
+    server.use(http.get("*/v1/server_features", () => HttpResponse.json({ features })));
+
+  it("offers a host engine only where the server switched it on", async () => {
+    serverHas(["usage", "engine_codex_sdk"]);
+    renderCreate();
+    await pickBlank();
+    fireEvent.click(screen.getByRole("tab", { name: /Model and engine/ }));
+    const engines = within(await screen.findByRole("radiogroup", { name: "Engine" }));
+    expect(await engines.findByRole("radio", { name: /Codex SDK/ })).toBeInTheDocument();
+    await waitFor(() => expect(engines.queryByRole("radio", { name: /Claude Agent SDK/ })).not.toBeInTheDocument());
+    expect(engines.getByRole("radio", { name: /Managed loop/ })).toBeChecked();
+  });
+
+  it("offers every engine on a server that lists them", async () => {
+    serverHas(["engine_codex_sdk", "engine_claude_agent_sdk"]);
+    renderCreate();
+    await pickBlank();
+    fireEvent.click(screen.getByRole("tab", { name: /Model and engine/ }));
+    const engines = within(await screen.findByRole("radiogroup", { name: "Engine" }));
+    fireEvent.click(engines.getByRole("radio", { name: /Claude Agent SDK/ }));
+    expect(await screen.findByText("Runs on the server host")).toBeInTheDocument();
+    expect(screen.queryByText(/is off on this server/)).not.toBeInTheDocument();
+  });
+
+  it("a config already on a switched-off engine says so and is not created", async () => {
+    serverHas(["engine_codex_sdk"]);
+    renderCreate();
+    await pickBlank();
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Loan processor" } });
+    const config = await currentConfig();
+    const editor = screen.getByRole("textbox", { name: "Agent config as JSON" });
+    fireEvent.change(editor, { target: { value: JSON.stringify({ ...config, _oma: { harness: "claude-agent-sdk" } }) } });
+    fireEvent.click(screen.getByRole("radio", { name: "Form" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Create agent" }));
+    expect(await screen.findByText(/Claude Agent SDK is off on this server\. Choose another engine/)).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+
+    // The form lands on the engine, with the saved one marked.
+    const engines = within(await screen.findByRole("radiogroup", { name: "Engine" }));
+    const claude = engines.getByRole("radio", { name: /Claude Agent SDK/ });
+    expect(claude).toBeChecked();
+    expect(within(claude).getByText("Off on this server")).toBeInTheDocument();
+
+    // Another engine clears it and the agent is created on that one.
+    fireEvent.click(engines.getByRole("radio", { name: /Managed loop/ }));
+    await waitFor(() => expect(engines.queryByRole("radio", { name: /Claude Agent SDK/ })).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Create agent" }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect((created[0]._oma as Record<string, unknown> | undefined)?.harness).toBeUndefined();
+  });
+});

@@ -19,6 +19,7 @@ import { VaultIcon } from "@/components/icons";
 import { toast } from "sonner";
 
 import { getActiveTenantId, readApiErrorMessage, useApi } from "../../lib/api";
+import { useEngineOff } from "../../lib/server-features";
 import { getClerkBearerToken } from "../../lib/clerk-auth";
 import { useApiQuery } from "../../lib/useApiQuery";
 import { subscribeOAuthMessages } from "../../lib/oauth-popup";
@@ -64,6 +65,7 @@ import {
   type FormState,
   type FormTab,
   type McpEntry,
+  engineLabel,
   isSubscriptionHarness,
   reasoningLevelForWire,
   type HarnessValue,
@@ -148,6 +150,7 @@ export function AgentFormDialog({
   const isEdit = !!editAgent;
 
   const [createError, setCreateError] = useState("");
+  const engineOff = useEngineOff();
   const [createStep, setCreateStep] = useState<"template" | "form">("template");
   const [templateSearch, setTemplateSearch] = useState("");
   const [form, setForm] = useState({ ...INITIAL_FORM });
@@ -915,6 +918,15 @@ export function AgentFormDialog({
   const create = async () => {
     if (creating) return;
     setCreateError("");
+    // An engine this server has switched off (a restored draft, pasted YAML)
+    // would create an agent whose first turn fails: stop here instead.
+    if (!form.runtimeId && engineOff(form.harness)) {
+      setTab("model");
+      setCreateError(
+        `${engineLabel(form.harness)} is off on this server. Choose another engine under Model and engine.`,
+      );
+      return;
+    }
     setCreating(true);
     try {
       const ambientRuleBody = form.ambientEnabled ? buildAmbientRuleBody(form) : null;
