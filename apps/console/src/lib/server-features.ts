@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useApi, isNotOnServer } from "./api";
 
 /**
@@ -55,10 +55,6 @@ export const SERVER_FEATURE_KEYS = [
   "cap_cli",
   /** POST /v1/agents/:id/ambient-rules/:ruleId/run ("Run now" / "Send test event"). */
   "ambient_run_now",
-  /** Sessions can run on the Claude Agent SDK engine (operator opt-in). */
-  "engine_claude_agent_sdk",
-  /** Sessions can run on the Codex SDK engine (operator opt-in). */
-  "engine_codex_sdk",
 ] as const;
 
 export type ServerFeature = (typeof SERVER_FEATURE_KEYS)[number];
@@ -91,6 +87,13 @@ export interface ServerFeatures {
    * stays on offer as before.
    */
   ambientTriggerSources: ReadonlySet<string> | null;
+  /**
+   * The host engines (see HOST_ENGINES) this server has switched on
+   * (`engines` in the answer). Null when the server does not say: an older
+   * server, where every engine stays on offer as before. An empty set means
+   * the server said none is on.
+   */
+  hostEngines: ReadonlySet<string> | null;
   /** Where the answer came from: the server's own list, or the console's probes. */
   source: "server" | "probe";
 }
@@ -103,12 +106,15 @@ type Api = ReturnType<typeof useApi>["api"];
 
 export async function loadServerFeatures(api: Api, signal?: AbortSignal): Promise<ServerFeatures> {
   try {
-    const body = await api<{ features?: unknown; ambient_trigger_sources?: unknown }>("/v1/server_features", { signal, silentErrors: true });
+    const body = await api<{ features?: unknown; ambient_trigger_sources?: unknown; engines?: unknown }>("/v1/server_features", { signal, silentErrors: true });
     const list = Array.isArray(body?.features) ? body.features.filter(isFeature) : [];
     const sources = Array.isArray(body?.ambient_trigger_sources)
       ? new Set(body.ambient_trigger_sources.filter((s): s is string => typeof s === "string"))
       : null;
-    return { features: new Set(list), ambientTriggerSources: sources, source: "server" };
+    const engines = Array.isArray(body?.engines)
+      ? new Set(body.engines.filter((e): e is string => typeof e === "string"))
+      : null;
+    return { features: new Set(list), ambientTriggerSources: sources, hostEngines: engines, source: "server" };
   } catch (err) {
     if (!isNotOnServer(err)) throw err;
   }
@@ -126,6 +132,7 @@ export async function loadServerFeatures(api: Api, signal?: AbortSignal): Promis
   return {
     features: new Set(results.filter((k): k is ServerFeature => k !== null)),
     ambientTriggerSources: null,
+    hostEngines: null,
     source: "probe",
   };
 }
@@ -156,24 +163,53 @@ export function useServerFeature(key: ServerFeature): boolean {
   return data?.features.has(key) ?? false;
 }
 
-/** The engines (an agent's `harness`) a server has only where its operator opted in. */
-const ENGINE_FEATURE: Record<string, ServerFeature> = {
-  "claude-agent-sdk": "engine_claude_agent_sdk",
-  "codex-sdk": "engine_codex_sdk",
-};
+/** The engines (an agent's `harness`) a server runs only where its operator opted in. */
+export const HOST_ENGINES: readonly string[] = ["claude-agent-sdk", "codex-sdk"];
+
+function engineIsOff(data: ServerFeatures | undefined, harness: string): boolean {
+  return HOST_ENGINES.includes(harness) && !!data?.hostEngines && !data.hostEngines.has(harness);
+}
 
 /**
- * Answers whether this server has `harness` switched off: a session on it
- * would fail its first turn, so the agent form does not offer it. True only
- * when the server's own list leaves the engine out. While the list is
- * loading, and on an older server that has none, nothing counts as off and
- * every engine is offered as before.
+ * Answers whether this server has `harness` switched off, from the cached
+ * answer, for what the agent form shows. True only when the server named
+ * its engines and left this one out. While the answer is loading, and on a
+ * server that does not name its engines, nothing counts as off.
+ *
+ * Not enough on its own to create an agent: use `useConfirmEngine` there.
  */
 export function useEngineOff(): (harness: string) => boolean {
   const { data } = useServerFeatures();
-  return (harness) => {
-    const key = ENGINE_FEATURE[harness];
-    return !!key && data?.source === "server" && !data.features.has(key);
+  return (harness) => engineIsOff(data, harness);
+}
+
+/** "unconfirmed": the server could not be asked (offline, 5xx). */
+export type EngineCheck = "on" | "off" | "unconfirmed";
+
+/**
+ * Asks the server again whether `harness` can run, for the moment an agent
+ * is about to be created on it. The cached answer is not enough there: it
+ * may still be loading, the read may have failed, or the operator may have
+ * switched the engine off since the tab opened. The fresh answer replaces
+ * the cached one, so the form updates too. Engines every server has need
+ * no call.
+ */
+export function useConfirmEngine(): (harness: string) => Promise<EngineCheck> {
+  const { api } = useApi();
+  const client = useQueryClient();
+  return async (harness) => {
+    if (!HOST_ENGINES.includes(harness)) return "on";
+    try {
+      const fresh = await client.fetchQuery<ServerFeatures>({
+        queryKey: SERVER_FEATURES_QUERY_KEY,
+        queryFn: ({ signal }) => loadServerFeatures(api, signal),
+        staleTime: 0,
+        retry: false,
+      });
+      return engineIsOff(fresh, harness) ? "off" : "on";
+    } catch {
+      return "unconfirmed";
+    }
   };
 }
 

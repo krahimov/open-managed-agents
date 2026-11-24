@@ -37,6 +37,8 @@ const TOOLKITS: Record<string, FakeToolkit> = {
   exa: { managed: [], schemes: { BEARER_TOKEN: [], API_KEY: [] } },
   twitter: { managed: [], schemes: { OAUTH2: ["client_id", "client_secret"] } },
   hackernews: { managed: [], schemes: { NO_AUTH: [] } },
+  // Canonical slug keeps its underscore: "microsoftteams" is unknown.
+  microsoft_teams: { managed: ["OAUTH2"], schemes: { OAUTH2: ["client_id", "client_secret"] } },
 };
 
 /** Fake Composio with the real API's answers for auth configs (probed
@@ -57,7 +59,9 @@ function fakeComposio(initial: FakeAuthConfig[] = []) {
 
     if (url.pathname === "/api/v3.1/auth_configs" && method === "GET") {
       const slug = url.searchParams.get("toolkit_slug") ?? "";
-      return json({ items: TOOLKITS[slug] ? configs.filter((cfg) => cfg.toolkit.slug === slug) : configs });
+      const managed = url.searchParams.get("is_composio_managed");
+      const ofKind = configs.filter((cfg) => managed === null || String(cfg.is_composio_managed) === managed);
+      return json({ items: TOOLKITS[slug] ? ofKind.filter((cfg) => cfg.toolkit.slug === slug) : ofKind });
     }
     if (url.pathname === "/api/v3.1/auth_configs" && method === "POST") {
       const slug = body?.toolkit?.slug as string;
@@ -130,11 +134,12 @@ async function rig(composio: ReturnType<typeof fakeComposio>) {
       composio: { apiKey: "platform-key", fetcher: composio.fetcher },
     }),
   );
-  const link = async (toolkit: string) => {
+  /** `extra.api_key` makes the request use a tenant's own Composio project. */
+  const link = async (toolkit: string, extra: Record<string, unknown> = {}) => {
     const res = await app.request(`/v1/vaults/${vault.id}/credentials/composio_accounts/link`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ toolkit }),
+      body: JSON.stringify({ toolkit, ...extra }),
     });
     return { status: res.status, body: (await res.json()) as Record<string, any> };
   };
@@ -191,33 +196,77 @@ describe("composio_accounts/link for apps without Composio-managed sign-in", () 
 
   it("a managed app prefers the managed config over an operator's custom one", async () => {
     const composio = fakeComposio([
-      { id: "ac_own_gmail", is_composio_managed: false, toolkit: { slug: "gmail" } },
+      { id: "ac_own_gmail", auth_scheme: "OAUTH2", is_composio_managed: false, toolkit: { slug: "gmail" } },
     ]);
     const r = await rig(composio);
     expect((await r.link("gmail")).body.auth_config_id).toBe("ac_managed_gmail");
+    // …and never lists the custom ones to find that out.
+    expect(composio.calls.filter((c) => c.method === "GET" && c.path === "/api/v3.1/auth_configs")).toHaveLength(1);
   });
 
-  it("an app that needs your own OAuth app (X) uses the operator's custom config when there is one", async () => {
+  it("in a tenant's own Composio project, an app that needs an OAuth app (X) uses the custom config there", async () => {
     const composio = fakeComposio([
-      { id: "ac_disabled_x", is_composio_managed: false, status: "DISABLED", toolkit: { slug: "twitter" } },
-      { id: "ac_own_x", is_composio_managed: false, toolkit: { slug: "twitter" } },
+      { id: "ac_disabled_x", auth_scheme: "OAUTH2", is_composio_managed: false, status: "DISABLED", toolkit: { slug: "twitter" } },
+      { id: "ac_own_x", auth_scheme: "OAUTH2", is_composio_managed: false, toolkit: { slug: "twitter" } },
+    ]);
+    const r = await rig(composio);
+    const res = await r.link("twitter", { api_key: "tenant-own-key" });
+    expect(res.status).toBe(201);
+    expect(res.body.auth_config_id).toBe("ac_own_x");
+  });
+
+  it("under the platform key, a custom OAuth app in the shared project is not handed out by toolkit name", async () => {
+    // The operator's X client: every tenant shares this Composio project.
+    const composio = fakeComposio([
+      { id: "ac_operator_x", auth_scheme: "OAUTH2", is_composio_managed: false, toolkit: { slug: "twitter" } },
     ]);
     const r = await rig(composio);
     const res = await r.link("twitter");
-    expect(res.status).toBe(201);
-    expect(res.body.auth_config_id).toBe("ac_own_x");
+    expect(res.status).toBe(422);
+    expect(res.body.code).toBe("COMPOSIO_CUSTOM_AUTH_REQUIRED");
+    // …and the message does not send them to a project the lookup never reads.
+    expect(res.body.error).toContain("platform's Composio connection");
+    expect(res.body.error).toContain("your own Composio API key");
+    expect(composio.calls.some((c) => c.path === "/api/v3.1/connected_accounts/link")).toBe(false);
+    // Naming the config still works, as before.
+    const named = await r.link("twitter", { auth_config_id: "ac_operator_x" });
+    expect(named.status).toBe(201);
+    expect(named.body.auth_config_id).toBe("ac_operator_x");
   });
 
   it("…and says what to do, in words, when there is none", async () => {
     const composio = fakeComposio();
     const r = await rig(composio);
-    const res = await r.link("twitter");
+    const res = await r.link("twitter", { api_key: "tenant-own-key" });
     expect(res.status).toBe(422);
     expect(res.body.code).toBe("COMPOSIO_CUSTOM_AUTH_REQUIRED");
     expect(res.body.error).toContain('"twitter"');
-    expect(res.body.error).toContain("your own developer app");
+    expect(res.body.error).toContain("in your Composio project");
     expect(res.body.error).not.toContain("{");
     expect(composio.calls.some((c) => c.path === "/api/v3.1/connected_accounts/link")).toBe(false);
+  });
+
+  it("two first connects at once create one config, not two", async () => {
+    const composio = fakeComposio();
+    const r = await rig(composio);
+    const [a, b] = await Promise.all([r.link("posthog"), r.link("posthog")]);
+    expect(a.status).toBe(201);
+    expect(b.status).toBe(201);
+    expect(a.body.auth_config_id).toBe(b.body.auth_config_id);
+    expect(composio.configs).toHaveLength(1);
+  });
+
+  it("a toolkit whose canonical slug keeps its underscore connects on the first try", async () => {
+    const composio = fakeComposio();
+    const r = await rig(composio);
+    const res = await r.link("microsoft_teams");
+    expect(res.status).toBe(201);
+    expect(res.body.auth_config_id).toBe("ac_managed_microsoft_teams");
+    // Stripped spelling first (unknown to Composio), then the canonical one.
+    expect(composio.authConfigCreates().map((c) => c.body.toolkit.slug)).toEqual(["microsoftteams", "microsoft_teams"]);
+    // The next connect finds that config without creating another.
+    expect((await r.link("Microsoft Teams")).body.auth_config_id).toBe("ac_managed_microsoft_teams");
+    expect(composio.configs).toHaveLength(1);
   });
 
   it("an app that needs no account (Hacker News) says so", async () => {

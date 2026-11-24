@@ -275,39 +275,61 @@ describe("New agent — sections and leaving", () => {
 // Prod 2026-11-24: the form offered "Claude Agent SDK" on a server that has
 // it switched off. The agent was created and its first turn failed.
 describe("New agent — engines this server has", () => {
-  const serverHas = (features: string[]) =>
-    server.use(http.get("*/v1/server_features", () => HttpResponse.json({ features })));
+  /** `engines` undefined: a server that does not name its engines. */
+  const serverHas = (engines: string[] | undefined, features: string[] = ["usage"]) =>
+    server.use(http.get("*/v1/server_features", () => HttpResponse.json({ features, ...(engines ? { engines } : {}) })));
+
+  const openEngines = async () => {
+    fireEvent.click(screen.getByRole("tab", { name: /Model and engine/ }));
+    return within(await screen.findByRole("radiogroup", { name: "Engine" }));
+  };
+
+  /** Put `_oma.harness` into the config through the JSON editor, and stay there. */
+  const pasteHarness = async (harness: string) => {
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Loan processor" } });
+    const config = await currentConfig();
+    const editor = screen.getByRole("textbox", { name: "Agent config as JSON" });
+    fireEvent.change(editor, { target: { value: JSON.stringify({ ...config, _oma: { harness } }) } });
+  };
 
   it("offers a host engine only where the server switched it on", async () => {
-    serverHas(["usage", "engine_codex_sdk"]);
+    serverHas(["codex-sdk"]);
     renderCreate();
     await pickBlank();
-    fireEvent.click(screen.getByRole("tab", { name: /Model and engine/ }));
-    const engines = within(await screen.findByRole("radiogroup", { name: "Engine" }));
+    const engines = await openEngines();
     expect(await engines.findByRole("radio", { name: /Codex SDK/ })).toBeInTheDocument();
     await waitFor(() => expect(engines.queryByRole("radio", { name: /Claude Agent SDK/ })).not.toBeInTheDocument());
     expect(engines.getByRole("radio", { name: /Managed loop/ })).toBeChecked();
   });
 
   it("offers every engine on a server that lists them", async () => {
-    serverHas(["engine_codex_sdk", "engine_claude_agent_sdk"]);
+    serverHas(["codex-sdk", "claude-agent-sdk"]);
     renderCreate();
     await pickBlank();
-    fireEvent.click(screen.getByRole("tab", { name: /Model and engine/ }));
-    const engines = within(await screen.findByRole("radiogroup", { name: "Engine" }));
+    const engines = await openEngines();
     fireEvent.click(engines.getByRole("radio", { name: /Claude Agent SDK/ }));
     expect(await screen.findByText("Runs on the server host")).toBeInTheDocument();
     expect(screen.queryByText(/is off on this server/)).not.toBeInTheDocument();
   });
 
-  it("a config already on a switched-off engine says so and is not created", async () => {
-    serverHas(["engine_codex_sdk"]);
+  it("offers every engine on a server that does not name its engines (the release before this one)", async () => {
+    // That server answers /v1/server_features, just without `engines`.
+    serverHas(undefined, ["workspace_access", "usage", "ambient_run_now"]);
     renderCreate();
     await pickBlank();
     fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Loan processor" } });
-    const config = await currentConfig();
-    const editor = screen.getByRole("textbox", { name: "Agent config as JSON" });
-    fireEvent.change(editor, { target: { value: JSON.stringify({ ...config, _oma: { harness: "claude-agent-sdk" } }) } });
+    const engines = await openEngines();
+    fireEvent.click(engines.getByRole("radio", { name: /Claude Agent SDK/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Create agent" }));
+    await waitFor(() => expect(created).toHaveLength(1));
+    expect((created[0]._oma as Record<string, unknown>).harness).toBe("claude-agent-sdk");
+  });
+
+  it("a config already on a switched-off engine says so and is not created", async () => {
+    serverHas(["codex-sdk"]);
+    renderCreate();
+    await pickBlank();
+    await pasteHarness("claude-agent-sdk");
     fireEvent.click(screen.getByRole("radio", { name: "Form" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Create agent" }));
@@ -326,5 +348,48 @@ describe("New agent — engines this server has", () => {
     fireEvent.click(screen.getByRole("button", { name: "Create agent" }));
     await waitFor(() => expect(created).toHaveLength(1));
     expect((created[0]._oma as Record<string, unknown> | undefined)?.harness).toBeUndefined();
+  });
+
+  it.each(["JSON", "YAML"])("Create from the %s editor does not get past a switched-off engine either", async (editor) => {
+    serverHas(["codex-sdk"]);
+    renderCreate();
+    await pickBlank();
+    await pasteHarness("claude-agent-sdk");
+    if (editor === "YAML") fireEvent.click(screen.getByRole("radio", { name: "YAML" }));
+    // Still in the editor: this path posts the config as written.
+    fireEvent.click(screen.getByRole("button", { name: "Create agent" }));
+    expect(await screen.findByText(/Claude Agent SDK is off on this server/)).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+  });
+
+  it("asks the server again at create: an engine switched off since the form opened is not used", async () => {
+    serverHas(["claude-agent-sdk"]);
+    renderCreate();
+    await pickBlank();
+    fireEvent.change(screen.getByRole("textbox", { name: "Name" }), { target: { value: "Loan processor" } });
+    const engines = await openEngines();
+    fireEvent.click(await engines.findByRole("radio", { name: /Claude Agent SDK/ }));
+    serverHas([]); // the operator switched it off
+    fireEvent.click(screen.getByRole("button", { name: "Create agent" }));
+    expect(await screen.findByText(/Claude Agent SDK is off on this server\. Choose another engine/)).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+    // The fresh answer reaches the form as well: the engine is now marked.
+    expect(await screen.findByText("Off on this server")).toBeInTheDocument();
+  });
+
+  it("does not create on a host engine while the server cannot be asked", async () => {
+    server.use(http.get("*/v1/server_features", () => new HttpResponse(null, { status: 503 })));
+    renderCreate();
+    await pickBlank();
+    await pasteHarness("claude-agent-sdk");
+    fireEvent.click(screen.getByRole("button", { name: "Create agent" }));
+    expect(await screen.findByText(/Could not confirm that this server runs Claude Agent SDK/)).toBeInTheDocument();
+    expect(created).toHaveLength(0);
+    // The managed loop needs no such answer.
+    fireEvent.click(screen.getByRole("radio", { name: "Form" }));
+    const engines = await openEngines();
+    fireEvent.click(engines.getByRole("radio", { name: /Managed loop/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Create agent" }));
+    await waitFor(() => expect(created).toHaveLength(1));
   });
 });

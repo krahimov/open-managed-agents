@@ -19,7 +19,7 @@ import { VaultIcon } from "@/components/icons";
 import { toast } from "sonner";
 
 import { getActiveTenantId, readApiErrorMessage, useApi } from "../../lib/api";
-import { useEngineOff } from "../../lib/server-features";
+import { useConfirmEngine } from "../../lib/server-features";
 import { getClerkBearerToken } from "../../lib/clerk-auth";
 import { useApiQuery } from "../../lib/useApiQuery";
 import { subscribeOAuthMessages } from "../../lib/oauth-popup";
@@ -150,7 +150,24 @@ export function AgentFormDialog({
   const isEdit = !!editAgent;
 
   const [createError, setCreateError] = useState("");
-  const engineOff = useEngineOff();
+  const confirmEngine = useConfirmEngine();
+  /**
+   * True when an agent on `harness` can be saved. An engine this server has
+   * switched off would make an agent whose first turn fails, so both ways of
+   * creating one (the form and the YAML/JSON editor) ask the server first.
+   * Says why on the form when it cannot.
+   */
+  const engineCanRun = async (harness: unknown): Promise<boolean> => {
+    if (typeof harness !== "string") return true;
+    const check = await confirmEngine(harness);
+    if (check === "on") return true;
+    setCreateError(
+      check === "off"
+        ? `${engineLabel(harness)} is off on this server. Choose another engine under Model and engine.`
+        : `Could not confirm that this server runs ${engineLabel(harness)}. Check your connection and try again.`,
+    );
+    return false;
+  };
   const [createStep, setCreateStep] = useState<"template" | "form">("template");
   const [templateSearch, setTemplateSearch] = useState("");
   const [form, setForm] = useState({ ...INITIAL_FORM });
@@ -918,14 +935,16 @@ export function AgentFormDialog({
   const create = async () => {
     if (creating) return;
     setCreateError("");
-    // An engine this server has switched off (a restored draft, pasted YAML)
-    // would create an agent whose first turn fails: stop here instead.
-    if (!form.runtimeId && engineOff(form.harness)) {
-      setTab("model");
-      setCreateError(
-        `${engineLabel(form.harness)} is off on this server. Choose another engine under Model and engine.`,
-      );
-      return;
+    setCreating(true);
+    try {
+      // A restored draft or pasted config can carry an engine this server
+      // has switched off.
+      if (!form.runtimeId && !(await engineCanRun(form.harness))) {
+        setTab("model");
+        return;
+      }
+    } finally {
+      setCreating(false);
     }
     setCreating(true);
     try {
@@ -1297,6 +1316,14 @@ export function AgentFormDialog({
         setCreateError("The config needs a name.");
         return;
       }
+      // The editor posts the config as written, so the engine is checked
+      // here too. An edit that leaves the agent on the engine it already
+      // has is let through: it changes something else.
+      const codeHarness =
+        (parsed as { harness?: unknown }).harness ??
+        (parsed as { _oma?: { harness?: unknown } })._oma?.harness;
+      const keepsEngine = !!editAgent && (codeHarness ?? "default") === (editAgent._oma?.harness ?? "default");
+      if (!keepsEngine && !(await engineCanRun(codeHarness))) return;
       if (editAgent) {
         const agent = await api<Agent>(`/v1/agents/${editAgent.id}`, {
           method: "POST",
