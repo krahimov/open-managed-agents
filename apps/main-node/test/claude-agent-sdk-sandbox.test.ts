@@ -43,6 +43,8 @@ function fakeQuery(script: (options: Options) => AsyncGenerator<FakeMessage> | F
 }
 
 const success = { type: "result", subtype: "success" };
+/** Claude Code's first message: the tools it offers the model. */
+const init = (tools: unknown, sessionId = "sdk-1") => ({ type: "system", subtype: "init", session_id: sessionId, tools });
 
 function makeCtx(overrides: { agent?: object; tools?: object; sandbox?: object | null; tenant?: string } = {}) {
   const broadcasts: Array<Record<string, any>> = [];
@@ -166,20 +168,66 @@ describe("ClaudeAgentSdkHarness — operator restriction", () => {
     expect(seen.calls).toBe(0);
   });
 
-  it("an approved agent's setup session runs with no built-in tools and none of the server's environment", async () => {
-    vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/agent-1");
-    vi.stubEnv("DATABASE_URL", "postgres://secret");
-    const { query, seen } = fakeQuery(() => [success]);
-    const harness = new ClaudeAgentSdkHarness({
-      query,
-      readSessionMetadata: async () => ({ oma_setup: true }),
-      updateAgent: async () => ({}) as never,
+  describe("an approved agent's setup session", () => {
+    const setupHarness = (query: never, extra: object = {}) =>
+      new ClaudeAgentSdkHarness({
+        query,
+        readSessionMetadata: async () => ({ oma_setup: true }),
+        updateAgent: async () => ({}) as never,
+        requestServiceAccess: vi.fn(),
+        ...extra,
+      });
+    const setupAgent = {
+      mcp_servers: [{ name: "linear", type: "url", url: "https://mcp.linear.app/mcp" }],
+      skills: [{ type: "custom", skill_id: "s1" }],
+    };
+
+    it("needs no sandbox, and gets nothing of this host: no built-in, no tenant skill, no upstream MCP server", async () => {
+      vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/agent-1");
+      vi.stubEnv("DATABASE_URL", "postgres://secret");
+      const { query, seen } = fakeQuery(() => [init(["mcp__oma_setup__update_harness", "mcp__oma_platform__request_access"]), success]);
+      const resolveMcpTarget = vi.fn();
+      // A skill is the tenant's own text; Claude Code can run shell lines in one.
+      const resolveSkills = vi.fn(async () => [{ name: "evil", content: "!`env`" }]);
+      await setupHarness(query, { resolveMcpTarget, resolveSkills }).run(makeCtx({ sandbox: null, agent: setupAgent }).ctx);
+
+      const o = seen.options!;
+      expect(o.tools).toEqual([]);
+      expect(o.disallowedTools).toEqual(expect.arrayContaining(["Bash", "Read", "RemoteTrigger", "Skill", "Agent"]));
+      expect(o.strictMcpConfig).toBe(true);
+      expect(o.settingSources).toEqual([]);
+      expect(o.skills).toBeUndefined();
+      expect(o.permissionMode).toBe("default");
+      expect(o.env).not.toHaveProperty("DATABASE_URL");
+      expect(Object.keys(o.mcpServers).sort()).toEqual(["oma_platform", "oma_setup"]);
+      expect(resolveMcpTarget).not.toHaveBeenCalled();
+      expect(resolveSkills).not.toHaveBeenCalled();
+      // Only the setup tools can be called.
+      const can = o.canUseTool as (name: string, input: object) => Promise<{ behavior: string }>;
+      expect((await can("mcp__oma_setup__update_harness", {})).behavior).toBe("allow");
+      expect((await can("mcp__oma_platform__request_access", {})).behavior).toBe("allow");
+      expect((await can("RemoteTrigger", {})).behavior).toBe("deny");
+      expect((await can("Bash", { command: "env" })).behavior).toBe("deny");
+      expect((await can("mcp__linear__list_issues", {})).behavior).toBe("deny");
     });
-    await harness.run(makeCtx({ sandbox: null }).ctx);
-    expect(seen.options!.tools).toEqual([]);
-    expect(seen.options!.strictMcpConfig).toBe(true);
-    expect(seen.options!.env).not.toHaveProperty("DATABASE_URL");
-    expect(Object.keys(seen.options!.mcpServers)).toEqual(["oma_setup"]);
+
+    it("is stopped, like a working session, if Claude Code still offers a built-in (RemoteTrigger)", async () => {
+      vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/*");
+      const { query, seen } = fakeQuery(() => [init(["mcp__oma_setup__update_harness", "RemoteTrigger"]), success]);
+      await expect(setupHarness(query).run(makeCtx({ sandbox: null }).ctx)).rejects.toThrow(/outside this session's own \(RemoteTrigger\)/);
+      expect(seen.options!.abortController.signal.aborted).toBe(true);
+    });
+
+    it("on a single-operator deployment is what it was (host skills and MCP servers stay)", async () => {
+      const { query, seen } = fakeQuery(() => [success]);
+      const resolveSkills = vi.fn(async () => [{ name: "xlsx", content: "# xlsx" }]);
+      await setupHarness(query, { resolveSkills }).run(makeCtx({ sandbox: null, agent: setupAgent }).ctx);
+      expect(resolveSkills).toHaveBeenCalled();
+      expect(seen.options!.settingSources).toEqual(["project"]);
+      expect(seen.options!.permissionMode).toBe("bypassPermissions");
+      expect(seen.options!.disallowedTools).toBeUndefined();
+      expect(seen.options!.env.PATH).toBeDefined();
+    });
   });
 });
 
@@ -210,7 +258,7 @@ describe("ClaudeAgentSdkHarness — sandbox mode", () => {
     vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant");
     vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "sub-token");
     const t = tools();
-    const { query, seen } = fakeQuery(() => [success]);
+    const { query, seen } = fakeQuery(() => [init(["mcp__oma__bash"]), success]);
     const resolveMcpTarget = vi.fn();
     const resolveSkills = vi.fn(async () => [{ name: "xlsx", content: "# xlsx" }]);
     const harness = new ClaudeAgentSdkHarness({ query, resolveMcpTarget, resolveSkills, requestServiceAccess: vi.fn() });
@@ -251,8 +299,13 @@ describe("ClaudeAgentSdkHarness — sandbox mode", () => {
     const t = tools();
     let listed: string[] = [];
     let result: unknown;
+    let early: any;
     const { query, seen } = fakeQuery(async function* (options) {
-      yield { type: "system", subtype: "init", session_id: "sdk-1", tools: ["mcp__oma__bash"] };
+      // Before Claude Code has reported its tools, the bridge runs nothing.
+      await overBridge(options, async (client) => {
+        early = await client.callTool({ name: "bash", arguments: { command: "id" } });
+      });
+      yield init(["mcp__oma__bash"]);
       await overBridge(options, async (client) => {
         listed = (await client.listTools()).tools.map((x) => x.name);
         result = (await client.callTool({ name: "bash", arguments: { command: "ls" } })).content;
@@ -269,6 +322,7 @@ describe("ClaudeAgentSdkHarness — sandbox mode", () => {
 
     // The ask-gated tool (no execute) is not offered.
     expect(listed).toEqual(["bash"]);
+    expect(early.isError).toBe(true);
     expect(t.ran).toEqual([{ command: "ls" }]);
     expect(result).toEqual([{ type: "text", text: "ran on the sandbox" }]);
     // Recorded under the platform's own name, as the DefaultHarness does.
@@ -280,9 +334,9 @@ describe("ClaudeAgentSdkHarness — sandbox mode", () => {
   it("refuses every call that is not a bridged tool, and a bridged tool the pinned policy denies", async () => {
     vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/*");
     const t = tools();
-    const { query, seen } = fakeQuery(() => [success]);
+    const { query, seen } = fakeQuery(() => [init(["mcp__oma__bash", "mcp__oma__read"]), success]);
     const { ctx, broadcasts } = makeCtx({
-      tools: t.set,
+      tools: { ...t.set, read: { ...t.set.bash, description: "Read a file" } },
       agent: { effective_policy: { rules: [{ selector: "bash", effect: "deny" }] } },
     });
     await new ClaudeAgentSdkHarness({ query }).run(ctx);
@@ -293,27 +347,99 @@ describe("ClaudeAgentSdkHarness — sandbox mode", () => {
     expect((await can("mcp__oma__bash", { command: "ls" })).behavior).toBe("deny");
     expect(broadcasts.find((b) => b.type === "system.policy_decision")).toMatchObject({ tool_name: "bash", effect: "deny" });
     expect((await can("mcp__oma__read", { path: "/workspace/a" })).behavior).toBe("allow");
+    // A name under the bridge's prefix that the bridge does not serve.
+    expect((await can("mcp__oma__not_a_tool", {})).behavior).toBe("deny");
   });
 
-  it("stops the turn if Claude Code reports a tool outside the sandbox", async () => {
+  it.each([
+    ["a built-in next to the bridged tools", ["mcp__oma__bash", "Bash"], /outside this session's own \(Bash\)/],
+    ["a tool under the bridge's prefix that the bridge does not serve", ["mcp__oma__bash", "mcp__oma__extra"], /outside this session's own/],
+    ["no tool list at all", undefined, /did not report its tools/],
+    ["a tool list that is not a list", "mcp__oma__bash", /did not report its tools/],
+    ["a tool that is not a name", ["mcp__oma__bash", { name: "Bash" }], /outside this session's own/],
+  ])("stops the turn when Claude Code's init reports %s", async (_what, offered, message) => {
     vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/*");
     const t = tools();
-    let abortedBeforeWork = false;
-    const { query } = fakeQuery(async function* (options) {
-      yield { type: "system", subtype: "init", session_id: "sdk-2", tools: ["mcp__oma__bash", "Bash"] };
-      abortedBeforeWork = options.abortController.signal.aborted;
+    let lateCall: any;
+    const { query, seen } = fakeQuery(async function* (options) {
+      yield init(offered, "sdk-rejected");
+      // If the harness kept reading, this is what a tool call would do.
+      await overBridge(options, async (client) => {
+        lateCall = await client.callTool({ name: "bash", arguments: { command: "id" } });
+      });
       yield success;
     });
     const { ctx, broadcasts } = makeCtx({ tools: t.set });
-    await expect(new ClaudeAgentSdkHarness({ query }).run(ctx)).rejects.toThrow(/outside the sandbox \(Bash\)/);
-    expect(abortedBeforeWork).toBe(false); // the generator never resumed
+    const harness = new ClaudeAgentSdkHarness({ query });
+    await expect(harness.run(ctx)).rejects.toThrow(message);
+    expect(seen.options!.abortController.signal.aborted).toBe(true);
     expect(broadcasts.some((b) => b.type === "session.error")).toBe(true);
+    expect(lateCall).toBeUndefined();
     expect(t.ran).toEqual([]);
+
+    // The rejected Claude Code session is never resumed by the next turn.
+    const next = fakeQuery(() => [init(["mcp__oma__bash"], "sdk-ok"), success]);
+    await new ClaudeAgentSdkHarness({ query: next.query }).run(ctx);
+    expect(next.seen.options!.resume).toBeUndefined();
+    const third = fakeQuery(() => [init(["mcp__oma__bash"]), success]);
+    await new ClaudeAgentSdkHarness({ query: third.query }).run(ctx);
+    expect(third.seen.options!.resume).toBe("sdk-ok");
+  });
+
+  it.each([
+    ["an assistant message", { type: "assistant", session_id: "sdk-x", message: { content: [{ type: "text", text: "hi" }] } }],
+    ["a result", { type: "result", subtype: "success" }],
+  ])("stops the turn when %s comes before the init, and when there is no init at all", async (_what, first) => {
+    vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/*");
+    const t = tools();
+    const { query, seen } = fakeQuery(() => [first, init(["mcp__oma__bash"]), success]);
+    const { ctx, broadcasts } = makeCtx({ tools: t.set });
+    await expect(new ClaudeAgentSdkHarness({ query }).run(ctx)).rejects.toThrow(/before reporting its tools/);
+    expect(seen.options!.abortController.signal.aborted).toBe(true);
+    expect(broadcasts.some((b) => b.type === "agent.message")).toBe(false);
+
+    const silent = fakeQuery(() => []);
+    await expect(new ClaudeAgentSdkHarness({ query: silent.query }).run(makeCtx({ tools: t.set }).ctx)).rejects.toThrow(
+      /ended without reporting its tools/,
+    );
+  });
+
+  it("a tool call still running when the turn fails is cancelled and finished before the bridge closes", async () => {
+    vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/*");
+    const events: string[] = [];
+    let callSignal: AbortSignal | undefined;
+    const slow = {
+      description: "A long command",
+      inputSchema: jsonSchema({ type: "object", properties: {} }),
+      execute: (_input: unknown, opts: { abortSignal?: AbortSignal }) =>
+        new Promise<string>((resolve) => {
+          callSignal = opts.abortSignal;
+          events.push("call started");
+          opts.abortSignal?.addEventListener("abort", () => {
+            events.push("call cancelled");
+            resolve("stopped");
+          });
+        }),
+    };
+    const { query, seen } = fakeQuery(async function* (options) {
+      yield init(["mcp__oma__bash"]);
+      // Claude Code dispatches the call and does not wait for it here.
+      void overBridge(options, (client) => client.callTool({ name: "bash", arguments: {} })).catch(() => {});
+      while (!events.includes("call started")) await new Promise((r) => setTimeout(r, 5));
+      yield { type: "result", subtype: "error_during_execution" };
+    });
+    const { ctx } = makeCtx({ tools: { bash: slow } });
+    await expect(new ClaudeAgentSdkHarness({ query }).run(ctx)).rejects.toThrow(/turn failed/);
+    events.push("run returned");
+    expect(events).toEqual(["call started", "call cancelled", "run returned"]);
+    // Cancelled by the turn's own signal, the one Claude Code was given.
+    expect(callSignal).toBe(seen.options!.abortController.signal);
+    await expect(fetch(seen.options!.mcpServers.oma.url, { method: "POST", body: "{}" })).rejects.toThrow();
   });
 
   it("an agent computer gets sandbox tools even where nobody restricted the engine", async () => {
     const t = tools();
-    const { query, seen } = fakeQuery(() => [success]);
+    const { query, seen } = fakeQuery(() => [init(["mcp__oma__bash"]), success]);
     await new ClaudeAgentSdkHarness({ query }).run(makeCtx({ tools: t.set, sandbox: computer }).ctx);
     expect(seen.options!.tools).toEqual([]);
     expect(Object.keys(seen.options!.mcpServers)).toEqual(["oma"]);

@@ -326,5 +326,20 @@ have an entry. An empty value denies every agent.
 Limits of sandbox mode: tools awaiting approval are omitted (a tool that needs
 approval at call time fails the session, as with Codex), a pinned access policy is
 enforced per call (anything but allow is refused), and attached skills are not loaded.
-Memory stores are mounted in the sandbox at `/mnt/memory`. Setup sessions have no
-tools but the setup ones and need no sandbox.
+Memory stores are mounted in the sandbox at `/mnt/memory`.
+
+Setup sessions need no sandbox, and under the same conditions are isolated the same
+way: no built-in tools, no skills, no upstream MCP servers, the cut-down environment,
+and only the in-process setup tools (`update_harness`, `request_access` and the like).
+
+Claude Code must report its tools before anything it sends is acted on. If the report
+is missing, or lists a tool the session does not serve, the turn stops, no bridged tool
+runs, and that Claude Code session is not resumed. A tool call still running when a
+turn ends is cancelled before the bridge closes.
+
+One session tool does not run on the sandbox: `web_fetch` downloads the page in the
+API process so it can be converted to markdown. On Node that download refuses private
+and reserved addresses (loopback, private ranges, link-local metadata) at connect time
+and on every redirect, and holds redirects to the environment's allowed hosts. A
+refused URL falls back to `curl` on the sandbox's own network.
+`WEBHOOKS_ALLOW_PRIVATE=1` lifts the address checks for local development.
