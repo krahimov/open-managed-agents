@@ -249,6 +249,39 @@ describe("ClaudeAgentSdkHarness — operator restriction", () => {
       expect(seen.options!.disallowedTools).toContain("mcp__oma_platform__request_access");
     });
 
+    it("a deny written for the tool's own name holds here too (create_ambient_rule, not only mcp__oma_platform__…)", async () => {
+      vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/*");
+      const createAmbientRule = vi.fn(async () => ({ id: "rule-1" }));
+      let viaHandler: any;
+      const { query, seen } = fakeQuery(async function* (options) {
+        yield init(["mcp__oma_setup__update_harness", "mcp__oma_platform__create_ambient_rule"]);
+        // Even if Claude Code never asked canUseTool, the handler refuses.
+        const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+        await options.mcpServers.oma_platform.instance.connect(serverSide);
+        const client = new Client({ name: "fake-claude-code", version: "1" });
+        await client.connect(clientSide);
+        viaHandler = await client.callTool({
+          name: "create_ambient_rule",
+          arguments: { name: "nightly", cron: "0 3 * * *", prompt: "run" },
+        });
+        await client.close();
+        yield success;
+      });
+      // The rule as every other harness's policy would write it.
+      const { ctx, broadcasts } = makeCtx({
+        sandbox: null,
+        agent: { effective_policy: { rules: [{ selector: "create_ambient_rule", effect: "deny" }] } },
+      });
+      await setupHarness(query, { createAmbientRule }).run(ctx);
+      const can = seen.options!.canUseTool as (name: string, input: object) => Promise<{ behavior: string }>;
+      expect((await can("mcp__oma_platform__create_ambient_rule", {})).behavior).toBe("deny");
+      expect(broadcasts.find((b) => b.type === "system.policy_decision")).toMatchObject({ tool_name: "create_ambient_rule", effect: "deny" });
+      expect(viaHandler.isError).toBe(true);
+      expect(createAmbientRule).not.toHaveBeenCalled();
+      // A tool the policy says nothing about is unaffected.
+      expect((await can("mcp__oma_setup__update_harness", {})).behavior).toBe("allow");
+    });
+
     it("its tools change nothing before Claude Code's tools are validated, after the turn, or against the policy", async () => {
       vi.stubEnv("OMA_CLAUDE_ALLOWED_AGENTS", "tnt-1/*");
       const updateAgent = vi.fn(async () => ({ id: "agent-1" }) as never);

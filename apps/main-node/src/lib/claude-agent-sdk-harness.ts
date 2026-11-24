@@ -431,8 +431,11 @@ const SANDBOX_TOOL_PREFIX = `mcp__${SANDBOX_TOOLS_SERVER}__`;
  * policy does not allow. `names` collects the exact tool names served.
  */
 interface InProcessGate {
-  open: (ccToolName: string) => boolean;
-  names: Set<string>;
+  /** `omaToolName`: the tool's own name ("create_ambient_rule"), which is
+   *  what a policy written for any other harness calls it. */
+  open: (ccToolName: string, omaToolName: string) => boolean;
+  /** Claude Code's name for each tool served → the tool's own name. */
+  names: Map<string, string>;
 }
 
 type SdkTool = ReturnType<typeof tool>;
@@ -443,11 +446,11 @@ function inProcessServer(name: string, tools: SdkTool[], gate?: InProcessGate) {
     ? tools
     : tools.map((t) => {
         const ccName = `mcp__${name}__${t.name}`;
-        gate.names.add(ccName);
+        gate.names.set(ccName, t.name);
         return {
           ...t,
           handler: (async (args: unknown, extra: unknown) =>
-            gate.open(ccName)
+            gate.open(ccName, t.name)
               ? (t.handler as (a: unknown, e: unknown) => Promise<unknown>)(args, extra)
               : {
                   content: [{ type: "text" as const, text: "This tool is not available in this session right now." }],
@@ -991,11 +994,17 @@ export class ClaudeAgentSdkHarness {
     const policy = ctx.agent.effective_policy;
     const hasPolicy = !!policy?.rules?.length;
     /** Isolated: anything the policy does not plainly allow is refused, since
-     *  this path cannot ask. */
-    const policyRefuses = (omaToolName: string): string | null => {
+     *  this path cannot ask. A tool is refused under ANY of the names given:
+     *  an in-process tool is `create_ambient_rule` to a policy written for
+     *  the other harnesses and `mcp__oma_platform__create_ambient_rule` to
+     *  one written for this one, and a deny under either must hold. */
+    const policyRefuses = (...toolNames: string[]): string | null => {
       if (!hasPolicy) return null;
-      const decision = evaluatePolicy(policy, omaToolName);
-      return decision.effect === "allow" ? null : (decision.selector ?? "default");
+      for (const name of toolNames) {
+        const decision = evaluatePolicy(policy, name);
+        if (decision.effect !== "allow") return decision.selector ?? "default";
+      }
+      return null;
     };
 
     let bridge: McpHttpBridge | null = null;
@@ -1009,7 +1018,10 @@ export class ClaudeAgentSdkHarness {
     const bridgedNames = new Map<string, string>();
     /** Exactly the in-process tool names an isolated setup session serves. */
     const setupGate: InProcessGate | undefined = isolated
-      ? { names: new Set(), open: (ccName) => acceptingCalls && policyRefuses(ccToolNameToOma(ccName)) === null }
+      ? {
+          names: new Map(),
+          open: (ccName, omaName) => acceptingCalls && policyRefuses(omaName, ccToolNameToOma(ccName)) === null,
+        }
       : undefined;
     if (sandboxed) {
       const tools = await codexComputerTools(ctx, {
@@ -1120,8 +1132,10 @@ export class ClaudeAgentSdkHarness {
       if (!isolatedToolAllowed(toolName)) {
         return { behavior: "deny" as const, message: "This tool is not available in this session." };
       }
-      const omaName = bridgedNames.get(toolName) ?? ccToolNameToOma(toolName);
-      const refusedBy = policyRefuses(omaName);
+      // A bridged tool has one name; an in-process one has two (see policyRefuses).
+      const bridged = bridgedNames.get(toolName);
+      const omaName = bridged ?? setupGate?.names.get(toolName) ?? ccToolNameToOma(toolName);
+      const refusedBy = bridged !== undefined ? policyRefuses(bridged) : policyRefuses(omaName, ccToolNameToOma(toolName));
       if (refusedBy !== null) {
         runtime.broadcast({
           type: "system.policy_decision",

@@ -239,6 +239,39 @@ describe("web_fetch downloads through the guarded fetch", () => {
     expect(out.sandboxCommands).toEqual([]);
   });
 
+  it.each(["file:///etc/passwd", "gopher://internal:70/", "not a url"])(
+    "reads web pages only: %s is refused outright, with or without the guarded fetch, and never reaches curl",
+    async (url) => {
+      const guarded = await run(url, { remote: true, webFetch: createPublicFetch() });
+      expect(guarded.value).toMatch(/only http and https URLs|Invalid URL/);
+      expect(guarded.sandboxCommands).toEqual([]);
+      // No converter and no guarded fetch (the plain fallback path).
+      const { buildTools } = await import("@open-managed-agents/agent/harness/tools");
+      const commands: string[] = [];
+      const sandbox = { exec: async (cmd: string) => { commands.push(cmd); return "exit=0\nroot:x:0:0"; }, readFile: async () => "", writeFile: async () => "ok" } as never;
+      const tools = await buildTools(agent, sandbox, {});
+      const out = await (tools.web_fetch as any).execute({ url }, opts);
+      expect(JSON.stringify(out)).toMatch(/only http and https URLs|Invalid URL/);
+      expect(commands).toEqual([]);
+    },
+  );
+
+  it("the curl fallback is held to http(s) on every redirect and is stopped with the call", async () => {
+    const { buildTools } = await import("@open-managed-agents/agent/harness/tools");
+    const cancel = new AbortController();
+    const calls: Array<{ cmd: string; signal?: AbortSignal }> = [];
+    const sandbox = {
+      exec: async (cmd: string, _timeout: number, o?: { signal?: AbortSignal }) => { calls.push({ cmd, signal: o?.signal }); return "exit=0\nraw"; },
+      readFile: async () => "", writeFile: async () => "ok",
+    } as never;
+    const tools = await buildTools(agent, sandbox, {});
+    await (tools.web_fetch as any).execute({ url: "https://example.com/a" }, { ...(opts as object), abortSignal: cancel.signal });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].cmd).toContain("--proto '=http,https'");
+    expect(calls[0].cmd).toContain("--proto-redir '=http,https'");
+    expect(calls[0].signal).toBe(cancel.signal);
+  });
+
   it("a page over the size limit falls back to the sandbox, which returns only its head", async () => {
     const out = await run(`http://public.test:${port}/big`, { remote: true, webFetch: fetcher({ maxBytes: 100 }) });
     expect(out.value).toContain("from the sandbox");

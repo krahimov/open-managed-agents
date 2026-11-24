@@ -1168,6 +1168,17 @@ export async function buildTools(
         const turnSignal = options?.abortSignal;
         const within = (ms: number) =>
           turnSignal ? AbortSignal.any([turnSignal, AbortSignal.timeout(ms)]) : AbortSignal.timeout(ms);
+        // A web page, nothing else: this tool also shells out to curl, which
+        // would read file:// (or gopher://, dict://…) for an agent that was
+        // given web access and no file or shell tool.
+        try {
+          const scheme = new URL(url).protocol;
+          if (scheme !== "http:" && scheme !== "https:") {
+            return `Error: only http and https URLs can be fetched (${scheme})`;
+          }
+        } catch {
+          return "Error: Invalid URL";
+        }
         // Networking restriction enforcement (limited mode)
         if (env?.environmentConfig?.networking?.type === "limited") {
           const allowedHosts = env.environmentConfig.networking.allowed_hosts || [];
@@ -1249,7 +1260,9 @@ export async function buildTools(
             // the sandbox has a network of its own. A local-subprocess
             // "sandbox" shares this host's, and curl there would reach
             // exactly what was just refused.
-            if (e.code === "host_not_allowed") return `Error: ${e.message}`;
+            if (e.code === "host_not_allowed" || e.code === "scheme" || e.code === "invalid_url") {
+              return `Error: ${e.message}`;
+            }
             if (e.code === "private_address" && typeof (sandbox as { sandboxCapabilities?: unknown }).sandboxCapabilities !== "function") {
               return `Error: ${e.message}. It cannot be fetched from here.`;
             }
@@ -1261,10 +1274,13 @@ export async function buildTools(
         }
         if (markdown === null) {
           if (turnSignal?.aborted) throw new Error("web_fetch was cancelled");
-          // Fallback: raw curl from sandbox (last-resort, model gets warning)
+          // Fallback: raw curl from sandbox (last-resort, model gets warning).
+          // http(s) only, on the first URL and on every redirect; stopped
+          // with the call.
           const raw = await sandbox.exec(
-            `curl -sL -m 30 '${url.replace(/'/g, "'\\''")}' | head -c ${cap}`,
+            `curl -sL -m 30 --proto '=http,https' --proto-redir '=http,https' '${url.replace(/'/g, "'\\''")}' | head -c ${cap}`,
             35000,
+            turnSignal ? { signal: turnSignal } : undefined,
           );
           markdown = `[NOTE: markdown extraction unavailable for this URL — returning raw response. Look for the actual content between HTML tags.]\n\n${truncateResult(raw)}`;
           isRaw = true;
@@ -1293,7 +1309,7 @@ export async function buildTools(
               prompt: `URL: ${url}\n\nPAGE CONTENT (markdown):\n\n${markdown}`,
               maxOutputTokens: 1500,
               temperature: 0.1,
-              abortSignal: AbortSignal.timeout(60_000),
+              abortSignal: within(60_000),
             });
             const summary = (summarizeResult.text || "").trim();
             if (summary.length === 0) throw new Error("aux model returned empty summary");
